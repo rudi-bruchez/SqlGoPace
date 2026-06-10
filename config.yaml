@@ -1,0 +1,52 @@
+# config.yaml — configuration de SqlGoPace
+# Les secrets (mot de passe, etc.) ne sont JAMAIS en clair ici : ils viennent du fichier .env
+# et sont injectés via ${VARIABLE}. Voir .env.example.
+
+database:
+  # La chaîne référence des variables d'environnement (.env). Auth Windows/Azure AD : retirer
+  # user id/password et ajouter "trusted connection" / le mode d'auth approprié au driver.
+  connection_string: "server=${DB_SERVER};database=${DB_NAME};user id=${DB_USER};password=${DB_PASSWORD};encrypt=true;trustServerCertificate=true;app name=SqlGoPace"
+  login_timeout_seconds: 15      # connexion uniquement — PAS de timeout de requête
+  # Query timeout du driver = 0 (infini) : pas de Global Timeout sur un DDL.
+  # Le contrôle de durée est délégué au monitoring (blocage / log), jamais à un timer fixe.
+
+directories:
+  to_run:     "./01.to_run"
+  processing: "./02.processing"
+  done:       "./03.done"
+  failed:     "./04.failed"
+
+monitoring:
+  blocking_poll_seconds: 10
+  log_poll_seconds: 60
+  progress_poll_seconds: 30
+  log_max_size_bytes: 53687091200   # 50 GB — plafond absolu (borné par max_size des fichiers log)
+  log_max_percent: 80               # secondaire
+  blocking_timeout_minutes: 5       # délai avant réaction quand notre DDL bloque d'autres sessions
+  log_drain_timeout_minutes: 30     # abandon si le log ne se libère pas
+  max_retry_attempts: 3
+  kill_grace_seconds: 30            # délai avant KILL explicite si l'annulation Go ne prend pas
+  checkpoint_between_operations: false  # n'a d'effet qu'en recovery model SIMPLE
+
+preflight:
+  require_data_free_space: true     # exige ≈ taille de l'objet libre dans le filegroup
+  check_tempdb: true
+  ag_send_queue_warn: true          # avertit mais n'empêche pas (configurable)
+
+options_override:
+  online:               { force: null }   # true / false / null(auto)
+  resumable:            { force: null }
+  wait_at_low_priority: { force: null }
+  maxdop:               { force: null }
+  sort_in_tempdb:       { force: null }
+  allow_abort_blockers: false        # DANGEREUX : autorise ABORT_AFTER_WAIT = BLOCKERS
+
+notifications:
+  webhook_url: "${WEBHOOK_URL}"      # vide = désactivé
+  on_events: [cancel, fail, pause, log_full, abort]
+
+history:
+  enabled: true
+  destination: "sqlite://./sqlgopace_history.db"
+
+matrix_file: "./ddl_compatibility.yaml"

@@ -27,6 +27,14 @@ go.work.sum
 # env file
 .env
 
+# SqlGoPace runtime
+sqlgopace_history.db
+sqlgopace_history.db-*
+02.processing/
+03.done/
+04.failed/
+
 # Editor/IDE
 # .idea/
 # .vscode/
+formation/

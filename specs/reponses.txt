@@ -1,0 +1,116 @@
+Mes remarques :
+
+1.1 Le KILL d'un DDL déclenche un ROLLBACK — souvent pire que le mal
+> En général, le KILL ne me dérange pas, il permet de débloquer la situation. Tu dis :
+
+- "qui peut durer aussi longtemps, voire plus, que l'opération elle-même" -> il est souvent assez rapide (il y a un cache du log en mémoire)
+- "qui ne peut pas être interrompu (un 2ᵉ KILL ne fait rien)" -> d'accord, mais on sait. On peut prévoir un thread de surveillance pour voir où en est le KILL.
+- "qui génère encore plus de journal" -> le journal prévoit un espace libre pour le ROLLBACK, pas un problème.
+
+Mais pour limiter les dégâts, je te propose :  
+- de vérifier si ADR est activé sur la base de données, pour savoir que tout va bien. https://learn.microsoft.com/en-us/sql/relational-databases/accelerated-database-recovery-concepts
+- comme tu dis : introduire la notion de KILL ... WITH STATUSONLY pour estimer le % rollback complete et logger que l'annulation est en cours (sinon l'opérateur croit que c'est planté.
+- RESUMABLE devient la stratégie d'orchestration, SI C'EST DISPONIBLE.
+
+Quand une opération est RESUMABLE = ON, au lieu de KILL (= rollback), on fait comme tu dis :
+- ALTER INDEX ... PAUSE → le travail déjà fait est conservé,
+- attendre que la pression (blocage / log) retombe,
+- ALTER INDEX ... RESUME.
+
+Logique de réaction par ordre de préférence :
+
+1. opération RESUMABLE supportée → PAUSE / RESUME
+2. sinon, WAIT_AT_LOW_PRIORITY → laisser SQL Server gérer **dans la phase d'attente de la commande**, mais ensuite, quand le DDL tourne, si ce sont d'autres requêtes utilisateurs qui sont bloquées, il faudra attendre la durrée configurée, et faire un KILL du DDL.
+3. sinon → cancel Go → KILL en dernier recours
+
+À ajouter : les opérations resumable survivent au crash du tool et au redémarrage du serveur. Il faut interroger sys.index_resumable_operations au démarrage pour reprendre une opération orpheline plutôt que de la relancer à zéro.
+
+1.3 stratégie « attendre que le journal se vide » 
+
+Tu dis : "c'est faux en recovery model FULL"
+NON : on attend justement un certain temps pour laisser passer le backup de journal.
+
+OK pour :
+- détecter SELECT recovery_model_desc FROM sys.databases au pré-vol,
+- interpréter log_reuse_wait_desc au lieu de le logger seulement :
+   - LOG_BACKUP → il faut une sauvegarde de journal , donc **ON ATTEND** -> normalement cela doit arriver toutes les 5 ou 15 minutes
+   - ACTIVE_TRANSACTION → c'est notre propre DDL,
+   - AVAILABILITY_REPLICA / REPLICATION → groupe de disponibilité / réplication : le log est bloqué par le secondaire
+- Information à ajouter dans le log si on décide d'abandonner la commande.
+- exécuter automatiquement un CHECKPOINT entre chaque commande (ajouter l'option pour activer cela dans le config.yaml)
+
+1.4 WAIT_AT_LOW_PRIORITY
+
+On va toujours injecter ABORT_AFTER_WAIT = SELF 
+On peut prévoir une option dans le yaml, dangereuse, pour autoriser BLOCKERS 
+
+1.5 Conscience des Availability Groups / tempdb / espace disque
+
+OK pour : "un gros DDL peut saturer la send queue et bloquer la troncature du log côté primaire si le secondaire ne suit pas. À
+  détecter (sys.dm_hadr_database_replica_states)." On indique la situation en live dans le TUI si activé, et on loggue, mais on y va quand même
+- tempdb : un rebuild ONLINE (surtout avec SORT_IN_TEMPDB) peut remplir tempdb → à monitorer comme le journal.
+- Espace data : un rebuild ONLINE construit une copie de l'index → il faut ~la taille de l'index en espace libre dans le filegroup.
+- Pré-vol d'espace disque/fichier si possible.
+
+1.6 Récupération après crash
+
+OK pour tes remarques, réfléchis à la meilleure solution :
+
+Le fichier est dans 01.processing. Si l'outil meurt (ou est tué), au redémarrage :
+- Le DDL tourne peut-être encore côté serveur (session orpheline).
+- Il faut une règle de reprise : retrouver une session orpheline (via un marqueur, p.ex. SET CONTEXT_INFO ou un commentaire signé
+  dans la requête), vérifier sys.index_resumable_operations, décider reprendre/abandonner. Sans ça, on risque de relancer un DDL déjà
+  en cours → double exécution.
+
+2. Fonctionnalités à fort levier
+
+- Mode --dry-run : afficher la commande DDL finale (avec options injectées) sans l'exécuter. À coupler avec un --explain qui montre pourquoi chaque option a été ajoutée (version détectée + matrice).
+- Suivi de progression : sys.dm_exec_requests.percent_complete + estimated_completion_time fonctionnent pour REBUILD/ALTER. À afficher dans la TUI et logger périodiquement → l'opérateur sait si c'est à 5 % ou 95 % avant de décider d'annuler, si TUI. Donc : dans TUI, permettre le CANCEL explicite
+- Pré-vol (preflight) consolidé par fichier : version/édition, recovery model, espace log/data/tempdb, AG, estimation taille de
+  l'objet, validation de syntaxe. Un échec de pré-vol envoie en 03.failed sans avoir posé un seul verrou.
+- Checkpoint par batch : un fichier a N batchs séparés par GO. Si le batch 2 échoue, le .log doit enregistrer quels batchs ont
+  réussi, et la reprise doit pouvoir repartir du batch en échec (ou exiger des DDL idempotents IF NOT EXISTS).
+- Fenêtre de maintenance : allowed_hours / jours, et comportement en fin de fenêtre (pause resumable plutôt qu'abandon).
+- Notifications : webhook/Slack/email sur cancel, échec, log plein. Pour de la prod, l'équipe veut être alertée, pas découvrir le .log le lendemain.
+- Découplage des intervalles de monitoring : un seul interval_seconds: 60 est trop grossier pour la détection de blocage (60 s de
+  blocage en prod = incident). Séparer : blocking_poll (p.ex. 10 s) vs log_poll (60 s).
+- Historique de run (SQLite ou table dédiée) : durées, retries, blocages — pour analyser les tendances et estimer les prochaines
+  opérations. Destination spécifiée dans config.yaml
+- Codes de sortie clairs pour l'intégration CI/agent SQL.
+
+3. Hygiène et cohérence des specs
+
+- Conflit timeout_minutes: 120 vs « pas de Global Timeout » : 
+  - Le query-timeout du driver Go doit être 0 (infini) et le contrôle de durée délégué au monitoring. 
+  - timeout_minutes n'est que le login/connection timeout, à renommer.
+- Utiliser le driver Go-mssql de Microsoft : https://github.com/microsoft/go-mssqldb#readme
+- Collision de préfixes de dossiers : j'ai changé la numérotation dans les specs, relis.
+- Schéma YAML : ddl_compatibility.yaml (versions.md). schéma canonique (la structure version → commands → options de versions.md).
+  - ALTER TABLE ALTER COLUMN ... ONLINE existe en effet depuis SQL Server 2016, J'ai vérifié dans la documentation :
+    WITH ( ONLINE = ON | OFF) <as applies to altering a column> -- Applies to: SQL Server 2016 (13.x) and later versions, and Azure SQL Database.
+- ajouter une table ProductMajorVersion → année (13=2016, 14=2017, 15=2019, 16=2022, 17=2025) et gérer Azure : EngineEdition 5 (SQL DB) et 8 (MI) sont evergreen (≈ Enterprise, ONLINE/RESUMABLE toujours dispo) — ils ne rentrent pas dans une matrice indexée par année. Prévoir une pseudo-version azure.
+  -> Mettre ça dans un fichier de configuration YAML.
+- Typo : MAXOP → MAXDOP. Et « Entreprise » → « Enterprise ». = CORRIGE
+- DB hardcodée : la requête log_reuse_wait_desc ... WHERE Name = 'EXAMPLEDB' doit être paramétrée par la base de la connexion
+  (DB_NAME()). CORRIGE
+- Sécurité des credentials : password=secret en clair dans le YAML. Utiliser un fichier .env
+  support de l'auth Windows/Azure AD, et encrypt=true dans la chaîne. 
+- Documenter aussi les permissions minimales requises (VIEW SERVER STATE pour les DMV, ALTER ANY CONNECTION ou sysadmin pour le KILL, ALTER sur les objets).
+
+- Spec du parser à durcir : préciser que le splitter doit ignorer un GO à l'intérieur d'une chaîne '...' ou d'un identifiant
+  [...]/"...", gérer GO N (répétition), et préserver le texte original pour le log. Pour l'injection d'options, préciser la fusion
+  dans une clause WITH (...) existante sans doublon (c'est là que l'AST GoSQLX aide réellement, sinon regex sur l'ensemble restreint
+  de commandes).
+  -> Sur ce sujet, voir ma question à la fin du document.
+
+- Format du .log non spécifié : schéma JSON + rendu humain : horodatages, durée, options injectées +
+  justification, batchs exécutés, retries/cancels avec texte des requêtes bloquées, percent_complete final, erreurs SQL.
+
+4. Precheck à ajouter : avant de commencer toute opération, on fait des vérifications sur le journal et les blocages, pour commencer dans une situation saine.
+
+## Mes remarques et questions :
+
+- Est-ce qu'il vaut la peine de coder quelque part le fait que certaines opérations sont metadata only et n'ont pas vraiment besoin de surveillance, comme par exemple un ajout de colonne not null avec une valeur par défaut en constante, qui est une opération de métadonnée seulement dans l'édition entreprise de SQL Server? 
+- Est-ce qu'il vaut mieux formaliser le ddl dans un yaml au lieu de parser un fichier sql? 
+
+- Fonctionnalités à ajouter dans le TUI : Dans le TUI, ajouter la capacité de voir en temps réel les autres sessions bloquées avec le détail, pour prendre manuellement la décision de kill 
