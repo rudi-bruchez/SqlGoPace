@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -23,6 +24,7 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
 	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
+	"github.com/rudi-bruchez/SqlGoPace/internal/tui"
 )
 
 // sqlitePath strips an optional "sqlite://" prefix from a history destination.
@@ -51,6 +53,7 @@ func cli(stdout, stderr io.Writer, args []string) error {
 		assumeVersion = fs.Int("assume-version", 0, "target SQL Server major version for offline dry-run (e.g. 16 for 2022)")
 		assumeEdition = fs.String("assume-edition", "enterprise", "target edition tier: enterprise, standard, express, azure")
 		matrixPath    = fs.String("matrix", "ddl_compatibility.yaml", "path to the DDL compatibility matrix")
+		useTUI        = fs.Bool("tui", false, "run with the interactive incident console")
 		showVersion   = fs.Bool("version", false, "print version and exit")
 	)
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +86,7 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	if cfg == nil {
 		return errors.New("run mode requires --config (connection, directories, policy); or pass --dry-run")
 	}
-	return runEngine(ctx, stdout, cfg, matrix)
+	return runEngine(ctx, stdout, cfg, matrix, *useTUI)
 }
 
 // dryRunAll renders every manifest's planned T-SQL without executing it.
@@ -105,8 +108,9 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 }
 
 // runEngine connects, detects the target, and runs every queued manifest with
-// monitoring and reaction.
-func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix) error {
+// monitoring and reaction. With useTUI, the interactive incident console runs in
+// the foreground while the engine runs in the background.
+func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix, useTUI bool) error {
 	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString)
 	if err != nil {
 		return err
@@ -150,10 +154,14 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		fmt.Fprintf(stdout, "-- recovery: %d requeued, %d adopted\n", rsum.Requeued, rsum.Adopted)
 	}
 
+	engineOut := stdout
+	if useTUI {
+		engineOut = io.Discard // narration would corrupt the console; the TUI shows state
+	}
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
-		run.WithOutput(stdout),
+		run.WithOutput(engineOut),
 	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
@@ -168,7 +176,12 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
 
-	summary, err := engine.ProcessAll(ctx)
+	var summary run.Summary
+	if useTUI {
+		summary, err = runWithTUI(ctx, conn, engine, cfg.Monitoring.ProgressPoll())
+	} else {
+		summary, err = engine.ProcessAll(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -177,6 +190,82 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		return fmt.Errorf("%d manifest(s) failed", summary.Failed)
 	}
 	return nil
+}
+
+// runWithTUI runs the incident console in the foreground while the engine runs
+// in the background. The console is fed live from the monitoring connection, and
+// operator actions (kill DDL, kill a blocker) are dispatched to the server.
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, pollInterval time.Duration) (run.Summary, error) {
+	actions := make(chan tui.Action, 8)
+	program := tui.NewProgram(tui.New("(running)", false, actions))
+
+	feedCtx, stopFeed := context.WithCancel(ctx)
+	defer stopFeed()
+	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval)
+	go dispatchActions(feedCtx, conn, conn.SPID(), actions)
+
+	type result struct {
+		summary run.Summary
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		summary, err := engine.ProcessAll(ctx)
+		done <- result{summary, err}
+		program.Quit() // close the console when the run finishes
+	}()
+
+	if err := program.Run(); err != nil {
+		return run.Summary{}, err
+	}
+	r := <-done
+	return r.summary, r.err
+}
+
+// feedConsole polls the server and sends progress and blocker updates to the TUI.
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if sessions, err := conn.ActiveSessions(ctx); err == nil {
+				var blockers []tui.Blocker
+				for _, s := range sessions {
+					if s.BlockingSPID == ddlSPID {
+						blockers = append(blockers, tui.Blocker{
+							SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
+							WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
+						})
+					}
+				}
+				program.Send(tui.BlockersMsg{Blockers: blockers})
+			}
+			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
+				program.Send(tui.ProgressMsg{Percent: p.PercentComplete, ETASeconds: p.EstimatedCompletionMS / 1000})
+			}
+		}
+	}
+}
+
+// dispatchActions routes operator intents to the server.
+func dispatchActions(ctx context.Context, conn *mssql.Conn, ddlSPID int, actions <-chan tui.Action) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case a := <-actions:
+			switch a.Kind {
+			case tui.ActionKillDDL:
+				_ = conn.Kill(ctx, ddlSPID)
+			case tui.ActionKillBlocker:
+				_ = conn.Kill(ctx, a.SPID)
+			}
+		}
+	}
 }
 
 // loadConfig loads the config file when one is given, else returns nil.

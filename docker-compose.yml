@@ -1,0 +1,25 @@
+# Throwaway SQL Server 2022 (Developer edition) for end-to-end / integration tests.
+#
+#   docker compose up -d        # or: make e2e-up
+#   make e2e-test               # runs the integration-tagged tests
+#   docker compose down -v      # or: make e2e-down
+#
+# The SA password must satisfy SQL Server's complexity policy.
+services:
+  mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: sqlgopace-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      MSSQL_SA_PASSWORD: "Str0ng_Passw0rd!"
+      MSSQL_PID: "Developer"
+    ports:
+      - "1433:1433"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s

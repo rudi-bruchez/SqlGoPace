@@ -4,7 +4,10 @@
 BINARY := sqlgopace
 PKG    := ./...
 
-.PHONY: all build test cover lint tidy vet integration clean
+# Connection string for integration / e2e tests against the docker-compose server.
+E2E_DSN ?= sqlserver://sa:Str0ng_Passw0rd!@localhost:1433?database=tempdb&encrypt=disable
+
+.PHONY: all build test cover lint tidy vet integration e2e-up e2e-down e2e-test e2e clean
 
 all: lint test build
 
@@ -28,7 +31,26 @@ tidy:
 	go mod tidy
 
 integration:
-	go test -race -tags=integration $(PKG)
+	SQLGOPACE_TEST_DSN="$(E2E_DSN)" go test -race -tags=integration $(PKG)
+
+# Bring up a throwaway SQL Server, wait until healthy.
+e2e-up:
+	docker compose up -d
+	@echo "waiting for SQL Server to become healthy..."
+	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' sqlgopace-mssql 2>/dev/null)" = "healthy" ]; do sleep 3; done
+	@echo "SQL Server is healthy."
+
+e2e-down:
+	docker compose down -v
+
+# Run only the e2e/integration tests against the running server.
+e2e-test:
+	SQLGOPACE_TEST_DSN="$(E2E_DSN)" go test -tags=integration -run 'Integration|E2E' $(PKG)
+
+# Full cycle: up, test, down.
+e2e: e2e-up
+	-$(MAKE) e2e-test
+	$(MAKE) e2e-down
 
 clean:
 	rm -rf bin coverage.out
