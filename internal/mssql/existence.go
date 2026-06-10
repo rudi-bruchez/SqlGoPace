@@ -1,0 +1,58 @@
+package mssql
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+// existsScalar runs a query expected to return a single non-zero count or flag
+// and reports whether it is positive.
+func (c *Conn) existsScalar(ctx context.Context, query string, args ...any) (bool, error) {
+	var n int
+	if err := c.pool.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
+		return false, fmt.Errorf("existence check: %w", err)
+	}
+	return n > 0, nil
+}
+
+const tableExistsSQL = `
+SELECT CASE WHEN OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table), 'U') IS NOT NULL
+            THEN 1 ELSE 0 END;`
+
+// TableExists reports whether the user table [schema].[table] exists.
+func (c *Conn) TableExists(ctx context.Context, schema, table string) (bool, error) {
+	return c.existsScalar(ctx, tableExistsSQL, sql.Named("schema", schema), sql.Named("table", table))
+}
+
+const indexExistsSQL = `
+SELECT COUNT(*) FROM sys.indexes
+WHERE name = @index
+  AND object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table));`
+
+// IndexExists reports whether the named index exists on [schema].[table].
+func (c *Conn) IndexExists(ctx context.Context, schema, table, index string) (bool, error) {
+	return c.existsScalar(ctx, indexExistsSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index))
+}
+
+const columnExistsSQL = `
+SELECT CASE WHEN COL_LENGTH(QUOTENAME(@schema) + '.' + QUOTENAME(@table), @column) IS NOT NULL
+            THEN 1 ELSE 0 END;`
+
+// ColumnExists reports whether the named column exists on [schema].[table].
+func (c *Conn) ColumnExists(ctx context.Context, schema, table, column string) (bool, error) {
+	return c.existsScalar(ctx, columnExistsSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("column", column))
+}
+
+const constraintExistsSQL = `
+SELECT COUNT(*) FROM sys.objects
+WHERE name = @constraint
+  AND parent_object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table));`
+
+// ConstraintExists reports whether the named constraint exists on [schema].[table].
+func (c *Conn) ConstraintExists(ctx context.Context, schema, table, constraint string) (bool, error) {
+	return c.existsScalar(ctx, constraintExistsSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("constraint", constraint))
+}
