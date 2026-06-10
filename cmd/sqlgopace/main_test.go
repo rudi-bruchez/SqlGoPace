@@ -46,6 +46,23 @@ func TestRunDryRunStandardOmitsOnline(t *testing.T) {
 	}
 }
 
+func TestRunDryRunWithConfigPolicy(t *testing.T) {
+	var out bytes.Buffer
+	// Offline target (assume flags) but policy comes from --config, which forces
+	// ONLINE off; the matrix path is taken from the config file.
+	args := []string{
+		"--dry-run", "--assume-version=16", "--assume-edition=enterprise",
+		"--config=testdata/config_force_online_off.yaml", exampleManifest,
+	}
+
+	if err := run(&out, io.Discard, args); err != nil {
+		t.Fatalf("run(config policy) error = %v, want nil", err)
+	}
+	if strings.Contains(out.String(), "ONLINE = ON") {
+		t.Errorf("config forced ONLINE off, but output still injects it:\n%s", out.String())
+	}
+}
+
 func TestRunExplain(t *testing.T) {
 	var out bytes.Buffer
 	args := []string{"--dry-run", "--explain", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, exampleManifest}

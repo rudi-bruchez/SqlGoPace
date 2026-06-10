@@ -3,17 +3,22 @@
 //
 // See specs/SPECS.md for the full behaviour and specs/IMPLEMENTATION.md for the
 // implementation plan. So far only offline planning (--dry-run / --explain) is
-// wired; execution and monitoring are added in later phases.
+// wired, optionally connecting to detect the real target; execution and
+// monitoring are added in later phases.
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 
+	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
 // version is the build version, overridden at release time via -ldflags.
@@ -33,6 +38,7 @@ func run(stdout, stderr io.Writer, args []string) error {
 	var (
 		dryRun        = fs.Bool("dry-run", false, "render the final T-SQL without executing anything")
 		explain       = fs.Bool("explain", false, "with --dry-run, show why each option was injected")
+		configPath    = fs.String("config", "", "path to config.yaml (provides option policy, matrix path, and live connection)")
 		assumeVersion = fs.Int("assume-version", 0, "target SQL Server major version for offline dry-run (e.g. 16 for 2022)")
 		assumeEdition = fs.String("assume-edition", "enterprise", "target edition tier: enterprise, standard, express, azure")
 		matrixPath    = fs.String("matrix", "ddl_compatibility.yaml", "path to the DDL compatibility matrix")
@@ -53,25 +59,87 @@ func run(stdout, stderr io.Writer, args []string) error {
 		return errors.New("only --dry-run is implemented so far; pass --dry-run")
 	}
 
-	target, err := offlineTarget(*assumeVersion, *assumeEdition)
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-	matrix, err := ddl.LoadFile(*matrixPath)
+
+	visited := visitedFlags(fs)
+	matrix, err := ddl.LoadFile(matrixFile(cfg, *configPath, *matrixPath, visited))
 	if err != nil {
 		return err
 	}
+	target, err := resolveTarget(context.Background(), stdout, visited, *assumeVersion, *assumeEdition, cfg)
+	if err != nil {
+		return err
+	}
+
 	manifests := fs.Args()
 	if len(manifests) == 0 {
 		return errors.New("no manifest files given")
 	}
-
+	policy := policyOf(cfg)
 	for _, path := range manifests {
-		if err := dryRunManifest(stdout, path, target, matrix, ddl.Policy{}, *explain); err != nil {
+		if err := dryRunManifest(stdout, path, target, matrix, policy, *explain); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// loadConfig loads the config file when one is given, else returns nil.
+func loadConfig(path string) (*config.Config, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return config.Load(path)
+}
+
+func policyOf(cfg *config.Config) ddl.Policy {
+	if cfg == nil {
+		return ddl.Policy{}
+	}
+	return cfg.Policy()
+}
+
+// matrixFile picks the matrix path: an explicit --matrix wins, otherwise the
+// config's matrix_file (resolved relative to the config file's directory, so it
+// is independent of the working directory).
+func matrixFile(cfg *config.Config, configPath, flagValue string, visited map[string]bool) string {
+	if cfg == nil || visited["matrix"] {
+		return flagValue
+	}
+	if filepath.IsAbs(cfg.MatrixFile) {
+		return cfg.MatrixFile
+	}
+	return filepath.Join(filepath.Dir(configPath), cfg.MatrixFile)
+}
+
+// resolveTarget returns the option-resolution target. It uses the --assume-*
+// flags when either is set (offline), otherwise connects via the config's
+// connection string to detect the real server.
+func resolveTarget(ctx context.Context, log io.Writer, visited map[string]bool, assumeVersion int, assumeEdition string, cfg *config.Config) (ddl.Target, error) {
+	offline := visited["assume-version"] || visited["assume-edition"]
+	if offline || cfg == nil {
+		return offlineTarget(assumeVersion, assumeEdition)
+	}
+
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString)
+	if err != nil {
+		return ddl.Target{}, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	info, err := conn.Detect(ctx)
+	if err != nil {
+		return ddl.Target{}, err
+	}
+	if !info.Supported() {
+		return ddl.Target{}, fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
+	}
+	fmt.Fprintf(log, "-- detected target: tier=%s major=%d adr=%t recovery=%s\n",
+		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
+	return info.Target(), nil
 }
 
 // offlineTarget builds a resolution target from the --assume-* flags.
@@ -81,9 +149,16 @@ func offlineTarget(major int, edition string) (ddl.Target, error) {
 		return ddl.Target{}, fmt.Errorf("invalid --assume-edition: %w", err)
 	}
 	if major <= 0 && tier != ddl.TierAzure {
-		return ddl.Target{}, errors.New("--assume-version is required for dry-run (e.g. 16 for SQL Server 2022)")
+		return ddl.Target{}, errors.New("set --assume-version (e.g. 16 for SQL Server 2022) or --config to connect")
 	}
 	return ddl.Target{MajorVersion: major, Tier: tier}, nil
+}
+
+// visitedFlags records which flags were explicitly set on the command line.
+func visitedFlags(fs *flag.FlagSet) map[string]bool {
+	visited := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { visited[f.Name] = true })
+	return visited
 }
 
 // dryRunManifest loads, plans, and renders one manifest to w.

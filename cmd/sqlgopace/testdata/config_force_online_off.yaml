@@ -1,0 +1,40 @@
+# Test fixture: forces ONLINE off, so even on Enterprise 2022 the generated SQL
+# must omit ONLINE/RESUMABLE/WAIT_AT_LOW_PRIORITY (they depend on ONLINE).
+database:
+  connection_string: "server=x;database=y"
+  login_timeout_seconds: 15
+directories:
+  to_run: ./a
+  processing: ./b
+  done: ./c
+  failed: ./d
+monitoring:
+  blocking_poll_seconds: 10
+  log_poll_seconds: 60
+  progress_poll_seconds: 30
+  log_max_size_bytes: 1000
+  log_max_percent: 80
+  blocking_timeout_minutes: 5
+  log_drain_timeout_minutes: 30
+  max_retry_attempts: 3
+  kill_grace_seconds: 30
+  checkpoint_between_operations: false
+preflight:
+  require_data_free_space: true
+  check_tempdb: true
+  ag_send_queue_warn: true
+options_override:
+  online: { force: false }
+  resumable: { force: null }
+  wait_at_low_priority: { force: null }
+  sort_in_tempdb: { force: null }
+  maxdop: { force: null }
+  allow_abort_blockers: false
+  wait_max_duration_minutes: 1
+notifications:
+  webhook_url: ""
+  on_events: [fail]
+history:
+  enabled: false
+  destination: ""
+matrix_file: ../../../ddl_compatibility.yaml
