@@ -15,13 +15,20 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
+	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
+
+// sqlitePath strips an optional "sqlite://" prefix from a history destination.
+func sqlitePath(dest string) string {
+	return strings.TrimPrefix(dest, "sqlite://")
+}
 
 // version is the build version, overridden at release time via -ldflags.
 var version = "dev"
@@ -143,7 +150,23 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		fmt.Fprintf(stdout, "-- recovery: %d requeued, %d adopted\n", rsum.Requeued, rsum.Adopted)
 	}
 
-	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), info.ADREnabled, run.System, conn, checker, runner, stdout)
+	opts := []run.EngineOption{
+		run.WithADR(info.ADREnabled),
+		run.WithSession(conn),
+		run.WithOutput(stdout),
+	}
+	if cfg.Notifications.WebhookURL != "" {
+		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
+	}
+	if cfg.History.Enabled {
+		history, err := report.OpenHistory(sqlitePath(cfg.History.Destination))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = history.Close() }()
+		opts = append(opts, run.WithHistory(history))
+	}
+	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
 
 	summary, err := engine.ProcessAll(ctx)
 	if err != nil {

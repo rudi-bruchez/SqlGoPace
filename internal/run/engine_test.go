@@ -63,7 +63,7 @@ func setupEngine(t *testing.T, pf run.Preflighter, runner run.OpRunner) (*run.En
 		t.Fatalf("load matrix: %v", err)
 	}
 	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
-	eng := run.NewEngine(dirs, target, matrix, ddl.Policy{}, false, run.System, nil, pf, runner, io.Discard)
+	eng := run.NewEngine(dirs, target, matrix, ddl.Policy{}, pf, runner)
 	return eng, dirs
 }
 
