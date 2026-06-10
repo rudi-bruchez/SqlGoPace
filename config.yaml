@@ -40,6 +40,7 @@ options_override:
   maxdop:               { force: null }
   sort_in_tempdb:       { force: null }
   allow_abort_blockers: false        # DANGEREUX : autorise ABORT_AFTER_WAIT = BLOCKERS
+  wait_max_duration_minutes: 1       # MAX_DURATION pour WAIT_AT_LOW_PRIORITY
 
 notifications:
   webhook_url: "${WEBHOOK_URL}"      # vide = désactivé
