@@ -134,7 +134,16 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		Done:       cfg.Directories.Done,
 		Failed:     cfg.Directories.Failed,
 	}
-	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), info.ADREnabled, checker, runner, stdout)
+
+	// Crash recovery: reconcile any manifests left in processing before starting.
+	recoverer := run.NewRecoverer(dirs, conn, stdout)
+	if rsum, rerr := recoverer.Recover(ctx); rerr != nil {
+		return rerr
+	} else if rsum.Requeued > 0 || rsum.Adopted > 0 {
+		fmt.Fprintf(stdout, "-- recovery: %d requeued, %d adopted\n", rsum.Requeued, rsum.Adopted)
+	}
+
+	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), info.ADREnabled, run.System, conn, checker, runner, stdout)
 
 	summary, err := engine.ProcessAll(ctx)
 	if err != nil {

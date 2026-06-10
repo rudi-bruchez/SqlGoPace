@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
@@ -15,6 +16,13 @@ import (
 // Preflighter runs the preflight checks for a manifest.
 type Preflighter interface {
 	Check(ctx context.Context, m *ddl.Manifest) (preflight.Report, error)
+}
+
+// SessionInfo provides the execution session signature for the crash-recovery
+// sidecar. *mssql.Conn satisfies it.
+type SessionInfo interface {
+	SPID() int
+	LoginTime(ctx context.Context) (string, error)
 }
 
 // OpRunner executes one planned operation (with monitoring and reaction). caps
@@ -33,30 +41,35 @@ type Summary struct {
 // each, claims it, preflights, plans, runs the operations, and routes it to done
 // or failed.
 type Engine struct {
-	dirs   Dirs
-	queue  *Queue
-	target ddl.Target
-	matrix *ddl.Matrix
-	policy ddl.Policy
-	adr    bool
-	pf     Preflighter
-	runner OpRunner
-	out    io.Writer
+	dirs    Dirs
+	queue   *Queue
+	target  ddl.Target
+	matrix  *ddl.Matrix
+	policy  ddl.Policy
+	adr     bool
+	clk     Clock
+	session SessionInfo // optional; when set, a recovery sidecar is written
+	pf      Preflighter
+	runner  OpRunner
+	out     io.Writer
 }
 
 // NewEngine wires an Engine over the lifecycle directories and dependencies.
-// adr is the target's Accelerated Database Recovery state, which biases reactions.
-func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, adr bool, pf Preflighter, runner OpRunner, out io.Writer) *Engine {
+// adr is the target's Accelerated Database Recovery state, which biases
+// reactions. session may be nil (no recovery sidecar is written).
+func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, adr bool, clk Clock, session SessionInfo, pf Preflighter, runner OpRunner, out io.Writer) *Engine {
 	return &Engine{
-		dirs:   dirs,
-		queue:  NewQueue(dirs),
-		target: target,
-		matrix: matrix,
-		policy: policy,
-		adr:    adr,
-		pf:     pf,
-		runner: runner,
-		out:    out,
+		dirs:    dirs,
+		queue:   NewQueue(dirs),
+		target:  target,
+		matrix:  matrix,
+		policy:  policy,
+		adr:     adr,
+		clk:     clk,
+		session: session,
+		pf:      pf,
+		runner:  runner,
+		out:     out,
 	}
 }
 
@@ -88,6 +101,7 @@ func (e *Engine) processOne(ctx context.Context, name string) bool {
 		fmt.Fprintf(e.out, "skip %s: %v\n", name, err)
 		return false
 	}
+	e.writeSidecar(ctx, name)
 
 	manifest, err := ddl.LoadManifestFile(procPath)
 	if err != nil {
@@ -117,6 +131,7 @@ func (e *Engine) processOne(ctx context.Context, name string) bool {
 }
 
 func (e *Engine) succeeded(name string) bool {
+	e.removeSidecar(name)
 	if err := e.queue.Complete(name); err != nil {
 		fmt.Fprintf(e.out, "complete %s: %v\n", name, err)
 	}
@@ -126,12 +141,47 @@ func (e *Engine) succeeded(name string) bool {
 }
 
 func (e *Engine) failed(name, detail string) bool {
+	e.removeSidecar(name)
 	if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
 	e.writeLog(e.dirs.Failed, name, "FAILED", detail)
 	fmt.Fprintf(e.out, "failed: %s\n", name)
 	return false
+}
+
+// writeSidecar records the run state next to the manifest so a crash can be
+// recovered. It is a best-effort, no-op when no session is configured.
+func (e *Engine) writeSidecar(ctx context.Context, name string) {
+	if e.session == nil {
+		return
+	}
+	login, err := e.session.LoginTime(ctx)
+	if err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: login time: %v\n", name, err)
+	}
+	state := RunState{
+		Manifest:  name,
+		SPID:      e.session.SPID(),
+		LoginTime: login,
+		StartedAt: e.clk.Now().UTC().Format(time.RFC3339),
+	}
+	if err := WriteState(e.sidecarPath(name), state); err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
+	}
+}
+
+func (e *Engine) removeSidecar(name string) {
+	if e.session == nil {
+		return
+	}
+	if err := RemoveState(e.sidecarPath(name)); err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
+	}
+}
+
+func (e *Engine) sidecarPath(name string) string {
+	return filepath.Join(e.dirs.Processing, name+stateSuffix)
 }
 
 func (e *Engine) writeLog(dir, name, outcome, detail string) {

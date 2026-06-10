@@ -79,6 +79,12 @@ func (q *Queue) Fail(name string) error {
 	return err
 }
 
+// Requeue moves a manifest from processing back to to_run, e.g. during recovery.
+func (q *Queue) Requeue(name string) error {
+	_, err := q.move(name, q.dirs.Processing, q.dirs.ToRun)
+	return err
+}
+
 func (q *Queue) move(name, from, to string) (string, error) {
 	dst := filepath.Join(to, name)
 	if err := os.Rename(filepath.Join(from, name), dst); err != nil {
