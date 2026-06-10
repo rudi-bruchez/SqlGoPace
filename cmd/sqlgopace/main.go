@@ -19,20 +19,22 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
+	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
 
 // version is the build version, overridden at release time via -ldflags.
 var version = "dev"
 
 func main() {
-	if err := run(os.Stdout, os.Stderr, os.Args[1:]); err != nil {
+	if err := cli(os.Stdout, os.Stderr, os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "sqlgopace:", err)
 		os.Exit(1)
 	}
 }
 
-// run is the testable entry point; main only wires it to the process streams.
-func run(stdout, stderr io.Writer, args []string) error {
+// cli is the testable entry point; main only wires it to the process streams.
+func cli(stdout, stderr io.Writer, args []string) error {
 	fs := flag.NewFlagSet("sqlgopace", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -55,34 +57,92 @@ func run(stdout, stderr io.Writer, args []string) error {
 		fmt.Fprintf(stdout, "sqlgopace %s\n", version)
 		return nil
 	}
-	if !*dryRun {
-		return errors.New("only --dry-run is implemented so far; pass --dry-run")
-	}
 
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		return err
 	}
-
 	visited := visitedFlags(fs)
 	matrix, err := ddl.LoadFile(matrixFile(cfg, *configPath, *matrixPath, visited))
 	if err != nil {
 		return err
 	}
-	target, err := resolveTarget(context.Background(), stdout, visited, *assumeVersion, *assumeEdition, cfg)
+
+	ctx := context.Background()
+	if *dryRun {
+		return dryRunAll(ctx, stdout, fs.Args(), visited, *assumeVersion, *assumeEdition, *explain, cfg, matrix)
+	}
+
+	if cfg == nil {
+		return errors.New("run mode requires --config (connection, directories, policy); or pass --dry-run")
+	}
+	return runEngine(ctx, stdout, cfg, matrix)
+}
+
+// dryRunAll renders every manifest's planned T-SQL without executing it.
+func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visited map[string]bool, assumeVersion int, assumeEdition string, explain bool, cfg *config.Config, matrix *ddl.Matrix) error {
+	target, err := resolveTarget(ctx, stdout, visited, assumeVersion, assumeEdition, cfg)
 	if err != nil {
 		return err
 	}
-
-	manifests := fs.Args()
 	if len(manifests) == 0 {
 		return errors.New("no manifest files given")
 	}
 	policy := policyOf(cfg)
 	for _, path := range manifests {
-		if err := dryRunManifest(stdout, path, target, matrix, policy, *explain); err != nil {
+		if err := dryRunManifest(stdout, path, target, matrix, policy, explain); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// runEngine connects, detects the target, and runs every queued manifest with
+// monitoring and reaction.
+func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix) error {
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = conn.Close() }()
+
+	info, err := conn.Detect(ctx)
+	if err != nil {
+		return err
+	}
+	if !info.Supported() {
+		return fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
+	}
+	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s\n",
+		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
+
+	thresholds := preflight.Thresholds{
+		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
+		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
+	}
+	checker := run.NewPreflightChecker(conn, info, thresholds)
+	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	runner := run.NewMonitoredRunner(conn, sampler, run.System, run.RunnerConfig{
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
+	})
+	dirs := run.Dirs{
+		ToRun:      cfg.Directories.ToRun,
+		Processing: cfg.Directories.Processing,
+		Done:       cfg.Directories.Done,
+		Failed:     cfg.Directories.Failed,
+	}
+	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), info.ADREnabled, checker, runner, stdout)
+
+	summary, err := engine.ProcessAll(ctx)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "processed: %d done, %d failed\n", summary.Done, summary.Failed)
+	if summary.Failed > 0 {
+		return fmt.Errorf("%d manifest(s) failed", summary.Failed)
 	}
 	return nil
 }

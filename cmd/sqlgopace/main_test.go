@@ -16,7 +16,7 @@ func TestRunDryRunEnterprise2022(t *testing.T) {
 	var out bytes.Buffer
 	args := []string{"--dry-run", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, exampleManifest}
 
-	if err := run(&out, io.Discard, args); err != nil {
+	if err := cli(&out, io.Discard, args); err != nil {
 		t.Fatalf("run(dry-run) error = %v, want nil", err)
 	}
 
@@ -38,7 +38,7 @@ func TestRunDryRunStandardOmitsOnline(t *testing.T) {
 	var out bytes.Buffer
 	args := []string{"--dry-run", "--assume-version=16", "--assume-edition=standard", matrixFlag, exampleManifest}
 
-	if err := run(&out, io.Discard, args); err != nil {
+	if err := cli(&out, io.Discard, args); err != nil {
 		t.Fatalf("run(dry-run standard) error = %v, want nil", err)
 	}
 	if strings.Contains(out.String(), "ONLINE = ON") {
@@ -55,7 +55,7 @@ func TestRunDryRunWithConfigPolicy(t *testing.T) {
 		"--config=testdata/config_force_online_off.yaml", exampleManifest,
 	}
 
-	if err := run(&out, io.Discard, args); err != nil {
+	if err := cli(&out, io.Discard, args); err != nil {
 		t.Fatalf("run(config policy) error = %v, want nil", err)
 	}
 	if strings.Contains(out.String(), "ONLINE = ON") {
@@ -67,7 +67,7 @@ func TestRunExplain(t *testing.T) {
 	var out bytes.Buffer
 	args := []string{"--dry-run", "--explain", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, exampleManifest}
 
-	if err := run(&out, io.Discard, args); err != nil {
+	if err := cli(&out, io.Discard, args); err != nil {
 		t.Fatalf("run(explain) error = %v, want nil", err)
 	}
 	if !strings.Contains(out.String(), "online = ON") {
@@ -77,7 +77,7 @@ func TestRunExplain(t *testing.T) {
 
 func TestRunVersion(t *testing.T) {
 	var out bytes.Buffer
-	if err := run(&out, io.Discard, []string{"--version"}); err != nil {
+	if err := cli(&out, io.Discard, []string{"--version"}); err != nil {
 		t.Fatalf("run(--version) error = %v, want nil", err)
 	}
 	if !strings.HasPrefix(out.String(), "sqlgopace ") {
@@ -97,7 +97,7 @@ func TestRunErrors(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if err := run(io.Discard, io.Discard, tt.args); err == nil {
+			if err := cli(io.Discard, io.Discard, tt.args); err == nil {
 				t.Errorf("run(%v) error = nil, want non-nil", tt.args)
 			}
 		})

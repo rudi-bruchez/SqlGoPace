@@ -26,7 +26,7 @@ type fakeOpRunner struct {
 	calls int
 }
 
-func (f *fakeOpRunner) Run(context.Context, ddl.Operation, string) error {
+func (f *fakeOpRunner) Run(context.Context, ddl.Operation, string, run.Capabilities) error {
 	f.calls++
 	return f.err
 }
@@ -63,7 +63,7 @@ func setupEngine(t *testing.T, pf run.Preflighter, runner run.OpRunner) (*run.En
 		t.Fatalf("load matrix: %v", err)
 	}
 	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
-	eng := run.NewEngine(dirs, target, matrix, ddl.Policy{}, pf, runner, io.Discard)
+	eng := run.NewEngine(dirs, target, matrix, ddl.Policy{}, false, pf, runner, io.Discard)
 	return eng, dirs
 }
 

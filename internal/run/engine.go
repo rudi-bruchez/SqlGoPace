@@ -17,9 +17,10 @@ type Preflighter interface {
 	Check(ctx context.Context, m *ddl.Manifest) (preflight.Report, error)
 }
 
-// OpRunner executes one planned operation (with monitoring and reaction).
+// OpRunner executes one planned operation (with monitoring and reaction). caps
+// reports the reaction capabilities derived from the resolved options and server.
 type OpRunner interface {
-	Run(ctx context.Context, op ddl.Operation, sql string) error
+	Run(ctx context.Context, op ddl.Operation, sql string, caps Capabilities) error
 }
 
 // Summary counts the outcome of a ProcessAll run.
@@ -37,19 +38,22 @@ type Engine struct {
 	target ddl.Target
 	matrix *ddl.Matrix
 	policy ddl.Policy
+	adr    bool
 	pf     Preflighter
 	runner OpRunner
 	out    io.Writer
 }
 
 // NewEngine wires an Engine over the lifecycle directories and dependencies.
-func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, pf Preflighter, runner OpRunner, out io.Writer) *Engine {
+// adr is the target's Accelerated Database Recovery state, which biases reactions.
+func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, adr bool, pf Preflighter, runner OpRunner, out io.Writer) *Engine {
 	return &Engine{
 		dirs:   dirs,
 		queue:  NewQueue(dirs),
 		target: target,
 		matrix: matrix,
 		policy: policy,
+		adr:    adr,
 		pf:     pf,
 		runner: runner,
 		out:    out,
@@ -104,7 +108,8 @@ func (e *Engine) processOne(ctx context.Context, name string) bool {
 	}
 
 	for i, step := range planned {
-		if err := e.runner.Run(ctx, step.Operation, step.SQL); err != nil {
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr}
+		if err := e.runner.Run(ctx, step.Operation, step.SQL, caps); err != nil {
 			return e.failed(name, fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), err))
 		}
 	}

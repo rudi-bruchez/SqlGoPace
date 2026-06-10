@@ -7,6 +7,7 @@ import "fmt"
 type PlannedOperation struct {
 	Operation Operation
 	SQL       string
+	Options   ResolvedOptions
 	Decisions []Decision
 }
 
@@ -26,6 +27,7 @@ func Plan(m *Manifest, t Target, matrix *Matrix, p Policy) ([]PlannedOperation, 
 		planned = append(planned, PlannedOperation{
 			Operation: op,
 			SQL:       sql,
+			Options:   res,
 			Decisions: decisions,
 		})
 	}

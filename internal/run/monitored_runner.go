@@ -21,7 +21,6 @@ type MonitoredRunner struct {
 	blockingTimeout time.Duration
 	killGrace       time.Duration
 	maxRetries      int
-	capsFor         func(ddl.Operation) Capabilities
 }
 
 // RunnerConfig configures a MonitoredRunner.
@@ -30,17 +29,10 @@ type RunnerConfig struct {
 	BlockingTimeout time.Duration
 	KillGrace       time.Duration
 	MaxRetries      int
-	// CapsFor reports the reaction capabilities for an operation (e.g. whether
-	// RESUMABLE was injected and whether ADR is on).
-	CapsFor func(ddl.Operation) Capabilities
 }
 
 // NewMonitoredRunner builds a MonitoredRunner.
 func NewMonitoredRunner(exec Executor, sampler Sampler, clk Clock, cfg RunnerConfig) *MonitoredRunner {
-	capsFor := cfg.CapsFor
-	if capsFor == nil {
-		capsFor = func(ddl.Operation) Capabilities { return Capabilities{} }
-	}
 	return &MonitoredRunner{
 		exec:            exec,
 		sampler:         sampler,
@@ -49,14 +41,13 @@ func NewMonitoredRunner(exec Executor, sampler Sampler, clk Clock, cfg RunnerCon
 		blockingTimeout: cfg.BlockingTimeout,
 		killGrace:       cfg.KillGrace,
 		maxRetries:      cfg.MaxRetries,
-		capsFor:         capsFor,
 	}
 }
 
 // Run executes op, retrying after a pressure cancel up to MaxRetries.
-func (r *MonitoredRunner) Run(ctx context.Context, op ddl.Operation, sql string) error {
+func (r *MonitoredRunner) Run(ctx context.Context, op ddl.Operation, sql string, caps Capabilities) error {
 	for attempt := 0; ; attempt++ {
-		err := r.runOnce(ctx, op, sql)
+		err := r.runOnce(ctx, op, sql, caps)
 		if !errors.Is(err, ErrCancelled) {
 			return err
 		}
@@ -67,7 +58,7 @@ func (r *MonitoredRunner) Run(ctx context.Context, op ddl.Operation, sql string)
 }
 
 // runOnce executes the DDL under monitoring once.
-func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql string) error {
+func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql string, caps Capabilities) error {
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 
@@ -79,7 +70,6 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 	samples := make(chan Sample)
 	go r.pump(sampleCtx, samples)
 
-	caps := r.capsFor(op)
 	err := supervise(ctx, r.clk, r.exec, op, caps, r.blockingTimeout, samples, done)
 	if !errors.Is(err, ErrCancelled) {
 		return err
