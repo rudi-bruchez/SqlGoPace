@@ -60,7 +60,22 @@ type Profile struct {
 	Heap        HeapRules        `yaml:"heap"`
 	Statistics  StatisticsRules  `yaml:"statistics"`
 	CheckDB     CheckDBRules     `yaml:"checkdb"`
+	Scope       ScopeRules       `yaml:"scope"`
 	Overrides   []Override       `yaml:"overrides"`
+}
+
+// ScopeRules selects which databases the server-wide mode (--all-databases) acts
+// on (spec §17.4). It is consulted only in multi-database mode; a single-database
+// run ignores it.
+type ScopeRules struct {
+	Databases DatabaseScope `yaml:"databases"`
+}
+
+// DatabaseScope is an include/exclude glob filter on database names. An empty
+// Include means "all"; Exclude always wins.
+type DatabaseScope struct {
+	Include []string `yaml:"include"` // globs; empty = ["*"]
+	Exclude []string `yaml:"exclude"` // globs; matched names are dropped
 }
 
 // IndexRules drives the REORGANIZE vs REBUILD decision (see spec §5.1).
@@ -201,13 +216,42 @@ func LoadFile(path string) (*Profile, error) {
 // (case-insensitive), and whether one matched. It is the pure override-resolution
 // step the decision core builds on.
 func (p *Profile) OverrideFor(schema, table string) (Override, bool) {
-	target := strings.ToLower(schema + "." + table)
+	target := schema + "." + table
 	for _, o := range p.Overrides {
-		if matched, err := path.Match(strings.ToLower(o.Match), target); err == nil && matched {
+		if matchGlob(o.Match, target) {
 			return o, true
 		}
 	}
 	return Override{}, false
+}
+
+// ScopeIncludes reports whether the database name passes the scope filter: it must
+// match an include glob (default "*") and no exclude glob. Case-insensitive.
+func (p *Profile) ScopeIncludes(database string) bool {
+	include := p.Scope.Databases.Include
+	if len(include) == 0 {
+		include = []string{"*"}
+	}
+	if !matchAnyGlob(include, database) {
+		return false
+	}
+	return !matchAnyGlob(p.Scope.Databases.Exclude, database)
+}
+
+// matchGlob reports whether target matches a single glob pattern, case-insensitively.
+func matchGlob(pattern, target string) bool {
+	matched, err := path.Match(strings.ToLower(pattern), strings.ToLower(target))
+	return err == nil && matched
+}
+
+// matchAnyGlob reports whether target matches any of the glob patterns.
+func matchAnyGlob(patterns []string, target string) bool {
+	for _, p := range patterns {
+		if matchGlob(p, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // applyDefaults fills the documented defaults for omitted values. Note: a field
@@ -338,6 +382,12 @@ func (p *Profile) validate() error {
 
 	if p.CheckDB.MaxDOP != nil && *p.CheckDB.MaxDOP < 0 {
 		return fmt.Errorf("checkdb.maxdop must be ≥ 0: %w", ErrInvalidProfile)
+	}
+
+	for _, g := range append(append([]string{}, p.Scope.Databases.Include...), p.Scope.Databases.Exclude...) {
+		if _, err := path.Match(g, ""); err != nil {
+			return fmt.Errorf("scope.databases: invalid glob %q: %w", g, ErrInvalidProfile)
+		}
 	}
 
 	for idx, o := range p.Overrides {

@@ -7,9 +7,13 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 )
 
 // fakeReader serves canned analysis results, keyed so buildInput's orchestration
@@ -164,6 +168,90 @@ func TestManifestsFromPlanOrderingAndWrite(t *testing.T) {
 		}
 		if len(m.Operations) != len(nm.manifest.Operations) {
 			t.Errorf("%s: loaded %d operations, want %d", nm.filename, len(m.Operations), len(nm.manifest.Operations))
+		}
+	}
+}
+
+func TestAutoPlan(t *testing.T) {
+	p := scenarioProfile(t)
+	manifests, plan, err := autoPlan(context.Background(), scenarioReader(), p, categorySet{}, "MYDB", io.Discard)
+	if err != nil {
+		t.Fatalf("autoPlan() error = %v", err)
+	}
+	// Same shape as the plan subcommand: checkdb, index, heaps, statistics.
+	if len(manifests) != 4 {
+		t.Errorf("autoPlan manifests = %d, want 4", len(manifests))
+	}
+	if len(plan.Operations()) != 4 {
+		t.Errorf("autoPlan operations = %d, want 4 (rebuild_index, rebuild_heap, update_statistics, check_db)", len(plan.Operations()))
+	}
+}
+
+func TestRecordPlanHistory(t *testing.T) {
+	p := scenarioProfile(t)
+	in, _ := buildInput(context.Background(), scenarioReader(), p, categorySet{}, "MYDB", io.Discard)
+	plan := maint.Decide(in, p)
+	manifests := manifestsFromPlan(plan, "MYDB")
+
+	dbPath := filepath.Join(t.TempDir(), "history.db")
+	cfg := &config.Config{History: config.HistoryConfig{Enabled: true, Destination: "sqlite://" + dbPath}}
+
+	recordPlanHistory(context.Background(), io.Discard, cfg, "MYDB", plan, manifests)
+
+	h, err := report.OpenHistory(dbPath)
+	if err != nil {
+		t.Fatalf("OpenHistory() error = %v", err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+	plans, rows, err := h.MaintenanceCounts(context.Background())
+	if err != nil {
+		t.Fatalf("MaintenanceCounts() error = %v", err)
+	}
+	// One plan; one row per emitted op: rebuild_index + rebuild_heap + update_statistics + check_db.
+	if plans != 1 || rows != 4 {
+		t.Errorf("counts = (%d plans, %d rows), want (1, 4)", plans, rows)
+	}
+}
+
+func TestRecordPlanHistoryDisabled(t *testing.T) {
+	// With history disabled, recording is a no-op and must not error or create a file.
+	cfg := &config.Config{History: config.HistoryConfig{Enabled: false}}
+	recordPlanHistory(context.Background(), io.Discard, cfg, "MYDB", maint.Plan{}, nil)
+}
+
+func TestManifestsMultiDatabaseBlocks(t *testing.T) {
+	p := scenarioProfile(t)
+	in, _ := buildInput(context.Background(), scenarioReader(), p, categorySet{}, "DB1", io.Discard)
+	plan := maint.Decide(in, p)
+
+	width := prefixWidth(2)
+	got := append(manifestsForDatabase(plan, "DB1", 0, width), manifestsForDatabase(plan, "DB2", 1, width)...)
+
+	want := []string{
+		"010_maint_DB1_checkdb.yaml", "020_maint_DB1_index.yaml",
+		"030_maint_DB1_heaps.yaml", "040_maint_DB1_statistics.yaml",
+		"050_maint_DB2_checkdb.yaml", "060_maint_DB2_index.yaml",
+		"070_maint_DB2_heaps.yaml", "080_maint_DB2_statistics.yaml",
+	}
+	var gotNames []string
+	for _, nm := range got {
+		gotNames = append(gotNames, nm.filename)
+	}
+	if diff := cmp.Diff(want, gotNames); diff != "" {
+		t.Errorf("multi-database manifest names mismatch (-want +got):\n%s", diff)
+	}
+}
+
+func TestPrefixWidth(t *testing.T) {
+	tests := []struct {
+		databases int
+		want      int
+	}{
+		{1, 3}, {2, 3}, {24, 3}, {25, 4}, {250, 5},
+	}
+	for _, tt := range tests {
+		if got := prefixWidth(tt.databases); got != tt.want {
+			t.Errorf("prefixWidth(%d) = %d, want %d", tt.databases, got, tt.want)
 		}
 	}
 }

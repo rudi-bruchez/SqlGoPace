@@ -3,11 +3,47 @@ package main
 import (
 	"bytes"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
+
+func TestQueuedDatabases(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, database string) {
+		body := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+		if database != "" {
+			body = "database: " + database + "\n" + body
+		}
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("010_a.yaml", "")     // no database → the connected database
+	write("020_b.yaml", "DB2")  // explicit
+	write("030_c.yaml", "db2")  // same database, different case
+	write("040_d.yaml", "CONN") // equals the connected database
+	_ = os.WriteFile(filepath.Join(dir, ".hidden.yaml"), []byte("ignored"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("ignored"), 0o644)
+
+	got, err := queuedDatabases(dir, "CONN")
+	if err != nil {
+		t.Fatalf("queuedDatabases() error = %v", err)
+	}
+	if diff := cmp.Diff([]string{"CONN", "DB2"}, got); diff != "" {
+		t.Errorf("queuedDatabases mismatch (-want +got):\n%s", diff)
+	}
+
+	// A missing directory is not an error (nothing queued yet).
+	if dbs, err := queuedDatabases(filepath.Join(dir, "nope"), "CONN"); err != nil || dbs != nil {
+		t.Errorf("queuedDatabases(missing) = (%v, %v), want (nil, nil)", dbs, err)
+	}
+}
 
 const (
 	exampleManifest = "../../01.to_run/.010_example_rebuild.yaml"
@@ -108,6 +144,7 @@ func TestRunErrors(t *testing.T) {
 		{"no manifests", []string{"--dry-run", "--assume-version=16", matrixFlag}},
 		{"bad edition", []string{"--dry-run", "--assume-version=16", "--assume-edition=bogus", matrixFlag, exampleManifest}},
 		{"missing matrix file", []string{"--dry-run", "--assume-version=16", "--matrix=does-not-exist.yaml", exampleManifest}},
+		{"auto with dry-run is rejected", []string{"--auto", "--dry-run", matrixFlag}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

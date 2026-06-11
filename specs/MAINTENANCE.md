@@ -26,6 +26,32 @@ Five maintenance categories are in scope for v1:
 
 The existing predefined-manifest workflow is **untouched**; everything here is additive.
 
+### Scope: one database at a time, server-wide via M8
+
+The object-level analysis and the DDL it generates always run in **one database's context** — the
+analysis reads (`sys.indexes`, `sys.partitions`, `sys.dm_db_partition_stats`,
+`sys.dm_db_index_physical_stats`, `sys.dm_db_index_operational_stats`, `sys.dm_db_stats_properties`,
+`sp_estimate_data_compression_savings`) are all **database-scoped to the current context**, and the
+generated DDL (`ALTER INDEX … ON [schema].[table]`, `ALTER TABLE … REBUILD`, `UPDATE STATISTICS`)
+executes against the **current** database — none of it can be three-part-named across databases. The
+**multi-database mode** (M8, §17) therefore does not work around this; it **iterates** eligible
+databases, opening **one connection per database** so each runs in its own context.
+
+**`check_db` is the one exception**: `DBCC CHECKDB (name)` runs from any context, so
+`checkdb.databases: [...]` (spec §4.5) genuinely targets several databases from a single connection.
+
+**Status of the manifest `database:` field.** It is now **honored end to end** (M8.3 + M8.4): the run
+path groups the queue by `database:` and runs **one engine per database, each on a connection in that
+database's context** (§17.6), so `plan --all-databases` → run, and `--auto --all-databases`, execute
+every database correctly. Each engine processes only its database's manifests (empty `database:` =
+the connected database), leaving the rest for their own engine. *(Behaviour change since the
+single-database era: a manifest whose `database:` names a database other than the connection's is no
+longer silently run against the connection.)* Crash recovery is multi-database too (M8.5): each
+orphan's sidecar records the database it ran in, and recovery reconciles it against a connection in
+that database (an orphan whose database is unreachable — e.g. now an AG secondary — is left for a
+later run). M8 is complete; the only outstanding item is a multi-database end-to-end run under
+`make e2e`.
+
 ## 2. Core design decision — the planner emits manifests
 
 The reusable value of SqlGoPace is the **engine** (`internal/run`): claim → expand → preflight →
@@ -46,16 +72,19 @@ There are **two surfaces** over that planner (confirmed: build the first now, th
   normal engine. Auditable, git-able, diff-able, `--dry-run` friendly — no surprises, no locks taken
   during analysis beyond cheap reads.
 
-- **`--auto` run flag (later).** Once the analysis is trusted, analyze and run directly in-memory in a
-  single invocation (unattended / SQL Agent / cron). Same planner, same engine; it simply skips the
-  materialize-and-review step. Off by default; explicitly opted in.
+- **`--auto` run flag.** Once the analysis is trusted, analyze and run in a single invocation
+  (unattended / SQL Agent / cron). Same planner, same engine: it writes the generated manifests into
+  the queue and **immediately processes the queue**, skipping only the human review pause. Writing to
+  the queue (rather than running purely in memory) is deliberate — a crash mid-run leaves recoverable
+  manifests + sidecars in `02.processing/`, exactly like any other run. Off by default; explicitly
+  opted in.
 
 ```
             ┌─────────────┐     materialize      ┌────────────┐   review    ┌────────────────┐
  plan  ───▶ │  ANALYZER   │ ───▶ 01.to_run/*.yaml ───────────▶ │  operator  │ ──▶ existing engine
             │ (read-only) │                                     └────────────┘
             └─────────────┘
- --auto ──▶ same ANALYZER ──▶ in-memory Manifest ─────────────────────────────▶ existing engine
+ --auto ──▶ same ANALYZER ──▶ 01.to_run/*.yaml ──(no review pause)──────────────▶ existing engine
 ```
 
 The analyzer is **pure-ish at the edges**: a thin `internal/mssql` layer that reads the analysis DMVs
@@ -276,8 +305,8 @@ degrades, it does not abort:
 
 - **Per-object read failure** (`sp_estimate_data_compression_savings` errors on an object, a
   `physical_stats` scan errors or times out, a table is dropped mid-sweep): **skip that object**, record
-  the reason in the analysis log / `maintenance_analysis` row (`decision = skip`, `rule_fired =
-  "read error: …"`), and continue. The object simply gets no operation this run.
+  the reason in the analysis log (`decision = skip`, `reason = "read error: …"`), and continue. The
+  object simply gets no operation this run.
 - **Missing permission** (`VIEW DATABASE STATE`, or rights to run `sp_estimate_*`): this is not
   per-object, it is fatal to the category — **fail fast** with a clear, actionable message naming the
   missing grant (see SPECS §17), exit code 2. Better to stop than to silently produce an empty plan
@@ -492,17 +521,25 @@ local SQLite history (`internal/report` history store), extended with maintenanc
 one history destination and avoids needing write/DDL permission on the target server. (A target-server
 `CommandLog`-style table is noted as a future option but is **not** v1.)
 
-New tables (additive migration in `report`):
+Two tables are added by an additive, idempotent migration in `report` (opening an existing run-history
+DB simply creates them; existing `runs` data is untouched):
 
-- `maintenance_analysis` — one row per analyzed object/partition: `database, schema, table, index,
-  partition, is_heap, page_count, avg_fragmentation, forwarded_record_percent, write_ratio,
-  size_none/row/page bytes, decision (skip/reorganize/rebuild/rebuild_heap), chosen_compression,
-  est_gain_percent, rule_fired, server_start_time, analyzed_at`.
-- `maintenance_plan` — links a generated manifest to the analysis rows that produced it.
+- `maintenance_plan` — one row per `plan` run: `database, generated_at, manifests, operations`.
+- `maintenance_analysis` — one row per **emitted** decision, linked via `plan_id`: `category, target,
+  decision, reason, page_count, size_mb, fragmentation, forwarded_percent, write_ratio,
+  current_compression, chosen_compression`.
 
-This enables trend analysis later (did fragmentation return quickly → fill-factor problem? did PAGE
-compression hold? is an object oscillating?). The existing per-run `.log` and `RunRecord` history are
-unchanged; maintenance analysis is a parallel, opt-in record keyed by the same run.
+The object identity lives in `target` (`schema.table.index (+partition)` or `schema.table` or the
+database); the rule that fired and the gain figures live in `reason`. v1 records **emitted operations
+only** (the actionable set, bounded by what a run would execute) — recording every healthy/skipped
+object is deferred to keep the table small on large databases. The structured columns
+(`fragmentation`, `forwarded_percent`, `write_ratio`, `chosen_compression`…) come from the metrics
+attached to each `maint.Decision`.
+
+This enables the trend analysis the feature is about: which objects are repeatedly rebuilt
+(oscillation → fill-factor problem), whether a chosen compression held, how fragmentation evolves.
+Recording is **best-effort and opt-in** (`history.enabled`) — a failure is logged, never fatal, and
+the existing per-run `.log` / `RunRecord` history is unchanged.
 
 ## 8. Monitoring & reaction fit (per operation)
 
@@ -518,10 +555,13 @@ reaction loop does the right thing without new branches in the engine where avoi
 | `check_db`         | no                          | duration/tempdb-driven; on pressure **KILL** and report (read-only snapshot → nothing to roll back) | cheap |
 | `rebuild_heap`     | no                          | like `rebuild_index` minus pause/resume — WALP/RESUMABLE unavailable, so on pressure: wait then cancel→KILL (and retry) | rollback (rebuilds all NC indexes too) |
 
-This adds at most a small `Incremental`/`CancelSafe` flag to `run.Capabilities` (alongside `Resumable`,
-`ADR`) so the reaction selector treats a `REORGANIZE` cancel as a clean stop rather than a
-rollback-bearing KILL. CHECKDB and stats are non-resumable and rely on the existing cancel/KILL path.
-No change to the monitoring threads themselves — they already poll blocking, log, and progress.
+This is implemented as a `CancelSafe` flag on `run.Capabilities` (alongside `Resumable`, `ADR`), set by
+`cancelSafe(op)` for `reorganize_index` / `check_db` / `update_statistics`. It does **not** change which
+`Action` the selector picks (these are not resumable, so they still `Cancel`) — it refines the
+**narration** so a REORGANIZE cancel reads as a clean stop ("incremental — committed work preserved, no
+rollback") rather than a rollback-bearing KILL. CHECKDB and stats otherwise rely on the existing
+cancel/KILL path. No change to the monitoring threads themselves — they already poll blocking, log, and
+progress.
 
 ## 9. Preflight additions
 
@@ -542,6 +582,12 @@ Analysis itself runs **before** any manifest exists, so it has its own light gua
 `VIEW DATABASE STATE` / the ability to run `sp_estimate_data_compression_savings`, and that the target
 databases are online and accessible.
 
+- **Multi-database (M8).** Ineligibility is enforced at two points: at **enumeration** (`UserDatabases`,
+  §17.3) so an AG secondary / read-only / offline database is never queued, and again as a **run-start
+  re-check** so a database that became ineligible *between* `plan` and the run (e.g. a failover) is
+  **left in the queue and logged**, never run against the wrong replica. The connected database is
+  always runnable (a usable connection is already held).
+
 ## 10. CLI surface
 
 ```bash
@@ -558,8 +604,13 @@ sqlgopace plan --config config.yaml --dry-run --explain
 # Then run the reviewed manifests through the normal engine (unchanged):
 sqlgopace --config config.yaml [--tui]
 
-# Later — analyze and run in one shot, unattended (explicit opt-in):
-sqlgopace --config config.yaml --auto [--profile …] [--categories …]
+# Analyze and run in one shot, unattended (explicit opt-in; no review pause):
+sqlgopace --config config.yaml --auto [--profile …] [--categories …] [--database …]
+
+# Multi-database (M8, §17): plan/run every eligible user database, or a chosen set:
+sqlgopace plan   --config config.yaml --all-databases
+sqlgopace plan   --config config.yaml --databases SALES,INVENTORY
+sqlgopace        --config config.yaml --auto --all-databases
 ```
 
 `plan` follows the `abort-resumable` subcommand pattern already in `cmd/sqlgopace` (dispatched before
@@ -608,7 +659,16 @@ Each phase is independently buildable/testable; the pure phases need no database
 - **M5 — history.** SQLite maintenance tables + recording.
 - **M6 — reaction tagging.** `Incremental`/`CancelSafe` capability for `REORGANIZE`; confirm CHECKDB /
   stats cancel paths. Integration tests for reorganize-cancel and checkdb-kill.
-- **M7 — `--auto`.** In-memory planner output as the queue source for unattended runs.
+- **M7 — `--auto`.** A flag on the run path that analyses, writes the generated manifests into the
+  queue, and processes them in one invocation — no review pause; rejected together with `--dry-run`
+  (use `plan --dry-run` to preview). Materialising into the queue keeps crash recovery intact.
+- **M8 — multi-database mode.** Server-wide maintenance: enumerate eligible user databases, scope via
+  flags + profile, analyse and run **one connection per database**, honoring the manifest `database:`
+  field. Specified in §17. Built: M8.1 (connection + enumeration), M8.2 (scope resolution), M8.3
+  (`plan` per-database blocks), M8.4 (run engine-per-database, `--auto` multi), M8.5 (per-database
+  crash recovery via the sidecar `database` + a probe resolver), M8.6 (run-start eligibility re-check
+  so a failover-since-plan database is left in the queue, + docs). **Complete.** The remaining
+  live-server validation is a multi-database `make e2e` run.
 
 ## 13. Dangers & how they are contained
 
@@ -633,6 +693,11 @@ Each phase is independently buildable/testable; the pure phases need no database
 
 ## 14. Out of scope for v1 (noted for later)
 
+- **Multi-database / server-wide object maintenance.** The current build analyses and maintains the
+  **connected database only** (see "Scope" under §1); `check_db` is the lone multi-database operation.
+  The server-wide mode is **fully specified as M8 in §17** (enumeration + eligibility, scope flags +
+  profile selector, per-database connection, honoring the manifest `database:` field) — specified, not
+  yet built.
 - Target-server `CommandLog`-style history table (v1 uses the local SQLite store).
 - Windowed/baselined write-intensity (v1 uses cumulative-since-restart counters as a heuristic).
 - Columnstore-specific maintenance (`REORGANIZE … COMPRESS_ALL_ROW_GROUPS`), partition merge/split,
@@ -765,4 +830,176 @@ operations:
 excluded. With `--explain`, each operation is preceded by its measurement + the rule that fired (the
 trailing comments above are the shape of that reasoning). The operator reviews these two files, then
 runs them through the normal engine.
+
+## 17. Multi-database mode (M8)
+
+> **Planning section.** This specifies the server-wide mode deferred in §1 (Scope) and §14. It is a
+> real milestone (M8), not a config tweak, because the analysis DMVs and the generated DDL are
+> *database-scoped to the current context* — so covering several databases means establishing **each
+> database's connection context**, and finally honoring the manifest `database:` field.
+
+### 17.1 Goal & non-goals
+
+**Goal.** Let `plan` and `--auto` scope maintenance to **many user databases** on the connected server
+(all eligible, or a selected subset) instead of only the connection's database. Each database is
+analysed and maintained in its own context; `check_db`'s existing multi-database list is folded in.
+
+**Non-goals (still deferred).** Per-database *profiles* or DB-qualified overrides (`match:
+"DB1.dbo.AUDIT_*"`) — v1 of M8 applies one profile to every in-scope database, overrides matching on
+`schema.table` within each. Cross-server / linked-server maintenance. Parallelism across databases
+(forbidden — see §17.7).
+
+### 17.2 The connection model (decided)
+
+Each database is reached by a **dedicated connection in that database's context**, reusing
+`mssql.Open` with the server and credentials from the base DSN but the `Database`/`Initial Catalog`
+rewritten to the target database. A `USE [db]` on the existing pinned/monitoring connections is
+**rejected** — it is exactly the "pool trap" (SPECS §3): the monitoring pool can hand back a
+connection in a different database context. So: **one `*mssql.Conn` per database**, opened when that
+database's turn comes and closed when done (no connection storm — at most one server-wide heavy
+operation at a time, §17.7).
+
+`internal/mssql` gains:
+- a way to open against a specific database (e.g. `OpenDatabase(ctx, dsn, db, version)`, which parses
+  the DSN once and overrides the catalog), and
+- `UserDatabases(ctx)` — the eligibility sweep (§17.3), runnable from any context.
+
+### 17.3 Database enumeration & eligibility
+
+Run once from the initial connection (reading `sys.databases` works from any context). A database is
+**eligible** when it is a user database, online, writable, and writable *here* (AG primary / mirroring
+principal), and the login can access it:
+
+```sql
+SELECT d.name
+FROM sys.databases d
+LEFT JOIN sys.dm_hadr_database_replica_states  rs  ON rs.database_id = d.database_id AND rs.is_local = 1
+LEFT JOIN sys.dm_hadr_availability_replica_states ars ON ars.replica_id = rs.replica_id
+LEFT JOIN sys.database_mirroring dm ON dm.database_id = d.database_id
+WHERE d.database_id > 4                 -- exclude master / tempdb / model / msdb
+  AND d.state_desc = 'ONLINE'
+  AND d.is_read_only = 0
+  AND d.source_database_id IS NULL      -- exclude database snapshots
+  AND (ars.role_desc IS NULL OR ars.role_desc = 'PRIMARY')          -- non-AG, or AG primary
+  AND (dm.mirroring_role_desc IS NULL OR dm.mirroring_role_desc = 'PRINCIPAL')  -- non-mirrored, or principal
+  AND HAS_DBACCESS(d.name) = 1          -- skip databases the login cannot access
+ORDER BY d.name;
+OPTION (RECOMPILE);
 ```
+
+**Ineligible databases are skipped with a logged reason** (AG secondary / read-only / offline /
+restoring / no access), never fatal — consistent with the §4.7 degradation rule. Eligibility is
+re-evaluated at the start of every run (a failover between runs is handled naturally). Databases are
+processed in **name order** for determinism.
+
+### 17.4 Scope selection (decided: flags + profile selector)
+
+The set processed is **eligible ∩ selected**:
+
+- **CLI** (on `plan` and the run path's `--auto`):
+  - `--all-databases` — every eligible database.
+  - `--databases a,b,c` — an explicit list (each is intersected with eligibility; an explicitly named
+    but ineligible database is skipped+logged — a future `--strict` could make that fatal, see §17.9).
+  - neither — today's behaviour: the connected database only.
+- **Profile** — a top-level selector applied when `--all-databases` is used (or as the default scope):
+
+```yaml
+# maintenance_profile.yaml
+scope:
+  databases:
+    include: ["*"]            # globs on database name; default: all eligible
+    exclude: ["*_archive", "tempdb_*"]
+```
+
+Resolution precedence: an explicit `--databases` list wins; else `--all-databases` ∩ profile
+`scope.databases` (include minus exclude); else the connected database. Glob matching reuses the
+case-insensitive matcher from `OverrideFor` (§5).
+
+### 17.5 `plan` output — per-database manifests
+
+`plan --all-databases` opens a connection per eligible database, runs the existing analysis there
+(`buildInput` → `Decide`), and writes that database's manifests, **grouped database-by-database** in
+the queue (the chosen ordering). The `database:` field is set on every manifest, and the filename
+encodes the database so the engine processes whole-database blocks in order, e.g.:
+
+```
+01.to_run/
+  010_maint_DB1_checkdb.yaml     020_maint_DB1_index.yaml
+  030_maint_DB1_heaps.yaml       040_maint_DB1_statistics.yaml
+  050_maint_DB2_checkdb.yaml     060_maint_DB2_index.yaml
+  …
+```
+
+(The numeric prefix advances per database so DB1's four manifests sort before DB2's — one contiguous
+block per database, categories in their §6 order within each.) History records one `maintenance_plan`
+row per database (the `database` column already exists, §7).
+
+### 17.6 Run orchestration — one engine per database (closes the `database:` gap)
+
+The run path groups the queued manifests **by their `database:` field** and, for each database in turn,
+opens a connection in that database's context and runs the engine over **that database's manifests
+only**. Because the filenames form per-database blocks, this is equivalent to walking the
+filename-sorted queue and opening a new connection whenever the target database changes.
+
+This is the change that finally **honors the manifest `database:` field** (the gap noted in §1):
+
+- The `Engine` stays single-connection. The run path adds a thin outer loop: partition the discovered
+  manifest names by database, then per database build a connection + `Engine` and process just that
+  partition (a small `Engine` database filter, or an explicit "process these names", empty filter =
+  today's whole-queue behaviour). The engine is otherwise unchanged — same preflight, monitoring,
+  reaction, reporting, `.log`, history.
+- A manifest whose `database:` is empty defaults to the connection's database (back-compatible).
+- A manifest whose `database:` is no longer eligible at run time (e.g. an AG failover since `plan`) is
+  **left in the queue and logged**, not failed.
+
+### 17.7 Concurrency — strictly sequential, server-wide
+
+SPECS §2 forbids two heavy DDL statements at once on a database; M8 keeps that **server-wide**: at most
+one maintenance operation runs at any moment across *all* databases. Databases are processed one fully
+before the next; within a database the engine is already one-manifest-at-a-time. Connections are
+opened per database and closed when its block finishes — no fan-out, no connection storm. (A bounded
+cross-database parallelism is a possible future tuning, explicitly out of scope here.)
+
+### 17.8 Crash recovery across databases
+
+Recovery (SPECS §11) already scans `02.processing/`. With M8 each leftover manifest carries its
+`database:`; recovery **groups orphans by database** and reconciles each against a connection in that
+database's context (resumable check, adopt, requeue). The run-state sidecar records the database (or it
+is read from the manifest) so the right connection is used. A database that became ineligible since the
+crash (failover) is left for a later run that finds it primary again.
+
+### 17.9 Preflight, history, dangers
+
+- **Preflight.** The existing AG check (SPECS §4, warn-not-fail) becomes, in multi-database mode, a
+  **hard skip** of secondaries during enumeration (§17.3) — we never queue work for a database we
+  cannot write. Per-database preflight is otherwise unchanged.
+- **History.** No schema change — `maintenance_plan.database` already distinguishes runs; trend
+  queries gain a server-wide view across databases.
+- **Dangers & mitigations:**
+  - *A server with hundreds of databases overruns the window* → the §6 batching budget
+    (`max_operations` / `time_budget_minutes`) applies **across the whole multi-database run**; when it
+    truncates, log which databases/objects were dropped (no silent truncation).
+  - *AG failover mid-run* → the per-database connection fails on write; treated as an interruption for
+    that database (left recoverable), the run continues with the next database.
+  - *Per-database permission differences* → skipped+logged at enumeration (`HAS_DBACCESS`).
+  - *Connection storm* → at most one database's connection open at a time.
+  - *A `--strict` flag* (future) to fail when an explicitly named `--databases` entry is ineligible.
+
+### 17.10 Build sub-phases (M8)
+
+- **M8.0 — planning.** This section.
+- **M8.1 — connection + enumeration.** `mssql.OpenDatabase` (catalog override) and
+  `mssql.UserDatabases` (eligibility sweep). Integration-tested (multiple DBs, an offline/read-only DB,
+  and — where feasible — an AG secondary).
+- **M8.2 — scope resolution (pure).** Flags + profile `scope.databases` (include/exclude globs) →
+  resolved database list; table-tested against a fixed eligible set.
+- **M8.3 — multi-database `plan`.** Per-database analysis loop → per-database manifest blocks; history
+  per database.
+- **M8.4 — multi-database run.** Group queued manifests by `database:`; one engine per database on its
+  own connection; **honor `database:`** (close the §1 gap). Back-compatible when no `database:` /
+  single database.
+- **M8.5 — recovery across databases.** Group orphans by database; reconcile per-database connection.
+- **M8.6 — preflight + docs.** *Done.* Secondary/read-only/offline are hard-skipped at enumeration
+  (§17.3); a **run-start eligibility re-check** (`runnableTargets`) leaves a database that became
+  ineligible between `plan` and the run in the queue rather than failing it; §1/§9/§10 and the README
+  updated. The one outstanding item is a multi-database end-to-end run under `make e2e`.

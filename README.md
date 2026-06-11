@@ -187,6 +187,7 @@ sqlgopace --dry-run --assume-version 16 --assume-edition enterprise \
 | *(none)*            | Silent run; everything is traced to a `.log` next to each processed manifest.   |
 | `--config <path>`   | Config file (connection, directories, policy, matrix path). Required to run.    |
 | `--tui`             | Interactive incident console: live progress, blockers, and operator actions.    |
+| `--auto`            | Analyse the database and run generated maintenance unattended (no review): writes the manifests into the queue, then processes it. Pairs with `--profile`/`--categories`/`--database`, or `--all-databases`/`--databases` for a server-wide run. See `plan`. |
 | `--dry-run`         | Render the final DDL without executing or taking any lock.                       |
 | `--explain`         | With `--dry-run`, show why each option was chosen (version/edition + matrix + config). |
 | `--assume-version`  | Offline dry-run target major version (e.g. `16` for SQL Server 2022).            |
@@ -228,6 +229,32 @@ It runs cheap-first: one metadata sweep selects candidates, and the expensive re
 survivors. The output is **reviewable manifests** written into the queue — nothing is executed until
 you run them through the normal engine.
 
+**Scope: the connected database.** Index, compression, heap, and statistics maintenance analyse and act
+on the single database the connection string points to (the analysis DMVs and generated DDL are
+database-scoped). Only `DBCC CHECKDB` can span several databases, via `checkdb.databases` in the
+profile. Point the connection string at the database you want to maintain.
+
+A server-wide **multi-database mode** maintains several databases in one go. `plan --all-databases` (or
+`--databases a,b,c`) materialises a per-database block of manifests, scoped by a `scope:` selector in
+the profile; the run then processes the queue **one connection per database**, sequentially. `--auto`
+accepts the same flags for an unattended server-wide run. Ineligible databases (AG secondary,
+read-only, offline, no access) are skipped with a logged reason.
+
+```bash
+# Plan maintenance for every eligible user database (review the per-database manifests):
+sqlgopace plan --config config.yaml --all-databases
+
+# Or a chosen set:
+sqlgopace plan --config config.yaml --databases SALES,INVENTORY
+
+# Unattended, server-wide, in one command:
+sqlgopace --config config.yaml --auto --all-databases
+```
+
+Crash recovery is database-aware: each in-flight operation records the database it ran in, and a later
+run reconciles it against that database (an orphan whose database is unreachable — e.g. now an AG
+secondary — is left for a future run). See [`specs/MAINTENANCE.md`](specs/MAINTENANCE.md) §17.
+
 ```bash
 # Analyse and print the manifests it would write (no files, no locks):
 sqlgopace plan --config config.yaml --dry-run
@@ -250,7 +277,9 @@ sqlgopace --config config.yaml
 | `--config`     | Config file (connection + default output directory). Required.               |
 | `--profile`    | Maintenance profile path (default `maintenance_profile.yaml`).               |
 | `--categories` | Comma-separated subset of `index,compression,heaps,statistics,checkdb` (default: all). |
-| `--database`   | `check_db` target database (default: the connected database).                |
+| `--database`   | Single-database mode: the database to plan (default: the connected database). |
+| `--all-databases` | Multi-database mode: plan every eligible user database (spec §17).         |
+| `--databases`  | Multi-database mode: comma-separated list of databases to plan.              |
 | `--out`        | Directory to write manifests into (default: the config's `to_run`).          |
 | `--dry-run`    | Print the manifests instead of writing them.                                 |
 | `--explain`    | Show the reasoning behind each decision.                                     |

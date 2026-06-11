@@ -49,6 +49,12 @@ type ReactionSink func(ReactionEvent)
 type Capabilities struct {
 	Resumable bool // the running operation can PAUSE/RESUME
 	ADR       bool // Accelerated Database Recovery makes a KILL rollback cheap
+	// CancelSafe marks an operation whose cancellation is a clean stop with no
+	// expensive rollback: REORGANIZE commits incrementally, DBCC CHECKDB is a
+	// read-only snapshot, UPDATE STATISTICS rolls back cheaply. It does not change
+	// which Action is chosen (these are not resumable, so they still Cancel) — it
+	// refines the narration so the cancel is not mistaken for a rollback-bearing kill.
+	CancelSafe bool
 }
 
 // Action is the reaction the engine takes under pressure.
@@ -89,4 +95,19 @@ func DecideReaction(p Pressure, c Capabilities) Action {
 	default:
 		return Cancel
 	}
+}
+
+// reactionEvent builds the reaction event for a stop action. A Pause preserves an
+// in-flight resumable operation; a Cancel of a cancel-safe (incremental) operation
+// is a clean stop whose committed work survives, which the detail makes explicit so
+// it reads as a clean cancel, not a rollback-bearing kill.
+func reactionEvent(action Action, p Pressure, c Capabilities) ReactionEvent {
+	if action == Pause {
+		return ReactionEvent{Kind: "pause", Detail: p.Detail()}
+	}
+	detail := p.Detail()
+	if c.CancelSafe {
+		detail += "; incremental — committed work preserved, no rollback"
+	}
+	return ReactionEvent{Kind: "cancel", Detail: detail}
 }

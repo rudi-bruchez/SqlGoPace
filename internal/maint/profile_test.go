@@ -199,6 +199,42 @@ func TestOverrideForFirstMatchWins(t *testing.T) {
 	}
 }
 
+func TestScopeIncludes(t *testing.T) {
+	// No scope block → include everything.
+	plain, err := maint.Parse([]byte("{}\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plain.ScopeIncludes("AnyDatabase") {
+		t.Errorf("default (no scope) should include every database")
+	}
+
+	p, err := maint.Parse([]byte("scope:\n  databases:\n    include: ['APP_*']\n    exclude: ['*_TEST']\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{"APP_SALES", true},
+		{"app_sales", true},       // case-insensitive
+		{"APP_SALES_TEST", false}, // included by APP_* but excluded by *_TEST (exclude wins)
+		{"OTHER", false},          // not included
+	}
+	for _, tt := range tests {
+		if got := p.ScopeIncludes(tt.name); got != tt.want {
+			t.Errorf("ScopeIncludes(%q) = %t, want %t", tt.name, got, tt.want)
+		}
+	}
+}
+
+func TestScopeInvalidGlob(t *testing.T) {
+	if _, err := maint.Parse([]byte("scope:\n  databases:\n    include: ['DB[']\n")); err == nil {
+		t.Errorf("Parse(bad scope glob) error = nil, want an error")
+	}
+}
+
 func TestCompressionDataCompression(t *testing.T) {
 	tests := []struct {
 		in   maint.Compression

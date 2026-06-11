@@ -3,11 +3,57 @@ package run
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
+
+func TestReactionEvent(t *testing.T) {
+	p := Pressure{BlockingOthers: true}
+
+	if ev := reactionEvent(Pause, p, Capabilities{Resumable: true}); ev.Kind != "pause" || ev.Detail != p.Detail() {
+		t.Errorf("pause event = %+v, want kind=pause detail=%q", ev, p.Detail())
+	}
+
+	plain := reactionEvent(Cancel, p, Capabilities{})
+	if plain.Kind != "cancel" || plain.Detail != p.Detail() {
+		t.Errorf("cancel event = %+v, want kind=cancel with no rollback note", plain)
+	}
+	if strings.Contains(plain.Detail, "incremental") {
+		t.Errorf("non-cancel-safe cancel must not claim incremental: %q", plain.Detail)
+	}
+
+	safe := reactionEvent(Cancel, p, Capabilities{CancelSafe: true})
+	if safe.Kind != "cancel" || !strings.Contains(safe.Detail, "incremental") {
+		t.Errorf("cancel-safe cancel = %+v, want a clean-stop note", safe)
+	}
+}
+
+func TestCancelSafe(t *testing.T) {
+	safe := []ddl.Operation{
+		ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX"},
+		ddl.CheckDB{Database: "MYDB"},
+		ddl.UpdateStatistics{Schema: "dbo", Table: "T"},
+	}
+	for _, op := range safe {
+		if !cancelSafe(op) {
+			t.Errorf("cancelSafe(%s) = false, want true", op.CommandType())
+		}
+	}
+	unsafe := []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"},
+		ddl.RebuildHeap{Schema: "dbo", Table: "T"},
+		ddl.CreateIndex{Schema: "dbo", Table: "T", Index: "IX", Columns: []string{"C"}},
+	}
+	for _, op := range unsafe {
+		if cancelSafe(op) {
+			t.Errorf("cancelSafe(%s) = true, want false (heavy builder, rollback on cancel)", op.CommandType())
+		}
+	}
+}
 
 var testStart = time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 

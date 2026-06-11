@@ -135,6 +135,38 @@ func TestProcessAllSuccess(t *testing.T) {
 	mustExist(t, filepath.Join(dirs.Done, "010_a.yaml.log"))
 }
 
+func TestProcessAllDatabaseFilter(t *testing.T) {
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithDatabase("DB1"))
+
+	dbManifest := func(db string) []byte {
+		return []byte("database: " + db + "\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n")
+	}
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "020_db1.yaml"), dbManifest("DB1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "030_db2.yaml"), dbManifest("DB2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	// 010_a (no database → owned by any) + 020_db1 (matches) processed; 030_db2 skipped.
+	if sum.Done != 2 {
+		t.Errorf("Summary.Done = %d, want 2 (no-database + DB1 manifests)", sum.Done)
+	}
+	if runner.calls != 2 {
+		t.Errorf("runner.calls = %d, want 2", runner.calls)
+	}
+	// The other database's manifest is left in the queue for its own engine.
+	mustExist(t, filepath.Join(dirs.ToRun, "030_db2.yaml"))
+	if _, err := os.Stat(filepath.Join(dirs.Done, "030_db2.yaml")); err == nil {
+		t.Errorf("030_db2.yaml should not have been processed (wrong database)")
+	}
+}
+
 func TestProcessAllPreflightFailure(t *testing.T) {
 	runner := &fakeOpRunner{}
 	report := preflight.Report{Checks: []preflight.Check{{Name: "server", Severity: preflight.Fail, Detail: "nope"}}}

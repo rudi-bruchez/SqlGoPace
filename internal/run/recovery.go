@@ -90,18 +90,39 @@ type RecoverySummary struct {
 	Adopted  int
 }
 
+// ProbeResolver opens a recovery probe for one database, returning the probe and a
+// cleanup to close it. It lets recovery reconcile each orphan against a connection
+// in the database the orphan ran in (spec §17.8).
+type ProbeResolver func(ctx context.Context, database string) (RecoveryProbe, func(), error)
+
 // Recoverer scans the processing directory for orphaned manifests after a crash
 // and reconciles them with the live server state.
 type Recoverer struct {
-	dirs  Dirs
-	queue *Queue
-	probe RecoveryProbe
-	out   io.Writer
+	dirs      Dirs
+	queue     *Queue
+	probe     RecoveryProbe // the connected database's probe (and the default)
+	connected string        // the connected database's name
+	resolver  ProbeResolver // opens a probe for another database; nil = single-database
+	out       io.Writer
+}
+
+// RecovererOption configures optional Recoverer behaviour.
+type RecovererOption func(*Recoverer)
+
+// WithRecoveryProbes enables per-database recovery: orphans whose sidecar names a
+// database other than connected are reconciled against a probe from resolver
+// (spec §17.8). Without it, every orphan uses the single connected probe.
+func WithRecoveryProbes(connected string, resolver ProbeResolver) RecovererOption {
+	return func(r *Recoverer) { r.connected, r.resolver = connected, resolver }
 }
 
 // NewRecoverer builds a Recoverer.
-func NewRecoverer(dirs Dirs, probe RecoveryProbe, out io.Writer) *Recoverer {
-	return &Recoverer{dirs: dirs, queue: NewQueue(dirs), probe: probe, out: out}
+func NewRecoverer(dirs Dirs, probe RecoveryProbe, out io.Writer, opts ...RecovererOption) *Recoverer {
+	r := &Recoverer{dirs: dirs, queue: NewQueue(dirs), probe: probe, out: out}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Recover reconciles every orphaned manifest found in processing.
@@ -113,6 +134,15 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 	if err != nil {
 		return RecoverySummary{}, fmt.Errorf("scan processing: %w", err)
 	}
+
+	// Probes opened per database are cached and closed at the end.
+	cache := make(map[string]RecoveryProbe)
+	var closers []func()
+	defer func() {
+		for _, c := range closers {
+			c()
+		}
+	}()
 
 	var sum RecoverySummary
 	for _, e := range entries {
@@ -128,7 +158,15 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 			fmt.Fprintf(r.out, "recovery: read %s: %v\n", name, err)
 			continue
 		}
-		facts, err := r.facts(ctx, st)
+
+		probe, err := r.probeFor(ctx, st.Database, cache, &closers)
+		if err != nil {
+			// Can't reach the orphan's database (e.g. an AG secondary now): leave it
+			// in processing for a later run that finds the database writable here.
+			fmt.Fprintf(r.out, "recovery: %s — cannot reach database %q: %v; left in processing\n", manifest, st.Database, err)
+			continue
+		}
+		facts, err := factsWith(ctx, probe, st)
 		if err != nil {
 			return RecoverySummary{}, err
 		}
@@ -148,12 +186,34 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 	return sum, nil
 }
 
-func (r *Recoverer) facts(ctx context.Context, st RunState) (RecoveryFacts, error) {
-	id, err := r.probe.SessionIdentity(ctx, st.SPID)
+// probeFor resolves the recovery probe for an orphan's database: the connected
+// probe for the connected database (or single-database mode), else a cached probe
+// opened via the resolver.
+func (r *Recoverer) probeFor(ctx context.Context, database string, cache map[string]RecoveryProbe, closers *[]func()) (RecoveryProbe, error) {
+	if r.resolver == nil || database == "" || strings.EqualFold(database, r.connected) {
+		return r.probe, nil
+	}
+	key := strings.ToLower(database)
+	if p, ok := cache[key]; ok {
+		return p, nil
+	}
+	p, closer, err := r.resolver(ctx, database)
+	if err != nil {
+		return nil, err
+	}
+	cache[key] = p
+	*closers = append(*closers, closer)
+	return p, nil
+}
+
+// factsWith correlates an orphan's recorded session against the live state read
+// through probe (the probe for the orphan's database).
+func factsWith(ctx context.Context, probe RecoveryProbe, st RunState) (RecoveryFacts, error) {
+	id, err := probe.SessionIdentity(ctx, st.SPID)
 	if err != nil {
 		return RecoveryFacts{}, fmt.Errorf("session identity for spid %d: %w", st.SPID, err)
 	}
-	ops, err := r.probe.ResumableOps(ctx)
+	ops, err := probe.ResumableOps(ctx)
 	if err != nil {
 		return RecoveryFacts{}, fmt.Errorf("resumable operations: %w", err)
 	}

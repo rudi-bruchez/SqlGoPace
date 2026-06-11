@@ -25,11 +25,28 @@ type Conn struct {
 // records its SPID. The driver applies no query timeout: long DDL is bounded by
 // monitoring and context cancellation, never a fixed timer.
 func Open(ctx context.Context, dsn, version string) (*Conn, error) {
+	return open(ctx, dsn, "", version)
+}
+
+// OpenDatabase connects like Open but targets a specific database, reusing the
+// server and credentials from the base DSN with the catalog overridden. It is how
+// multi-database maintenance reaches each database in its own context, rather than
+// issuing USE on a pooled connection (the pool trap, SPECS §3 / spec §17.2).
+func OpenDatabase(ctx context.Context, dsn, database, version string) (*Conn, error) {
+	return open(ctx, dsn, database, version)
+}
+
+// open is the shared connection setup. A non-empty database overrides the DSN's
+// catalog so the pinned execution connection lands in that database.
+func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
 	cfg, err := msdsn.Parse(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse connection string: %w", err)
 	}
 	cfg.AppName = appNameWithVersion(cfg.AppName, version)
+	if database != "" {
+		cfg.Database = database
+	}
 
 	pool := sql.OpenDB(mssqldb.NewConnectorConfig(cfg))
 	if err := pool.PingContext(ctx); err != nil {

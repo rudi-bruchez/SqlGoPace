@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -108,6 +109,83 @@ func TestRecovererRequeuesOnRestart(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dirs.Processing, name+stateSuffix)); !os.IsNotExist(err) {
 		t.Errorf("sidecar still present after requeue")
+	}
+}
+
+func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
+	// An orphan from DB2 must be reconciled against the DB2 probe, not the
+	// connected one. The connected probe would Adopt (alive); the DB2 probe sees
+	// no session → Restart → requeue. The outcome proves which probe was used.
+	st := RunState{SPID: 57, Database: "DB2", LoginTime: "2026-06-10T12:00:00"}
+	dirs, _ := setupRecovery(t, st)
+	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
+	db2 := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}
+
+	var resolvedFor string
+	r := NewRecoverer(dirs, connected, io.Discard, WithRecoveryProbes("CONN",
+		func(_ context.Context, db string) (RecoveryProbe, func(), error) {
+			resolvedFor = db
+			return db2, func() {}, nil
+		}))
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if resolvedFor != "DB2" {
+		t.Errorf("resolver called for %q, want DB2", resolvedFor)
+	}
+	if sum.Requeued != 1 || sum.Adopted != 0 {
+		t.Errorf("sum = %+v, want Requeued 1 / Adopted 0 (DB2 probe → Restart)", sum)
+	}
+}
+
+func TestRecovererConnectedDatabaseUsesBaseProbe(t *testing.T) {
+	// An orphan from the connected database uses the base probe; the resolver is
+	// never called.
+	st := RunState{SPID: 57, Database: "CONN", LoginTime: "2026-06-10T12:00:00"}
+	dirs, _ := setupRecovery(t, st)
+	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
+
+	called := false
+	r := NewRecoverer(dirs, connected, io.Discard, WithRecoveryProbes("CONN",
+		func(context.Context, string) (RecoveryProbe, func(), error) {
+			called = true
+			return nil, nil, nil
+		}))
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if called {
+		t.Errorf("resolver must not be called for the connected database")
+	}
+	if sum.Adopted != 1 {
+		t.Errorf("Adopted = %d, want 1 (base probe, live orphan)", sum.Adopted)
+	}
+}
+
+func TestRecovererUnreachableDatabaseLeavesOrphan(t *testing.T) {
+	// If the orphan's database can't be reached (e.g. now an AG secondary), the
+	// orphan is left in processing for a later run, not requeued or adopted.
+	st := RunState{SPID: 57, Database: "DB2", LoginTime: "x"}
+	dirs, name := setupRecovery(t, st)
+
+	r := NewRecoverer(dirs, fakeRecoveryProbe{}, io.Discard, WithRecoveryProbes("CONN",
+		func(context.Context, string) (RecoveryProbe, func(), error) {
+			return nil, nil, errors.New("availability-group secondary")
+		}))
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if sum.Requeued != 0 || sum.Adopted != 0 {
+		t.Errorf("sum = %+v, want all zero (left in processing)", sum)
+	}
+	if _, serr := os.Stat(filepath.Join(dirs.Processing, name+stateSuffix)); serr != nil {
+		t.Errorf("orphan sidecar should remain in processing: %v", serr)
 	}
 }
 

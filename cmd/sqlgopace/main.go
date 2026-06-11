@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -62,6 +63,12 @@ func cli(stdout, stderr io.Writer, args []string) error {
 		matrixPath    = fs.String("matrix", "ddl_compatibility.yaml", "path to the DDL compatibility matrix")
 		useTUI        = fs.Bool("tui", false, "run with the interactive incident console")
 		showVersion   = fs.Bool("version", false, "print version and exit")
+		useAuto       = fs.Bool("auto", false, "analyze the database and run generated maintenance, unattended (no review)")
+		autoProfile   = fs.String("profile", "maintenance_profile.yaml", "maintenance profile path (with --auto)")
+		autoCats      = fs.String("categories", "", "comma-separated category subset (with --auto); default all")
+		autoDatabase  = fs.String("database", "", "single-database --auto: the database to maintain (default the connected database)")
+		autoAll       = fs.Bool("all-databases", false, "with --auto: maintain every eligible user database (spec §17)")
+		autoDatabases = fs.String("databases", "", "with --auto: comma-separated list of databases to maintain")
 	)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -86,6 +93,9 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	}
 
 	ctx := context.Background()
+	if *useAuto && *dryRun {
+		return errors.New("--auto runs maintenance; to preview it without running, use `sqlgopace plan --dry-run`")
+	}
 	if *dryRun {
 		return dryRunAll(ctx, stdout, fs.Args(), visited, *assumeVersion, *assumeEdition, *explain, cfg, matrix)
 	}
@@ -93,7 +103,21 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	if cfg == nil {
 		return errors.New("run mode requires --config (connection, directories, policy); or pass --dry-run")
 	}
-	return runEngine(ctx, stdout, cfg, matrix, *useTUI)
+	auto := autoConfig{
+		enabled: *useAuto, profile: *autoProfile, categories: *autoCats,
+		database: *autoDatabase, allDatabases: *autoAll, databases: *autoDatabases,
+	}
+	return runEngine(ctx, stdout, cfg, matrix, *useTUI, auto)
+}
+
+// autoConfig carries the --auto analysis settings into the run path.
+type autoConfig struct {
+	enabled      bool
+	profile      string
+	categories   string
+	database     string // single-database --auto target
+	allDatabases bool   // --auto --all-databases
+	databases    string // --auto --databases a,b,c
 }
 
 // dryRunAll renders every manifest's planned T-SQL without executing it. When
@@ -120,8 +144,10 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 
 // runEngine connects, detects the target, and runs every queued manifest with
 // monitoring and reaction. With useTUI, the interactive incident console runs in
-// the foreground while the engine runs in the background.
-func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix, useTUI bool) error {
+// the foreground while the engine runs in the background. With auto.enabled, it
+// first analyses the database and writes the generated maintenance manifests into
+// the queue, then processes the queue — one unattended command, no review pause.
+func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix, useTUI bool, auto autoConfig) error {
 	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
 	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
 	if err != nil {
@@ -139,6 +165,136 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
 
+	// --auto: analyse and materialise maintenance manifests into the queue before
+	// the engine processes it. Materialising (rather than running purely in memory)
+	// means a crash mid-run leaves recoverable manifests + sidecars, like any run.
+	if auto.enabled {
+		if err := runAuto(ctx, stdout, conn, cfg, auto); err != nil {
+			return err
+		}
+	}
+
+	dirs := run.Dirs{
+		ToRun:      cfg.Directories.ToRun,
+		Processing: cfg.Directories.Processing,
+		Done:       cfg.Directories.Done,
+		Failed:     cfg.Directories.Failed,
+	}
+
+	// Crash recovery: reconcile any manifests left in processing before starting.
+	// Each orphan is reconciled against a connection in the database it ran in
+	// (recorded in its sidecar); other databases are reached via OpenDatabase.
+	recoverer := run.NewRecoverer(dirs, conn, stdout,
+		run.WithRecoveryProbes(info.Database, func(rctx context.Context, db string) (run.RecoveryProbe, func(), error) {
+			c, oerr := mssql.OpenDatabase(rctx, cfg.Database.ConnectionString, db, version.Version())
+			if oerr != nil {
+				return nil, nil, oerr
+			}
+			return c, func() { _ = c.Close() }, nil
+		}))
+	if rsum, rerr := recoverer.Recover(ctx); rerr != nil {
+		return rerr
+	} else if rsum.Requeued > 0 || rsum.Adopted > 0 {
+		fmt.Fprintf(stdout, "-- recovery: %d requeued, %d adopted\n", rsum.Requeued, rsum.Adopted)
+	}
+
+	engineOut := stdout
+	if useTUI {
+		engineOut = io.Discard // narration would corrupt the console; the TUI shows state
+	}
+
+	var history *report.History
+	if cfg.History.Enabled {
+		history, err = report.OpenHistory(sqlitePath(cfg.History.Destination))
+		if err != nil {
+			return err
+		}
+		defer func() { _ = history.Close() }()
+	}
+
+	// Run an engine per database the queue targets, each on a connection in that
+	// database's context (spec §17.6), sequentially — at most one heavy DDL runs
+	// server-wide at a time (§17.7).
+	targets, err := queuedDatabases(dirs.ToRun, info.Database)
+	if err != nil {
+		return err
+	}
+	if len(targets) == 0 {
+		fmt.Fprintln(stdout, "-- nothing to process")
+		return nil
+	}
+
+	// Re-check eligibility for any non-connected target: a database that became an
+	// AG secondary / read-only since `plan` is left in the queue, not failed (§17.6).
+	if needsEligibilityRecheck(targets, info.Database) {
+		eligible, eerr := conn.UserDatabases(ctx)
+		if eerr != nil {
+			return eerr
+		}
+		var skipped []dbSkip
+		targets, skipped = runnableTargets(targets, info.Database, eligible)
+		for _, s := range skipped {
+			fmt.Fprintf(stdout, "-- skip database %s: %s; left in queue\n", s.name, s.reason)
+		}
+	}
+
+	var total run.Summary
+	var runErr error
+	for _, db := range targets {
+		dbConn, dbInfo, reused, cerr := connForDatabase(ctx, conn, info, db, cfg.Database.ConnectionString)
+		if cerr != nil {
+			fmt.Fprintf(stdout, "-- skip database %s: %v\n", db, cerr)
+			runErr = cerr
+			continue
+		}
+		if !dbInfo.Supported() {
+			if !reused {
+				_ = dbConn.Close()
+			}
+			fmt.Fprintf(stdout, "-- skip database %s: unsupported engine edition %d\n", db, dbInfo.EngineEdition)
+			continue
+		}
+		if len(targets) > 1 {
+			fmt.Fprintf(stdout, "-- database %s\n", db)
+		}
+
+		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history)
+		var sum run.Summary
+		if useTUI {
+			sum, err = runWithTUI(ctx, dbConn, engine, cfg.Monitoring.ProgressPoll())
+		} else {
+			sum, err = engine.ProcessAll(ctx)
+		}
+		if !reused {
+			_ = dbConn.Close()
+		}
+		if err != nil {
+			fmt.Fprintf(stdout, "-- database %s: %v\n", db, err)
+			runErr = err
+			continue
+		}
+		total.Done += sum.Done
+		total.Failed += sum.Failed
+		total.Interrupted += sum.Interrupted
+	}
+
+	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted\n", total.Done, total.Failed, total.Interrupted)
+	if total.Interrupted > 0 {
+		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", total.Interrupted)
+	}
+	if runErr != nil {
+		return runErr
+	}
+	if total.Failed > 0 {
+		return fmt.Errorf("%d manifest(s) failed", total.Failed)
+	}
+	return nil
+}
+
+// buildEngine wires a run.Engine for one database's connection, sharing the given
+// history (may be nil) and reading policy, monitoring, and notification settings
+// from cfg. It is called once per database in a multi-database run.
+func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History) *run.Engine {
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
@@ -153,25 +309,6 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		KillGrace:       cfg.Monitoring.KillGrace(),
 		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
 	})
-	dirs := run.Dirs{
-		ToRun:      cfg.Directories.ToRun,
-		Processing: cfg.Directories.Processing,
-		Done:       cfg.Directories.Done,
-		Failed:     cfg.Directories.Failed,
-	}
-
-	// Crash recovery: reconcile any manifests left in processing before starting.
-	recoverer := run.NewRecoverer(dirs, conn, stdout)
-	if rsum, rerr := recoverer.Recover(ctx); rerr != nil {
-		return rerr
-	} else if rsum.Requeued > 0 || rsum.Adopted > 0 {
-		fmt.Fprintf(stdout, "-- recovery: %d requeued, %d adopted\n", rsum.Requeued, rsum.Adopted)
-	}
-
-	engineOut := stdout
-	if useTUI {
-		engineOut = io.Discard // narration would corrupt the console; the TUI shows state
-	}
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
@@ -180,38 +317,81 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		run.WithWaits(conn),
 		run.WithResumeCheck(conn),
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
+		run.WithDatabase(info.Database),
 		run.WithOutput(engineOut),
 	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
 	}
-	if cfg.History.Enabled {
-		history, err := report.OpenHistory(sqlitePath(cfg.History.Destination))
-		if err != nil {
-			return err
-		}
-		defer func() { _ = history.Close() }()
+	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
-	engine := run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+}
 
-	var summary run.Summary
-	if useTUI {
-		summary, err = runWithTUI(ctx, conn, engine, cfg.Monitoring.ProgressPoll())
-	} else {
-		summary, err = engine.ProcessAll(ctx)
+// connForDatabase returns a connection in the target database's context. It reuses
+// the already-open base connection when the target is the connected database;
+// otherwise it opens a fresh connection (and detects its server facts). reused is
+// true when the base connection was returned (the caller must not close it).
+func connForDatabase(ctx context.Context, base *mssql.Conn, baseInfo mssql.ServerInfo, db, dsn string) (conn *mssql.Conn, info mssql.ServerInfo, reused bool, err error) {
+	if strings.EqualFold(db, baseInfo.Database) {
+		return base, baseInfo, true, nil
+	}
+	conn, err = mssql.OpenDatabase(ctx, dsn, db, version.Version())
+	if err != nil {
+		return nil, mssql.ServerInfo{}, false, err
+	}
+	info, err = conn.Detect(ctx)
+	if err != nil {
+		_ = conn.Close()
+		return nil, mssql.ServerInfo{}, false, err
+	}
+	return conn, info, false, nil
+}
+
+// queuedDatabases returns the distinct databases the to_run manifests target, in
+// name order. A manifest with no `database:` field (or one that fails to load)
+// belongs to the connected database, so its work still runs and load errors still
+// surface during processing.
+func queuedDatabases(toRunDir, connected string) ([]string, error) {
+	entries, err := os.ReadDir(toRunDir)
+	if os.IsNotExist(err) {
+		return nil, nil
 	}
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("scan queue: %w", err)
 	}
-	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted\n", summary.Done, summary.Failed, summary.Interrupted)
-	if summary.Interrupted > 0 {
-		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", summary.Interrupted)
+	seen := make(map[string]bool)
+	var dbs []string
+	for _, e := range entries {
+		if e.IsDir() || !isYAMLManifest(e.Name()) {
+			continue
+		}
+		db := connected
+		if m, lerr := ddl.LoadManifestFile(filepath.Join(toRunDir, e.Name())); lerr == nil && m.Database != "" {
+			db = m.Database
+		}
+		if key := strings.ToLower(db); !seen[key] {
+			seen[key] = true
+			dbs = append(dbs, db)
+		}
 	}
-	if summary.Failed > 0 {
-		return fmt.Errorf("%d manifest(s) failed", summary.Failed)
+	sort.Strings(dbs)
+	return dbs, nil
+}
+
+// isYAMLManifest reports whether a filename is a manifest the queue picks up: a
+// .yaml/.yml file not starting with a dot (matching the runner's own rule).
+func isYAMLManifest(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
 	}
-	return nil
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".yaml", ".yml":
+		return true
+	default:
+		return false
+	}
 }
 
 // runWithTUI runs the incident console in the foreground while the engine runs

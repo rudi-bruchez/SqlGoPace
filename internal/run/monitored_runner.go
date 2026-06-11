@@ -152,11 +152,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 		return Continue, err
 	}
 
-	kind := "cancel"
-	if action == Pause {
-		kind = "pause"
-	}
-	sink(ReactionEvent{Kind: kind, Detail: pressure.Detail()})
+	sink(reactionEvent(action, pressure, caps))
 
 	// Stop the running statement: abort via context cancel first, KILL as a
 	// fallback if it does not stop in time.

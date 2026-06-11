@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -105,6 +106,7 @@ type Engine struct {
 	waits            WaitReader
 	resumeCheck      ResumableProbe
 	reconnectTimeout time.Duration
+	database         string // when set, process only manifests for this database
 	out              io.Writer
 }
 
@@ -151,6 +153,13 @@ func WithReconnectTimeout(d time.Duration) EngineOption {
 	return func(e *Engine) { e.reconnectTimeout = d }
 }
 
+// WithDatabase declares the database this engine's connection targets, so it
+// processes only manifests for that database — those with no `database:` field, or
+// one matching (case-insensitive). Manifests targeting another database are left in
+// the queue for the engine that owns it (spec §17.6). Empty (the default) processes
+// every manifest, regardless of its `database:` field.
+func WithDatabase(name string) EngineOption { return func(e *Engine) { e.database = name } }
+
 // NewEngine wires an Engine over the lifecycle directories and required
 // dependencies; optional behaviour is supplied via options.
 func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, pf Preflighter, runner OpRunner, opts ...EngineOption) *Engine {
@@ -183,6 +192,10 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 
 	var sum Summary
 	for _, name := range names {
+		if !e.ownsManifest(name) {
+			fmt.Fprintf(e.out, "skip %s: targets another database; left in queue (run is on %q)\n", name, e.database)
+			continue
+		}
 		switch e.processOne(ctx, name) {
 		case outcomeDone:
 			sum.Done++
@@ -193,6 +206,21 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 		}
 	}
 	return sum, nil
+}
+
+// ownsManifest reports whether this engine should process the named manifest: it
+// does when no database filter is set, or the manifest's database is empty or
+// matches the filter (case-insensitive). A manifest that cannot be read is claimed
+// anyway so processOne surfaces the load error properly.
+func (e *Engine) ownsManifest(name string) bool {
+	if e.database == "" {
+		return true
+	}
+	m, err := ddl.LoadManifestFile(filepath.Join(e.dirs.ToRun, name))
+	if err != nil {
+		return true
+	}
+	return m.Database == "" || strings.EqualFold(m.Database, e.database)
 }
 
 func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
@@ -241,7 +269,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 
 	for i, step := range planned {
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation)}
 
 		var reactions []report.ReactionLine
 		sink := func(ev ReactionEvent) {
@@ -438,6 +466,7 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) {
 
 	state := RunState{
 		Manifest:  name,
+		Database:  e.database,
 		SPID:      e.session.SPID(),
 		LoginTime: login,
 		Marker:    marker,
@@ -501,6 +530,19 @@ func optionDecisions(ds []ddl.Decision) []report.OptionDecision {
 
 func opTarget(op ddl.Operation) string {
 	return op.Target().String()
+}
+
+// cancelSafe reports whether cancelling op under pressure is a clean stop with no
+// expensive rollback: a REORGANIZE commits incrementally, DBCC CHECKDB is a
+// read-only snapshot, and UPDATE STATISTICS rolls back cheaply. Heavy builders
+// (REBUILD index/heap, CREATE INDEX, ALTER COLUMN, ADD CONSTRAINT) are not.
+func cancelSafe(op ddl.Operation) bool {
+	switch op.(type) {
+	case ddl.ReorganizeIndex, ddl.CheckDB, ddl.UpdateStatistics:
+		return true
+	default:
+		return false
+	}
 }
 
 // isInterruption reports whether a reaction kind stops the running statement, so

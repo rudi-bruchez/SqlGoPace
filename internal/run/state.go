@@ -11,6 +11,7 @@ import (
 // login_time + CONTEXT_INFO marker) and decide whether to resume or abandon.
 type RunState struct {
 	Manifest  string `json:"manifest"`
+	Database  string `json:"database,omitempty"` // the database the operation ran in (for per-database recovery)
 	SPID      int    `json:"spid"`
 	LoginTime string `json:"login_time,omitempty"`
 	Marker    string `json:"marker"`

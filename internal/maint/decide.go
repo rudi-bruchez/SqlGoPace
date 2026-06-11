@@ -68,6 +68,22 @@ type Decision struct {
 	Kind     string // ddl command type, or "skip"
 	Reason   string
 	Op       ddl.Operation // nil when skipped
+	Metrics  Metrics       // the measured inputs behind the decision, for history/trends
+}
+
+// Metrics captures the measured inputs that drove a decision, so the run history
+// can record them for trend analysis. Not every category populates every field
+// (a zero WriteRatio or ForwardedPercent means "not measured / not applicable").
+type Metrics struct {
+	PageCount            int64
+	SizeMB               int64
+	FragmentationPercent float64
+	ForwardedPercent     float64 // heaps
+	WriteRatio           float64 // writes / total access, 0 when not measured
+	Rows                 int64   // statistics
+	ModificationCounter  int64   // statistics
+	CurrentCompression   string  // NONE | ROW | PAGE (T-SQL keyword)
+	ChosenCompression    string  // effective compression after the op ("" = unchanged/none)
 }
 
 // Input bundles the measurements for one analysis pass.
@@ -159,8 +175,18 @@ func Decide(in Input, p *Profile) Plan {
 }
 
 // DecideIndex resolves the REORGANIZE/REBUILD and compression decision for one
-// index measurement (spec §5.1, §5.2).
+// index measurement (spec §5.1, §5.2) and attaches its metrics.
 func DecideIndex(m IndexMeasurement, p *Profile) Decision {
+	d := decideIndex(m, p)
+	d.Metrics = Metrics{
+		PageCount: m.PageCount, SizeMB: m.SizeMB, FragmentationPercent: m.FragmentationPercent,
+		WriteRatio: writeRatioOf(m.Write), CurrentCompression: m.Current.DataCompression(),
+		ChosenCompression: chosenCompression(d, m.Current),
+	}
+	return d
+}
+
+func decideIndex(m IndexMeasurement, p *Profile) Decision {
 	target := indexLabel(m.Schema, m.Table, m.Index, m.Partition)
 	ov, _ := p.OverrideFor(m.Schema, m.Table)
 	if ov.Skip {
@@ -226,8 +252,20 @@ func DecideIndex(m IndexMeasurement, p *Profile) Decision {
 	return Decision{Category: "index", Target: target, Kind: "rebuild_index", Reason: reason, Op: op}
 }
 
-// DecideHeap resolves the rebuild decision for one heap measurement (spec §5.3).
+// DecideHeap resolves the rebuild decision for one heap measurement (spec §5.3)
+// and attaches its metrics.
 func DecideHeap(m HeapMeasurement, p *Profile) Decision {
+	d := decideHeap(m, p)
+	d.Metrics = Metrics{
+		SizeMB: m.SizeMB, FragmentationPercent: m.FragmentationPercent,
+		ForwardedPercent: ratioPercent(m.ForwardedRecordCount, m.RecordCount),
+		WriteRatio:       writeRatioOf(m.Write), CurrentCompression: m.Current.DataCompression(),
+		ChosenCompression: chosenCompression(d, m.Current),
+	}
+	return d
+}
+
+func decideHeap(m HeapMeasurement, p *Profile) Decision {
 	target := m.Schema + "." + m.Table
 	if !p.Heap.Enabled {
 		return skipDecision("heap", target, "heap maintenance disabled")
@@ -270,9 +308,15 @@ func DecideHeap(m HeapMeasurement, p *Profile) Decision {
 }
 
 // DecideStatistic resolves the UPDATE STATISTICS decision for one statistic
-// measurement (spec §5.4). It does not apply the rebuild-suppression rule; Decide
-// does, since that needs the whole plan.
+// measurement (spec §5.4) and attaches its metrics. It does not apply the
+// rebuild-suppression rule; Decide does, since that needs the whole plan.
 func DecideStatistic(m StatMeasurement, p *Profile) Decision {
+	d := decideStatistic(m, p)
+	d.Metrics = Metrics{Rows: m.Rows, ModificationCounter: m.ModificationCounter}
+	return d
+}
+
+func decideStatistic(m StatMeasurement, p *Profile) Decision {
 	target := m.Schema + "." + m.Table + "." + m.Statistic
 	if !p.Statistics.Enabled {
 		return skipDecision("statistics", target, "statistics maintenance disabled")
@@ -422,6 +466,35 @@ func indexLabel(schema, table, index string, partition *int) string {
 
 func key(schema, table, name string) string {
 	return strings.ToLower(schema + "." + table + "." + name)
+}
+
+// writeRatioOf returns writes / total access, or 0 when activity is unknown.
+func writeRatioOf(w *WriteActivity) float64 {
+	if w == nil {
+		return 0
+	}
+	total := w.Writes + w.Reads
+	if total == 0 {
+		return 0
+	}
+	return float64(w.Writes) / float64(total)
+}
+
+// chosenCompression returns the effective compression after the decision's
+// operation (the rebuild's DATA_COMPRESSION), or the current setting when the
+// operation leaves compression unchanged.
+func chosenCompression(d Decision, current Compression) string {
+	switch op := d.Op.(type) {
+	case ddl.RebuildIndex:
+		if op.DataCompression != "" {
+			return op.DataCompression
+		}
+	case ddl.RebuildHeap:
+		if op.DataCompression != "" {
+			return op.DataCompression
+		}
+	}
+	return current.DataCompression()
 }
 
 // pctSaving returns the percentage saved going from current to candidate sizes.

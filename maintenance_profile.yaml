@@ -41,6 +41,13 @@ checkdb:
   data_purity: false
   maxdop: null                     # null = server default
 
+# Server-wide scope, consulted only with --all-databases (multi-database mode, §17).
+# Globs on database name; exclude wins. Empty include = all eligible user databases.
+scope:
+  databases:
+    include: ["*"]
+    exclude: []                    # e.g. ["*_archive", "*_test"]
+
 overrides:
   - match: "dbo.AUDIT_*"
     rebuild: forbid                # never REBUILD these; REORGANIZE only
