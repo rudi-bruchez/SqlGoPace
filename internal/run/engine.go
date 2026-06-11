@@ -500,8 +500,7 @@ func optionDecisions(ds []ddl.Decision) []report.OptionDecision {
 }
 
 func opTarget(op ddl.Operation) string {
-	ref := op.Target()
-	return fmt.Sprintf("%s.%s.%s", ref.Schema, ref.Table, ref.Name)
+	return op.Target().String()
 }
 
 // isInterruption reports whether a reaction kind stops the running statement, so

@@ -17,6 +17,14 @@ func Generate(op Operation, res ResolvedOptions) (string, error) {
 	switch o := op.(type) {
 	case RebuildIndex:
 		return generateRebuildIndex(o, res), nil
+	case ReorganizeIndex:
+		return generateReorganizeIndex(o), nil
+	case RebuildHeap:
+		return generateRebuildHeap(o, res), nil
+	case UpdateStatistics:
+		return generateUpdateStatistics(o), nil
+	case CheckDB:
+		return generateCheckDB(o, res), nil
 	case CreateIndex:
 		return generateCreateIndex(o, res), nil
 	case AlterColumn:
@@ -119,13 +127,76 @@ func IsAllIndexRebuild(op Operation) bool {
 	return ok && strings.EqualFold(ri.Index, "ALL")
 }
 
+// isSinglePartitionRebuild reports whether op rebuilds a single named partition
+// (REBUILD PARTITION = n). Its WITH clause accepts only SORT_IN_TEMPDB / MAXDOP /
+// DATA_COMPRESSION / XML_COMPRESSION plus ONLINE / WAIT_AT_LOW_PRIORITY — never
+// RESUMABLE, which option resolution must therefore drop.
+func isSinglePartitionRebuild(op Operation) bool {
+	ri, ok := op.(RebuildIndex)
+	return ok && ri.Partition != nil
+}
+
 func generateRebuildIndex(o RebuildIndex, res ResolvedOptions) string {
 	index := quoteIdent(o.Index)
 	if strings.EqualFold(o.Index, "ALL") {
 		index = "ALL"
 	}
-	return fmt.Sprintf("ALTER INDEX %s ON %s REBUILD%s;",
-		index, qualified(o.Schema, o.Table), withClause(res, o.DataCompression))
+	return fmt.Sprintf("ALTER INDEX %s ON %s REBUILD%s%s;",
+		index, qualified(o.Schema, o.Table), partitionClause(o.Partition), withClause(res, o.DataCompression))
+}
+
+// partitionClause renders " PARTITION = n" for a partition-targeted index
+// operation, or "" for a whole-index operation.
+func partitionClause(partition *int) string {
+	if partition == nil {
+		return ""
+	}
+	return " PARTITION = " + strconv.Itoa(*partition)
+}
+
+func generateReorganizeIndex(o ReorganizeIndex) string {
+	with := ""
+	if o.LOBCompaction {
+		with = " WITH (LOB_COMPACTION = ON)"
+	}
+	return fmt.Sprintf("ALTER INDEX %s ON %s REORGANIZE%s%s;",
+		quoteIdent(o.Index), qualified(o.Schema, o.Table), partitionClause(o.Partition), with)
+}
+
+func generateRebuildHeap(o RebuildHeap, res ResolvedOptions) string {
+	return fmt.Sprintf("ALTER TABLE %s REBUILD%s;",
+		qualified(o.Schema, o.Table), withClause(res, o.DataCompression))
+}
+
+func generateUpdateStatistics(o UpdateStatistics) string {
+	target := qualified(o.Schema, o.Table)
+	if o.Statistic != "" {
+		target += " " + quoteIdent(o.Statistic)
+	}
+	with := ""
+	switch {
+	case o.FullScan:
+		with = " WITH FULLSCAN"
+	case o.SamplePercent != nil:
+		with = fmt.Sprintf(" WITH SAMPLE %d PERCENT", *o.SamplePercent)
+	case o.Resample:
+		with = " WITH RESAMPLE"
+	}
+	return fmt.Sprintf("UPDATE STATISTICS %s%s;", target, with)
+}
+
+func generateCheckDB(o CheckDB, res ResolvedOptions) string {
+	opts := []string{"NO_INFOMSGS", "ALL_ERRORMSGS"}
+	if o.PhysicalOnly {
+		opts = append(opts, "PHYSICAL_ONLY")
+	}
+	if o.DataPurity {
+		opts = append(opts, "DATA_PURITY")
+	}
+	if res.MaxDOP != nil {
+		opts = append(opts, "MAXDOP = "+strconv.Itoa(*res.MaxDOP))
+	}
+	return fmt.Sprintf("DBCC CHECKDB (%s) WITH %s;", quoteIdent(o.Database), strings.Join(opts, ", "))
 }
 
 func generateCreateIndex(o CreateIndex, res ResolvedOptions) string {

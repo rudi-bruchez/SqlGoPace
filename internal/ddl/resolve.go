@@ -71,6 +71,14 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 		resumable, resReason, resRel = false, "omitted: RESUMABLE is not supported with ALTER INDEX ALL", true
 	}
 
+	// RESUMABLE is likewise not permitted when rebuilding a single partition: that
+	// syntax accepts only SORT_IN_TEMPDB / MAXDOP / DATA_COMPRESSION / XML_COMPRESSION
+	// plus ONLINE / WAIT_AT_LOW_PRIORITY. Drop it before the ONLINE dependency so we
+	// do not force ONLINE on for an option we are about to remove.
+	if resumable && isSinglePartitionRebuild(op) {
+		resumable, resReason, resRel = false, "omitted: RESUMABLE is not supported when rebuilding a single partition", true
+	}
+
 	// Index-type gating: columnstore / XML / spatial indexes rebuild offline and
 	// reject the ONLINE family. Applies only to expanded ALL rebuilds, where the
 	// index kind is known; KindUnknown (single named index) is treated as rowstore.
@@ -173,6 +181,10 @@ func pickBool(applicable, defaultOn bool, perOp, global *bool) (value bool, reas
 func overridesOf(op Operation) OptionOverrides {
 	switch o := op.(type) {
 	case RebuildIndex:
+		return o.Options
+	case RebuildHeap:
+		return o.Options
+	case CheckDB:
 		return o.Options
 	case CreateIndex:
 		return o.Options

@@ -84,6 +84,65 @@ func TestParseManifest(t *testing.T) {
 	}
 }
 
+const maintenanceYAML = `
+description: "Maintenance operations"
+operations:
+  - operation: reorganize_index
+    schema: dbo
+    table: T
+    index: IX
+    partition: 2
+    lob_compaction: true
+  - operation: rebuild_heap
+    schema: dbo
+    table: H
+    data_compression: PAGE
+  - operation: update_statistics
+    schema: dbo
+    table: T
+    statistic: ST
+    sample_percent: 30
+  - operation: check_db
+    database: MYDB
+    physical_only: true
+`
+
+func TestParseMaintenanceManifest(t *testing.T) {
+	m, err := ddl.ParseManifest(strings.NewReader(maintenanceYAML))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v, want nil", err)
+	}
+	if got, want := len(m.Operations), 4; got != want {
+		t.Fatalf("len(Operations) = %d, want %d", got, want)
+	}
+
+	partition := 2
+	sample := 30
+	wantOps := []ddl.Operation{
+		ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX", Partition: &partition, LOBCompaction: true},
+		ddl.RebuildHeap{Schema: "dbo", Table: "H", DataCompression: "PAGE"},
+		ddl.UpdateStatistics{Schema: "dbo", Table: "T", Statistic: "ST", SamplePercent: &sample},
+		ddl.CheckDB{Database: "MYDB", PhysicalOnly: true},
+	}
+	if diff := cmp.Diff(wantOps, m.Operations); diff != "" {
+		t.Errorf("Operations mismatch (-want +got):\n%s", diff)
+	}
+
+	// check_db is database-scoped: the database lives in Target().Database, never Table.
+	cdb := m.Operations[3].(ddl.CheckDB)
+	ref := cdb.Target()
+	if ref.Database != "MYDB" || ref.Table != "" || ref.Schema != "" {
+		t.Errorf("CheckDB.Target() = %+v, want only Database set", ref)
+	}
+	if got, want := ref.String(), "MYDB"; got != want {
+		t.Errorf("CheckDB Target().String() = %q, want %q", got, want)
+	}
+	// rebuild_heap is table-level: no named object, so String() drops the trailing dot.
+	if got, want := m.Operations[1].Target().String(), "dbo.H"; got != want {
+		t.Errorf("RebuildHeap Target().String() = %q, want %q", got, want)
+	}
+}
+
 func TestParseManifestErrors(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -108,6 +167,26 @@ func TestParseManifestErrors(t *testing.T) {
 		{
 			name:    "no operations",
 			yaml:    "description: empty\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "check_db missing database",
+			yaml:    "operations:\n  - operation: check_db\n    physical_only: true\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "reorganize_index missing index",
+			yaml:    "operations:\n  - operation: reorganize_index\n    schema: dbo\n    table: T\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "update_statistics conflicting sampling",
+			yaml:    "operations:\n  - operation: update_statistics\n    schema: dbo\n    table: T\n    full_scan: true\n    resample: true\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "update_statistics sample percent out of range",
+			yaml:    "operations:\n  - operation: update_statistics\n    schema: dbo\n    table: T\n    sample_percent: 200\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
 	}

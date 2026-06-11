@@ -47,6 +47,9 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	if len(args) > 0 && args[0] == "abort-resumable" {
 		return runAbortResumable(stdout, stderr, args[1:])
 	}
+	if len(args) > 0 && args[0] == "plan" {
+		return runPlan(stdout, stderr, args[1:])
+	}
 
 	fs := flag.NewFlagSet("sqlgopace", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -424,9 +427,8 @@ func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []dd
 	}
 
 	for i, step := range planned {
-		ref := step.Operation.Target()
-		fmt.Fprintf(w, "-- [%d] %s %s.%s.%s\n",
-			i+1, step.Operation.CommandType(), ref.Schema, ref.Table, ref.Name)
+		fmt.Fprintf(w, "-- [%d] %s %s\n",
+			i+1, step.Operation.CommandType(), step.Operation.Target())
 		fmt.Fprintln(w, step.SQL)
 		if explain {
 			for _, d := range step.Decisions {

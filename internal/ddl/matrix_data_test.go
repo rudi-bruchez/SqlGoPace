@@ -41,6 +41,16 @@ func TestShippedMatrixParses(t *testing.T) {
 		{"rebuild online standard blocked", 16, ddl.TierStandard, "rebuild_index", "online", false},
 		// Azure is evergreen.
 		{"azure resumable yes", 0, ddl.TierAzure, "rebuild_index", "resumable", true},
+		// check_db MAXDOP introduced in 2014 (major 12); available on Standard too.
+		{"checkdb maxdop 2012 no", 11, ddl.TierStandard, "check_db", "maxdop", false},
+		{"checkdb maxdop 2014 yes", 12, ddl.TierStandard, "check_db", "maxdop", true},
+		// rebuild_heap ONLINE introduced in 2016 (major 13), Enterprise/Azure only.
+		{"heap online 2014 no", 12, ddl.TierEnterprise, "rebuild_heap", "online", false},
+		{"heap online 2016 yes", 13, ddl.TierEnterprise, "rebuild_heap", "online", true},
+		{"heap online standard blocked", 16, ddl.TierStandard, "rebuild_heap", "online", false},
+		// rebuild_heap never supports RESUMABLE or WAIT_AT_LOW_PRIORITY.
+		{"heap resumable never", 16, ddl.TierEnterprise, "rebuild_heap", "resumable", false},
+		{"heap walp never", 16, ddl.TierEnterprise, "rebuild_heap", "wait_at_low_priority", false},
 	}
 	for _, f := range facts {
 		t.Run(f.name, func(t *testing.T) {

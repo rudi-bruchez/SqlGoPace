@@ -21,11 +21,29 @@ var (
 	ErrInvalidManifest = errors.New("invalid manifest")
 )
 
-// ObjectRef identifies the database object an operation targets.
+// ObjectRef identifies the database object an operation targets. Most operations
+// are object-scoped (Schema + Table + Name). A few are database-scoped (e.g.
+// check_db): those set Database and leave Schema/Table/Name empty, so a database
+// name is never smuggled into Table.
 type ObjectRef struct {
-	Schema string
-	Table  string
-	Name   string // index, column, or constraint name depending on the operation
+	Schema   string
+	Table    string
+	Name     string // index, column, or constraint name depending on the operation
+	Database string // set only for database-scoped operations (check_db); Schema/Table empty then
+}
+
+// String renders the reference for logs and reports: the database alone for a
+// database-scoped operation, "schema.table" for a table-level operation (no named
+// object), else "schema.table.name".
+func (r ObjectRef) String() string {
+	switch {
+	case r.Database != "" && r.Schema == "" && r.Table == "":
+		return r.Database
+	case r.Name == "":
+		return r.Schema + "." + r.Table
+	default:
+		return r.Schema + "." + r.Table + "." + r.Name
+	}
 }
 
 // Operation is the closed set of supported DDL operations. Each kind is its own
@@ -149,6 +167,14 @@ func decodeOperation(node *yaml.Node) (Operation, error) {
 		return nil, fmt.Errorf("missing %q field: %w", "operation", ErrInvalidManifest)
 	case "rebuild_index":
 		return decodeInto[RebuildIndex](node)
+	case "reorganize_index":
+		return decodeInto[ReorganizeIndex](node)
+	case "rebuild_heap":
+		return decodeInto[RebuildHeap](node)
+	case "update_statistics":
+		return decodeInto[UpdateStatistics](node)
+	case "check_db":
+		return decodeInto[CheckDB](node)
 	case "create_index":
 		return decodeInto[CreateIndex](node)
 	case "alter_column":
@@ -201,6 +227,7 @@ type RebuildIndex struct {
 	Schema          string          `yaml:"schema"`
 	Table           string          `yaml:"table"`
 	Index           string          `yaml:"index"`
+	Partition       *int            `yaml:"partition"` // nil = whole index; set = REBUILD PARTITION = n
 	DataCompression string          `yaml:"data_compression"`
 	Options         OptionOverrides `yaml:"options"`
 
@@ -212,7 +239,9 @@ type RebuildIndex struct {
 }
 
 func (o RebuildIndex) CommandType() string { return "rebuild_index" }
-func (o RebuildIndex) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Index} }
+func (o RebuildIndex) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Index}
+}
 func (o RebuildIndex) Validate() error {
 	return requireFields("rebuild_index", map[string]string{
 		"schema": o.Schema, "table": o.Table, "index": o.Index,
@@ -231,7 +260,9 @@ type CreateIndex struct {
 }
 
 func (o CreateIndex) CommandType() string { return "create_index" }
-func (o CreateIndex) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Index} }
+func (o CreateIndex) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Index}
+}
 func (o CreateIndex) Validate() error {
 	if err := requireFields("create_index", map[string]string{
 		"schema": o.Schema, "table": o.Table, "index": o.Index,
@@ -255,7 +286,9 @@ type AlterColumn struct {
 }
 
 func (o AlterColumn) CommandType() string { return "alter_column" }
-func (o AlterColumn) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Column} }
+func (o AlterColumn) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Column}
+}
 func (o AlterColumn) Validate() error {
 	return requireFields("alter_column", map[string]string{
 		"schema": o.Schema, "table": o.Table, "column": o.Column, "type": o.DataType,
@@ -273,7 +306,9 @@ type AddColumn struct {
 }
 
 func (o AddColumn) CommandType() string { return "add_column" }
-func (o AddColumn) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Column} }
+func (o AddColumn) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Column}
+}
 func (o AddColumn) Validate() error {
 	return requireFields("add_column", map[string]string{
 		"schema": o.Schema, "table": o.Table, "column": o.Column, "type": o.DataType,
@@ -291,7 +326,9 @@ type AddConstraint struct {
 }
 
 func (o AddConstraint) CommandType() string { return "add_constraint" }
-func (o AddConstraint) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Constraint} }
+func (o AddConstraint) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Constraint}
+}
 func (o AddConstraint) Validate() error {
 	if err := requireFields("add_constraint", map[string]string{
 		"schema": o.Schema, "table": o.Table, "constraint": o.Constraint, "kind": o.Kind,
@@ -312,7 +349,9 @@ type DropIndex struct {
 }
 
 func (o DropIndex) CommandType() string { return "drop_index" }
-func (o DropIndex) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Index} }
+func (o DropIndex) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Index}
+}
 func (o DropIndex) Validate() error {
 	return requireFields("drop_index", map[string]string{
 		"schema": o.Schema, "table": o.Table, "index": o.Index,
@@ -327,7 +366,9 @@ type DropColumn struct {
 }
 
 func (o DropColumn) CommandType() string { return "drop_column" }
-func (o DropColumn) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Column} }
+func (o DropColumn) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Column}
+}
 func (o DropColumn) Validate() error {
 	return requireFields("drop_column", map[string]string{
 		"schema": o.Schema, "table": o.Table, "column": o.Column,
@@ -342,9 +383,110 @@ type DropConstraint struct {
 }
 
 func (o DropConstraint) CommandType() string { return "drop_constraint" }
-func (o DropConstraint) Target() ObjectRef   { return ObjectRef{o.Schema, o.Table, o.Constraint} }
+func (o DropConstraint) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Constraint}
+}
 func (o DropConstraint) Validate() error {
 	return requireFields("drop_constraint", map[string]string{
 		"schema": o.Schema, "table": o.Table, "constraint": o.Constraint,
 	})
+}
+
+// ReorganizeIndex is ALTER INDEX ... REORGANIZE: an always-online, incremental
+// defragment. It cannot change data compression (that requires a REBUILD), so it
+// carries no DataCompression. Partition nil means the whole index.
+type ReorganizeIndex struct {
+	Schema        string `yaml:"schema"`
+	Table         string `yaml:"table"`
+	Index         string `yaml:"index"`
+	Partition     *int   `yaml:"partition"`      // nil = whole index
+	LOBCompaction bool   `yaml:"lob_compaction"` // WITH (LOB_COMPACTION = ON)
+}
+
+func (o ReorganizeIndex) CommandType() string { return "reorganize_index" }
+func (o ReorganizeIndex) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Index}
+}
+func (o ReorganizeIndex) Validate() error {
+	return requireFields("reorganize_index", map[string]string{
+		"schema": o.Schema, "table": o.Table, "index": o.Index,
+	})
+}
+
+// RebuildHeap is ALTER TABLE ... REBUILD on a heap (a table with no clustered
+// index). It clears forwarded records and reclaims space, and as a side effect
+// rebuilds every nonclustered index on the table. It accepts ONLINE / MAXDOP /
+// DATA_COMPRESSION but never RESUMABLE or WAIT_AT_LOW_PRIORITY (neither is valid
+// for a heap rebuild). The target is the table itself — there is no index name.
+type RebuildHeap struct {
+	Schema          string          `yaml:"schema"`
+	Table           string          `yaml:"table"`
+	DataCompression string          `yaml:"data_compression"`
+	Options         OptionOverrides `yaml:"options"`
+}
+
+func (o RebuildHeap) CommandType() string { return "rebuild_heap" }
+func (o RebuildHeap) Target() ObjectRef   { return ObjectRef{Schema: o.Schema, Table: o.Table} }
+func (o RebuildHeap) Validate() error {
+	return requireFields("rebuild_heap", map[string]string{
+		"schema": o.Schema, "table": o.Table,
+	})
+}
+
+// UpdateStatistics is UPDATE STATISTICS. An empty Statistic targets every
+// statistic on the table. Sampling comes from the maintenance rules: at most one
+// of FullScan, SamplePercent, or Resample may be set.
+type UpdateStatistics struct {
+	Schema        string `yaml:"schema"`
+	Table         string `yaml:"table"`
+	Statistic     string `yaml:"statistic"`      // optional; empty = all statistics on the table
+	FullScan      bool   `yaml:"full_scan"`      // WITH FULLSCAN
+	SamplePercent *int   `yaml:"sample_percent"` // WITH SAMPLE n PERCENT (1..100)
+	Resample      bool   `yaml:"resample"`       // WITH RESAMPLE
+}
+
+func (o UpdateStatistics) CommandType() string { return "update_statistics" }
+func (o UpdateStatistics) Target() ObjectRef {
+	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Statistic}
+}
+func (o UpdateStatistics) Validate() error {
+	if err := requireFields("update_statistics", map[string]string{
+		"schema": o.Schema, "table": o.Table,
+	}); err != nil {
+		return err
+	}
+	set := 0
+	if o.FullScan {
+		set++
+	}
+	if o.SamplePercent != nil {
+		set++
+	}
+	if o.Resample {
+		set++
+	}
+	if set > 1 {
+		return fmt.Errorf("update_statistics: at most one of full_scan, sample_percent, resample: %w", ErrInvalidManifest)
+	}
+	if o.SamplePercent != nil && (*o.SamplePercent < 1 || *o.SamplePercent > 100) {
+		return fmt.Errorf("update_statistics: sample_percent must be in 1..100: %w", ErrInvalidManifest)
+	}
+	return nil
+}
+
+// CheckDB is DBCC CHECKDB for an entire database. It is database-scoped: its
+// Target carries the database name, never a table (see ObjectRef). NO_INFOMSGS and
+// ALL_ERRORMSGS are always emitted; PHYSICAL_ONLY / DATA_PURITY are rule-driven
+// switches, and only MAXDOP is resolved from the matrix.
+type CheckDB struct {
+	Database     string          `yaml:"database"`
+	PhysicalOnly bool            `yaml:"physical_only"`
+	DataPurity   bool            `yaml:"data_purity"`
+	Options      OptionOverrides `yaml:"options"` // only MAXDOP applies
+}
+
+func (o CheckDB) CommandType() string { return "check_db" }
+func (o CheckDB) Target() ObjectRef   { return ObjectRef{Database: o.Database} }
+func (o CheckDB) Validate() error {
+	return requireFields("check_db", map[string]string{"database": o.Database})
 }

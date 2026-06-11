@@ -53,3 +53,18 @@ commands:
   drop_index:        {}
   drop_column:       {}
   drop_constraint:   {}
+
+  reorganize_index:  {}             # ALTER INDEX ... REORGANIZE: always online, no injectable options
+                                    # (LOB_COMPACTION is a rule-driven switch, not version-gated)
+
+  update_statistics: {}             # UPDATE STATISTICS: FULLSCAN/SAMPLE come from the rules, not the matrix
+
+  check_db:                         # DBCC CHECKDB
+    maxdop:               { min_major: 12, editions: [enterprise, standard, azure] }   # DBCC ... MAXDOP, 2014
+    # NO_INFOMSGS / ALL_ERRORMSGS / PHYSICAL_ONLY / DATA_PURITY are behavioural switches, not capabilities.
+
+  rebuild_heap:                     # ALTER TABLE ... REBUILD (heap)
+    online:               { min_major: 13, editions: [enterprise, azure] }             # ONLINE heap rebuild, 2016
+    data_compression:     { min_major: 10, editions: [enterprise, azure] }
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
+    # NB: no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap rebuild, on any version.

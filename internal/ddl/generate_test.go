@@ -109,6 +109,72 @@ func TestGenerate(t *testing.T) {
 			want: "IF EXISTS (SELECT 1 FROM sys.objects WHERE name = N'FK_X' AND parent_object_id = OBJECT_ID(N'[dbo].[T]'))\n" +
 				"    ALTER TABLE [dbo].[T] DROP CONSTRAINT [FK_X];",
 		},
+		{
+			name: "rebuild_index single partition with compression",
+			op:   ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX", Partition: intPtr(3), DataCompression: "PAGE"},
+			res:  ddl.ResolvedOptions{Online: true},
+			want: "ALTER INDEX [IX] ON [dbo].[T] REBUILD PARTITION = 3 WITH (ONLINE = ON, DATA_COMPRESSION = PAGE);",
+		},
+		{
+			name: "reorganize_index plain",
+			op:   ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX"},
+			res:  ddl.ResolvedOptions{},
+			want: "ALTER INDEX [IX] ON [dbo].[T] REORGANIZE;",
+		},
+		{
+			name: "reorganize_index partition with lob compaction",
+			op:   ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX", Partition: intPtr(2), LOBCompaction: true},
+			res:  ddl.ResolvedOptions{},
+			want: "ALTER INDEX [IX] ON [dbo].[T] REORGANIZE PARTITION = 2 WITH (LOB_COMPACTION = ON);",
+		},
+		{
+			name: "rebuild_heap no options",
+			op:   ddl.RebuildHeap{Schema: "dbo", Table: "T"},
+			res:  ddl.ResolvedOptions{},
+			want: "ALTER TABLE [dbo].[T] REBUILD;",
+		},
+		{
+			name: "rebuild_heap online maxdop compression",
+			op:   ddl.RebuildHeap{Schema: "dbo", Table: "T", DataCompression: "PAGE"},
+			res:  ddl.ResolvedOptions{Online: true, MaxDOP: intPtr(4)},
+			want: "ALTER TABLE [dbo].[T] REBUILD WITH (ONLINE = ON, MAXDOP = 4, DATA_COMPRESSION = PAGE);",
+		},
+		{
+			name: "update_statistics whole table fullscan",
+			op:   ddl.UpdateStatistics{Schema: "dbo", Table: "T", FullScan: true},
+			res:  ddl.ResolvedOptions{},
+			want: "UPDATE STATISTICS [dbo].[T] WITH FULLSCAN;",
+		},
+		{
+			name: "update_statistics named stat with sample",
+			op:   ddl.UpdateStatistics{Schema: "dbo", Table: "T", Statistic: "IX_T", SamplePercent: intPtr(30)},
+			res:  ddl.ResolvedOptions{},
+			want: "UPDATE STATISTICS [dbo].[T] [IX_T] WITH SAMPLE 30 PERCENT;",
+		},
+		{
+			name: "update_statistics resample",
+			op:   ddl.UpdateStatistics{Schema: "dbo", Table: "T", Resample: true},
+			res:  ddl.ResolvedOptions{},
+			want: "UPDATE STATISTICS [dbo].[T] WITH RESAMPLE;",
+		},
+		{
+			name: "update_statistics default sampling",
+			op:   ddl.UpdateStatistics{Schema: "dbo", Table: "T"},
+			res:  ddl.ResolvedOptions{},
+			want: "UPDATE STATISTICS [dbo].[T];",
+		},
+		{
+			name: "check_db basic",
+			op:   ddl.CheckDB{Database: "MYDB"},
+			res:  ddl.ResolvedOptions{},
+			want: "DBCC CHECKDB ([MYDB]) WITH NO_INFOMSGS, ALL_ERRORMSGS;",
+		},
+		{
+			name: "check_db physical_only data_purity maxdop",
+			op:   ddl.CheckDB{Database: "MYDB", PhysicalOnly: true, DataPurity: true},
+			res:  ddl.ResolvedOptions{MaxDOP: intPtr(2)},
+			want: "DBCC CHECKDB ([MYDB]) WITH NO_INFOMSGS, ALL_ERRORMSGS, PHYSICAL_ONLY, DATA_PURITY, MAXDOP = 2;",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

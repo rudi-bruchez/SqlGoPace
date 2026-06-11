@@ -148,6 +148,16 @@ func (c *Conn) PausedResumable(ctx context.Context, schema, table, index string)
 		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index))
 }
 
+// CurrentDatabase returns the name of the connected database (DB_NAME()), used as
+// the default check_db target when the maintenance profile names no databases.
+func (c *Conn) CurrentDatabase(ctx context.Context) (string, error) {
+	var name string
+	if err := c.pool.QueryRowContext(ctx, "SELECT DB_NAME()").Scan(&name); err != nil {
+		return "", fmt.Errorf("read current database: %w", err)
+	}
+	return name, nil
+}
+
 // Session is one active user request, as seen by the monitoring connection.
 type Session struct {
 	SPID             int

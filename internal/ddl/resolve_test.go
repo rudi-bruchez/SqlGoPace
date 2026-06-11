@@ -80,6 +80,27 @@ func TestResolveEnterprise2016DropsResumable(t *testing.T) {
 	}
 }
 
+func TestResolveSinglePartitionRebuildDropsResumable(t *testing.T) {
+	m := resolveMatrix()
+	// A single-partition rebuild: ONLINE and WALP are permitted, but RESUMABLE is
+	// not (single-partition syntax does not accept it).
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX", Partition: intPtr(3)}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.Resumable {
+		t.Errorf("Resumable = true, want false (not supported when rebuilding a single partition)")
+	}
+	if !got.Online || !got.WaitAtLowPriority {
+		t.Errorf("Online/WALP = %t/%t, want both true (permitted for single-partition rebuild)",
+			got.Online, got.WaitAtLowPriority)
+	}
+	if v, ok := decisionValue(decisions, "resumable"); !ok || v != "OFF" {
+		t.Errorf("decision[resumable] = %q (present=%t), want OFF with an explanation", v, ok)
+	}
+}
+
 func TestResolveStandardOmitsEnterpriseOptions(t *testing.T) {
 	m := resolveMatrix()
 	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}

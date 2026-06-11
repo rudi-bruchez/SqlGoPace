@@ -214,6 +214,47 @@ sqlgopace abort-resumable --config config.yaml --include-running
 
 By default only `PAUSED` operations are aborted. The exit code is non-zero if any abort fails.
 
+### Maintenance: `plan`
+
+The `plan` subcommand turns SqlGoPace into a maintenance planner: it inspects the connected database
+and **generates** the maintenance work itself — fragmentation-driven `REORGANIZE`/`REBUILD`, data
+compression (`ROW`/`PAGE`, chosen on measured gain and write-intensity), heap rebuilds (forwarded
+records), `UPDATE STATISTICS`, and `DBCC CHECKDB` — instead of you hand-writing the manifests. The
+rules live in `maintenance_profile.yaml` (thresholds, per-object overrides). See
+[`specs/MAINTENANCE.md`](specs/MAINTENANCE.md) for the full design.
+
+It runs cheap-first: one metadata sweep selects candidates, and the expensive reads
+(`sp_estimate_data_compression_savings`, sampled `dm_db_index_physical_stats`) run only over the
+survivors. The output is **reviewable manifests** written into the queue — nothing is executed until
+you run them through the normal engine.
+
+```bash
+# Analyse and print the manifests it would write (no files, no locks):
+sqlgopace plan --config config.yaml --dry-run
+
+# Same, with the reasoning behind every decision:
+sqlgopace plan --config config.yaml --dry-run --explain
+
+# Materialise reviewable manifests into the queue (the config's to_run directory):
+sqlgopace plan --config config.yaml
+
+# Restrict to some categories, and override the check_db target database:
+sqlgopace plan --config config.yaml --categories index,compression,heaps --database MYDB
+
+# Then review the generated 01.to_run/*.yaml and run them as usual:
+sqlgopace --config config.yaml
+```
+
+| Flag           | Effect                                                                       |
+|----------------|------------------------------------------------------------------------------|
+| `--config`     | Config file (connection + default output directory). Required.               |
+| `--profile`    | Maintenance profile path (default `maintenance_profile.yaml`).               |
+| `--categories` | Comma-separated subset of `index,compression,heaps,statistics,checkdb` (default: all). |
+| `--database`   | `check_db` target database (default: the connected database).                |
+| `--out`        | Directory to write manifests into (default: the config's `to_run`).          |
+| `--dry-run`    | Print the manifests instead of writing them.                                 |
+| `--explain`    | Show the reasoning behind each decision.                                     |
+
 ## Compatibility matrix
 
 `ddl_compatibility.yaml` declares, per operation, which options are eligible by minimum
