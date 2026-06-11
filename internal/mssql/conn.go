@@ -4,9 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
-	// Register the "sqlserver" driver.
-	_ "github.com/microsoft/go-mssqldb"
+	mssqldb "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
 )
 
 // Conn holds the two distinct connections SqlGoPace needs: a pinned, dedicated
@@ -18,15 +19,19 @@ type Conn struct {
 	spid int
 }
 
-// Open connects with the given DSN ("sqlserver" driver, ADO or URL form),
-// pins a dedicated execution connection, hardens its session, and records its
-// SPID. The driver applies no query timeout: long DDL is bounded by monitoring
-// and context cancellation, never a fixed timer.
-func Open(ctx context.Context, dsn string) (*Conn, error) {
-	pool, err := sql.Open("sqlserver", dsn)
+// Open connects with the given DSN (ADO or URL form), stamps the application
+// version into the connection's application name (visible server-side as
+// program_name), pins a dedicated execution connection, hardens its session, and
+// records its SPID. The driver applies no query timeout: long DDL is bounded by
+// monitoring and context cancellation, never a fixed timer.
+func Open(ctx context.Context, dsn, version string) (*Conn, error) {
+	cfg, err := msdsn.Parse(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("open connection: %w", err)
+		return nil, fmt.Errorf("parse connection string: %w", err)
 	}
+	cfg.AppName = appNameWithVersion(cfg.AppName, version)
+
+	pool := sql.OpenDB(mssqldb.NewConnectorConfig(cfg))
 	if err := pool.PingContext(ctx); err != nil {
 		_ = pool.Close()
 		return nil, fmt.Errorf("ping server: %w", err)
@@ -59,6 +64,22 @@ func (c *Conn) harden(ctx context.Context) error {
 		return fmt.Errorf("harden execution session: %w", err)
 	}
 	return nil
+}
+
+// appNameWithVersion appends the application version to the configured application
+// name so the running build is visible server-side (sys.dm_exec_sessions
+// program_name), e.g. "SqlGoPace/0.1.0". A missing or default-driver app name
+// falls back to "SqlGoPace".
+func appNameWithVersion(appName, version string) string {
+	base := strings.TrimSpace(appName)
+	if base == "" || base == "go-mssqldb" {
+		base = "SqlGoPace"
+	}
+	v := strings.TrimSpace(version)
+	if v == "" {
+		return base
+	}
+	return base + "/" + v
 }
 
 // SPID returns the session id of the pinned execution connection.

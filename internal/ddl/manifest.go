@@ -196,13 +196,19 @@ func requireFields(opType string, fields map[string]string) error {
 // --- Concrete operations -------------------------------------------------
 
 // RebuildIndex is ALTER INDEX ... REBUILD. Index may be "ALL" to expand to one
-// operation per index (resolved later against sys.indexes).
+// operation per index (resolved later against sys.indexes, see ExpandRebuildAll).
 type RebuildIndex struct {
 	Schema          string          `yaml:"schema"`
 	Table           string          `yaml:"table"`
 	Index           string          `yaml:"index"`
 	DataCompression string          `yaml:"data_compression"`
 	Options         OptionOverrides `yaml:"options"`
+
+	// Kind is the index's storage kind, populated only when this rebuild was
+	// produced by expanding an "ALL" rebuild. It gates option resolution
+	// (columnstore/XML/spatial reject ONLINE/RESUMABLE/WALP). KindUnknown for a
+	// single named index loaded straight from YAML — no type gating is applied.
+	Kind IndexKind `yaml:"-"`
 }
 
 func (o RebuildIndex) CommandType() string { return "rebuild_index" }

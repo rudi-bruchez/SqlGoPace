@@ -13,7 +13,7 @@ import (
 
 const rebuildAndAddYAML = `
 description: "Rebuild and add a column"
-database: EXAMPLEDB
+database: MYDB
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -40,7 +40,7 @@ func TestParseManifest(t *testing.T) {
 	if got, want := m.Description, "Rebuild and add a column"; got != want {
 		t.Errorf("Description = %q, want %q", got, want)
 	}
-	if got, want := m.Database, "EXAMPLEDB"; got != want {
+	if got, want := m.Database, "MYDB"; got != want {
 		t.Errorf("Database = %q, want %q", got, want)
 	}
 	if got, want := len(m.Operations), 2; got != want {
@@ -122,7 +122,9 @@ func TestParseManifestErrors(t *testing.T) {
 }
 
 func TestLoadShippedExampleManifest(t *testing.T) {
-	path := filepath.FromSlash("../../01.to_run/010_example_rebuild.yaml")
+	// Shipped example is dot-prefixed so the runner treats it as disabled, but it
+	// must still parse as a valid manifest.
+	path := filepath.FromSlash("../../01.to_run/.010_example_rebuild.yaml")
 	m, err := ddl.LoadManifestFile(path)
 	if err != nil {
 		t.Fatalf("LoadManifestFile(%q) error = %v, want nil", path, err)

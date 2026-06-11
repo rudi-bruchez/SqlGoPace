@@ -27,6 +27,27 @@ SA password `Str0ng_Passw0rd!`). Override the connection string with `E2E_DSN`:
 make e2e-test E2E_DSN='sqlserver://sa:My_Pass1!@localhost:1433?database=tempdb&encrypt=disable'
 ```
 
+## Podman instead of Docker
+
+The container runtime is parameterized through the `CONTAINER` and `COMPOSE`
+make variables (default `docker` / `docker compose`). To use Podman:
+
+```bash
+podman machine start    # Podman runs in a WSL2 VM on Windows; start it first
+make e2e CONTAINER=podman COMPOSE="podman compose"
+```
+
+The Go tests connect over TCP to `localhost:1433`, and `podman machine`
+forwards published ports to the host, so the tests themselves are
+runtime-agnostic. Two things to know:
+
+- `podman compose` needs a compose provider available (Podman 4.7+ delegates to
+  the Docker compose plugin or to `podman-compose`).
+- `make e2e-up` polls `'{{.State.Health.Status}}'`; older Podman versions expose
+  the field as `.State.Healthcheck` instead, in which case the wait loop may not
+  detect "healthy". If so, bring the server up by hand and run the tests directly
+  (see [Running by hand](#running-by-hand)).
+
 ## Running by hand
 
 ```bash
@@ -36,6 +57,42 @@ go test -tags=integration ./...
 
 The DSN is a `go-mssqldb` connection string (URL or ADO form). `encrypt=disable`
 is convenient against a throwaway local container; production uses `encrypt=true`.
+
+## Running against an existing / remote server
+
+Nothing in the tests is tied to `localhost` — they are entirely driven by
+`SQLGOPACE_TEST_DSN`. Point that DSN at any reachable SQL Server and a test
+database of your choice. Skip `make e2e` / `e2e-up` / `e2e-down` (those manage
+the local container) and run the tests directly, or via `make integration`:
+
+```bash
+make integration \
+  E2E_DSN='sqlserver://user:pass@dev-sql.example.com:1433?database=SqlGoPaceTest&encrypt=true&trustServerCertificate=true'
+```
+
+Differences from the throwaway container:
+
+- **`encrypt`** — a remote server usually requires `encrypt=true`; add
+  `trustServerCertificate=true` if its certificate is not in your trust store.
+- **`database=`** — point at a real **test database you accept mutating**, not
+  necessarily `tempdb`.
+
+**This is not read-only on the target database.** `TestE2ERebuildIndex` creates
+`dbo.sqlgopace_e2e`, inserts ~1000 rows, creates `IX_sqlgopace_e2e`, runs a real
+`ALTER INDEX … REBUILD` under monitoring, and drops the table on cleanup. Use a
+dedicated test database — never a shared/sensitive one. The footprint is small
+(the table is its own; the schema-modification lock only covers it).
+
+### Required permissions for the login
+
+- On the test database: create/drop tables and indexes, and insert — in practice
+  `db_ddladmin` + `db_datawriter` (or `db_owner` on that test database).
+- **`VIEW SERVER STATE`** (server level) — the monitoring connection reads
+  server-scoped DMVs (active sessions, progress, log-space usage). Without it,
+  sampling fails even on a clean rebuild.
+- `ALTER ANY CONNECTION` (or sysadmin/processadmin) — only needed to exercise the
+  `KILL` path (a blocker exceeding the timeout). Not required for a rebuild
+  without contention.
 
 ## What is covered
 

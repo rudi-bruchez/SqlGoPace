@@ -201,6 +201,12 @@ func objectExistence(ctx context.Context, p Prober, op ddl.Operation) (table, ta
 		return false, false, nil
 	}
 
+	// ALTER INDEX ALL ... REBUILD has no single named index to verify; the table's
+	// existence (checked above) is the precondition.
+	if ddl.IsAllIndexRebuild(op) {
+		return table, true, nil
+	}
+
 	switch op.(type) {
 	case ddl.RebuildIndex, ddl.CreateIndex, ddl.DropIndex:
 		target, err = p.IndexExists(ctx, ref.Schema, ref.Table, ref.Name)

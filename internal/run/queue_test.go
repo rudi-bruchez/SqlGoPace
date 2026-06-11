@@ -37,7 +37,9 @@ func TestQueueDiscoverSorted(t *testing.T) {
 	q, dirs := newTestQueue(t)
 	writeFile(t, dirs.ToRun, "020_b.yaml")
 	writeFile(t, dirs.ToRun, "010_a.yaml")
-	writeFile(t, dirs.ToRun, "notes.txt") // ignored
+	writeFile(t, dirs.ToRun, "notes.txt")   // ignored: not a manifest extension
+	writeFile(t, dirs.ToRun, ".010_a.yaml") // ignored: hidden / disabled by leading dot
+	writeFile(t, dirs.ToRun, ".gitkeep")    // ignored: dotfile
 
 	got, err := q.Discover()
 	if err != nil {

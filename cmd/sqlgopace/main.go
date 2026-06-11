@@ -25,15 +25,13 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 	"github.com/rudi-bruchez/SqlGoPace/internal/tui"
+	"github.com/rudi-bruchez/SqlGoPace/internal/version"
 )
 
 // sqlitePath strips an optional "sqlite://" prefix from a history destination.
 func sqlitePath(dest string) string {
 	return strings.TrimPrefix(dest, "sqlite://")
 }
-
-// version is the build version, overridden at release time via -ldflags.
-var version = "dev"
 
 func main() {
 	if err := cli(os.Stdout, os.Stderr, os.Args[1:]); err != nil {
@@ -44,6 +42,12 @@ func main() {
 
 // cli is the testable entry point; main only wires it to the process streams.
 func cli(stdout, stderr io.Writer, args []string) error {
+	// Subcommands are dispatched before flag parsing; everything else (run /
+	// dry-run) keeps the existing flag-based interface.
+	if len(args) > 0 && args[0] == "abort-resumable" {
+		return runAbortResumable(stdout, stderr, args[1:])
+	}
+
 	fs := flag.NewFlagSet("sqlgopace", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	var (
@@ -64,7 +68,7 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	}
 
 	if *showVersion {
-		fmt.Fprintf(stdout, "sqlgopace %s\n", version)
+		fmt.Fprintf(stdout, "sqlgopace %s\n", version.Version())
 		return nil
 	}
 
@@ -89,18 +93,22 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	return runEngine(ctx, stdout, cfg, matrix, *useTUI)
 }
 
-// dryRunAll renders every manifest's planned T-SQL without executing it.
+// dryRunAll renders every manifest's planned T-SQL without executing it. When
+// connected (not offline), it expands "ALTER INDEX ALL" rebuilds against the live
+// server so the rendered plan matches what a real run would execute.
 func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visited map[string]bool, assumeVersion int, assumeEdition string, explain bool, cfg *config.Config, matrix *ddl.Matrix) error {
-	target, err := resolveTarget(ctx, stdout, visited, assumeVersion, assumeEdition, cfg)
-	if err != nil {
-		return err
-	}
 	if len(manifests) == 0 {
 		return errors.New("no manifest files given")
 	}
+	target, expander, cleanup, err := dryRunSession(ctx, stdout, visited, assumeVersion, assumeEdition, cfg)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
 	policy := policyOf(cfg)
 	for _, path := range manifests {
-		if err := dryRunManifest(stdout, path, target, matrix, policy, explain); err != nil {
+		if err := dryRunManifest(ctx, stdout, path, target, matrix, policy, explain, expander); err != nil {
 			return err
 		}
 	}
@@ -111,7 +119,8 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 // monitoring and reaction. With useTUI, the interactive incident console runs in
 // the foreground while the engine runs in the background.
 func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix, useTUI bool) error {
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString)
+	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
 	if err != nil {
 		return err
 	}
@@ -135,7 +144,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	runner := run.NewMonitoredRunner(conn, sampler, run.System, run.RunnerConfig{
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
 		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
 		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
 	})
@@ -161,6 +172,11 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
+		run.WithExpander(conn),
+		run.WithProgress(conn),
+		run.WithWaits(conn),
+		run.WithResumeCheck(conn),
+		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithOutput(engineOut),
 	}
 	if cfg.Notifications.WebhookURL != "" {
@@ -185,7 +201,10 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(stdout, "processed: %d done, %d failed\n", summary.Done, summary.Failed)
+	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted\n", summary.Done, summary.Failed, summary.Interrupted)
+	if summary.Interrupted > 0 {
+		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", summary.Interrupted)
+	}
 	if summary.Failed > 0 {
 		return fmt.Errorf("%d manifest(s) failed", summary.Failed)
 	}
@@ -245,10 +264,37 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 				program.Send(tui.BlockersMsg{Blockers: blockers})
 			}
 			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
-				program.Send(tui.ProgressMsg{Percent: p.PercentComplete, ETASeconds: p.EstimatedCompletionMS / 1000})
+				program.Send(progressMsg(p))
+			}
+			if waits, err := conn.SessionWaits(ctx, ddlSPID); err == nil {
+				program.Send(waitsMsg(waits))
 			}
 		}
 	}
+}
+
+// progressMsg maps a server progress reading to a TUI message. During a rollback
+// the request's percent_complete is rollback progress, shown separately from
+// forward progress.
+func progressMsg(p mssql.Progress) tui.ProgressMsg {
+	msg := tui.ProgressMsg{ETASeconds: p.EstimatedCompletionMS / 1000}
+	if p.IsRollback() {
+		msg.RollbackPercent = p.PercentComplete
+	} else {
+		msg.Percent = p.PercentComplete
+	}
+	return msg
+}
+
+// waitsMsg categorizes a session's cumulative waits into a TUI message showing
+// what is slowing the DDL down.
+func waitsMsg(waits []mssql.SessionWait) tui.WaitsMsg {
+	cats, total := mssql.CategorizeWaits(waits)
+	out := make([]tui.WaitCategory, len(cats))
+	for i, c := range cats {
+		out[i] = tui.WaitCategory{Name: c.Name, WaitMS: c.WaitTimeMS, Tasks: c.Tasks}
+	}
+	return tui.WaitsMsg{Categories: out, TotalMS: total}
 }
 
 // dispatchActions routes operator intents to the server.
@@ -296,31 +342,37 @@ func matrixFile(cfg *config.Config, configPath, flagValue string, visited map[st
 	return filepath.Join(filepath.Dir(configPath), cfg.MatrixFile)
 }
 
-// resolveTarget returns the option-resolution target. It uses the --assume-*
-// flags when either is set (offline), otherwise connects via the config's
-// connection string to detect the real server.
-func resolveTarget(ctx context.Context, log io.Writer, visited map[string]bool, assumeVersion int, assumeEdition string, cfg *config.Config) (ddl.Target, error) {
+// dryRunSession resolves the dry-run target and, when connected, an index
+// expander for "ALTER INDEX ALL" rebuilds. It uses the --assume-* flags when
+// either is set (offline, no expander), otherwise connects via the config's
+// connection string to detect the real server. The returned cleanup closes any
+// connection that was opened.
+func dryRunSession(ctx context.Context, log io.Writer, visited map[string]bool, assumeVersion int, assumeEdition string, cfg *config.Config) (ddl.Target, run.IndexExpander, func(), error) {
+	noop := func() {}
 	offline := visited["assume-version"] || visited["assume-edition"]
 	if offline || cfg == nil {
-		return offlineTarget(assumeVersion, assumeEdition)
+		t, err := offlineTarget(assumeVersion, assumeEdition)
+		return t, nil, noop, err
 	}
 
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString)
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
 	if err != nil {
-		return ddl.Target{}, err
+		return ddl.Target{}, nil, noop, err
 	}
-	defer func() { _ = conn.Close() }()
+	cleanup := func() { _ = conn.Close() }
 
 	info, err := conn.Detect(ctx)
 	if err != nil {
-		return ddl.Target{}, err
+		cleanup()
+		return ddl.Target{}, nil, noop, err
 	}
 	if !info.Supported() {
-		return ddl.Target{}, fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
+		cleanup()
+		return ddl.Target{}, nil, noop, fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
 	}
 	fmt.Fprintf(log, "-- detected target: tier=%s major=%d adr=%t recovery=%s\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
-	return info.Target(), nil
+	return info.Target(), conn, cleanup, nil
 }
 
 // offlineTarget builds a resolution target from the --assume-* flags.
@@ -342,11 +394,18 @@ func visitedFlags(fs *flag.FlagSet) map[string]bool {
 	return visited
 }
 
-// dryRunManifest loads, plans, and renders one manifest to w.
-func dryRunManifest(w io.Writer, path string, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool) error {
+// dryRunManifest loads, optionally expands ALL rebuilds, plans, and renders one
+// manifest to w. expander is nil for an offline dry-run.
+func dryRunManifest(ctx context.Context, w io.Writer, path string, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool, expander run.IndexExpander) error {
 	manifest, err := ddl.LoadManifestFile(path)
 	if err != nil {
 		return err
+	}
+	if expander != nil {
+		manifest, err = run.ExpandAll(ctx, expander, manifest)
+		if err != nil {
+			return err
+		}
 	}
 	planned, err := ddl.Plan(manifest, target, matrix, policy)
 	if err != nil {

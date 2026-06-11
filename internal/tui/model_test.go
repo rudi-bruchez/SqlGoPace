@@ -43,6 +43,24 @@ func TestModelUpdatesFromMessages(t *testing.T) {
 	}
 }
 
+func TestModelRendersWaits(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", true, nil)
+	m, _ = send(m, tui.WaitsMsg{
+		TotalMS: 800,
+		Categories: []tui.WaitCategory{
+			{Name: "Transaction log", WaitMS: 600, Tasks: 45},
+			{Name: "Locking", WaitMS: 200, Tasks: 2},
+		},
+	})
+
+	view := m.View()
+	for _, want := range []string{"waits slowing the DDL (total 800ms)", "Transaction log", "Locking", "600ms"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("View() missing %q\n%s", want, view)
+		}
+	}
+}
+
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", true, actions)

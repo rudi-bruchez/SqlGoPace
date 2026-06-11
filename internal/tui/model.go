@@ -53,6 +53,13 @@ type Blocker struct {
 	Query    string
 }
 
+// WaitCategory is one category of waits accumulated by the running DDL.
+type WaitCategory struct {
+	Name   string
+	WaitMS int64
+	Tasks  int64
+}
+
 // Messages the host feeds from the monitor stream.
 type (
 	// ProgressMsg carries progress for the running operation.
@@ -63,6 +70,11 @@ type (
 	}
 	// BlockersMsg carries the current set of blocked sessions.
 	BlockersMsg struct{ Blockers []Blocker }
+	// WaitsMsg carries the running DDL's wait categories (what is slowing it down).
+	WaitsMsg struct {
+		Categories []WaitCategory
+		TotalMS    int64
+	}
 	// StatusMsg updates the lifecycle status (and optionally the operation label).
 	StatusMsg struct {
 		Status    Status
@@ -105,6 +117,8 @@ type Model struct {
 	etaSeconds      int64
 	rollbackPercent float64
 	blockers        []Blocker
+	waits           []WaitCategory
+	waitTotalMS     int64
 	cursor          int
 	actions         chan<- Action
 	quitting        bool
@@ -131,6 +145,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.cursor >= len(m.blockers) {
 			m.cursor = max(0, len(m.blockers)-1)
 		}
+	case WaitsMsg:
+		m.waits = msg.Categories
+		m.waitTotalMS = msg.TotalMS
 	case StatusMsg:
 		m.status = msg.Status
 		if msg.Operation != "" {
@@ -214,6 +231,13 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "%s%s\n", marker, line)
 		if bl.Query != "" {
 			fmt.Fprintf(&b, "    %s\n", truncate(bl.Query, 80))
+		}
+	}
+
+	if len(m.waits) > 0 {
+		fmt.Fprintf(&b, "\nwaits slowing the DDL (total %dms):\n", m.waitTotalMS)
+		for _, w := range m.waits {
+			fmt.Fprintf(&b, "  %-20s %8dms  %6d tasks\n", w.Name, w.WaitMS, w.Tasks)
 		}
 	}
 

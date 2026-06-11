@@ -57,7 +57,13 @@ func (q *Queue) Discover() ([]string, error) {
 	return names, nil
 }
 
+// isManifest reports whether a file name is a manifest to process. Files whose
+// name starts with a dot are skipped, so a manifest can be disabled by prefixing
+// it with "." and editor/OS dotfiles (.gitkeep, .DS_Store) are never picked up.
 func isManifest(name string) bool {
+	if strings.HasPrefix(name, ".") {
+		return false
+	}
 	ext := strings.ToLower(filepath.Ext(name))
 	return ext == ".yaml" || ext == ".yml"
 }

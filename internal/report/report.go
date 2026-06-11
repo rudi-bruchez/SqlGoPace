@@ -22,6 +22,24 @@ type OptionDecision struct {
 	Reason string `json:"reason"`
 }
 
+// ReactionLine records one reaction taken while an operation ran (a pause,
+// resume, cancel, or fallback kill), so the log shows how pressure was handled.
+type ReactionLine struct {
+	Kind   string `json:"kind"`
+	At     string `json:"at"`
+	Detail string `json:"detail"`
+}
+
+// WaitLine is one category of waits that slowed the operation, with its summed
+// time (and the signal/CPU portion).
+type WaitLine struct {
+	Category    string `json:"category"`
+	Description string `json:"description"`
+	WaitMS      int64  `json:"wait_ms"`
+	SignalMS    int64  `json:"signal_ms,omitempty"`
+	Tasks       int64  `json:"tasks"`
+}
+
 // OperationReport is the outcome of one executed operation.
 type OperationReport struct {
 	Index       int              `json:"index"`
@@ -29,6 +47,9 @@ type OperationReport struct {
 	Target      string           `json:"target"`
 	SQL         string           `json:"sql"`
 	Options     []OptionDecision `json:"options,omitempty"`
+	Reactions   []ReactionLine   `json:"reactions,omitempty"`
+	Waits       []WaitLine       `json:"waits,omitempty"`
+	WaitTotalMS int64            `json:"wait_total_ms,omitempty"`
 	Outcome     string           `json:"outcome"`
 	Error       string           `json:"error,omitempty"`
 	DurationMS  int64            `json:"duration_ms"`
@@ -72,6 +93,15 @@ func Write(w io.Writer, r RunReport) error {
 			fmt.Fprintf(w, "  [%d] %s %s — %s (%dms)\n", op.Index, op.CommandType, op.Target, op.Outcome, op.DurationMS)
 			for _, d := range op.Options {
 				fmt.Fprintf(w, "      %s = %s (%s)\n", d.Option, d.Value, d.Reason)
+			}
+			for _, rx := range op.Reactions {
+				fmt.Fprintf(w, "      reaction: %s at %s (%s)\n", rx.Kind, rx.At, rx.Detail)
+			}
+			if len(op.Waits) > 0 {
+				fmt.Fprintf(w, "      waits (total %dms):\n", op.WaitTotalMS)
+				for _, wl := range op.Waits {
+					fmt.Fprintf(w, "        %-20s %8dms  %6d tasks  — %s\n", wl.Category, wl.WaitMS, wl.Tasks, wl.Description)
+				}
 			}
 			if op.Error != "" {
 				fmt.Fprintf(w, "      error: %s\n", op.Error)

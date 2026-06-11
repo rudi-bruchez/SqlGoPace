@@ -64,6 +64,28 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	walp, walpReason, walpRel, _ := pickBool(app("wait_at_low_priority"), true, ov.WaitAtLowPriority, p.WaitAtLowPriority)
 	sort, sortReason, sortRel, _ := pickBool(app("sort_in_tempdb"), false, ov.SortInTempDB, p.SortInTempDB)
 
+	// RESUMABLE is not supported with ALTER INDEX ALL: SQL Server requires a single
+	// named index for a resumable rebuild. Drop it before the ONLINE dependency so
+	// we do not force ONLINE on for an option we are about to remove.
+	if resumable && IsAllIndexRebuild(op) {
+		resumable, resReason, resRel = false, "omitted: RESUMABLE is not supported with ALTER INDEX ALL", true
+	}
+
+	// Index-type gating: columnstore / XML / spatial indexes rebuild offline and
+	// reject the ONLINE family. Applies only to expanded ALL rebuilds, where the
+	// index kind is known; KindUnknown (single named index) is treated as rowstore.
+	if ri, ok := op.(RebuildIndex); ok && !ri.Kind.supportsOnlineRebuild() {
+		if online {
+			online, onlineReason, onlineRel = false, "omitted: "+ri.Kind.String()+" index rebuilds offline", true
+		}
+		if resumable {
+			resumable, resReason, resRel = false, "omitted: "+ri.Kind.String()+" index does not support resumable", true
+		}
+		if walp {
+			walp, walpReason, walpRel = false, "omitted: "+ri.Kind.String()+" index does not support wait_at_low_priority", true
+		}
+	}
+
 	// RESUMABLE requires ONLINE. Honor an explicit "online off"; otherwise turn
 	// ONLINE on to satisfy the dependency when the target supports it.
 	if resumable && !online {

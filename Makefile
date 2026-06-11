@@ -7,6 +7,11 @@ PKG    := ./...
 # Connection string for integration / e2e tests against the docker-compose server.
 E2E_DSN ?= sqlserver://sa:Str0ng_Passw0rd!@localhost:1433?database=tempdb&encrypt=disable
 
+# Container runtime. Defaults to Docker; override for Podman:
+#   make e2e CONTAINER=podman COMPOSE="podman compose"
+CONTAINER ?= docker
+COMPOSE   ?= docker compose
+
 .PHONY: all build test cover lint tidy vet integration e2e-up e2e-down e2e-test e2e clean
 
 all: lint test build
@@ -35,13 +40,13 @@ integration:
 
 # Bring up a throwaway SQL Server, wait until healthy.
 e2e-up:
-	docker compose up -d
+	$(COMPOSE) up -d
 	@echo "waiting for SQL Server to become healthy..."
-	@until [ "$$(docker inspect -f '{{.State.Health.Status}}' sqlgopace-mssql 2>/dev/null)" = "healthy" ]; do sleep 3; done
+	@until [ "$$($(CONTAINER) inspect -f '{{.State.Health.Status}}' sqlgopace-mssql 2>/dev/null)" = "healthy" ]; do sleep 3; done
 	@echo "SQL Server is healthy."
 
 e2e-down:
-	docker compose down -v
+	$(COMPOSE) down -v
 
 # Run only the e2e/integration tests against the running server.
 e2e-test:

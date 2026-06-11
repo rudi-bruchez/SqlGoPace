@@ -30,7 +30,7 @@ func seedTable(t *testing.T, dsn string) {
 	t.Helper()
 	ctx := context.Background()
 
-	conn, err := mssql.Open(ctx, dsn)
+	conn, err := mssql.Open(ctx, dsn, "test")
 	if err != nil {
 		t.Fatalf("open setup connection: %v", err)
 	}
@@ -49,7 +49,7 @@ func seedTable(t *testing.T, dsn string) {
 	}
 
 	t.Cleanup(func() {
-		c, err := mssql.Open(context.Background(), dsn)
+		c, err := mssql.Open(context.Background(), dsn, "test")
 		if err != nil {
 			return
 		}

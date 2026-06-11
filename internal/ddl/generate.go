@@ -111,6 +111,14 @@ func quoteColumns(columns []string) string {
 
 // --- per-operation generators --------------------------------------------
 
+// IsAllIndexRebuild reports whether op is a REBUILD over the "ALL" sentinel,
+// i.e. ALTER INDEX ALL ... REBUILD. Several rules differ for ALL: there is no
+// single named index to verify at preflight, and RESUMABLE is not supported.
+func IsAllIndexRebuild(op Operation) bool {
+	ri, ok := op.(RebuildIndex)
+	return ok && strings.EqualFold(ri.Index, "ALL")
+}
+
 func generateRebuildIndex(o RebuildIndex, res ResolvedOptions) string {
 	index := quoteIdent(o.Index)
 	if strings.EqualFold(o.Index, "ALL") {

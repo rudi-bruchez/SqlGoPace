@@ -1,14 +1,14 @@
 # ddl_compatibility.yaml
-# Matrice de compatibilité des options DDL par version (ProductMajorVersion) et édition.
+# DDL option compatibility matrix by version (ProductMajorVersion) and edition.
 #
-# Résolution : une option est APPLICABLE pour une opération si
-#   target_major >= min_major  ET  target_tier ∈ editions
-# Dépendances exprimées via `requires` (ex. resumable requiert online).
+# Resolution: an option is APPLICABLE for an operation if
+#   target_major >= min_major  AND  target_tier ∈ editions
+# Dependencies are expressed via `requires` (e.g. resumable requires online).
 #
-# Tiers d'édition (dérivés de SERVERPROPERTY('EngineEdition')) :
+# Edition tiers (derived from SERVERPROPERTY('EngineEdition')):
 #   2 -> standard | 3 -> enterprise (Enterprise/Developer/Evaluation) | 4 -> express
 #   5 -> azure (SQL Database) | 8 -> azure (Managed Instance)   <- evergreen, pseudo-major 9999
-# Éditions non gérées : 6/9/11/12 (Synapse / SQL Edge / Fabric).
+# Unsupported editions: 6/9/11/12 (Synapse / SQL Edge / Fabric).
 
 major_to_year:
   13: 2016
@@ -17,7 +17,7 @@ major_to_year:
   16: 2022
   17: 2025
 
-azure_pseudo_major: 9999          # appliqué quand EngineEdition ∈ {5, 8}
+azure_pseudo_major: 9999          # applied when EngineEdition ∈ {5, 8}
 
 commands:
 
@@ -39,11 +39,11 @@ commands:
 
   alter_column:                   # ALTER TABLE ALTER COLUMN
     online:               { min_major: 13, editions: [enterprise, azure] }                       # 2016
-    # WAIT_AT_LOW_PRIORITY n'est PAS supporté avec ONLINE ALTER COLUMN, quelle que soit la version.
+    # WAIT_AT_LOW_PRIORITY is NOT supported with ONLINE ALTER COLUMN, on any version.
 
   add_column:                     # ALTER TABLE ADD <column>
-    # Aucune option injectable. La rapidité dépend du caractère metadata-only (default constant,
-    # édition Enterprise, type/compression de la table) — évalué au pré-vol, jamais injecté.
+    # No injectable option. Speed depends on whether it is metadata-only (constant default,
+    # Enterprise edition, table type/compression) — assessed at preflight, never injected.
     {}
 
   add_constraint:                 # ALTER TABLE ADD CONSTRAINT (PRIMARY KEY / UNIQUE)

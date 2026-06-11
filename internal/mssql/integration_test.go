@@ -34,7 +34,7 @@ func openTestConn(t *testing.T) (*mssql.Conn, context.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
 
-	conn, err := mssql.Open(ctx, dsn(t))
+	conn, err := mssql.Open(ctx, dsn(t), "test")
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

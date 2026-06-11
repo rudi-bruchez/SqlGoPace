@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 )
 
 // LogSpace is the transaction-log usage snapshot. UsedBytes vs an absolute cap
@@ -50,47 +51,66 @@ func (c *Conn) LogReuseWait(ctx context.Context) (string, error) {
 }
 
 // Progress is a running request's completion estimate. PercentComplete is
-// populated for REBUILD/ALTER and during a KILL rollback.
+// populated for REBUILD/ALTER and during a rollback; Command distinguishes the
+// two — during a KILL/abort rollback it reads "KILLED/ROLLBACK", so the percent
+// is rollback progress rather than forward progress.
 type Progress struct {
 	PercentComplete       float64
 	EstimatedCompletionMS int64
 	ElapsedMS             int64
+	Command               string
+}
+
+// IsRollback reports whether the request is rolling back, in which case
+// PercentComplete is the rollback completion.
+func (p Progress) IsRollback() bool {
+	return strings.Contains(strings.ToUpper(p.Command), "ROLLBACK")
 }
 
 const progressSQL = `
-SELECT percent_complete, estimated_completion_time, total_elapsed_time
+SELECT percent_complete, estimated_completion_time, total_elapsed_time, command
 FROM sys.dm_exec_requests
 WHERE session_id = @spid;`
 
 // Progress reads completion estimates for the given session. found is false when
 // the session has no active request (e.g. the DDL has finished).
 func (c *Conn) Progress(ctx context.Context, spid int) (p Progress, found bool, err error) {
+	var command sql.NullString
 	row := c.pool.QueryRowContext(ctx, progressSQL, sql.Named("spid", spid))
-	switch err := row.Scan(&p.PercentComplete, &p.EstimatedCompletionMS, &p.ElapsedMS); {
+	switch err := row.Scan(&p.PercentComplete, &p.EstimatedCompletionMS, &p.ElapsedMS, &command); {
 	case errors.Is(err, sql.ErrNoRows):
 		return Progress{}, false, nil
 	case err != nil:
 		return Progress{}, false, fmt.Errorf("read progress: %w", err)
 	default:
+		p.Command = command.String
 		return p, true, nil
 	}
 }
 
 // ResumableOp is an in-progress or paused resumable index operation, surviving
-// tool and server restarts; consulted on startup to adopt orphaned operations.
+// tool and server restarts; consulted on startup to adopt orphaned operations and
+// by the abort-resumable command to cancel them. Schema/Table are resolved so the
+// operation can be addressed in an ALTER INDEX statement.
 type ResumableOp struct {
+	Schema          string
+	Table           string
 	ObjectID        int64
 	IndexID         int
 	Name            string
 	StateDesc       string // "RUNNING" | "PAUSED"
 	PercentComplete float64
+	LastPauseTime   string // ISO 8601, empty when never paused
 }
 
 const resumableOpsSQL = `
-SELECT object_id, index_id, name, state_desc, percent_complete
+SELECT OBJECT_SCHEMA_NAME(object_id), OBJECT_NAME(object_id),
+       object_id, index_id, name, state_desc, percent_complete,
+       CONVERT(varchar(30), last_pause_time, 126)
 FROM sys.index_resumable_operations;`
 
-// ResumableOps lists resumable index operations known to the engine.
+// ResumableOps lists resumable index operations in the connected database, with
+// their object schema/table resolved.
 func (c *Conn) ResumableOps(ctx context.Context) ([]ResumableOp, error) {
 	rows, err := c.pool.QueryContext(ctx, resumableOpsSQL)
 	if err != nil {
@@ -100,13 +120,32 @@ func (c *Conn) ResumableOps(ctx context.Context) ([]ResumableOp, error) {
 
 	var ops []ResumableOp
 	for rows.Next() {
-		var op ResumableOp
-		if err := rows.Scan(&op.ObjectID, &op.IndexID, &op.Name, &op.StateDesc, &op.PercentComplete); err != nil {
+		var (
+			op                           ResumableOp
+			schema, table, lastPauseTime sql.NullString
+		)
+		if err := rows.Scan(&schema, &table, &op.ObjectID, &op.IndexID, &op.Name, &op.StateDesc, &op.PercentComplete, &lastPauseTime); err != nil {
 			return nil, fmt.Errorf("scan resumable operation: %w", err)
 		}
+		op.Schema, op.Table, op.LastPauseTime = schema.String, table.String, lastPauseTime.String
 		ops = append(ops, op)
 	}
 	return ops, rows.Err()
+}
+
+const pausedResumableSQL = `
+SELECT COUNT(*) FROM sys.index_resumable_operations
+WHERE object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND name = @index AND state_desc = 'PAUSED';`
+
+// PausedResumable reports whether a paused resumable rebuild exists for the named
+// index on [schema].[table]. It tells an interrupted-but-recoverable operation
+// (the session was killed / the connection dropped, leaving the work paused) from
+// a genuine failure. It runs on the monitoring pool, so it survives the loss of
+// the execution session.
+func (c *Conn) PausedResumable(ctx context.Context, schema, table, index string) (bool, error) {
+	return c.existsScalar(ctx, pausedResumableSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index))
 }
 
 // Session is one active user request, as seen by the monitoring connection.

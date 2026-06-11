@@ -64,6 +64,7 @@ type MonitoringConfig struct {
 	LogDrainTimeoutMinutes      int   `yaml:"log_drain_timeout_minutes"`
 	MaxRetryAttempts            int   `yaml:"max_retry_attempts"`
 	KillGraceSeconds            int   `yaml:"kill_grace_seconds"`
+	ReconnectTimeoutMinutes     int   `yaml:"reconnect_timeout_minutes"`
 	CheckpointBetweenOperations bool  `yaml:"checkpoint_between_operations"`
 }
 
@@ -95,6 +96,12 @@ func (m MonitoringConfig) LogDrainTimeout() time.Duration {
 // KillGrace returns the grace period before an explicit KILL.
 func (m MonitoringConfig) KillGrace() time.Duration {
 	return time.Duration(m.KillGraceSeconds) * time.Second
+}
+
+// ReconnectTimeout returns how long to wait for the server to come back (and the
+// resumable state to become readable) after a connection loss before deciding.
+func (m MonitoringConfig) ReconnectTimeout() time.Duration {
+	return time.Duration(m.ReconnectTimeoutMinutes) * time.Minute
 }
 
 // PreflightConfig toggles individual pre-flight checks.
@@ -185,6 +192,9 @@ func Load(path string) (*Config, error) {
 func (c *Config) applyDefaults() {
 	if c.OptionsOverride.WaitMaxDurationMinutes <= 0 {
 		c.OptionsOverride.WaitMaxDurationMinutes = 1
+	}
+	if c.Monitoring.ReconnectTimeoutMinutes <= 0 {
+		c.Monitoring.ReconnectTimeoutMinutes = 2
 	}
 }
 

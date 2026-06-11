@@ -38,3 +38,9 @@ sqlgopace_history.db-*
 # .idea/
 # .vscode/
 formation/
+config-local.yaml
+config-local.yaml-*
+
+# Application's logs and db
+*.log
+*.db

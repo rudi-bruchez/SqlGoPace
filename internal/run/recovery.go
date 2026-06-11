@@ -157,7 +157,14 @@ func (r *Recoverer) facts(ctx context.Context, st RunState) (RecoveryFacts, erro
 	if err != nil {
 		return RecoveryFacts{}, fmt.Errorf("resumable operations: %w", err)
 	}
-	return RecoveryFacts{OrphanAlive: matchesOrphan(id, st), ResumableExists: len(ops) > 0}, nil
+	paused := false
+	for _, op := range ops {
+		if op.StateDesc == "PAUSED" {
+			paused = true
+			break
+		}
+	}
+	return RecoveryFacts{OrphanAlive: matchesOrphan(id, st), ResumableExists: paused}, nil
 }
 
 func (r *Recoverer) requeue(manifest, statePath string) error {

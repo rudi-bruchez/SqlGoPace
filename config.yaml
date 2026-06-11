@@ -1,14 +1,16 @@
-# config.yaml — configuration de SqlGoPace
-# Les secrets (mot de passe, etc.) ne sont JAMAIS en clair ici : ils viennent du fichier .env
-# et sont injectés via ${VARIABLE}. Voir .env.example.
+# config.yaml — SqlGoPace configuration
+# Secrets (passwords, etc.) are NEVER stored in plaintext here: they come from the .env file
+# and are injected via ${VARIABLE}. See .env.example.
 
 database:
-  # La chaîne référence des variables d'environnement (.env). Auth Windows/Azure AD : retirer
-  # user id/password et ajouter "trusted connection" / le mode d'auth approprié au driver.
+  # The connection string references environment variables (.env). For Windows / Azure AD auth:
+  # remove user id/password and add "trusted connection" / the auth mode appropriate for the driver.
+  # The app version is appended to "app name" automatically (e.g. SqlGoPace/0.1.0), so the running
+  # build is visible server-side in sys.dm_exec_sessions.program_name.
   connection_string: "server=${DB_SERVER};database=${DB_NAME};user id=${DB_USER};password=${DB_PASSWORD};encrypt=true;trustServerCertificate=true;app name=SqlGoPace"
-  login_timeout_seconds: 15      # connexion uniquement — PAS de timeout de requête
-  # Query timeout du driver = 0 (infini) : pas de Global Timeout sur un DDL.
-  # Le contrôle de durée est délégué au monitoring (blocage / log), jamais à un timer fixe.
+  login_timeout_seconds: 15      # connection only — NOT a query timeout
+  # Driver query timeout = 0 (infinite): no global timeout on a DDL statement.
+  # Duration control is delegated to monitoring (blocking / log), never a fixed timer.
 
 directories:
   to_run:     "./01.to_run"
@@ -20,18 +22,19 @@ monitoring:
   blocking_poll_seconds: 10
   log_poll_seconds: 60
   progress_poll_seconds: 30
-  log_max_size_bytes: 53687091200   # 50 GB — plafond absolu (borné par max_size des fichiers log)
-  log_max_percent: 80               # secondaire
-  blocking_timeout_minutes: 5       # délai avant réaction quand notre DDL bloque d'autres sessions
-  log_drain_timeout_minutes: 30     # abandon si le log ne se libère pas
+  log_max_size_bytes: 53687091200   # 50 GB — absolute ceiling (bounded by the log files' max_size)
+  log_max_percent: 80               # secondary
+  blocking_timeout_minutes: 5       # delay before reacting when our DDL blocks other sessions
+  log_drain_timeout_minutes: 30     # give up if the log does not drain
   max_retry_attempts: 3
-  kill_grace_seconds: 30            # délai avant KILL explicite si l'annulation Go ne prend pas
-  checkpoint_between_operations: false  # n'a d'effet qu'en recovery model SIMPLE
+  kill_grace_seconds: 30            # delay before an explicit KILL if the Go cancellation does not take effect
+  reconnect_timeout_minutes: 2      # wait this long for the server to come back before classifying an interruption
+  checkpoint_between_operations: false  # only has an effect under SIMPLE recovery model
 
 preflight:
-  require_data_free_space: true     # exige ≈ taille de l'objet libre dans le filegroup
+  require_data_free_space: true     # requires ≈ the object's size free in the filegroup
   check_tempdb: true
-  ag_send_queue_warn: true          # avertit mais n'empêche pas (configurable)
+  ag_send_queue_warn: true          # warns but does not block (configurable)
 
 options_override:
   online:               { force: null }   # true / false / null(auto)
@@ -39,11 +42,11 @@ options_override:
   wait_at_low_priority: { force: null }
   maxdop:               { force: null }
   sort_in_tempdb:       { force: null }
-  allow_abort_blockers: false        # DANGEREUX : autorise ABORT_AFTER_WAIT = BLOCKERS
-  wait_max_duration_minutes: 1       # MAX_DURATION pour WAIT_AT_LOW_PRIORITY
+  allow_abort_blockers: false        # DANGEROUS: allows ABORT_AFTER_WAIT = BLOCKERS
+  wait_max_duration_minutes: 1       # MAX_DURATION for WAIT_AT_LOW_PRIORITY
 
 notifications:
-  webhook_url: "${WEBHOOK_URL}"      # vide = désactivé
+  webhook_url: "${WEBHOOK_URL}"      # empty = disabled
   on_events: [cancel, fail, pause, log_full, abort]
 
 history:

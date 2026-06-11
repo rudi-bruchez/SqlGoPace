@@ -5,12 +5,26 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
 const (
-	exampleManifest = "../../01.to_run/010_example_rebuild.yaml"
+	exampleManifest = "../../01.to_run/.010_example_rebuild.yaml"
 	matrixFlag      = "--matrix=../../ddl_compatibility.yaml"
 )
+
+func TestProgressMsgForwardVsRollback(t *testing.T) {
+	fwd := progressMsg(mssql.Progress{PercentComplete: 30, EstimatedCompletionMS: 5000, Command: "ALTER INDEX"})
+	if fwd.Percent != 30 || fwd.RollbackPercent != 0 || fwd.ETASeconds != 5 {
+		t.Errorf("forward progress = %+v, want Percent=30 RollbackPercent=0 ETASeconds=5", fwd)
+	}
+
+	rb := progressMsg(mssql.Progress{PercentComplete: 60, Command: "KILLED/ROLLBACK"})
+	if rb.RollbackPercent != 60 || rb.Percent != 0 {
+		t.Errorf("rollback progress = %+v, want RollbackPercent=60 Percent=0", rb)
+	}
+}
 
 func TestRunDryRunEnterprise2022(t *testing.T) {
 	var out bytes.Buffer
