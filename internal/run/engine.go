@@ -27,6 +27,15 @@ type OpRunner interface {
 	Run(ctx context.Context, op ddl.Operation, sql string, caps Capabilities, sink ReactionSink) error
 }
 
+// ShrinkDriver runs a shrink operation, which does not fit the one-statement
+// OpRunner model: it reads DMVs at run time, builds per-chunk SQL, and loops. The
+// engine routes ddl.Shrink operations here. *ShrinkRunner satisfies it.
+type ShrinkDriver interface {
+	Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, sink ReactionSink) ([]ShrinkResult, error)
+}
+
+var _ ShrinkDriver = (*ShrinkRunner)(nil)
+
 // SessionInfo provides the execution session signature for the crash-recovery
 // sidecar, including a CONTEXT_INFO marker so an orphaned session can be correlated
 // to its run reliably (a bare SPID is reused). *mssql.Conn satisfies it.
@@ -96,6 +105,7 @@ type Engine struct {
 	policy           ddl.Policy
 	pf               Preflighter
 	runner           OpRunner
+	shrink           ShrinkDriver
 	adr              bool
 	clk              Clock
 	session          SessionInfo
@@ -115,6 +125,12 @@ type EngineOption func(*Engine)
 
 // WithADR sets the target's Accelerated Database Recovery state (biases reactions).
 func WithADR(adr bool) EngineOption { return func(e *Engine) { e.adr = adr } }
+
+// WithShrinkRunner routes ddl.Shrink operations to the dedicated shrink driver
+// instead of the OpRunner. Without it, a shrink operation falls back to the
+// OpRunner, whose indicative PlannedOperation.SQL is not the real per-chunk SQL —
+// so a shrink driver should always be wired when shrink manifests are expected.
+func WithShrinkRunner(d ShrinkDriver) EngineOption { return func(e *Engine) { e.shrink = d } }
 
 // WithClock sets the clock (defaults to System).
 func WithClock(c Clock) EngineOption { return func(e *Engine) { e.clk = c } }
@@ -286,7 +302,17 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			}
 		}
 		waitsBefore := e.snapshotWaits(ctx)
-		runErr := e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+		var (
+			runErr        error
+			shrinkResults []ShrinkResult
+		)
+		if sh, ok := step.Operation.(ddl.Shrink); ok && e.shrink != nil {
+			// Shrink is multi-statement and built at run time; route to the driver,
+			// passing the resolved options (only WALP is meaningful for a shrink).
+			shrinkResults, runErr = e.shrink.Run(ctx, sh, step.Options, sink)
+		} else {
+			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+		}
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
 
 		opRep := report.OperationReport{
@@ -298,6 +324,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			Reactions:   reactions,
 			Waits:       waitLines,
 			WaitTotalMS: waitTotal,
+			Shrink:      shrinkReport(shrinkResults),
 			DurationMS:  e.msSince(opStart),
 		}
 		if runErr != nil {
@@ -530,6 +557,27 @@ func optionDecisions(ds []ddl.Decision) []report.OptionDecision {
 
 func opTarget(op ddl.Operation) string {
 	return op.Target().String()
+}
+
+// shrinkReport maps the driver's per-file results into the run report.
+func shrinkReport(results []ShrinkResult) []report.ShrinkFileReport {
+	if len(results) == 0 {
+		return nil
+	}
+	out := make([]report.ShrinkFileReport, len(results))
+	for i, r := range results {
+		out[i] = report.ShrinkFileReport{
+			File:      r.File,
+			Type:      r.Type,
+			InitialMB: r.InitialMB,
+			FinalMB:   r.FinalMB,
+			GainedMB:  r.InitialMB - r.FinalMB,
+			Chunks:    r.Chunks,
+			NoOp:      r.NoOp,
+			Reason:    r.Reason,
+		}
+	}
+	return out
 }
 
 // cancelSafe reports whether cancelling op under pressure is a clean stop with no

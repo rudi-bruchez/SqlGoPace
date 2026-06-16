@@ -309,6 +309,18 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		KillGrace:       cfg.Monitoring.KillGrace(),
 		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
 	})
+	shrinkRunner := run.NewShrinkRunner(conn, conn, sampler, run.System, run.ShrinkRunnerConfig{
+		Tuning:          shrinkTuning(cfg.Shrink),
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+	}, run.WithShrinkProgress(func(p run.ShrinkProgress) {
+		// Deterministic per-chunk progress (design §9), unlike the fluctuating
+		// dm_exec_requests percent used for other operations.
+		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
+	}))
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
@@ -318,6 +330,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithResumeCheck(conn),
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithDatabase(info.Database),
+		run.WithShrinkRunner(shrinkRunner),
 		run.WithOutput(engineOut),
 	}
 	if cfg.Notifications.WebhookURL != "" {
@@ -327,6 +340,24 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		opts = append(opts, run.WithHistory(history))
 	}
 	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+}
+
+// shrinkTuning maps the config block to the run-side tuning carrier (config.ShrinkConfig
+// has already applied its defaults), mirroring how cfg.Policy() maps to ddl.Policy.
+func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
+	return run.ShrinkTuning{
+		InitialStepSmallMB:   s.InitialStepSmallMB,
+		InitialStepMediumMB:  s.InitialStepMediumMB,
+		InitialStepLargeMB:   s.InitialStepLargeMB,
+		MinStepMB:            s.MinStepMB,
+		MaxStepMB:            s.MaxStepMB,
+		TargetBatch:          s.TargetBatch(),
+		MaxNoProgress:        s.MaxNoProgress,
+		NoProgressBackoff:    s.NoProgressBackoff(),
+		NoProgressBackoffMax: s.NoProgressBackoffMax(),
+		SelfWaitTimeout:      s.SelfWaitTimeout(),
+		LogReuseWaitTimeout:  s.LogReuseWaitTimeout(),
+	}
 }
 
 // connForDatabase returns a connection in the target database's context. It reuses

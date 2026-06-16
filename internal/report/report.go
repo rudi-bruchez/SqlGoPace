@@ -40,19 +40,34 @@ type WaitLine struct {
 	Tasks       int64  `json:"tasks"`
 }
 
+// ShrinkFileReport is the per-file outcome of a shrink operation: the page-moving
+// shrink driver works file by file, so a single shrink operation can produce
+// several of these (notably files:all).
+type ShrinkFileReport struct {
+	File      string `json:"file"`
+	Type      string `json:"type"` // "data" | "log"
+	InitialMB int    `json:"initial_mb"`
+	FinalMB   int    `json:"final_mb"`
+	GainedMB  int    `json:"gained_mb"`
+	Chunks    int    `json:"chunks,omitempty"`
+	NoOp      bool   `json:"no_op,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
 // OperationReport is the outcome of one executed operation.
 type OperationReport struct {
-	Index       int              `json:"index"`
-	CommandType string           `json:"command_type"`
-	Target      string           `json:"target"`
-	SQL         string           `json:"sql"`
-	Options     []OptionDecision `json:"options,omitempty"`
-	Reactions   []ReactionLine   `json:"reactions,omitempty"`
-	Waits       []WaitLine       `json:"waits,omitempty"`
-	WaitTotalMS int64            `json:"wait_total_ms,omitempty"`
-	Outcome     string           `json:"outcome"`
-	Error       string           `json:"error,omitempty"`
-	DurationMS  int64            `json:"duration_ms"`
+	Index       int                `json:"index"`
+	CommandType string             `json:"command_type"`
+	Target      string             `json:"target"`
+	SQL         string             `json:"sql"`
+	Options     []OptionDecision   `json:"options,omitempty"`
+	Reactions   []ReactionLine     `json:"reactions,omitempty"`
+	Waits       []WaitLine         `json:"waits,omitempty"`
+	WaitTotalMS int64              `json:"wait_total_ms,omitempty"`
+	Shrink      []ShrinkFileReport `json:"shrink,omitempty"`
+	Outcome     string             `json:"outcome"`
+	Error       string             `json:"error,omitempty"`
+	DurationMS  int64              `json:"duration_ms"`
 }
 
 // CheckLine is one preflight check result.
@@ -102,6 +117,19 @@ func Write(w io.Writer, r RunReport) error {
 				for _, wl := range op.Waits {
 					fmt.Fprintf(w, "        %-20s %8dms  %6d tasks  — %s\n", wl.Category, wl.WaitMS, wl.Tasks, wl.Description)
 				}
+			}
+			for _, sf := range op.Shrink {
+				fmt.Fprintf(w, "      shrink %s (%s): %d MB -> %d MB (gained %d MB)", sf.File, sf.Type, sf.InitialMB, sf.FinalMB, sf.GainedMB)
+				if sf.Chunks > 0 {
+					fmt.Fprintf(w, ", %d chunks", sf.Chunks)
+				}
+				if sf.NoOp {
+					fmt.Fprint(w, ", no-op")
+				}
+				if sf.Reason != "" {
+					fmt.Fprintf(w, " — %s", sf.Reason)
+				}
+				fmt.Fprintln(w)
 			}
 			if op.Error != "" {
 				fmt.Fprintf(w, "      error: %s\n", op.Error)
