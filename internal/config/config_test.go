@@ -124,6 +124,74 @@ func TestParseInvalid(t *testing.T) {
 	}
 }
 
+func TestShrinkConfigDefaultsWhenAbsent(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	// validYAML has no shrink: block at all.
+	cfg, err := config.Parse([]byte(validYAML))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	s := cfg.Shrink
+	checks := []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"initial_step_small_mb", s.InitialStepSmallMB, 100},
+		{"initial_step_medium_mb", s.InitialStepMediumMB, 250},
+		{"initial_step_large_mb", s.InitialStepLargeMB, 500},
+		{"min_step_mb", s.MinStepMB, 50},
+		{"max_step_mb", s.MaxStepMB, 1024},
+		{"target_batch_seconds", s.TargetBatchSeconds, 5},
+		{"max_no_progress", s.MaxNoProgress, 3},
+		{"no_progress_backoff_seconds", s.NoProgressBackoffSeconds, 30},
+		{"no_progress_backoff_max_seconds", s.NoProgressBackoffMaxSeconds, 300},
+		{"self_wait_timeout_minutes", s.SelfWaitTimeoutMinutes, 5},
+		{"log_reuse_wait_timeout_minutes", s.LogReuseWaitTimeoutMinutes, 30},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("Shrink.%s = %d, want default %d", c.name, c.got, c.want)
+		}
+	}
+	if got, want := s.TargetBatch(), 5*time.Second; got != want {
+		t.Errorf("TargetBatch() = %v, want %v", got, want)
+	}
+	if got, want := s.LogReuseWaitTimeout(), 30*time.Minute; got != want {
+		t.Errorf("LogReuseWaitTimeout() = %v, want %v", got, want)
+	}
+}
+
+func TestShrinkConfigPartialOverride(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "shrink:\n  min_step_mb: 8\n  max_step_mb: 4096\n"
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	if cfg.Shrink.MinStepMB != 8 {
+		t.Errorf("MinStepMB = %d, want overridden 8", cfg.Shrink.MinStepMB)
+	}
+	if cfg.Shrink.MaxStepMB != 4096 {
+		t.Errorf("MaxStepMB = %d, want overridden 4096", cfg.Shrink.MaxStepMB)
+	}
+	// Untouched fields keep their defaults.
+	if cfg.Shrink.TargetBatchSeconds != 5 {
+		t.Errorf("TargetBatchSeconds = %d, want default 5", cfg.Shrink.TargetBatchSeconds)
+	}
+}
+
+func TestShrinkConfigRejectsMinAboveMax(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "shrink:\n  min_step_mb: 2048\n  max_step_mb: 1024\n"
+	if _, err := config.Parse([]byte(yaml)); err == nil {
+		t.Errorf("Parse() with min > max error = nil, want non-nil")
+	}
+}
+
 func TestLoadShippedConfig(t *testing.T) {
 	t.Setenv("DB_SERVER", "localhost")
 	t.Setenv("DB_NAME", "testdb")

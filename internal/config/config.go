@@ -30,6 +30,7 @@ type Config struct {
 	OptionsOverride OptionsOverrideConfig `yaml:"options_override"`
 	Notifications   NotificationsConfig   `yaml:"notifications"`
 	History         HistoryConfig         `yaml:"history"`
+	Shrink          ShrinkConfig          `yaml:"shrink"`
 	MatrixFile      string                `yaml:"matrix_file"`
 }
 
@@ -132,6 +133,52 @@ type OptionsOverrideConfig struct {
 	WaitMaxDurationMinutes int       `yaml:"wait_max_duration_minutes"`
 }
 
+// ShrinkConfig holds the tuning parameters for the DBCC SHRINKFILE driver. Every
+// field is optional: an absent shrink: block (or any zero/negative field) falls
+// back to the documented default. These are global only (never per-manifest) —
+// they depend on the instance's storage and SLA, not on the operation. They are
+// starting points and bounds that the driver's dynamic step calibration varies.
+type ShrinkConfig struct {
+	InitialStepSmallMB          int `yaml:"initial_step_small_mb"`           // reclaim < 5 GB
+	InitialStepMediumMB         int `yaml:"initial_step_medium_mb"`          // reclaim 5–50 GB
+	InitialStepLargeMB          int `yaml:"initial_step_large_mb"`           // reclaim > 50 GB
+	MinStepMB                   int `yaml:"min_step_mb"`                     // floor: below this, per-loop overhead dominates
+	MaxStepMB                   int `yaml:"max_step_mb"`                     // ceiling: avoid saturating I/O in one move
+	TargetBatchSeconds          int `yaml:"target_batch_seconds"`            // an "ideal" chunk lasts a few seconds
+	MaxNoProgress               int `yaml:"max_no_progress"`                 // consecutive no-gain chunks before clean stop
+	NoProgressBackoffSeconds    int `yaml:"no_progress_backoff_seconds"`     // wait before retry, doubled each no-progress
+	NoProgressBackoffMaxSeconds int `yaml:"no_progress_backoff_max_seconds"` // backoff ceiling
+	SelfWaitTimeoutMinutes      int `yaml:"self_wait_timeout_minutes"`       // max wait on Sch-M / snapshot before clean stop
+	LogReuseWaitTimeoutMinutes  int `yaml:"log_reuse_wait_timeout_minutes"`  // max wait for a scheduled BACKUP LOG to free the log
+}
+
+// TargetBatch returns the ideal per-chunk duration.
+func (s ShrinkConfig) TargetBatch() time.Duration {
+	return time.Duration(s.TargetBatchSeconds) * time.Second
+}
+
+// NoProgressBackoff returns the initial backoff after a no-progress chunk.
+func (s ShrinkConfig) NoProgressBackoff() time.Duration {
+	return time.Duration(s.NoProgressBackoffSeconds) * time.Second
+}
+
+// NoProgressBackoffMax returns the backoff ceiling.
+func (s ShrinkConfig) NoProgressBackoffMax() time.Duration {
+	return time.Duration(s.NoProgressBackoffMaxSeconds) * time.Second
+}
+
+// SelfWaitTimeout returns how long the driver waits while blocked (Sch-M/snapshot)
+// before stopping cleanly.
+func (s ShrinkConfig) SelfWaitTimeout() time.Duration {
+	return time.Duration(s.SelfWaitTimeoutMinutes) * time.Minute
+}
+
+// LogReuseWaitTimeout returns how long to wait for a scheduled log backup to free
+// the log before abandoning a log shrink cleanly.
+func (s ShrinkConfig) LogReuseWaitTimeout() time.Duration {
+	return time.Duration(s.LogReuseWaitTimeoutMinutes) * time.Minute
+}
+
 // NotificationsConfig holds webhook settings.
 type NotificationsConfig struct {
 	WebhookURL string   `yaml:"webhook_url"`
@@ -196,6 +243,28 @@ func (c *Config) applyDefaults() {
 	if c.Monitoring.ReconnectTimeoutMinutes <= 0 {
 		c.Monitoring.ReconnectTimeoutMinutes = 2
 	}
+	c.Shrink.applyDefaults()
+}
+
+// applyDefaults fills any unset (zero or negative) shrink field with its default,
+// so a missing shrink: block or a partial override both yield a working config.
+func (s *ShrinkConfig) applyDefaults() {
+	setIf := func(p *int, def int) {
+		if *p <= 0 {
+			*p = def
+		}
+	}
+	setIf(&s.InitialStepSmallMB, 100)
+	setIf(&s.InitialStepMediumMB, 250)
+	setIf(&s.InitialStepLargeMB, 500)
+	setIf(&s.MinStepMB, 50)
+	setIf(&s.MaxStepMB, 1024)
+	setIf(&s.TargetBatchSeconds, 5)
+	setIf(&s.MaxNoProgress, 3)
+	setIf(&s.NoProgressBackoffSeconds, 30)
+	setIf(&s.NoProgressBackoffMaxSeconds, 300)
+	setIf(&s.SelfWaitTimeoutMinutes, 5)
+	setIf(&s.LogReuseWaitTimeoutMinutes, 30)
 }
 
 func (c *Config) validate() error {
@@ -239,6 +308,10 @@ func (c *Config) validate() error {
 	}
 	if strings.TrimSpace(c.MatrixFile) == "" {
 		return fmt.Errorf("matrix_file is required: %w", ErrInvalidConfig)
+	}
+	if c.Shrink.MinStepMB > c.Shrink.MaxStepMB {
+		return fmt.Errorf("shrink.min_step_mb (%d) must be <= max_step_mb (%d): %w",
+			c.Shrink.MinStepMB, c.Shrink.MaxStepMB, ErrInvalidConfig)
 	}
 	return nil
 }
