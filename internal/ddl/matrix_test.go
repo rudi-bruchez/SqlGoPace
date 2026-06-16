@@ -78,6 +78,14 @@ func testMatrix() *ddl.Matrix {
 			"create_index": {
 				"wait_at_low_priority": {MinMajor: 16, Editions: ent, Requires: []string{"online"}},
 			},
+			"shrink_data": {
+				// Unlike online-index WALP, shrink WALP is not Enterprise-gated and has no
+				// `requires: [online]` (DBCC has no ONLINE clause).
+				"wait_at_low_priority": {MinMajor: 16, Editions: []ddl.Tier{
+					ddl.TierEnterprise, ddl.TierStandard, ddl.TierExpress, ddl.TierAzure,
+				}},
+			},
+			"shrink_log": {},
 			"drop_index": {},
 		},
 	}
@@ -101,6 +109,11 @@ func TestMatrixApplicable(t *testing.T) {
 		{"azure evergreen overrides major", 9, ddl.TierAzure, "rebuild_index", "resumable", true},
 		{"create walp at min version", 16, ddl.TierEnterprise, "create_index", "wait_at_low_priority", true},
 		{"create walp below min version", 15, ddl.TierEnterprise, "create_index", "wait_at_low_priority", false},
+		{"shrink walp 2022 enterprise", 16, ddl.TierEnterprise, "shrink_data", "wait_at_low_priority", true},
+		{"shrink walp 2022 standard (not edition-gated)", 16, ddl.TierStandard, "shrink_data", "wait_at_low_priority", true},
+		{"shrink walp 2022 express (not edition-gated)", 16, ddl.TierExpress, "shrink_data", "wait_at_low_priority", true},
+		{"shrink walp 2019 too old", 15, ddl.TierEnterprise, "shrink_data", "wait_at_low_priority", false},
+		{"shrink_log has no walp", 16, ddl.TierEnterprise, "shrink_log", "wait_at_low_priority", false},
 		{"unknown option", 16, ddl.TierEnterprise, "rebuild_index", "nope", false},
 		{"unknown command", 16, ddl.TierEnterprise, "nope", "online", false},
 		{"command with no rules", 16, ddl.TierEnterprise, "drop_index", "online", false},

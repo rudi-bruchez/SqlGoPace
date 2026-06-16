@@ -68,3 +68,12 @@ commands:
     data_compression:     { min_major: 10, editions: [enterprise, azure] }
     maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
     # NB: no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap rebuild, on any version.
+
+  shrink_data:                      # DBCC SHRINKFILE on a data file (.mdf/.ndf)
+    # WAIT_AT_LOW_PRIORITY for shrink is 2022+ and, unlike online-index WALP, is NOT
+    # Enterprise-gated: DBCC SHRINKFILE runs on every edition. No `requires: [online]`
+    # either — DBCC has no ONLINE clause. Applies to data files only (Sch-M on IAM pages).
+    wait_at_low_priority: { min_major: 16, editions: [enterprise, standard, express, azure] }  # 2022
+
+  shrink_log:        {}             # DBCC SHRINKFILE on a log file: no injectable option.
+                                    # WALP does not apply to log files (VLF truncation, no IAM Sch-M).
