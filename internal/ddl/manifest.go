@@ -189,6 +189,8 @@ func decodeOperation(node *yaml.Node) (Operation, error) {
 		return decodeInto[DropColumn](node)
 	case "drop_constraint":
 		return decodeInto[DropConstraint](node)
+	case "shrink":
+		return decodeInto[Shrink](node)
 	default:
 		return nil, fmt.Errorf("%q: %w", disc.Operation, ErrUnknownOperation)
 	}
@@ -489,4 +491,49 @@ func (o CheckDB) CommandType() string { return "check_db" }
 func (o CheckDB) Target() ObjectRef   { return ObjectRef{Database: o.Database} }
 func (o CheckDB) Validate() error {
 	return requireFields("check_db", map[string]string{"database": o.Database})
+}
+
+// Shrink is DBCC SHRINKFILE on a data or log file. It does not fit the
+// "one operation = one statement" model: a dedicated runtime driver reads DMVs,
+// builds the per-chunk SQL via the helpers in shrink.go, and runs its own loop.
+// Like check_db it is file/database-scoped, so its Target carries the file name in
+// Name and never a schema.table (see ObjectRef and the check_db target convention).
+type Shrink struct {
+	Type            string          `yaml:"type"`            // "data" | "log"
+	Files           string          `yaml:"files"`           // "all" | logical file name; defaults to "all"
+	EmptyFile       bool            `yaml:"emptyfile"`       // reserved for Phase 2; must be false in v1
+	TargetFreeSpace string          `yaml:"targetfreespace"` // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
+	Options         OptionOverrides `yaml:"options"`         // only WaitAtLowPriority is relevant
+}
+
+// FilesOrAll returns the configured logical file name, defaulting to "all".
+func (o Shrink) FilesOrAll() string {
+	if strings.TrimSpace(o.Files) == "" {
+		return "all"
+	}
+	return o.Files
+}
+
+func (o Shrink) CommandType() string {
+	if strings.EqualFold(strings.TrimSpace(o.Type), "log") {
+		return "shrink_log"
+	}
+	return "shrink_data" // "data" and, pre-validation, any other value
+}
+
+func (o Shrink) Target() ObjectRef { return ObjectRef{Name: o.FilesOrAll()} }
+
+func (o Shrink) Validate() error {
+	switch strings.ToLower(strings.TrimSpace(o.Type)) {
+	case "data", "log":
+	default:
+		return fmt.Errorf("shrink: type must be \"data\" or \"log\", got %q: %w", o.Type, ErrInvalidManifest)
+	}
+	if o.EmptyFile {
+		return fmt.Errorf("shrink: emptyfile is reserved for Phase 2 and must be false: %w", ErrInvalidManifest)
+	}
+	if _, err := ParseTargetFreeSpace(o.TargetFreeSpace); err != nil {
+		return fmt.Errorf("shrink: %w", err)
+	}
+	return nil
 }

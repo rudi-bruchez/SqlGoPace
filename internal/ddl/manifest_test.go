@@ -189,6 +189,26 @@ func TestParseManifestErrors(t *testing.T) {
 			yaml:    "operations:\n  - operation: update_statistics\n    schema: dbo\n    table: T\n    sample_percent: 200\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
+		{
+			name:    "shrink invalid type",
+			yaml:    "operations:\n  - operation: shrink\n    type: index\n    targetfreespace: 10%\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "shrink emptyfile reserved",
+			yaml:    "operations:\n  - operation: shrink\n    type: data\n    emptyfile: true\n    targetfreespace: 10%\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "shrink unparseable targetfreespace",
+			yaml:    "operations:\n  - operation: shrink\n    type: data\n    targetfreespace: lots\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "shrink missing targetfreespace",
+			yaml:    "operations:\n  - operation: shrink\n    type: log\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
