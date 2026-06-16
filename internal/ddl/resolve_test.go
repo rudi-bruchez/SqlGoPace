@@ -24,6 +24,12 @@ func resolveMatrix() *ddl.Matrix {
 				"sort_in_tempdb":       {MinMajor: 9, Editions: []ddl.Tier{ddl.TierEnterprise, ddl.TierStandard, ddl.TierAzure}},
 				"maxdop":               {MinMajor: 9, Editions: []ddl.Tier{ddl.TierEnterprise, ddl.TierStandard, ddl.TierAzure}},
 			},
+			"shrink_data": {
+				"wait_at_low_priority": {MinMajor: 16, Editions: []ddl.Tier{
+					ddl.TierEnterprise, ddl.TierStandard, ddl.TierExpress, ddl.TierAzure,
+				}},
+			},
+			"shrink_log": {},
 		},
 	}
 }
@@ -174,5 +180,68 @@ func TestResolveNoOptionsForPlainOperation(t *testing.T) {
 
 	if got != (ddl.ResolvedOptions{}) {
 		t.Errorf("Resolve(add_column) = %+v, want zero ResolvedOptions", got)
+	}
+}
+
+func TestResolveShrinkWALPAuto2022(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard} // not Enterprise-gated
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	// WALP only; never ONLINE/RESUMABLE/MAX_DURATION for a shrink.
+	want := ddl.ResolvedOptions{WaitAtLowPriority: true, AbortAfterWait: "SELF"}
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("Resolve(shrink) mismatch (-want +got):\n%s", diff)
+	}
+	if got.MaxDurationMinutes != 0 {
+		t.Errorf("shrink WALP MaxDurationMinutes = %d, want 0 (no MAX_DURATION)", got.MaxDurationMinutes)
+	}
+	if v, ok := decisionValue(decisions, "wait_at_low_priority"); !ok || v != "ON" {
+		t.Errorf("decision[wait_at_low_priority] = %q (ok=%t), want ON", v, ok)
+	}
+	if _, ok := decisionValue(decisions, "online"); ok {
+		t.Errorf("Resolve(shrink) emitted an online decision, want none")
+	}
+}
+
+func TestResolveShrinkWALPUnsupportedPre2022(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%"}
+	target := ddl.Target{MajorVersion: 15, Tier: ddl.TierEnterprise} // 2019: no shrink WALP
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.WaitAtLowPriority {
+		t.Errorf("Resolve(shrink, 2019) WaitAtLowPriority = true, want false")
+	}
+}
+
+func TestResolveShrinkAbortBlockers(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{AllowAbortBlockers: true})
+
+	if !got.WaitAtLowPriority || got.AbortAfterWait != "BLOCKERS" {
+		t.Errorf("Resolve(shrink, AllowAbortBlockers) = {WALP:%t Abort:%q}, want {true BLOCKERS}",
+			got.WaitAtLowPriority, got.AbortAfterWait)
+	}
+}
+
+func TestResolveShrinkLogHasNoWALP(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{Type: "log", TargetFreeSpace: "100MB"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.WaitAtLowPriority {
+		t.Errorf("Resolve(shrink_log) WaitAtLowPriority = true, want false (WALP not valid for log)")
+	}
+	if len(decisions) != 0 {
+		t.Errorf("Resolve(shrink_log) decisions = %v, want none", decisions)
 	}
 }

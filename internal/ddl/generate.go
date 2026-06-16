@@ -39,6 +39,8 @@ func Generate(op Operation, res ResolvedOptions) (string, error) {
 		return generateDropColumn(o), nil
 	case DropConstraint:
 		return generateDropConstraint(o), nil
+	case Shrink:
+		return generateShrink(o, res), nil
 	default:
 		return "", fmt.Errorf("%T: %w", op, ErrUnsupportedOperation)
 	}
@@ -265,6 +267,46 @@ func generateDropConstraint(o DropConstraint) string {
 	cond := fmt.Sprintf("IF EXISTS (SELECT 1 FROM sys.objects WHERE name = %s AND parent_object_id = OBJECT_ID(%s))",
 		nLiteral(o.Constraint), objectLiteral(o.Schema, o.Table))
 	return guard(cond, stmt)
+}
+
+// --- shrink generators ---------------------------------------------------
+//
+// DBCC SHRINKFILE does not fit the WITH-clause builder used by index/table DDL:
+// its WAIT_AT_LOW_PRIORITY has no MAX_DURATION and is not nested in ONLINE = ON.
+// These dedicated helpers are called per chunk by the runtime shrink driver.
+
+// shrinkWith renders the trailing " WITH ..." for a shrink statement. WALP is
+// emitted only when resolved on; NO_INFOMSGS is always added to cut noise.
+func shrinkWith(res ResolvedOptions) string {
+	if res.WaitAtLowPriority {
+		return fmt.Sprintf(" WITH WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = %s), NO_INFOMSGS", res.AbortAfterWait)
+	}
+	return " WITH NO_INFOMSGS"
+}
+
+// ShrinkChunkSQL builds one page-moving shrink statement: DBCC SHRINKFILE with a
+// target size in megabytes. file is a logical file name (sys.database_files.name).
+func ShrinkChunkSQL(file string, targetMB int, res ResolvedOptions) string {
+	return fmt.Sprintf("DBCC SHRINKFILE (%s, %d)%s;", nLiteral(file), targetMB, shrinkWith(res))
+}
+
+// ShrinkTruncateOnlySQL builds a TRUNCATEONLY shrink: it releases trailing free
+// space without moving pages (no fragmentation, no target size). WALP does not
+// apply, so NO_INFOMSGS is the only option.
+func ShrinkTruncateOnlySQL(file string) string {
+	return fmt.Sprintf("DBCC SHRINKFILE (%s, TRUNCATEONLY) WITH NO_INFOMSGS;", nLiteral(file))
+}
+
+// generateShrink returns an INDICATIVE statement for a shrink operation. The real
+// SQL is multi-statement and built at run time by the shrink driver: target sizes
+// come from live DMV reads and files:all expands to one op per file. So
+// PlannedOperation.SQL for a shrink is illustrative only; the engine routes shrink
+// operations to the driver rather than executing this string.
+func generateShrink(o Shrink, res ResolvedOptions) string {
+	return fmt.Sprintf(
+		"-- shrink is built at run time per chunk; representative statement:\n"+
+			"DBCC SHRINKFILE (%s, <target_mb>)%s;",
+		nLiteral(o.FilesOrAll()), shrinkWith(res))
 }
 
 func renderLiteral(l Literal) string {

@@ -51,6 +51,14 @@ type Decision struct {
 // resolved options and an explanation trail.
 func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []Decision) {
 	cmd := op.CommandType()
+
+	// Shrink does not share the index/table option model: DBCC SHRINKFILE has no
+	// ONLINE clause, so the "WALP requires ONLINE" dependency must never fire, and
+	// online/resumable/sort_in_tempdb are not options here. Resolve WALP alone.
+	if cmd == "shrink_data" || cmd == "shrink_log" {
+		return resolveShrink(op, t, m, p)
+	}
+
 	ov := overridesOf(op)
 
 	app := func(option string) bool {
@@ -153,6 +161,37 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	return res, decisions
 }
 
+// resolveShrink resolves options for a DBCC SHRINKFILE operation. Only
+// WAIT_AT_LOW_PRIORITY is injectable (2022+, data files only — gated by the
+// matrix). There is no ONLINE clause for DBCC, so no "WALP requires ONLINE"
+// dependency is applied and no MAX_DURATION is emitted (the engine fixes the
+// shrink WALP timeout at ~1 minute). ABORT_AFTER_WAIT defaults to SELF and only
+// becomes BLOCKERS when the global policy opts in.
+func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []Decision) {
+	cmd := op.CommandType()
+	ov := overridesOf(op)
+
+	app := m.Applicable(t.MajorVersion, t.Tier, cmd, "wait_at_low_priority")
+	walp, reason, relevant, _ := pickBool(app, true, ov.WaitAtLowPriority, p.WaitAtLowPriority)
+
+	res := ResolvedOptions{WaitAtLowPriority: walp}
+	if walp {
+		res.AbortAfterWait = "SELF"
+		if p.AllowAbortBlockers {
+			res.AbortAfterWait = "BLOCKERS"
+		}
+		// No MAX_DURATION for shrink WALP: the engine uses a fixed ~1-minute wait.
+	}
+
+	var decisions []Decision
+	if relevant {
+		decisions = append(decisions, Decision{
+			Option: "wait_at_low_priority", Value: onOff(walp), Reason: reason,
+		})
+	}
+	return res, decisions
+}
+
 // pickBool resolves one boolean option. defaultOn selects the auto behaviour:
 // safety options default to applicability, tuning options default to off.
 // A forced-on but unsupported option is omitted. It returns the value, a reason,
@@ -191,6 +230,8 @@ func overridesOf(op Operation) OptionOverrides {
 	case AlterColumn:
 		return o.Options
 	case AddConstraint:
+		return o.Options
+	case Shrink:
 		return o.Options
 	default:
 		return OptionOverrides{}

@@ -2,6 +2,7 @@ package ddl_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -186,6 +187,75 @@ func TestGenerate(t *testing.T) {
 				t.Errorf("Generate() mismatch:\n got: %s\nwant: %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestShrinkChunkSQL(t *testing.T) {
+	tests := []struct {
+		name string
+		file string
+		mb   int
+		res  ddl.ResolvedOptions
+		want string
+	}{
+		{
+			name: "with WALP",
+			file: "MyDb_Data",
+			mb:   8192,
+			res:  ddl.ResolvedOptions{WaitAtLowPriority: true, AbortAfterWait: "SELF"},
+			want: "DBCC SHRINKFILE (N'MyDb_Data', 8192) WITH WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF), NO_INFOMSGS;",
+		},
+		{
+			name: "WALP blockers",
+			file: "MyDb_Data",
+			mb:   512,
+			res:  ddl.ResolvedOptions{WaitAtLowPriority: true, AbortAfterWait: "BLOCKERS"},
+			want: "DBCC SHRINKFILE (N'MyDb_Data', 512) WITH WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = BLOCKERS), NO_INFOMSGS;",
+		},
+		{
+			name: "no WALP",
+			file: "MyDb_Data",
+			mb:   1024,
+			res:  ddl.ResolvedOptions{},
+			want: "DBCC SHRINKFILE (N'MyDb_Data', 1024) WITH NO_INFOMSGS;",
+		},
+		{
+			name: "escapes quote in file name",
+			file: "weird'name",
+			mb:   100,
+			res:  ddl.ResolvedOptions{},
+			want: "DBCC SHRINKFILE (N'weird''name', 100) WITH NO_INFOMSGS;",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ddl.ShrinkChunkSQL(tt.file, tt.mb, tt.res); got != tt.want {
+				t.Errorf("ShrinkChunkSQL() =\n got: %s\nwant: %s", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShrinkTruncateOnlySQL(t *testing.T) {
+	got := ddl.ShrinkTruncateOnlySQL("MyDb_Data")
+	want := "DBCC SHRINKFILE (N'MyDb_Data', TRUNCATEONLY) WITH NO_INFOMSGS;"
+	if got != want {
+		t.Errorf("ShrinkTruncateOnlySQL() =\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestGenerateShrinkIsIndicative(t *testing.T) {
+	op := ddl.Shrink{Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%"}
+	got, err := ddl.Generate(op, ddl.ResolvedOptions{WaitAtLowPriority: true, AbortAfterWait: "SELF"})
+	if err != nil {
+		t.Fatalf("Generate(shrink) error = %v, want nil", err)
+	}
+	// Indicative only: a leading comment and a <target_mb> placeholder, never a
+	// concrete chunk size (the driver fills that at run time).
+	for _, sub := range []string{"-- shrink is built at run time", "<target_mb>", "N'MyDb_Data'", "WAIT_AT_LOW_PRIORITY"} {
+		if !strings.Contains(got, sub) {
+			t.Errorf("Generate(shrink) = %q, want it to contain %q", got, sub)
+		}
 	}
 }
 
