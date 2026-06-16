@@ -1,0 +1,107 @@
+package run
+
+import "time"
+
+// ShrinkTuning is the run-side carrier of the DBCC SHRINKFILE driver parameters.
+// It mirrors config.ShrinkConfig but lives here so internal/run stays free of the
+// config package: the engine consumes primitives (durations/ints), exactly as it
+// consumes ddl.Policy rather than the raw config. cmd maps config.ShrinkConfig
+// into a ShrinkTuning when wiring the engine.
+type ShrinkTuning struct {
+	InitialStepSmallMB   int           // reclaim < 5 GB
+	InitialStepMediumMB  int           // reclaim 5–50 GB
+	InitialStepLargeMB   int           // reclaim > 50 GB
+	MinStepMB            int           // step floor
+	MaxStepMB            int           // step ceiling
+	TargetBatch          time.Duration // ideal per-chunk duration
+	MaxNoProgress        int           // consecutive no-gain chunks before clean stop
+	NoProgressBackoff    time.Duration // initial backoff after a no-progress chunk
+	NoProgressBackoffMax time.Duration // backoff ceiling
+	SelfWaitTimeout      time.Duration // max wait while blocked (Sch-M/snapshot)
+	LogReuseWaitTimeout  time.Duration // max wait for a scheduled log backup
+}
+
+// WaitDeltas captures the per-chunk change in the waits that gate shrink stepsize:
+// average WRITELOG and PAGEIOLATCH_EX latency (milliseconds) and how long this
+// shrink blocked other sessions (seconds). These are deltas measured over a single
+// chunk — never the cumulative values from sys.dm_os_wait_stats, which would bias
+// every decision toward the server's lifetime history.
+type WaitDeltas struct {
+	WriteLogAvgMs      float64
+	PageIOLatchExAvgMs float64
+	BlockingSeconds    float64
+}
+
+// Stepsize thresholds (documented constants, not exposed in config): they classify
+// the volume to reclaim into the small/medium/large initial-step tiers.
+const (
+	reclaimSmallCeilingMB  = 5 * 1024  // < 5 GB
+	reclaimMediumCeilingMB = 50 * 1024 // 5–50 GB
+)
+
+// Wait thresholds that gate the step adjustment (design §7.2).
+const (
+	writeLogReduceMs      = 10 // WRITELOG avg above this → I/O is the bottleneck
+	pageIOLatchReduceMs   = 20 // PAGEIOLATCH_EX avg above this → read I/O is the bottleneck
+	ioLatchGrowMs         = 5  // both latencies below this → headroom to grow
+	blockingReduceSeconds = 30 // blocking others longer than this → back off
+)
+
+// InitialStepMB picks the starting chunk size in megabytes from the volume to
+// reclaim. The tiers are deliberately conservative starting points; AdjustStepMB
+// raises the step from here when the I/O keeps up.
+func InitialStepMB(reclaimMB int, t ShrinkTuning) int {
+	switch {
+	case reclaimMB < reclaimSmallCeilingMB:
+		return t.InitialStepSmallMB
+	case reclaimMB <= reclaimMediumCeilingMB:
+		return t.InitialStepMediumMB
+	default:
+		return t.InitialStepLargeMB
+	}
+}
+
+// AdjustStepMB returns the next chunk size given the last chunk's duration and wait
+// deltas. It halves the step under I/O pressure or sustained blocking, doubles it
+// when I/O is light and the chunk finished within the target batch duration, and
+// clamps the result to [MinStepMB, MaxStepMB]. Reduction takes precedence: the two
+// conditions are mutually exclusive in practice (one needs high latency, the other
+// low), but the order makes the safe choice explicit.
+func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning) int {
+	reduce := w.WriteLogAvgMs > writeLogReduceMs ||
+		w.PageIOLatchExAvgMs > pageIOLatchReduceMs ||
+		w.BlockingSeconds > blockingReduceSeconds
+	grow := w.WriteLogAvgMs < ioLatchGrowMs &&
+		w.PageIOLatchExAvgMs < ioLatchGrowMs &&
+		w.BlockingSeconds == 0 &&
+		elapsed < t.TargetBatch
+
+	switch {
+	case reduce:
+		step /= 2
+	case grow:
+		step *= 2
+	}
+	return clampStep(step, t.MinStepMB, t.MaxStepMB)
+}
+
+// clampStep bounds step to [min, max].
+func clampStep(step, min, max int) int {
+	if step < min {
+		return min
+	}
+	if step > max {
+		return max
+	}
+	return step
+}
+
+// NextTargetMB is the target size for the next chunk: one step below current, but
+// never past the final target. The last chunk therefore lands exactly on final.
+func NextTargetMB(current, step, final int) int {
+	next := current - step
+	if next < final {
+		return final
+	}
+	return next
+}
