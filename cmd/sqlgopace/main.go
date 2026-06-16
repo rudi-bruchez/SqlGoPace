@@ -1,7 +1,7 @@
 // Command sqlgopace runs demanding DDL operations against Microsoft SQL Server
 // while monitoring their impact on locking and the transaction log.
 //
-// See specs/SPECS.md for the full behaviour and specs/IMPLEMENTATION.md for the
+// See specs/SPECS.md for the full behavior and specs/IMPLEMENTATION.md for the
 // implementation plan. So far only offline planning (--dry-run / --explain) is
 // wired, optionally connecting to detect the real target; execution and
 // monitoring are added in later phases.
@@ -165,8 +165,8 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
 
-	// --auto: analyse and materialise maintenance manifests into the queue before
-	// the engine processes it. Materialising (rather than running purely in memory)
+	// --auto: analyze and materialize maintenance manifests into the queue before
+	// the engine processes it. Materializing (rather than running purely in memory)
 	// means a crash mid-run leaves recoverable manifests + sidecars, like any run.
 	if auto.enabled {
 		if err := runAuto(ctx, stdout, conn, cfg, auto); err != nil {

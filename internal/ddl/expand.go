@@ -41,7 +41,7 @@ func (k IndexKind) String() string {
 // supportsOnlineRebuild reports whether an index of this kind accepts the ONLINE
 // family of options (ONLINE, RESUMABLE, WAIT_AT_LOW_PRIORITY). Only rowstore
 // indexes do; columnstore/XML/spatial rebuild offline. KindUnknown is treated as
-// rowstore so single named indexes keep their version/edition-driven behaviour.
+// rowstore so single named indexes keep their version/edition-driven behavior.
 func (k IndexKind) supportsOnlineRebuild() bool {
 	return k == KindUnknown || k == KindRowstore
 }

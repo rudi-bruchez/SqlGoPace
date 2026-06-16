@@ -14,7 +14,7 @@ import (
 // the supervisor, which reacts under pressure. To pause a resumable operation it
 // aborts the running statement (a context cancel that pauses the operation while
 // preserving its work), waits for relief, then issues ALTER INDEX ... RESUME; a
-// non-resumable operation is cancelled and retried up to MaxRetries. An explicit
+// non-resumable operation is canceled and retried up to MaxRetries. An explicit
 // KILL is only a fallback when the abort does not stop the statement in time.
 type MonitoredRunner struct {
 	exec            Executor
@@ -78,7 +78,7 @@ func (r *MonitoredRunner) Run(ctx context.Context, op ddl.Operation, sql string,
 
 // runOnce executes the operation under monitoring, pausing and resuming a
 // resumable operation under pressure until it completes. It returns ErrCancelled
-// when a non-resumable operation is cancelled under pressure, so Run retries it.
+// when a non-resumable operation is canceled under pressure, so Run retries it.
 func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql string, caps Capabilities, sink ReactionSink) error {
 	return runLoop(
 		sql,
@@ -130,7 +130,7 @@ func runLoop(sql string, runStatement func(string) (Action, error), waitForRelie
 }
 
 // runStatement runs one statement under monitoring. On a Pause or Cancel decision
-// it stops the statement by cancelling the execution context — an attention that
+// it stops the statement by canceling the execution context — an attention that
 // aborts the statement, which pauses a resumable operation while keeping the
 // pinned connection alive for a later RESUME. If the statement does not stop
 // within the grace period, it issues an explicit KILL as a fallback. Reactions

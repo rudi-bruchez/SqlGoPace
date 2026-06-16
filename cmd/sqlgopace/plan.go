@@ -489,7 +489,7 @@ func planMulti(ctx context.Context, stdout io.Writer, conn *mssql.Conn, cfg *con
 		plan, err := analyseDatabase(ctx, dbConn, profile, cats, db, stdout)
 		_ = dbConn.Close()
 		if err != nil {
-			fmt.Fprintf(stdout, "-- skip database %s: analyse: %v\n", db, err)
+			fmt.Fprintf(stdout, "-- skip database %s: analyze: %v\n", db, err)
 			continue
 		}
 		if explain {
@@ -530,8 +530,8 @@ func autoPlan(ctx context.Context, r analysisReader, profile *maint.Profile, cat
 	return manifestsFromPlan(plan, db), plan, nil
 }
 
-// runAuto implements the run path's --auto flag: analyse the connected database and
-// materialise the generated maintenance manifests into the queue (the config's
+// runAuto implements the run path's --auto flag: analyze the connected database and
+// materialize the generated maintenance manifests into the queue (the config's
 // to_run), so the engine then processes them like any other manifests. It records
 // the analysis to history, same as the plan subcommand.
 func runAuto(ctx context.Context, w io.Writer, conn *mssql.Conn, cfg *config.Config, a autoConfig) error {
@@ -544,7 +544,7 @@ func runAuto(ctx context.Context, w io.Writer, conn *mssql.Conn, cfg *config.Con
 		return err
 	}
 
-	// Multi-database --auto: materialise per-database manifest blocks into the
+	// Multi-database --auto: materialize per-database manifest blocks into the
 	// queue; runEngine's per-database loop then executes them.
 	if a.allDatabases || strings.TrimSpace(a.databases) != "" {
 		return planMulti(ctx, w, conn, cfg, profile, cats, cfg.Directories.ToRun, a.allDatabases, splitDatabases(a.databases), false, false)
@@ -557,7 +557,7 @@ func runAuto(ctx context.Context, w io.Writer, conn *mssql.Conn, cfg *config.Con
 		}
 	}
 
-	fmt.Fprintf(w, "-- auto: analysing %s\n", db)
+	fmt.Fprintf(w, "-- auto: analyzing %s\n", db)
 	manifests, plan, err := autoPlan(ctx, conn, profile, cats, db, w)
 	if err != nil {
 		return err

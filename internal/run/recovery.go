@@ -106,7 +106,7 @@ type Recoverer struct {
 	out       io.Writer
 }
 
-// RecovererOption configures optional Recoverer behaviour.
+// RecovererOption configures optional Recoverer behavior.
 type RecovererOption func(*Recoverer)
 
 // WithRecoveryProbes enables per-database recovery: orphans whose sidecar names a

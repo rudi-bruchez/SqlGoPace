@@ -85,7 +85,7 @@ func (a Action) String() string {
 
 // DecideReaction selects the least-destructive reaction for the current pressure
 // and capabilities. A resumable operation is paused (which relieves both blocking
-// and log pressure while preserving work); otherwise the operation is cancelled.
+// and log pressure while preserving work); otherwise the operation is canceled.
 func DecideReaction(p Pressure, c Capabilities) Action {
 	switch {
 	case !p.Any():

@@ -192,7 +192,7 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 	return res, decisions
 }
 
-// pickBool resolves one boolean option. defaultOn selects the auto behaviour:
+// pickBool resolves one boolean option. defaultOn selects the auto behavior:
 // safety options default to applicability, tuning options default to off.
 // A forced-on but unsupported option is omitted. It returns the value, a reason,
 // whether the option is worth explaining, and whether it came from an override.

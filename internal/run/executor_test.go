@@ -216,7 +216,7 @@ func TestRunLoopPausesRepeatedly(t *testing.T) {
 }
 
 func TestRunLoopReliefErrorPropagates(t *testing.T) {
-	boom := errors.New("ctx cancelled while waiting")
+	boom := errors.New("ctx canceled while waiting")
 	s := &stmtRun{actions: []Action{Pause}, errs: []error{nil}, reliefErr: boom}
 	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, boom) {
 		t.Errorf("runLoop() = %v, want %v", err, boom)

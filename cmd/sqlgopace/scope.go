@@ -22,7 +22,7 @@ type dbSkip struct {
 //     still enforced; an unknown or ineligible name is skipped with a reason);
 //   - else --all-databases ∩ the profile scope (scope-excluded databases are
 //     dropped silently — that is intentional, not a skip-worthy surprise);
-//   - else the connected database only (today's single-database behaviour).
+//   - else the connected database only (today's single-database behavior).
 //
 // `all` is the eligibility sweep (mssql.UserDatabases); `connected` is the
 // connection's current database. The function is pure and table-tested.

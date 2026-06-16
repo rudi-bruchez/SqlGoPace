@@ -1,41 +1,55 @@
-# golangci-lint configuration for SqlGoPace.
+# golangci-lint configuration for SqlGoPace (schema v2).
 # Run with: golangci-lint run
-run:
-  timeout: 3m
-
+# errcheck / govet / staticcheck / ineffassign / unused are part of the v2 default
+# set and run without being listed here.
+version: "2"
 linters:
   enable:
-    - errcheck
-    - govet
-    - staticcheck
-    - ineffassign
-    - unused
-    - revive
-    - gofmt
-    - goimports
-    - misspell
-    - gocritic
-    - errorlint      # enforce %w / errors.Is/As usage
     - bodyclose
+    - errorlint
+    - gocritic
+    - misspell
     - nilerr
-    - unconvert
     - prealloc
-
-linters-settings:
-  goimports:
-    local-prefixes: github.com/rudi-bruchez/SqlGoPace
-  revive:
+    - revive
+    - unconvert
+  settings:
+    misspell:
+      locale: US
+    revive:
+      rules:
+        - name: exported
+          arguments:
+            - checkPrivateReceivers
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
     rules:
-      - name: exported
-        arguments: [checkPrivateReceivers]
-  misspell:
-    locale: US
-
+      - linters:
+          - prealloc
+        path: _test\.go
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0
-  exclude-rules:
-    # Test files may be a little looser.
-    - path: _test\.go
-      linters:
-        - prealloc
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/rudi-bruchez/SqlGoPace
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

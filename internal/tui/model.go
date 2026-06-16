@@ -34,7 +34,7 @@ func (s Status) String() string {
 	case StatusPaused:
 		return "PAUSED"
 	case StatusCancelling:
-		return "CANCELLING"
+		return "CANCELING"
 	case StatusDone:
 		return "DONE"
 	default:

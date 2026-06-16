@@ -120,7 +120,7 @@ type Engine struct {
 	out              io.Writer
 }
 
-// EngineOption configures optional Engine behaviour.
+// EngineOption configures optional Engine behavior.
 type EngineOption func(*Engine)
 
 // WithADR sets the target's Accelerated Database Recovery state (biases reactions).
@@ -159,7 +159,7 @@ func WithProgress(p ProgressReader) EngineOption { return func(e *Engine) { e.pr
 // (from sys.dm_exec_session_wait_stats). Requires a session for the SPID.
 func WithWaits(w WaitReader) EngineOption { return func(e *Engine) { e.waits = w } }
 
-// WithResumeCheck lets the engine recognise an interrupted-but-paused resumable
+// WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
 func WithResumeCheck(p ResumableProbe) EngineOption { return func(e *Engine) { e.resumeCheck = p } }
 
@@ -177,7 +177,7 @@ func WithReconnectTimeout(d time.Duration) EngineOption {
 func WithDatabase(name string) EngineOption { return func(e *Engine) { e.database = name } }
 
 // NewEngine wires an Engine over the lifecycle directories and required
-// dependencies; optional behaviour is supplied via options.
+// dependencies; optional behavior is supplied via options.
 func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, pf Preflighter, runner OpRunner, opts ...EngineOption) *Engine {
 	e := &Engine{
 		dirs:   dirs,
@@ -580,7 +580,7 @@ func shrinkReport(results []ShrinkResult) []report.ShrinkFileReport {
 	return out
 }
 
-// cancelSafe reports whether cancelling op under pressure is a clean stop with no
+// cancelSafe reports whether canceling op under pressure is a clean stop with no
 // expensive rollback: a REORGANIZE commits incrementally, DBCC CHECKDB is a
 // read-only snapshot, and UPDATE STATISTICS rolls back cheaply. Heavy builders
 // (REBUILD index/heap, CREATE INDEX, ALTER COLUMN, ADD CONSTRAINT) are not.

@@ -9,7 +9,7 @@ import (
 )
 
 // Executor runs and controls a single DDL operation against the server. Pausing a
-// resumable operation is done by aborting the running statement (cancelling its
+// resumable operation is done by aborting the running statement (canceling its
 // context), not by a separate ALTER INDEX PAUSE, so the interface only needs to
 // run, identify, and kill the execution session.
 type Executor interface {
@@ -42,14 +42,14 @@ type Sampler interface {
 	Log(ctx context.Context) (LogSample, error)
 }
 
-// ErrCancelled signals the operation was cancelled under pressure and may be
+// ErrCancelled signals the operation was canceled under pressure and may be
 // retried by the caller.
-var ErrCancelled = errors.New("operation cancelled under pressure")
+var ErrCancelled = errors.New("operation canceled under pressure")
 
 // supervise monitors one running statement and returns the reaction to take,
 // along with the pressure that triggered it. It returns (Continue, _, err) when
 // the statement finishes on its own (err is nil on success) or the context is
-// cancelled, and (Pause|Cancel, pressure, nil) when sustained pressure warrants
+// canceled, and (Pause|Cancel, pressure, nil) when sustained pressure warrants
 // stopping the statement. samples streams snapshots; done delivers the statement
 // result. Blocking pressure is debounced over blockingTimeout.
 func supervise(
