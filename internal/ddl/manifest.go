@@ -33,12 +33,15 @@ type ObjectRef struct {
 }
 
 // String renders the reference for logs and reports: the database alone for a
-// database-scoped operation, "schema.table" for a table-level operation (no named
-// object), else "schema.table.name".
+// database-scoped operation, the logical file name for a file-scoped operation
+// (shrink), "schema.table" for a table-level operation (no named object), else
+// "schema.table.name".
 func (r ObjectRef) String() string {
 	switch {
 	case r.Database != "" && r.Schema == "" && r.Table == "":
 		return r.Database
+	case r.Schema == "" && r.Table == "":
+		return r.Name // file-scoped (shrink): the logical file name
 	case r.Name == "":
 		return r.Schema + "." + r.Table
 	default:

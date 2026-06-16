@@ -69,6 +69,11 @@ func TestCheckOperation(t *testing.T) {
 		{"add column already exists", ddl.AddColumn{Schema: "dbo", Table: "T", Column: "C", DataType: "BIT"}, true, true, preflight.Warn},
 		{"alter column missing", ddl.AlterColumn{Schema: "dbo", Table: "T", Column: "C", DataType: "BIT"}, true, false, preflight.Fail},
 		{"drop constraint missing", ddl.DropConstraint{Schema: "dbo", Table: "T", Constraint: "PK"}, true, false, preflight.Fail},
+		// Database- and file-scoped operations have no table precondition: they must
+		// pass even when no table by that (empty) name exists.
+		{"shrink data passes without a table", ddl.Shrink{Type: "data", Files: "all"}, false, false, preflight.Pass},
+		{"shrink log passes without a table", ddl.Shrink{Type: "log", Files: "MyDb_Log"}, false, false, preflight.Pass},
+		{"check_db passes without a table", ddl.CheckDB{Database: "MyDb"}, false, false, preflight.Pass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -142,6 +147,21 @@ func TestRun(t *testing.T) {
 		}
 		if !rep.HasFailure() {
 			t.Errorf("Run() should fail when the target index is missing")
+		}
+	})
+
+	t.Run("file-scoped shrink passes without a matching table", func(t *testing.T) {
+		p := healthyProber()
+		p.tableExists = false // no table named "" exists; shrink must not require one
+		shrinkManifest := &ddl.Manifest{Operations: []ddl.Operation{
+			ddl.Shrink{Type: "data", Files: "all"},
+		}}
+		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.OK() {
+			t.Errorf("Run() report not OK for a shrink manifest:\n%v", rep.Checks)
 		}
 	})
 
