@@ -93,6 +93,10 @@ dedicated test database — never a shared/sensitive one. The footprint is small
 - `ALTER ANY CONNECTION` (or sysadmin/processadmin) — only needed to exercise the
   `KILL` path (a blocker exceeding the timeout). Not required for a rebuild
   without contention.
+- **`DBCC SHRINKFILE`** (the `shrink` operation / `TestE2EShrinkData`) requires
+  `db_owner` on the test database (or `sysadmin`). `db_ddladmin` is **not** enough
+  to shrink files. The shrink reads (file space, `sys.dm_db_log_info`) are covered
+  by the database-level access already granted plus `VIEW SERVER STATE`.
 
 ## What is covered
 
@@ -103,6 +107,12 @@ dedicated test database — never a shared/sensitive one. The footprint is small
   real `cli(--config …)` path (connect → detect → preflight → plan → execute under
   monitoring → move to `03.done` + write the run log), and asserts the manifest
   landed in `done` with its `.log`. Cleans up the table afterwards.
+- **`cmd/sqlgopace`** (`TestE2EShrinkData`): grows the data file with a wide table
+  then drops it, runs a `shrink` (`type: data`, `files: all`) manifest through the
+  real CLI, and asserts a successful run carrying a per-file shrink summary in the
+  log (a reduction or a no-op are both valid depending on the reclaimable space).
+- **`internal/mssql`** (`shrink_integration_test.go`): `FileSpace`, `FileSizeMB`,
+  `LogReuse`, `ActiveLogFloorMB` against the live database.
 
 ## CI
 

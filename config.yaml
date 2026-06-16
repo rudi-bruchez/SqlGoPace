@@ -53,4 +53,21 @@ history:
   enabled: true
   destination: "sqlite://./sqlgopace_history.db"
 
+# Tuning for the `shrink` operation (DBCC SHRINKFILE). Entirely OPTIONAL: omit the
+# whole block and every field below takes its default. Global only (never per-manifest)
+# — these depend on the instance's storage and SLA. They are starting points and bounds
+# the driver's dynamic calibration varies, so usually left untouched.
+shrink:
+  initial_step_small_mb:  100   # initial chunk when reclaiming < 5 GB
+  initial_step_medium_mb: 250   # 5–50 GB
+  initial_step_large_mb:  500   # > 50 GB
+  min_step_mb:             50    # chunk floor
+  max_step_mb:           1024    # chunk ceiling
+  target_batch_seconds:     5    # aim each chunk at a few seconds
+  max_no_progress:          3    # consecutive no-gain chunks before a clean stop
+  no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
+  no_progress_backoff_max_seconds: 300   # backoff ceiling
+  self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
+  log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
+
 matrix_file: "./ddl_compatibility.yaml"

@@ -129,6 +129,77 @@ matrix_file: '%s'
 	return path
 }
 
+// seedFreeSpace grows the connected database's data file with a wide table, then
+// drops it, leaving reclaimable free space for a shrink to act on. It is
+// best-effort: if the file does not grow past its minimum the shrink is a valid
+// no-op, which the test accepts.
+func seedFreeSpace(t *testing.T, dsn string) {
+	t.Helper()
+	ctx := context.Background()
+
+	conn, err := mssql.Open(ctx, dsn, "test")
+	if err != nil {
+		t.Fatalf("open setup connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	stmts := []string{
+		"IF OBJECT_ID('dbo.sqlgopace_shrink_e2e','U') IS NOT NULL DROP TABLE dbo.sqlgopace_shrink_e2e;",
+		"CREATE TABLE dbo.sqlgopace_shrink_e2e (id INT IDENTITY PRIMARY KEY, payload CHAR(2000) NOT NULL);",
+		"INSERT INTO dbo.sqlgopace_shrink_e2e (payload) SELECT TOP (40000) 'x' FROM sys.all_objects a CROSS JOIN sys.all_objects b;",
+		"DROP TABLE dbo.sqlgopace_shrink_e2e;", // frees the pages so the file can shrink
+		"CHECKPOINT;",
+	}
+	for _, s := range stmts {
+		if err := conn.ExecDDL(ctx, s); err != nil {
+			t.Fatalf("seed statement %q: %v", s, err)
+		}
+	}
+}
+
+const e2eShrinkManifest = `
+description: e2e shrink data
+operations:
+  - operation: shrink
+    type: data
+    files: all
+    targetfreespace: 10%
+`
+
+func TestE2EShrinkData(t *testing.T) {
+	dsn := e2eDSN(t)
+	seedFreeSpace(t, dsn)
+
+	root := t.TempDir()
+	toRun := filepath.Join(root, "01.to_run")
+	if err := os.MkdirAll(toRun, 0o755); err != nil {
+		t.Fatalf("mkdir to_run: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(toRun, "010_shrink.yaml"), []byte(e2eShrinkManifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	cfgPath := writeE2EConfig(t, root, dsn)
+
+	var out bytes.Buffer
+	if err := cli(&out, &out, []string{"--config", cfgPath}); err != nil {
+		t.Fatalf("cli(run) error = %v\n--- output ---\n%s", err, out.String())
+	}
+
+	donePath := filepath.Join(root, "03.done", "010_shrink.yaml")
+	if _, err := os.Stat(donePath); err != nil {
+		t.Errorf("manifest not in done: %v\n--- output ---\n%s", err, out.String())
+	}
+	logBytes, err := os.ReadFile(donePath + ".log")
+	if err != nil {
+		t.Fatalf("run log not written: %v", err)
+	}
+	// The run log must carry a per-file shrink summary (a reduction or a no-op are
+	// both valid successful outcomes depending on the seeded free space).
+	if !bytes.Contains(logBytes, []byte("shrink ")) {
+		t.Errorf("run log missing a shrink summary\n--- log ---\n%s", logBytes)
+	}
+}
+
 func TestE2ERebuildIndex(t *testing.T) {
 	dsn := e2eDSN(t)
 	seedTable(t, dsn)

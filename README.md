@@ -114,7 +114,28 @@ Key `config.yaml` sections:
 | `options_override` | Force `online` / `resumable` / `wait_at_low_priority` / `maxdop` / `sort_in_tempdb` on/off/auto, globally. |
 | `notifications`    | Optional webhook URL and the events that trigger it.                    |
 | `history`          | Optional SQLite run history.                                            |
+| `shrink`           | Tuning for the `shrink` driver (chunk sizes, batch target, no-progress/self-wait/log-reuse timeouts). Optional — every field defaults. |
 | `matrix_file`      | Path to the DDL compatibility matrix (resolved relative to the config). |
+
+The `shrink:` block is **entirely optional** — omit it and every field takes the default
+below. The values are global only (they depend on the instance's storage and SLA, not on a
+manifest) and are starting points and bounds that the driver's dynamic calibration varies; an
+operator usually only touches them for atypical storage.
+
+```yaml
+shrink:
+  initial_step_small_mb:  100   # initial chunk when reclaiming < 5 GB
+  initial_step_medium_mb: 250   # 5–50 GB
+  initial_step_large_mb:  500   # > 50 GB
+  min_step_mb:             50    # chunk floor (below this, per-loop overhead dominates)
+  max_step_mb:           1024    # chunk ceiling (don't saturate I/O in one move)
+  target_batch_seconds:     5    # aim each chunk at a few seconds → vivid reactions
+  max_no_progress:          3    # consecutive no-gain chunks before stopping cleanly
+  no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
+  no_progress_backoff_max_seconds: 300   # backoff ceiling
+  self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
+  log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
+```
 
 ## Manifest format
 
@@ -158,6 +179,61 @@ operations:
 | `drop_column`     | `ALTER TABLE … DROP COLUMN …`              |
 | `add_constraint`  | `ALTER TABLE … ADD CONSTRAINT … WITH (…)`  |
 | `drop_constraint` | `ALTER TABLE … DROP CONSTRAINT …`          |
+| `shrink`          | `DBCC SHRINKFILE (…) WITH (…)`             |
+
+### Shrinking files: `operation: shrink`
+
+`shrink` reclaims space from a database's **data** or **log** files with `DBCC SHRINKFILE`,
+driven file by file. Unlike the other operations it is not one statement: the driver reads the
+file's space at run time, runs a free `TRUNCATEONLY` pass first, then moves pages in
+**calibrated chunks**, adjusting the chunk size from the I/O and log waits each chunk produced.
+Because every internal batch commits, a shrink can be stopped at any time with no rollback and
+is **re-entrant** — re-running toward the same target resumes where it left off.
+
+```yaml
+# Reclaim space from all data files, leaving ~10% free above what's used:
+- operation: shrink
+  type: data            # "data" | "log"
+  files: all            # "all" (every file of the type) | a logical file name
+  targetfreespace: 10%  # free space wanted in the final file: "N%" or "N MB"
+  options:
+    wait_at_low_priority: true   # 2022+ only (matrix-gated); auto if omitted
+
+# Reclaim a specific log file down to ~50 MB of free space:
+- operation: shrink
+  type: log
+  files: MyDb_Log
+  targetfreespace: 50MB
+```
+
+- **`type`** (required): `data` or `log` — selects the eligible files and the algorithm
+  (chunked page-move for data; truncation for log).
+- **`files`** (default `all`): a logical file name (`sys.database_files.name`), or `all` to
+  shrink every file of the type, one at a time (never two of a filegroup in parallel).
+- **`targetfreespace`**: the free space wanted in the final file, as a **percent of used
+  space** (`N%` ⇒ final ≈ `used × (1 + N/100)`) or an absolute `N MB` (final ≈ `used + N`).
+  Always clamped to the floor a file can actually reach (its used space, or the active VLFs
+  for a log).
+- **`emptyfile`**: reserved for a future release; `true` is rejected in this version.
+- **`options.wait_at_low_priority`**: auto by default. On SQL Server 2022+ it is injected for
+  **data** shrinks so the schema-modify lock waits at low priority instead of blocking queries.
+  It does not apply to log files. `DBCC SHRINKFILE` takes no `MAXDOP`.
+
+Behaviour worth knowing:
+
+- **Automatic `TRUNCATEONLY`** is always tried first — if the free space is already at the end
+  of the file, it is reclaimed instantly with no page movement (and no fragmentation).
+- **No-op** when there is nothing to reclaim (no free space, or the target is not below the
+  current size): reported as a successful "nothing to reclaim".
+- **Log files**: in **SIMPLE** recovery a `CHECKPOINT` is issued, then the log is shrunk. In
+  **FULL/BULK_LOGGED**, if the log cannot yet be truncated (e.g. awaiting a log backup),
+  SqlGoPace **waits** — bounded by `log_reuse_wait_timeout_minutes` — for the environment's
+  scheduled backup to free the log, then shrinks; it **never issues `BACKUP LOG` itself** and
+  abandons cleanly (work preserved) if the wait times out.
+- **Fragmentation**: a data-file shrink fragments indexes by design; rebuild/reorganize
+  afterwards if needed. (Automatic before/after fragmentation reporting is a future feature.)
+- Reactions reuse the engine's monitoring: under blocking or log pressure the driver pauses
+  between chunks (free — committed work is kept) and shrinks the next chunk smaller.
 
 ## Usage
 
