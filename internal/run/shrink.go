@@ -237,12 +237,17 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			return result, err
 		}
 
-		// A chunk stopped under pressure: wait for relief before trying again.
+		// A chunk stopped under pressure: wait for relief before trying again. A
+		// log-drain timeout is a clean stop (work preserved); a cancelled context or
+		// any other error is propagated, not swallowed as success.
 		if stopped {
 			if err := r.awaitRelief(ctx, sink); err != nil {
-				result.FinalMB = current
-				result.Reason = "stopped: " + err.Error() + " (work preserved)"
-				return result, nil
+				if errors.Is(err, ErrLogDrainTimeout) {
+					result.FinalMB = current
+					result.Reason = "stopped: log did not drain before timeout (work preserved)"
+					return result, nil
+				}
+				return result, err
 			}
 		}
 
