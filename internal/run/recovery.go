@@ -63,7 +63,7 @@ func DecideRecovery(f RecoveryFacts) RecoveryAction {
 // matchesOrphan reports whether a live session is the one recorded in state. The
 // SPID alone is unreliable (reused), so login_time must match and, when present,
 // the CONTEXT_INFO marker must prefix the session's context_info.
-func matchesOrphan(id mssql.SessionIdentity, st RunState) bool {
+func matchesOrphan(id mssql.SessionIdentity, st State) bool {
 	if !id.Exists || id.LoginTime != st.LoginTime {
 		return false
 	}
@@ -208,7 +208,7 @@ func (r *Recoverer) probeFor(ctx context.Context, database string, cache map[str
 
 // factsWith correlates an orphan's recorded session against the live state read
 // through probe (the probe for the orphan's database).
-func factsWith(ctx context.Context, probe RecoveryProbe, st RunState) (RecoveryFacts, error) {
+func factsWith(ctx context.Context, probe RecoveryProbe, st State) (RecoveryFacts, error) {
 	id, err := probe.SessionIdentity(ctx, st.SPID)
 	if err != nil {
 		return RecoveryFacts{}, fmt.Errorf("session identity for spid %d: %w", st.SPID, err)

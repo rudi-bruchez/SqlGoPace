@@ -6,10 +6,10 @@ import (
 	"os"
 )
 
-// RunState is the sidecar written next to a manifest while it executes. After a
+// State is the sidecar written next to a manifest while it executes. After a
 // crash it lets recovery correlate an orphaned session to its run (SPID +
 // login_time + CONTEXT_INFO marker) and decide whether to resume or abandon.
-type RunState struct {
+type State struct {
 	Manifest  string `json:"manifest"`
 	Database  string `json:"database,omitempty"` // the database the operation ran in (for per-database recovery)
 	SPID      int    `json:"spid"`
@@ -20,7 +20,7 @@ type RunState struct {
 }
 
 // WriteState writes the sidecar state as indented JSON.
-func WriteState(path string, s RunState) error {
+func WriteState(path string, s State) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal run state: %w", err)
@@ -32,14 +32,14 @@ func WriteState(path string, s RunState) error {
 }
 
 // ReadState reads a sidecar state file.
-func ReadState(path string) (RunState, error) {
+func ReadState(path string) (State, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return RunState{}, fmt.Errorf("read run state: %w", err)
+		return State{}, fmt.Errorf("read run state: %w", err)
 	}
-	var s RunState
+	var s State
 	if err := json.Unmarshal(data, &s); err != nil {
-		return RunState{}, fmt.Errorf("unmarshal run state: %w", err)
+		return State{}, fmt.Errorf("unmarshal run state: %w", err)
 	}
 	return s, nil
 }

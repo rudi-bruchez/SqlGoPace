@@ -65,7 +65,7 @@ func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", true, actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58}, {SPID: 61}}})
-	m, _ = send(m, key("x")) // kill selected (first) blocker
+	_, _ = send(m, key("x")) // kill selected (first) blocker; model not needed after
 
 	a, ok := drain(t, actions)
 	if !ok {

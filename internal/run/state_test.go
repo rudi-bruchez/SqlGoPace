@@ -12,7 +12,7 @@ import (
 
 func TestRunStateRoundTrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "010_a.yaml.state.json")
-	state := run.RunState{
+	state := run.State{
 		Manifest:  "010_a.yaml",
 		SPID:      57,
 		Marker:    "0x0123456789abcdeffedcba9876543210",

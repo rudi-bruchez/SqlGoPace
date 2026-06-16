@@ -128,7 +128,7 @@ func (pl Plan) OperationsByCategory(category string) []ddl.Operation {
 // table whose heap is rebuilt is dropped (the heap rebuild rebuilds all its
 // nonclustered indexes). See spec §3.1.
 func Decide(in Input, p *Profile) Plan {
-	var ds []Decision
+	ds := make([]Decision, 0, len(in.Indexes)+len(in.Heaps))
 	for _, m := range in.Indexes {
 		ds = append(ds, DecideIndex(m, p))
 	}

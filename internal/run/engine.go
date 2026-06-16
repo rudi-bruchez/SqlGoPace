@@ -491,7 +491,7 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) {
 
 	marker := e.stampMarker(ctx, name)
 
-	state := RunState{
+	state := State{
 		Manifest:  name,
 		Database:  e.database,
 		SPID:      e.session.SPID(),

@@ -288,20 +288,21 @@ func groupInventory(inv []mssql.InventoryObject) ([][]mssql.InventoryObject, []t
 	var tables []tableRef
 	seenTable := map[int64]bool{}
 
-	var cur []mssql.InventoryObject
-	for _, o := range inv {
-		if len(cur) > 0 && (cur[0].ObjectID != o.ObjectID || cur[0].IndexID != o.IndexID) {
-			groups = append(groups, cur)
-			cur = nil
+	// Each (object, index) group is a contiguous run in inv (the query orders them
+	// adjacent), so groups are sub-slices of inv rather than freshly accumulated.
+	start := 0
+	for i, o := range inv {
+		if i > start && (inv[start].ObjectID != o.ObjectID || inv[start].IndexID != o.IndexID) {
+			groups = append(groups, inv[start:i])
+			start = i
 		}
-		cur = append(cur, o)
 		if !seenTable[o.ObjectID] {
 			seenTable[o.ObjectID] = true
 			tables = append(tables, tableRef{schema: o.Schema, table: o.Table, objectID: o.ObjectID})
 		}
 	}
-	if len(cur) > 0 {
-		groups = append(groups, cur)
+	if len(inv) > start {
+		groups = append(groups, inv[start:])
 	}
 	return groups, tables
 }

@@ -36,6 +36,7 @@ linters:
       - third_party$
       - builtin$
       - examples$
+      - ^tmp/ # throwaway dev helpers, not product code
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

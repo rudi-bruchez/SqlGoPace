@@ -32,7 +32,7 @@ func TestDecideRecovery(t *testing.T) {
 }
 
 func TestMatchesOrphan(t *testing.T) {
-	st := RunState{SPID: 57, LoginTime: "2026-06-10T12:00:00", Marker: "0x0123"}
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00", Marker: "0x0123"}
 
 	tests := []struct {
 		name string
@@ -65,7 +65,7 @@ func (f fakeRecoveryProbe) ResumableOps(context.Context) ([]mssql.ResumableOp, e
 	return f.ops, nil
 }
 
-func setupRecovery(t *testing.T, st RunState) (Dirs, string) {
+func setupRecovery(t *testing.T, st State) (Dirs, string) {
 	t.Helper()
 	root := t.TempDir()
 	dirs := Dirs{
@@ -90,7 +90,7 @@ func setupRecovery(t *testing.T, st RunState) (Dirs, string) {
 }
 
 func TestRecovererRequeuesOnRestart(t *testing.T) {
-	st := RunState{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
 	dirs, name := setupRecovery(t, st)
 
 	// No live session, no resumable op -> Restart -> requeue.
@@ -116,7 +116,7 @@ func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
 	// An orphan from DB2 must be reconciled against the DB2 probe, not the
 	// connected one. The connected probe would Adopt (alive); the DB2 probe sees
 	// no session → Restart → requeue. The outcome proves which probe was used.
-	st := RunState{SPID: 57, Database: "DB2", LoginTime: "2026-06-10T12:00:00"}
+	st := State{SPID: 57, Database: "DB2", LoginTime: "2026-06-10T12:00:00"}
 	dirs, _ := setupRecovery(t, st)
 	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
 	db2 := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}
@@ -143,7 +143,7 @@ func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
 func TestRecovererConnectedDatabaseUsesBaseProbe(t *testing.T) {
 	// An orphan from the connected database uses the base probe; the resolver is
 	// never called.
-	st := RunState{SPID: 57, Database: "CONN", LoginTime: "2026-06-10T12:00:00"}
+	st := State{SPID: 57, Database: "CONN", LoginTime: "2026-06-10T12:00:00"}
 	dirs, _ := setupRecovery(t, st)
 	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
 
@@ -169,7 +169,7 @@ func TestRecovererConnectedDatabaseUsesBaseProbe(t *testing.T) {
 func TestRecovererUnreachableDatabaseLeavesOrphan(t *testing.T) {
 	// If the orphan's database can't be reached (e.g. now an AG secondary), the
 	// orphan is left in processing for a later run, not requeued or adopted.
-	st := RunState{SPID: 57, Database: "DB2", LoginTime: "x"}
+	st := State{SPID: 57, Database: "DB2", LoginTime: "x"}
 	dirs, name := setupRecovery(t, st)
 
 	r := NewRecoverer(dirs, fakeRecoveryProbe{}, io.Discard, WithRecoveryProbes("CONN",
@@ -190,7 +190,7 @@ func TestRecovererUnreachableDatabaseLeavesOrphan(t *testing.T) {
 }
 
 func TestRecovererAdoptsLiveOrphan(t *testing.T) {
-	st := RunState{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
 	dirs, name := setupRecovery(t, st)
 
 	// Live session matches -> orphan alive -> adopt -> leave in processing.
