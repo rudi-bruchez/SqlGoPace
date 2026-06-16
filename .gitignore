@@ -44,3 +44,6 @@ config-local.yaml-*
 # Application's logs and db
 *.log
 *.db
+
+# Codegraph daemon runtime
+.codegraph/daemon.pid
