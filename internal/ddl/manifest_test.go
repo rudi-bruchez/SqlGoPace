@@ -84,6 +84,33 @@ func TestParseManifest(t *testing.T) {
 	}
 }
 
+func TestParseOnFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		yaml     string
+		want     ddl.OnFailure
+		wantCont bool
+	}{
+		{name: "absent defaults to stop", yaml: "", want: "", wantCont: false},
+		{name: "explicit stop", yaml: "on_failure: stop\n", want: ddl.OnFailureStop, wantCont: false},
+		{name: "continue", yaml: "on_failure: continue\n", want: ddl.OnFailureContinue, wantCont: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			y := tt.yaml + "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+			m, err := ddl.ParseManifest(strings.NewReader(y))
+			if err != nil {
+				t.Fatalf("ParseManifest() error = %v", err)
+			}
+			if m.OnFailure != tt.want {
+				t.Errorf("OnFailure = %q, want %q", m.OnFailure, tt.want)
+			}
+			if m.Continue() != tt.wantCont {
+				t.Errorf("Continue() = %v, want %v", m.Continue(), tt.wantCont)
+			}
+		})
+	}
+}
+
 const maintenanceYAML = `
 description: "Maintenance operations"
 operations:
@@ -207,6 +234,11 @@ func TestParseManifestErrors(t *testing.T) {
 		{
 			name:    "shrink missing targetfreespace",
 			yaml:    "operations:\n  - operation: shrink\n    type: log\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "invalid on_failure",
+			yaml:    "on_failure: kontinue\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
 	}

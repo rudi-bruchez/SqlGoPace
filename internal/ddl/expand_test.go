@@ -84,6 +84,30 @@ func TestExpandPassesThroughNonAll(t *testing.T) {
 	}
 }
 
+// TestExpandPreservesManifestFields guards against expansion silently dropping
+// top-level manifest fields — in particular on_failure, whose loss made the engine
+// fall back to fail-fast for a continue-mode manifest whenever the expander was wired.
+func TestExpandPreservesManifestFields(t *testing.T) {
+	m := &ddl.Manifest{
+		Description: "compress everything",
+		Database:    "MYDB",
+		OnFailure:   ddl.OnFailureContinue,
+		Operations:  []ddl.Operation{ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "ALL"}},
+	}
+	out, err := ddl.ExpandRebuildAll(m, indexes(
+		ddl.IndexDescriptor{Name: "PK_T", Clustered: true, Kind: ddl.KindRowstore},
+	))
+	if err != nil {
+		t.Fatalf("ExpandRebuildAll() error = %v", err)
+	}
+	if out.Description != m.Description || out.Database != m.Database {
+		t.Errorf("expanded manifest = {Description:%q Database:%q}, want originals preserved", out.Description, out.Database)
+	}
+	if !out.Continue() {
+		t.Errorf("expanded manifest OnFailure = %q, want continue preserved through expansion", out.OnFailure)
+	}
+}
+
 func TestExpandEmptyIndexList(t *testing.T) {
 	m := &ddl.Manifest{Operations: []ddl.Operation{
 		ddl.RebuildIndex{Schema: "dbo", Table: "Heap", Index: "ALL"},

@@ -24,7 +24,7 @@ monitoring:
   progress_poll_seconds: 30
   log_max_size_bytes: 53687091200   # 50 GB — absolute ceiling (bounded by the log files' max_size)
   log_max_percent: 80               # secondary
-  blocking_timeout_minutes: 5       # delay before reacting when our DDL blocks other sessions
+  blocking_timeout_minutes: 1       # delay before reacting when our DDL blocks other sessions
   log_drain_timeout_minutes: 30     # give up if the log does not drain
   max_retry_attempts: 3
   kill_grace_seconds: 30            # delay before an explicit KILL if the Go cancellation does not take effect

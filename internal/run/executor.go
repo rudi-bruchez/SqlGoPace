@@ -78,7 +78,9 @@ func supervise(
 			}
 
 			pressure := Pressure{
-				BlockingOthers: !blockingStart.IsZero() && clk.Since(blockingStart) >= blockingTimeout,
+				// IgnoreBlocking holds the lock through blocking: the blocking
+				// reaction is suppressed, but transaction-log pressure still applies.
+				BlockingOthers: !caps.IgnoreBlocking && !blockingStart.IsZero() && clk.Since(blockingStart) >= blockingTimeout,
 				LogOverCap:     s.LogOverCap,
 				LogReuseWait:   s.LogReuseWait,
 			}

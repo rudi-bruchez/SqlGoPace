@@ -171,6 +171,39 @@ func TestResolveMaxDOPAndAbortBlockers(t *testing.T) {
 	}
 }
 
+func TestResolveIgnoreBlocking(t *testing.T) {
+	m := resolveMatrix()
+	// ignore_blocking is a reaction-policy override: it flows through to the
+	// resolved options (and a decision) without being a T-SQL WITH option, and is
+	// honored even on Standard, where no soft reaction option is available.
+	op := ddl.RebuildIndex{
+		Schema: "dbo", Table: "T", Index: "IX",
+		Options: ddl.OptionOverrides{IgnoreBlocking: boolPtr(true)},
+	}
+	target := ddl.Target{MajorVersion: 15, Tier: ddl.TierStandard}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if !got.IgnoreBlocking {
+		t.Errorf("IgnoreBlocking = false, want true (per-op override)")
+	}
+	var found bool
+	for _, d := range decisions {
+		if d.Option == "ignore_blocking" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("decisions missing an ignore_blocking entry, want one for --explain")
+	}
+
+	// Absent override → false.
+	plain := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+	if got2, _ := ddl.Resolve(plain, target, m, ddl.Policy{}); got2.IgnoreBlocking {
+		t.Errorf("IgnoreBlocking = true with no override, want false")
+	}
+}
+
 func TestResolveNoOptionsForPlainOperation(t *testing.T) {
 	m := resolveMatrix()
 	op := ddl.AddColumn{Schema: "dbo", Table: "T", Column: "C", DataType: "BIT"}

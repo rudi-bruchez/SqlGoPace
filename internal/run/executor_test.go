@@ -118,6 +118,38 @@ func TestSupervisePauseOnSustainedBlockingResumable(t *testing.T) {
 	}
 }
 
+func TestSuperviseIgnoreBlockingHoldsLock(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	clk := NewManualClock(testStart)
+	out := runSupervise(clk, Capabilities{IgnoreBlocking: true}, samples, done)
+
+	samples <- Sample{BlockingOthers: true} // starts the (suppressed) blocking timer
+	clk.Advance(90 * time.Second)
+	samples <- Sample{BlockingOthers: true} // well past timeout, but ignore_blocking -> no reaction
+	done <- nil                             // the statement finishes on its own
+
+	got := <-out
+	if got.action != Continue || got.err != nil {
+		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — ignore_blocking holds the lock", got.action, got.err)
+	}
+}
+
+func TestSuperviseIgnoreBlockingStillHonorsLog(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	clk := NewManualClock(testStart)
+	out := runSupervise(clk, Capabilities{IgnoreBlocking: true}, samples, done) // not resumable
+
+	// Blocking is ignored, but transaction-log pressure must still stop the op.
+	samples <- Sample{BlockingOthers: true, LogOverCap: true}
+
+	got := <-out
+	if got.action != Cancel || got.err != nil {
+		t.Errorf("supervise() = (%v, %v), want (Cancel, nil) — log pressure is still honored", got.action, got.err)
+	}
+}
+
 func TestSuperviseContextCancel(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)

@@ -55,6 +55,10 @@ type Capabilities struct {
 	// which Action is chosen (these are not resumable, so they still Cancel) — it
 	// refines the narration so the cancel is not mistaken for a rollback-bearing kill.
 	CancelSafe bool
+	// IgnoreBlocking suppresses the blocking reaction for this operation: it holds
+	// its lock through to completion even while blocking other sessions. Transaction-
+	// log pressure is still honored. Set per operation via the ignore_blocking option.
+	IgnoreBlocking bool
 }
 
 // Action is the reaction the engine takes under pressure.

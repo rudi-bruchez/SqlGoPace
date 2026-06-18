@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -283,9 +284,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
+	var failedOps []ddl.Operation
 	for i, step := range planned {
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation)}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking}
 
 		var reactions []report.ReactionLine
 		sink := func(ev ReactionEvent) {
@@ -341,13 +343,19 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			}
 			opRep.Outcome = "failed"
 			rep.Operations = append(rep.Operations, opRep)
-			rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
-			return e.finalize(ctx, name, rep, start, false)
+			if !manifest.Continue() {
+				rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
+				return e.finalize(ctx, name, rep, start, false)
+			}
+			// continue-on-failure: quarantine the failed op and keep going.
+			failedOps = append(failedOps, step.Operation)
+			fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
+			continue
 		}
 		opRep.Outcome = "success"
 		rep.Operations = append(rep.Operations, opRep)
 	}
-	return e.finalize(ctx, name, rep, start, true)
+	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
 }
 
 // finalize records a terminal outcome: moves the manifest, writes the report,
@@ -382,6 +390,73 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 		return outcomeDone
 	}
 	return outcomeFailed
+}
+
+// finalizeAll routes a manifest whose operation loop completed. With no failed
+// operations it is a plain success. With some failed operations (only reachable in
+// continue-on-failure mode) it is a PARTIAL run: a recovery manifest is written and
+// the original manifest is routed to failed for the operator to follow up.
+func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+	if len(failed) == 0 {
+		return e.finalize(ctx, name, rep, start, true)
+	}
+	return e.finalizePartial(ctx, name, m, rep, start, failed)
+}
+
+// finalizePartial records a PARTIAL outcome: some operations succeeded and some
+// were quarantined. It moves the original manifest to failed, writes a re-runnable
+// recovery manifest (the failed operations, carrying on_failure: continue) next to
+// it, and reports/records the run like a failure so the exit code reflects it.
+func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+	e.removeSidecar(name)
+	rep.FinishedAt = e.now()
+	rep.DurationMS = e.msSince(start)
+	rep.Outcome = "PARTIAL"
+
+	if err := e.queue.Fail(name); err != nil {
+		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
+	}
+
+	recovery := &ddl.Manifest{
+		Description: recoveryDescription(m, name),
+		Database:    m.Database,
+		OnFailure:   ddl.OnFailureContinue,
+		Operations:  failed,
+	}
+	recName := name + ".recovery.yaml"
+	rep.Error = fmt.Sprintf("%d of %d operation(s) failed; recovery manifest: %s", len(failed), len(rep.Operations), recName)
+	if err := e.writeRecovery(filepath.Join(e.dirs.Failed, recName), recovery); err != nil {
+		fmt.Fprintf(e.out, "write recovery manifest %s: %v\n", recName, err)
+	}
+
+	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
+		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
+	}
+	e.notify(ctx, "fail", name, rep.Error)
+	e.record(ctx, *rep)
+
+	fmt.Fprintf(e.out, "partial: %s — %d failed op(s) quarantined to %s\n", name, len(failed), recName)
+	return outcomeFailed
+}
+
+// writeRecovery renders a recovery manifest to YAML and writes it.
+func (e *Engine) writeRecovery(path string, m *ddl.Manifest) error {
+	data, err := ddl.MarshalManifest(m)
+	if err != nil {
+		return fmt.Errorf("marshal recovery manifest: %w", err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write recovery manifest: %w", err)
+	}
+	return nil
+}
+
+// recoveryDescription builds the recovery manifest's description from the original.
+func recoveryDescription(m *ddl.Manifest, name string) string {
+	if m.Description != "" {
+		return "Recovery for: " + m.Description
+	}
+	return "Recovery for " + name
 }
 
 // finalizeInterrupted records a recoverable interruption: the manifest and its

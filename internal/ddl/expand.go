@@ -66,6 +66,7 @@ func ExpandRebuildAll(m *Manifest, lookup func(schema, table string) ([]IndexDes
 	out := &Manifest{
 		Description: m.Description,
 		Database:    m.Database,
+		OnFailure:   m.OnFailure,
 		Operations:  make([]Operation, 0, len(m.Operations)),
 	}
 	for _, op := range m.Operations {

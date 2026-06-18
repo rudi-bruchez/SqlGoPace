@@ -36,6 +36,11 @@ type ResolvedOptions struct {
 	// WaitAtLowPriority is true.
 	AbortAfterWait     string // "SELF" | "BLOCKERS"
 	MaxDurationMinutes int
+
+	// IgnoreBlocking carries the per-operation reaction-policy override: when true,
+	// the engine does not yield the operation when it blocks other sessions. It is
+	// not a T-SQL option; it flows to the runner's Capabilities.
+	IgnoreBlocking bool
 }
 
 // Decision records why one option was set the way it was, for --explain output.
@@ -142,6 +147,7 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 			res.MaxDOP = &v
 		}
 	}
+	res.IgnoreBlocking = ov.IgnoreBlocking != nil && *ov.IgnoreBlocking
 
 	// Build the decision trail in a stable order.
 	var decisions []Decision
@@ -156,6 +162,9 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	add(sortRel, "sort_in_tempdb", onOff(sort), sortReason)
 	if res.MaxDOP != nil {
 		add(true, "maxdop", strconv.Itoa(*res.MaxDOP), "set by override")
+	}
+	if res.IgnoreBlocking {
+		add(true, "ignore_blocking", "ON", "set by override: hold the lock through blocking (reaction policy, not a WITH option)")
 	}
 
 	return res, decisions

@@ -30,6 +30,9 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.Database != "" {
 		addPair(root, "database", scalarNode(m.Database))
 	}
+	if m.OnFailure != "" {
+		addPair(root, "on_failure", scalarNode(string(m.OnFailure)))
+	}
 	addPair(root, "operations", operations)
 
 	var buf bytes.Buffer

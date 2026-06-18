@@ -68,6 +68,12 @@ type OptionOverrides struct {
 	WaitAtLowPriority *bool `yaml:"wait_at_low_priority"`
 	SortInTempDB      *bool `yaml:"sort_in_tempdb"`
 	MaxDOP            *int  `yaml:"maxdop"`
+
+	// IgnoreBlocking is a reaction-policy override, NOT a T-SQL WITH option: when
+	// true, the engine does not yield this operation when it blocks other sessions
+	// (it holds its lock through to completion). Transaction-log protection still
+	// applies. Use it to force an important rebuild through despite blocking.
+	IgnoreBlocking *bool `yaml:"ignore_blocking"`
 }
 
 // Literal is a constant scalar default value as written in the manifest. It
@@ -88,15 +94,37 @@ func (l *Literal) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// OnFailure controls what the engine does when an operation fails. The empty
+// value means stop (fail-fast), preserving the default behavior.
+type OnFailure string
+
+const (
+	// OnFailureStop fails the whole manifest on the first failed operation.
+	OnFailureStop OnFailure = "stop"
+	// OnFailureContinue quarantines a failed operation, runs the rest, and writes
+	// a re-runnable recovery manifest holding the failed operations.
+	OnFailureContinue OnFailure = "continue"
+)
+
 // Manifest is one task: an ordered list of operations run sequentially.
 type Manifest struct {
 	Description string
 	Database    string
+	OnFailure   OnFailure // empty defaults to stop (fail-fast)
 	Operations  []Operation
 }
 
+// Continue reports whether the manifest should keep going past a failed operation.
+func (m *Manifest) Continue() bool { return m.OnFailure == OnFailureContinue }
+
 // Validate checks the manifest has at least one operation and each is valid.
 func (m *Manifest) Validate() error {
+	switch m.OnFailure {
+	case "", OnFailureStop, OnFailureContinue:
+	default:
+		return fmt.Errorf("on_failure must be %q or %q, got %q: %w",
+			OnFailureStop, OnFailureContinue, m.OnFailure, ErrInvalidManifest)
+	}
 	if len(m.Operations) == 0 {
 		return fmt.Errorf("no operations: %w", ErrInvalidManifest)
 	}
@@ -114,6 +142,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
 		Description string      `yaml:"description"`
 		Database    string      `yaml:"database"`
+		OnFailure   string      `yaml:"on_failure"`
 		Operations  []yaml.Node `yaml:"operations"`
 	}
 	if err := value.Decode(&raw); err != nil {
@@ -122,6 +151,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 
 	m.Description = raw.Description
 	m.Database = raw.Database
+	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
 	m.Operations = make([]Operation, 0, len(raw.Operations))
 	for i := range raw.Operations {
 		op, err := decodeOperation(&raw.Operations[i])

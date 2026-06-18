@@ -52,6 +52,7 @@ One file = one logical task = an ordered list of operations executed **sequentia
 # 01.to_run/010_rebuild_dispatch.yaml
 description: "Recompress and add a column on DISPATCH"
 database: MYDB          # optional: otherwise the database from the connection string
+on_failure: stop        # optional: stop (default) | continue (see §11.3)
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -105,6 +106,13 @@ Automatically applied dependencies:
 - `resumable: true` ⇒ forces `online: true` (RESUMABLE requires ONLINE for an index).
 - `wait_at_low_priority` is injected only if `online: true`.
 - an option not supported by the target is **silently omitted** (and traced under `--explain`).
+
+`options.ignore_blocking: true` is a **reaction-policy override, not a T-SQL `WITH` option**:
+it suppresses the blocking reaction (§9) for that single operation, so the operation holds its
+lock to completion and leaves the other sessions blocked. Transaction-log pressure is still
+honored. It is per operation (the rest of the batch keeps yielding), edition-independent (it is
+about reactions, not injectable T-SQL), and traced under `--explain`. Typical use: force the one
+important index through in a `on_failure: continue` batch.
 
 ### 1.4 Metadata-only operations
 
@@ -456,6 +464,13 @@ relaxed. The tool factors the ADR state into the strategy choice.
 After a cancellation, we wait until there is no more blocking / the log has dropped, then we
 **retry the same operation** up to `max_retry_attempts` times.
 
+**Per-operation escape hatch — `options.ignore_blocking: true`.** The whole hierarchy above reacts
+to *blocking* and *log* pressure. Setting `ignore_blocking` on one operation removes **blocking**
+from its pressure inputs: that operation never pauses/cancels *because it blocks others* — it holds
+its lock to completion and leaves the blocked sessions waiting. The **log** branch still applies (a
+log over cap still stops it). This is the deliberate inverse of the default "be a good citizen"
+posture, for the rare index that must go through regardless. See §1.3.
+
 ---
 
 ## 10. Clean `KILL` strategy (cancel vs kill)
@@ -532,6 +547,29 @@ no longer wanted, the **`abort-resumable`** subcommand inventories the connected
 operations (`sys.index_resumable_operations`, with their schema/table resolved) and cancels each with
 `ALTER INDEX … ABORT`. It targets `PAUSED` operations by default (`--include-running` to also stop
 running ones), and `--dry-run` previews without changing anything.
+
+### 11.3 Continue-on-failure & recovery manifests (`on_failure: continue`)
+
+By default a manifest is **fail-fast**: the first operation that fails (after the reaction
+hierarchy is exhausted, e.g. a `KILL` because the offline rebuild kept blocking other sessions)
+sends the whole manifest to `04.failed/` and the remaining operations are not attempted.
+
+A manifest may instead set **`on_failure: continue`** at top level. Then a failed operation is
+**quarantined** and the engine **continues** with the next operation. When the loop finishes, if any
+operation failed:
+
+- the original manifest is moved to `04.failed/` and its run is reported **`PARTIAL`** (its `.log`
+  lists every operation, success and failure, with the per-operation reaction timestamps and
+  durations — so *which* objects were locked and for how long is recorded);
+- a re-runnable **recovery manifest** `<name>.recovery.yaml` is written next to it in `04.failed/`,
+  containing **only the failed operations** with their original options. It carries
+  `on_failure: continue` itself, so it round-trips; move it into `01.to_run/` to retry just those.
+
+A `PARTIAL` run counts as a failed manifest for the exit code (§16). A recoverable interruption
+(paused resumable, §11.1) still wins over continue mode — such an operation is left in
+`02.processing/` for recovery, never quarantined. Note that a recovery manifest for an `ALL` rebuild
+contains the **expanded** per-index rebuilds (§1.6), so only the indexes that actually failed are
+retried.
 
 ---
 

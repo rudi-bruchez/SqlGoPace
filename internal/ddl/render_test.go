@@ -16,6 +16,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 	in := &ddl.Manifest{
 		Description: "Maintenance plan for MYDB",
 		Database:    "MYDB",
+		OnFailure:   ddl.OnFailureContinue,
 		Operations: []ddl.Operation{
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE"},
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_PART", Partition: intPtr(3), DataCompression: "ROW"},
@@ -52,7 +53,7 @@ func TestMarshalManifestOmitsEmpty(t *testing.T) {
 		t.Fatalf("MarshalManifest() error = %v", err)
 	}
 	out := string(data)
-	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:"} {
+	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:", "on_failure:"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("output contains %q, want it omitted:\n%s", banned, out)
 		}

@@ -49,6 +49,14 @@ A manifest flows through a set of directories as it is processed:
                               ↘   04.failed/  (failure, with a .log)
 ```
 
+By default a manifest is fail-fast: the first failed operation sends the whole manifest
+to `04.failed/`. Setting `on_failure: continue` (see the manifest example below) instead
+**quarantines** each failed operation and runs the rest; the run ends as **`PARTIAL`** and
+a re-runnable **recovery manifest** `<name>.recovery.yaml` — holding only the failed
+operations — is written into `04.failed/`. Move it back into `01.to_run/` to retry just
+those. Use this for independent batches (e.g. compressing many indexes) where a few
+objects may be locked while the rest should still proceed.
+
 If the process crashes mid-operation, the next run reconciles anything left in
 `02.processing/` — adopting a still-running operation, resuming a paused resumable
 index build, or requeuing the work.
@@ -147,6 +155,7 @@ and the compatibility matrix; per-operation `options:` blocks override them.
 # 01.to_run/010_rebuild_dispatch.yaml
 description: "Recompress DISPATCH indexes and add a tracking column"
 database: MYDB          # optional; defaults to the connection's database
+on_failure: stop        # optional: stop (default, fail-fast) | continue (quarantine + recovery manifest)
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -157,6 +166,8 @@ operations:
     # left empty → injected automatically per version/edition + matrix + config
     options:
       maxdop: 4              # explicit override for THIS operation
+      # ignore_blocking: true  # reaction policy: hold the lock through blocking,
+      #                        # leaving other sessions blocked (force this index through)
 
   - operation: add_column
     schema: dbo
