@@ -200,7 +200,7 @@ func decideIndex(m IndexMeasurement, p *Profile) Decision {
 	fragRebuild := frag >= p.Index.RebuildFromPercent
 	fragReorganize := !fragRebuild && frag >= p.Index.ReorganizeFromPercent
 
-	comp := decideCompression(m.Current, m.Estimate, m.Write, ov, p)
+	comp := decideCompression(m.Schema, m.Table, m.Index, m.Current, m.Estimate, m.Write, ov, p)
 	needRebuild := fragRebuild || comp.change
 
 	if !needRebuild {
@@ -295,7 +295,7 @@ func decideHeap(m HeapMeasurement, p *Profile) Decision {
 		return skipDecision("heap", target, "no trigger: "+reason)
 	}
 
-	comp := decideCompression(m.Current, m.Estimate, m.Write, ov, p)
+	comp := decideCompression(m.Schema, m.Table, "", m.Current, m.Estimate, m.Write, ov, p)
 	dataCompression := ""
 	if comp.change {
 		dataCompression = comp.target.DataCompression()
@@ -384,16 +384,20 @@ type compressionOutcome struct {
 }
 
 // decideCompression picks the compression tier for an object (spec §5.2, §5.4): an
-// override pin wins; otherwise the highest-gain tier that clears its bar, capped
-// for write-intensive objects. A NONE outcome never forces a decompress — it just
-// means "no beneficial change", so change is false unless an override pins it.
-func decideCompression(current Compression, est *CompressionEstimate, write *WriteActivity, ov Override, p *Profile) compressionOutcome {
+// override pin wins; otherwise, if the object is in compression scope, the
+// highest-gain tier that clears its bar, capped for write-intensive objects. A NONE
+// outcome never forces a decompress — it just means "no beneficial change", so
+// change is false unless an override pins it. index is "" for a heap.
+func decideCompression(schema, table, index string, current Compression, est *CompressionEstimate, write *WriteActivity, ov Override, p *Profile) compressionOutcome {
 	if ov.Compression != "" {
 		return compressionOutcome{target: ov.Compression, change: !sameCompression(ov.Compression, current),
 			reason: "override pins compression = " + string(ov.Compression)}
 	}
 	if !p.Compression.Enabled {
 		return compressionOutcome{reason: "compression analysis disabled"}
+	}
+	if !p.Compression.CompressesObject(schema, table, index) {
+		return compressionOutcome{reason: "out of compression scope"}
 	}
 	if est == nil {
 		return compressionOutcome{reason: "no compression estimate"}

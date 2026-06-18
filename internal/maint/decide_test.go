@@ -131,6 +131,71 @@ func TestDecideIndexOverridePinsCompression(t *testing.T) {
 	}
 }
 
+func TestDecideIndexCompressionScope(t *testing.T) {
+	// An index that, in full scope, compresses to PAGE on its estimated gain.
+	pageGain := &maint.CompressionEstimate{CurrentKB: 100, RowKB: 70, PageKB: 50}
+
+	t.Run("out of include scope skips compression on low frag", func(t *testing.T) {
+		p, err := maint.Parse([]byte("compression:\n  enabled: true\n  objects:\n    include: [dbo.Other]\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := bigIndex(2)
+		m.Estimate = pageGain
+		d := maint.DecideIndex(m, p)
+		if d.Kind != "skip" {
+			t.Fatalf("Kind = %q, want skip (reason: %s)", d.Kind, d.Reason)
+		}
+	})
+
+	t.Run("excluded but fragmented still rebuilds without compression", func(t *testing.T) {
+		p, err := maint.Parse([]byte("compression:\n  enabled: true\n  objects:\n    exclude: [dbo.T]\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := bigIndex(50) // above rebuild threshold: defrag must still happen
+		m.Estimate = pageGain
+		d := maint.DecideIndex(m, p)
+		if d.Kind != "rebuild_index" {
+			t.Fatalf("Kind = %q, want rebuild_index (reason: %s)", d.Kind, d.Reason)
+		}
+		if ri := d.Op.(ddl.RebuildIndex); ri.DataCompression != "" {
+			t.Errorf("DataCompression = %q, want \"\" (compression out of scope)", ri.DataCompression)
+		}
+	})
+
+	t.Run("excluding one index spares another", func(t *testing.T) {
+		p, err := maint.Parse([]byte("compression:\n  enabled: true\n  objects:\n    exclude: [dbo.T.OTHER]\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := bigIndex(2) // low frag: only compression can promote it to a rebuild
+		m.Estimate = pageGain
+		d := maint.DecideIndex(m, p)
+		if d.Kind != "rebuild_index" {
+			t.Fatalf("Kind = %q, want rebuild_index (reason: %s)", d.Kind, d.Reason)
+		}
+		if ri := d.Op.(ddl.RebuildIndex); ri.DataCompression != "PAGE" {
+			t.Errorf("DataCompression = %q, want PAGE", ri.DataCompression)
+		}
+	})
+
+	t.Run("override pin wins over exclude", func(t *testing.T) {
+		p, err := maint.Parse([]byte("compression:\n  enabled: true\n  objects:\n    exclude: [dbo.T]\noverrides:\n  - match: dbo.T\n    compression: page\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		m := bigIndex(2)
+		d := maint.DecideIndex(m, p)
+		if d.Kind != "rebuild_index" {
+			t.Fatalf("Kind = %q, want rebuild_index (reason: %s)", d.Kind, d.Reason)
+		}
+		if ri := d.Op.(ddl.RebuildIndex); ri.DataCompression != "PAGE" {
+			t.Errorf("DataCompression = %q, want PAGE (override pin must beat exclude)", ri.DataCompression)
+		}
+	})
+}
+
 func TestDecideIndexForbidAndCeiling(t *testing.T) {
 	forbid, err := maint.Parse([]byte("overrides:\n  - match: dbo.T\n    rebuild: forbid\n"))
 	if err != nil {

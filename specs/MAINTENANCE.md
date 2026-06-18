@@ -345,6 +345,12 @@ compression:
   write_intensive_compression: row # row | none — cap applied to hot objects
   activity_floor: 1000             # min total access since restart before write_ratio is trusted (§5.4)
   per_partition: true              # decide each partition independently (alive/hot vs cold/archive)
+  # Restrict which objects the heuristic may compress (§5.2). Globs match a whole
+  # table ("schema.table") or one index ("schema.table.index"); exclude wins. This
+  # filter governs ONLY compression — fragmented objects are still reorganized/rebuilt.
+  objects:
+    include: []                    # allowlist: empty = all; ["dbo.BigFact", "dbo.Orders.IX_Orders_Date"]
+    exclude: []                    # denylist: ["dbo.HOT_*", "dbo.Orders.PK_Orders"]
 
 heap:
   enabled: true
@@ -401,14 +407,17 @@ separate opt-in for when the rules are trusted).
 
 For each candidate:
 
-1. If an override pins `compression`, use it.
-2. Else read `NONE`/`ROW`/`PAGE` estimated sizes (§4.2) and write-intensity (§4.3).
-3. If write-intensive (`ratio ≥ write_intensive_ratio`) → cap at `write_intensive_compression`
+1. If an override pins `compression`, use it (honored even if the object is excluded by the scope filter).
+2. Else, if `compression.objects` is set and the object is outside it (not in a non-empty `include`, or in
+   `exclude` — exclude wins, matched at `schema.table` or `schema.table.index` granularity), make **no
+   compression change**. Fragmentation-driven reorganize/rebuild (§5.1) still applies.
+3. Else read `NONE`/`ROW`/`PAGE` estimated sizes (§4.2) and write-intensity (§4.3).
+4. If write-intensive (`ratio ≥ write_intensive_ratio`) → cap at `write_intensive_compression`
    (`ROW` or `NONE`), regardless of PAGE gain.
-4. Else choose the **highest-gain tier that clears its bar**: prefer `PAGE` if it saves
+5. Else choose the **highest-gain tier that clears its bar**: prefer `PAGE` if it saves
    `≥ page_min_extra_gain_percent` more than `ROW`; else `ROW` if it saves `≥ min_gain_percent` vs
    current; else `NONE` (no rebuild emitted for compression).
-5. A chosen compression that differs from the current setting emits a `rebuild_index` (whole index or
+6. A chosen compression that differs from the current setting emits a `rebuild_index` (whole index or
    `PARTITION = n`) carrying `data_compression`. The current setting is read from
    `sys.partitions.data_compression_desc` so an unchanged decision emits nothing.
 

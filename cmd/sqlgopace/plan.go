@@ -140,7 +140,7 @@ func indexMeasurements(ctx context.Context, r analysisReader, p *maint.Profile, 
 				Partition: &part, PageCount: pageByPart[part], SizeMB: int64(row.SizeMB),
 				FragmentationPercent: fragByPart[part], Current: parseCompression(row.Compression),
 			}
-			if estimable(row) {
+			if estimable(row) && p.Compression.CompressesObject(row.Schema, row.Table, row.IndexName) {
 				m.Estimate = estimateFor(ctx, r, row.Schema, row.Table, row.IndexID, &part, logw)
 				m.Write = writeFor(ctx, r, row.ObjectID, row.IndexID, &part)
 			}
@@ -163,7 +163,7 @@ func indexMeasurements(ctx context.Context, r analysisReader, p *maint.Profile, 
 		Schema: head.Schema, Table: head.Table, Index: head.IndexName, Clustered: clustered,
 		PageCount: pageCount, SizeMB: sizeMB, FragmentationPercent: maxFrag, Current: parseCompression(head.Compression),
 	}
-	if wantComp && estimable(head) {
+	if wantComp && estimable(head) && p.Compression.CompressesObject(head.Schema, head.Table, head.IndexName) {
 		m.Estimate = estimateFor(ctx, r, head.Schema, head.Table, head.IndexID, nil, logw)
 		m.Write = writeFor(ctx, r, head.ObjectID, head.IndexID, nil)
 	}
@@ -205,7 +205,7 @@ func heapMeasurement(ctx context.Context, r analysisReader, p *maint.Profile, wa
 		FragmentationPercent: maxFrag, PageSpaceUsedPercent: minPageSpace,
 		Current: parseCompression(head.Compression),
 	}
-	if wantComp {
+	if wantComp && p.Compression.CompressesObject(head.Schema, head.Table, "") {
 		m.Estimate = estimateFor(ctx, r, head.Schema, head.Table, 0, nil, logw)
 		m.Write = writeFor(ctx, r, head.ObjectID, 0, nil)
 	}

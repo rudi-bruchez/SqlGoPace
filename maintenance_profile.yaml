@@ -19,6 +19,14 @@ compression:
   write_intensive_compression: row # row | none — cap applied to hot objects
   activity_floor: 1000             # min total access since restart before write_ratio is trusted
   per_partition: true              # decide each partition independently
+  # Restrict which objects the compression heuristic may change. Globs match a whole
+  # table ("schema.table") or a single index ("schema.table.index"); exclude wins.
+  # This governs ONLY compression — fragmented objects are still reorganized/rebuilt,
+  # and an explicit `compression:` override below is always honored. Leave both empty
+  # to consider every eligible object.
+  objects:
+    include: []                    # allowlist: empty = all; e.g. ["dbo.BigFact", "dbo.Orders.IX_Orders_Date"]
+    exclude: []                    # denylist: e.g. ["dbo.HOT_*", "dbo.Orders.PK_Orders"]
 
 heap:
   enabled: true

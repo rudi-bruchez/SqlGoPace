@@ -97,6 +97,30 @@ type CompressionRules struct {
 	WriteIntensiveCompression Compression `yaml:"write_intensive_compression"` // cap value: row | none
 	ActivityFloor             int64       `yaml:"activity_floor"`              // min access before the ratio is trusted
 	PerPartition              bool        `yaml:"per_partition"`
+	Objects                   ObjectScope `yaml:"objects"` // include/exclude filter on which objects may be compressed
+}
+
+// ObjectScope is an include/exclude glob filter on which objects the compression
+// heuristic may change. Each glob matches an object's "schema.table" (the whole
+// table) or "schema.table.index" (one index). An empty Include means "all"; an
+// Exclude always wins. It governs only the automatic compression heuristic —
+// fragmentation-driven reorganize/rebuild still runs on out-of-scope objects, and
+// an explicit `compression:` override pin is honored regardless (spec §5.2).
+type ObjectScope struct {
+	Include []string `yaml:"include"` // globs; empty = compress any eligible object
+	Exclude []string `yaml:"exclude"` // globs; matched objects are never auto-compressed
+}
+
+// CompressesObject reports whether an object is in compression scope: with a
+// non-empty Include it must match one (allowlist), and it must match no Exclude
+// glob (denylist; exclude wins). The index argument is "" for a heap. Each glob is
+// tested against both "schema.table" and "schema.table.index", so a two-part glob
+// selects a whole table and a three-part glob a single index.
+func (r CompressionRules) CompressesObject(schema, table, index string) bool {
+	if len(r.Objects.Include) > 0 && !matchObject(r.Objects.Include, schema, table, index) {
+		return false
+	}
+	return !matchObject(r.Objects.Exclude, schema, table, index)
 }
 
 // HeapRules drives the heap-rebuild decision (see spec §5.3).
@@ -254,6 +278,17 @@ func matchAnyGlob(patterns []string, target string) bool {
 	return false
 }
 
+// matchObject reports whether any glob matches the object at table granularity
+// ("schema.table") or index granularity ("schema.table.index"). index is "" for a
+// heap, leaving only the table identity to match.
+func matchObject(patterns []string, schema, table, index string) bool {
+	tableID := schema + "." + table
+	if matchAnyGlob(patterns, tableID) {
+		return true
+	}
+	return index != "" && matchAnyGlob(patterns, tableID+"."+index)
+}
+
 // applyDefaults fills the documented defaults for omitted values. Note: a field
 // left at its Go zero value is treated as "unset" and takes the default, so to
 // disable a non-zero-defaulted floor (e.g. page_count_floor) set it to a small
@@ -362,6 +397,9 @@ func (p *Profile) validate() error {
 	if p.Compression.ActivityFloor < 0 {
 		return fmt.Errorf("compression.activity_floor must be ≥ 0: %w", ErrInvalidProfile)
 	}
+	if err := validateGlobs("compression.objects", p.Compression.Objects.Include, p.Compression.Objects.Exclude); err != nil {
+		return err
+	}
 
 	if p.Heap.MinSizeMB < 0 {
 		return fmt.Errorf("heap.min_size_mb must be ≥ 0: %w", ErrInvalidProfile)
@@ -384,10 +422,8 @@ func (p *Profile) validate() error {
 		return fmt.Errorf("checkdb.maxdop must be ≥ 0: %w", ErrInvalidProfile)
 	}
 
-	for _, g := range append(append([]string{}, p.Scope.Databases.Include...), p.Scope.Databases.Exclude...) {
-		if _, err := path.Match(g, ""); err != nil {
-			return fmt.Errorf("scope.databases: invalid glob %q: %w", g, ErrInvalidProfile)
-		}
+	if err := validateGlobs("scope.databases", p.Scope.Databases.Include, p.Scope.Databases.Exclude); err != nil {
+		return err
 	}
 
 	for idx, o := range p.Overrides {
@@ -404,6 +440,19 @@ func (p *Profile) validate() error {
 		case "", CompressionNone, CompressionRow, CompressionPage:
 		default:
 			return fmt.Errorf("overrides[%d]: compression = %q, want none/row/page or empty: %w", idx, o.Compression, ErrInvalidProfile)
+		}
+	}
+	return nil
+}
+
+// validateGlobs reports the first syntactically invalid glob across the given
+// pattern lists, attributing it to the named profile field.
+func validateGlobs(name string, lists ...[]string) error {
+	for _, list := range lists {
+		for _, g := range list {
+			if _, err := path.Match(g, ""); err != nil {
+				return fmt.Errorf("%s: invalid glob %q: %w", name, g, ErrInvalidProfile)
+			}
 		}
 	}
 	return nil

@@ -235,6 +235,41 @@ func TestScopeInvalidGlob(t *testing.T) {
 	}
 }
 
+func TestCompressionCompressesObject(t *testing.T) {
+	tests := []struct {
+		name                 string
+		include, exclude     []string
+		schema, table, index string
+		want                 bool
+	}{
+		{"empty filter includes all", nil, nil, "dbo", "T", "IX", true},
+		{"include matches table", []string{"dbo.T"}, nil, "dbo", "T", "IX", true},
+		{"include matches table glob", []string{"dbo.BIG_*"}, nil, "dbo", "BIG_FACT", "IX", true},
+		{"include misses table", []string{"dbo.Other"}, nil, "dbo", "T", "IX", false},
+		{"include matches one index", []string{"dbo.T.IX"}, nil, "dbo", "T", "IX", true},
+		{"include misses other index", []string{"dbo.T.OTHER"}, nil, "dbo", "T", "IX", false},
+		{"exclude wins over include", []string{"dbo.*"}, []string{"dbo.T"}, "dbo", "T", "IX", false},
+		{"exclude one index only", nil, []string{"dbo.T.IX"}, "dbo", "T", "IX", false},
+		{"exclude spares other index", nil, []string{"dbo.T.OTHER"}, "dbo", "T", "IX", true},
+		{"heap matched by table glob", []string{"dbo.*"}, nil, "dbo", "H", "", true},
+		{"heap not matched by index glob", []string{"dbo.H.IX"}, nil, "dbo", "H", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := maint.CompressionRules{Objects: maint.ObjectScope{Include: tt.include, Exclude: tt.exclude}}
+			if got := r.CompressesObject(tt.schema, tt.table, tt.index); got != tt.want {
+				t.Errorf("CompressesObject(%q,%q,%q) = %v, want %v", tt.schema, tt.table, tt.index, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCompressionObjectsInvalidGlob(t *testing.T) {
+	if _, err := maint.Parse([]byte("compression:\n  objects:\n    exclude: ['dbo.T[']\n")); err == nil {
+		t.Errorf("Parse(bad compression.objects glob) error = nil, want an error")
+	}
+}
+
 func TestCompressionDataCompression(t *testing.T) {
 	tests := []struct {
 		in   maint.Compression
