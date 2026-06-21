@@ -163,8 +163,8 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	if !info.Supported() {
 		return fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
 	}
-	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s\n",
-		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
+	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
+		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
 
 	// --auto: analyze and materialize maintenance manifests into the queue before
 	// the engine processes it. Materializing (rather than running purely in memory)
@@ -330,6 +330,17 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		// dm_exec_requests percent used for other operations.
 		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
 	}))
+	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
+		Tuning:          batchTuning(cfg.BatchDML),
+		RCSI:            info.RCSIEnabled,
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+	}, run.WithBatchDMLProgress(func(p run.BatchDMLProgress) {
+		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
+	}))
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
@@ -342,6 +353,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithDatabase(info.Database),
 		run.WithShrinkRunner(shrinkRunner),
+		run.WithBatchDMLRunner(batchRunner),
 		run.WithOutput(engineOut),
 	}
 	if cfg.Notifications.WebhookURL != "" {
@@ -352,6 +364,21 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	}
 	opts = append(opts, extra...)
 	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+}
+
+// batchTuning maps the batch-DML config block to the run-side tuning carrier
+// (defaults already applied), mirroring shrinkTuning.
+func batchTuning(b config.BatchDMLConfig) run.BatchTuning {
+	return run.BatchTuning{
+		InitialSmallRows:  b.InitialSmallRows,
+		InitialMediumRows: b.InitialMediumRows,
+		InitialLargeRows:  b.InitialLargeRows,
+		MinRows:           b.MinRows,
+		MaxRows:           b.MaxRows,
+		EscalationCapRows: b.EscalationCapRows,
+		TargetBatch:       b.TargetBatch(),
+		SelfWaitTimeout:   b.SelfWaitTimeout(),
+	}
 }
 
 // shrinkTuning maps the config block to the run-side tuning carrier (config.ShrinkConfig
@@ -640,8 +667,8 @@ func dryRunSession(ctx context.Context, log io.Writer, visited map[string]bool, 
 		cleanup()
 		return ddl.Target{}, nil, noop, fmt.Errorf("unsupported engine edition %d", info.EngineEdition)
 	}
-	fmt.Fprintf(log, "-- detected target: tier=%s major=%d adr=%t recovery=%s\n",
-		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel)
+	fmt.Fprintf(log, "-- detected target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
+		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
 	return info.Target(), conn, cleanup, nil
 }
 

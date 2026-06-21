@@ -304,9 +304,24 @@ func decodeOperation(node *yaml.Node) (Operation, error) {
 		return decodeInto[DropConstraint](node)
 	case "shrink":
 		return decodeInto[Shrink](node)
+	case "batch_update":
+		return decodeBatchDML(node, "update")
+	case "batch_delete":
+		return decodeBatchDML(node, "delete")
 	default:
 		return nil, fmt.Errorf("%q: %w", disc.Operation, ErrUnknownOperation)
 	}
+}
+
+// decodeBatchDML decodes a batch_update/batch_delete node and stamps the verb,
+// which is carried by the discriminator rather than a YAML field.
+func decodeBatchDML(node *yaml.Node, verb string) (Operation, error) {
+	var op BatchDML
+	if err := node.Decode(&op); err != nil {
+		return nil, err
+	}
+	op.Verb = verb
+	return op, nil
 }
 
 // decodeInto decodes a YAML node into the concrete operation type T.
@@ -649,4 +664,134 @@ func (o Shrink) Validate() error {
 		return fmt.Errorf("shrink: %w", err)
 	}
 	return nil
+}
+
+// Condition is one simple predicate in a batch_update/batch_delete where list: a
+// column compared to a scalar literal, or a NULL test. Conditions are AND-ed. The
+// operator must be in the fixed allowlist (see batch.go); arbitrary SQL goes through
+// where_raw instead.
+type Condition struct {
+	Column string   `yaml:"column"`
+	Op     string   `yaml:"op"`    // one of the batchOps allowlist
+	Value  *Literal `yaml:"value"` // required, except for IS NULL / IS NOT NULL
+}
+
+// validate reports whether the condition is usable: a column, an allowed operator,
+// and a value present iff the operator needs one.
+func (c Condition) validate() error {
+	if strings.TrimSpace(c.Column) == "" {
+		return fmt.Errorf("condition: column is required: %w", ErrInvalidManifest)
+	}
+	norm, ok := normalizeBatchOp(c.Op)
+	if !ok {
+		return fmt.Errorf("condition: unsupported op %q: %w", c.Op, ErrInvalidManifest)
+	}
+	if batchOpIsNullTest(norm) {
+		if c.Value != nil {
+			return fmt.Errorf("condition: %s takes no value: %w", norm, ErrInvalidManifest)
+		}
+	} else if c.Value == nil {
+		return fmt.Errorf("condition: op %s requires a value: %w", norm, ErrInvalidManifest)
+	}
+	return nil
+}
+
+// BatchSpec configures how a batch_update/batch_delete is chunked.
+type BatchSpec struct {
+	Strategy    string `yaml:"strategy"`     // "" or "predicate" (key_range is planned for a later iteration)
+	Key         string `yaml:"key"`          // key column for key_range; unused by the predicate strategy
+	InitialRows *int   `yaml:"initial_rows"` // optional starting batch size; auto-sized when nil
+}
+
+// validate reports whether the batch spec is usable for this iteration.
+func (b BatchSpec) validate() error {
+	switch strings.ToLower(strings.TrimSpace(b.Strategy)) {
+	case "", "predicate":
+	case "key_range":
+		return fmt.Errorf("batch.strategy %q is planned for a later iteration; use \"predicate\": %w", b.Strategy, ErrInvalidManifest)
+	default:
+		return fmt.Errorf("batch.strategy must be \"predicate\", got %q: %w", b.Strategy, ErrInvalidManifest)
+	}
+	if b.InitialRows != nil && *b.InitialRows <= 0 {
+		return fmt.Errorf("batch.initial_rows must be positive, got %d: %w", *b.InitialRows, ErrInvalidManifest)
+	}
+	return nil
+}
+
+// BatchDML is a chunked UPDATE or DELETE: a large DML statement run as a loop of
+// small, individually-committed batches so it never escalates to a table lock or
+// blows up the transaction log. Like Shrink it does not fit the "one operation =
+// one statement" model: a dedicated runtime driver builds the per-batch SQL and
+// runs its own loop (see specs/BATCH-DML.md). It is table-scoped (no named object,
+// like rebuild_heap). Verb is carried by the discriminator, not a YAML field.
+type BatchDML struct {
+	Verb             string             `yaml:"-"` // "update" | "delete"
+	Schema           string             `yaml:"schema"`
+	Table            string             `yaml:"table"`
+	Set              map[string]Literal `yaml:"set"`       // column -> scalar literal (update only)
+	SetRaw           string             `yaml:"set_raw"`   // guarded raw SET list (update only)
+	Where            []Condition        `yaml:"where"`     // simple conditions, AND-ed
+	WhereRaw         string             `yaml:"where_raw"` // guarded raw predicate
+	Batch            BatchSpec          `yaml:"batch"`
+	ConfirmFullTable bool               `yaml:"confirm_full_table"`
+	Options          OptionOverrides    `yaml:"options"` // only MAXDOP applies to DML
+}
+
+func (o BatchDML) CommandType() string {
+	if o.Verb == "delete" {
+		return "batch_delete"
+	}
+	return "batch_update"
+}
+
+func (o BatchDML) Target() ObjectRef { return ObjectRef{Schema: o.Schema, Table: o.Table} }
+
+func (o BatchDML) Validate() error {
+	cmd := o.CommandType()
+	if err := requireFields(cmd, map[string]string{"schema": o.Schema, "table": o.Table}); err != nil {
+		return err
+	}
+
+	hasSet := len(o.Set) > 0
+	hasSetRaw := strings.TrimSpace(o.SetRaw) != ""
+	switch o.Verb {
+	case "update":
+		if hasSet == hasSetRaw { // neither set, or both set
+			return fmt.Errorf("%s: set exactly one of set or set_raw: %w", cmd, ErrInvalidManifest)
+		}
+	case "delete":
+		if hasSet || hasSetRaw {
+			return fmt.Errorf("%s: delete takes no set/set_raw: %w", cmd, ErrInvalidManifest)
+		}
+	default:
+		return fmt.Errorf("batch_dml: unknown verb %q: %w", o.Verb, ErrInvalidManifest)
+	}
+	for col := range o.Set {
+		if strings.TrimSpace(col) == "" {
+			return fmt.Errorf("%s: set has an empty column name: %w", cmd, ErrInvalidManifest)
+		}
+	}
+
+	hasWhere := len(o.Where) > 0
+	hasWhereRaw := strings.TrimSpace(o.WhereRaw) != ""
+	if hasWhere && hasWhereRaw {
+		return fmt.Errorf("%s: set at most one of where or where_raw: %w", cmd, ErrInvalidManifest)
+	}
+	for i, c := range o.Where {
+		if err := c.validate(); err != nil {
+			return fmt.Errorf("%s: where[%d]: %w", cmd, i, err)
+		}
+	}
+
+	// Whole-table guard: no predicate at all is destructive and must be confirmed.
+	if !hasWhere && !hasWhereRaw && !o.ConfirmFullTable {
+		return fmt.Errorf("%s: no where/where_raw targets the whole table; set confirm_full_table: true to allow it (or use TRUNCATE for an unconditional delete): %w", cmd, ErrInvalidManifest)
+	}
+	// A raw whole-table UPDATE cannot self-limit under the predicate strategy, so it
+	// would loop forever — require a self-limiting where_raw.
+	if o.Verb == "update" && hasSetRaw && !hasWhere && !hasWhereRaw {
+		return fmt.Errorf("%s: set_raw without where/where_raw cannot self-limit (it would loop forever); add a self-limiting where_raw: %w", cmd, ErrInvalidManifest)
+	}
+
+	return o.Batch.validate()
 }

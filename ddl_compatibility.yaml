@@ -77,3 +77,10 @@ commands:
 
   shrink_log:        {}             # DBCC SHRINKFILE on a log file: no injectable option.
                                     # WALP does not apply to log files (VLF truncation, no IAM Sch-M).
+
+  batch_update:                     # chunked UPDATE (run in batches by the runtime driver)
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, express, azure] }  # OPTION (MAXDOP n)
+    # No ONLINE/RESUMABLE/WAIT_AT_LOW_PRIORITY: those are index/table DDL options, not DML.
+
+  batch_delete:                     # chunked DELETE (run in batches by the runtime driver)
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, express, azure] }  # OPTION (MAXDOP n)

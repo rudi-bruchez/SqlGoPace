@@ -54,6 +54,15 @@ type ShrinkFileReport struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+// BatchDMLReport is the outcome of one batched UPDATE/DELETE operation.
+type BatchDMLReport struct {
+	Verb      string `json:"verb"` // "update" | "delete"
+	Rows      int64  `json:"rows"`
+	Batches   int    `json:"batches"`
+	FinalRows int    `json:"final_rows,omitempty"` // the last adaptive batch size
+	Reason    string `json:"reason,omitempty"`     // why it stopped early; empty on completion
+}
+
 // OperationReport is the outcome of one executed operation.
 type OperationReport struct {
 	Index       int                `json:"index"`
@@ -65,6 +74,7 @@ type OperationReport struct {
 	Waits       []WaitLine         `json:"waits,omitempty"`
 	WaitTotalMS int64              `json:"wait_total_ms,omitempty"`
 	Shrink      []ShrinkFileReport `json:"shrink,omitempty"`
+	BatchDML    *BatchDMLReport    `json:"batch_dml,omitempty"`
 	Outcome     string             `json:"outcome"`
 	Error       string             `json:"error,omitempty"`
 	DurationMS  int64              `json:"duration_ms"`

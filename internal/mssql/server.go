@@ -21,6 +21,14 @@ type ServerInfo struct {
 	Database      string
 	RecoveryModel string // "FULL" | "SIMPLE" | "BULK_LOGGED"
 	ADREnabled    bool
+
+	// RCSIEnabled is READ_COMMITTED_SNAPSHOT and SnapshotIsolation is
+	// ALLOW_SNAPSHOT_ISOLATION. Both are informational for DDL (which conflicts on
+	// schema locks, not data locks) but matter for batched DML: with RCSI off, lock
+	// escalation to a table X lock blocks readers; with it on, the cost shifts to
+	// the tempdb version store.
+	RCSIEnabled       bool
+	SnapshotIsolation bool
 }
 
 // Tier maps the engine edition to a capability tier.
@@ -47,7 +55,9 @@ SELECT
     CAST(SERVERPROPERTY('EngineEdition') AS int),
     CAST(SERVERPROPERTY('ProductMajorVersion') AS int),
     DB_NAME(),
-    CAST(d.recovery_model_desc AS nvarchar(60))
+    CAST(d.recovery_model_desc AS nvarchar(60)),
+    CONVERT(bit, d.is_read_committed_snapshot_on),
+    CONVERT(bit, CASE WHEN d.snapshot_isolation_state = 1 THEN 1 ELSE 0 END)
 FROM sys.databases d
 WHERE d.database_id = DB_ID();`
 
@@ -66,7 +76,8 @@ func DetectServer(ctx context.Context, conn *sql.Conn) (ServerInfo, error) {
 		major sql.NullInt64
 	)
 	err := conn.QueryRowContext(ctx, detectBaseSQL).
-		Scan(&info.EngineEdition, &major, &info.Database, &info.RecoveryModel)
+		Scan(&info.EngineEdition, &major, &info.Database, &info.RecoveryModel,
+			&info.RCSIEnabled, &info.SnapshotIsolation)
 	if err != nil {
 		return ServerInfo{}, fmt.Errorf("detect server: %w", err)
 	}

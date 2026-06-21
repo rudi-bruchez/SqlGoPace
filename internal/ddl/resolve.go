@@ -69,6 +69,12 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 		return resolveShrink(op, t, m, p)
 	}
 
+	// Batched DML shares none of the index/table WITH options: only MAXDOP (a query
+	// hint) and the reaction-policy overrides apply. Resolve them directly.
+	if cmd == "batch_update" || cmd == "batch_delete" {
+		return resolveBatchDML(op, t, m, p)
+	}
+
 	ov := overridesOf(op)
 
 	app := func(option string) bool {
@@ -212,6 +218,38 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 	return res, decisions
 }
 
+// resolveBatchDML resolves options for a batch_update/batch_delete. Only MAXDOP (a
+// query hint, gated by the matrix) is a T-SQL option; ignore_blocking and
+// max_block_minutes are reaction-policy overrides that flow to the runner. There is
+// no ONLINE/RESUMABLE/WALP family for DML, so none is considered.
+func resolveBatchDML(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []Decision) {
+	ov := overridesOf(op)
+	var res ResolvedOptions
+	var decisions []Decision
+
+	if m.Applicable(t.MajorVersion, t.Tier, op.CommandType(), "maxdop") {
+		if md := firstInt(ov.MaxDOP, p.MaxDOP); md != nil {
+			v := *md
+			res.MaxDOP = &v
+			decisions = append(decisions, Decision{Option: "maxdop", Value: strconv.Itoa(v), Reason: "set by override"})
+		}
+	}
+
+	res.IgnoreBlocking = ov.IgnoreBlocking != nil && *ov.IgnoreBlocking
+	if ov.MaxBlockMinutes != nil && *ov.MaxBlockMinutes > 0 {
+		res.MaxBlockMinutes = *ov.MaxBlockMinutes
+	}
+	if res.IgnoreBlocking {
+		decisions = append(decisions, Decision{Option: "ignore_blocking", Value: "ON",
+			Reason: "set by override: hold the lock through blocking (reaction policy, not a WITH option)"})
+	}
+	if res.MaxBlockMinutes > 0 {
+		decisions = append(decisions, Decision{Option: "max_block_minutes", Value: strconv.Itoa(res.MaxBlockMinutes),
+			Reason: "set by override: yield after this long even if the blocker is ignored (safety cap)"})
+	}
+	return res, decisions
+}
+
 // pickBool resolves one boolean option. defaultOn selects the auto behavior:
 // safety options default to applicability, tuning options default to off.
 // A forced-on but unsupported option is omitted. It returns the value, a reason,
@@ -252,6 +290,8 @@ func overridesOf(op Operation) OptionOverrides {
 	case AddConstraint:
 		return o.Options
 	case Shrink:
+		return o.Options
+	case BatchDML:
 		return o.Options
 	default:
 		return OptionOverrides{}

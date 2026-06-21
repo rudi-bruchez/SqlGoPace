@@ -7,6 +7,7 @@ package preflight
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -115,6 +116,36 @@ func CheckBlocking(sessions []mssql.Session) Check {
 	return Check{"blocking", Pass, "no pre-existing blocking"}
 }
 
+// requiresElevatedRights reports whether an operation needs db_owner or sysadmin:
+// DBCC SHRINKFILE (shrink) and DBCC CHECKDB (check_db) both do. Lesser DDL rights
+// (db_ddladmin, ALTER on a table) are not enough for these.
+func requiresElevatedRights(op ddl.Operation) bool {
+	switch op.(type) {
+	case ddl.CheckDB, ddl.Shrink:
+		return true
+	default:
+		return false
+	}
+}
+
+// needsElevatedRights reports whether any operation in the manifest requires
+// db_owner / sysadmin, so the permission probe runs at most once per manifest.
+func needsElevatedRights(m *ddl.Manifest) bool {
+	return slices.ContainsFunc(m.Operations, requiresElevatedRights)
+}
+
+// CheckElevatedRights verifies the connected login can run the manifest's
+// elevated-privilege operations (shrink / check_db). The grant requirement is
+// surfaced explicitly so a missing membership is actionable, not an opaque
+// execution-time DBCC error.
+func CheckElevatedRights(hasAccess bool) Check {
+	if !hasAccess {
+		return Check{"permissions", Fail,
+			"shrink/check_db require db_owner (in this database) or sysadmin; the connected login has neither"}
+	}
+	return Check{"permissions", Pass, "db_owner or sysadmin"}
+}
+
 // CheckOperation verifies an operation's preconditions: the table must exist, and
 // the target object must exist (for rebuild/alter/drop) or not exist (for
 // create/add — already present means the idempotent guard will skip it).
@@ -157,6 +188,8 @@ type Prober interface {
 	IndexExists(ctx context.Context, schema, table, index string) (bool, error)
 	ColumnExists(ctx context.Context, schema, table, column string) (bool, error)
 	ConstraintExists(ctx context.Context, schema, table, constraint string) (bool, error)
+	HasElevatedDBAccess(ctx context.Context) (bool, error)
+	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
 }
 
 var _ Prober = (*mssql.Conn)(nil)
@@ -188,14 +221,73 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 	}
 	rep.add(CheckBlocking(sessions))
 
+	// Operations that issue DBCC (shrink, check_db) need db_owner or sysadmin.
+	// Probe once if any is present, so a missing grant fails preflight with a clear
+	// message rather than an opaque DBCC error at execution time.
+	if needsElevatedRights(m) {
+		access, err := p.HasElevatedDBAccess(ctx)
+		if err != nil {
+			return Report{}, fmt.Errorf("preflight elevated access: %w", err)
+		}
+		rep.add(CheckElevatedRights(access))
+	}
+
 	for _, op := range m.Operations {
 		tableExists, targetExists, err := objectExistence(ctx, p, op)
 		if err != nil {
 			return Report{}, err
 		}
 		rep.add(CheckOperation(op, tableExists, targetExists))
+
+		// Batched DML needs UPDATE/DELETE permission on the table (a clear preflight
+		// failure beats an opaque execution-time permission error), plus an RCSI
+		// advisory on how lock escalation / the tempdb version store will behave.
+		if b, ok := op.(ddl.BatchDML); ok {
+			if tableExists {
+				perm := dmlPermissionFor(b)
+				has, err := p.HasDMLPermission(ctx, b.Schema, b.Table, perm)
+				if err != nil {
+					return Report{}, fmt.Errorf("preflight dml permission %s.%s: %w", b.Schema, b.Table, err)
+				}
+				rep.add(CheckBatchDMLPermission(b, perm, has))
+			}
+			rep.add(CheckBatchDMLIsolation(info, b))
+		}
 	}
 	return rep, nil
+}
+
+// dmlPermissionFor returns the object permission a batch operation needs.
+func dmlPermissionFor(op ddl.BatchDML) string {
+	if op.Verb == "delete" {
+		return "DELETE"
+	}
+	return "UPDATE"
+}
+
+// CheckBatchDMLPermission verifies the connected login can run the batch operation's
+// UPDATE/DELETE on the target table.
+func CheckBatchDMLPermission(op ddl.BatchDML, perm string, hasAccess bool) Check {
+	name := fmt.Sprintf("%s %s.%s permission", op.CommandType(), op.Schema, op.Table)
+	if !hasAccess {
+		return Check{name, Fail,
+			fmt.Sprintf("the connected login lacks %s permission on [%s].[%s]", perm, op.Schema, op.Table)}
+	}
+	return Check{name, Pass, perm + " granted"}
+}
+
+// CheckBatchDMLIsolation is an advisory (never blocking) on how the database's
+// snapshot-isolation state shapes a batched DML: with RCSI off, lock escalation to a
+// table X lock blocks readers (so batches are capped small); with it on, readers are
+// unaffected but the tempdb version store grows with each changed row.
+func CheckBatchDMLIsolation(info mssql.ServerInfo, op ddl.BatchDML) Check {
+	name := fmt.Sprintf("%s isolation advisory", op.CommandType())
+	if info.RCSIEnabled || info.SnapshotIsolation {
+		return Check{name, Warn,
+			"RCSI/snapshot isolation is on: readers are not blocked by the batch, but each changed row adds a tempdb version-store entry — watch tempdb on a long run"}
+	}
+	return Check{name, Warn,
+		"RCSI is off: a batch large enough to escalate to a table lock blocks readers; batch size is capped below the escalation threshold — keep batches small or enable RCSI"}
 }
 
 // objectExistence resolves whether the operation's table and target object exist.

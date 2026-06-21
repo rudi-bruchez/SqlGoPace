@@ -126,6 +126,22 @@ func (c *Conn) ExecDDL(ctx context.Context, statement string) error {
 	return nil
 }
 
+// ExecRows runs a statement on the pinned execution connection and returns the
+// number of rows it affected. The batch-DML driver uses the count to know when a
+// predicate loop is exhausted (zero rows affected). Cancellation is propagated via
+// ctx; see Kill for the server-side fallback.
+func (c *Conn) ExecRows(ctx context.Context, statement string) (int64, error) {
+	res, err := c.exec.ExecContext(ctx, statement)
+	if err != nil {
+		return 0, fmt.Errorf("execute dml: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected: %w", err)
+	}
+	return n, nil
+}
+
 // Kill issues KILL <spid> on the monitoring pool — never the execution
 // connection — as the server-side fallback when Go cancellation does not stop
 // the DDL.

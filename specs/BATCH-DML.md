@@ -1,7 +1,10 @@
 # BATCH-DML — `UPDATE` / `DELETE` découpés en lots
 
-> **DRAFT** — source de vérité du comportement visé pour les opérations DML par lots.
-> Aucune ligne n'est encore codée ; ce document fixe le design à valider.
+> Source de vérité du comportement visé pour les opérations DML par lots.
+> **It1 (MVP) implémenté** : `batch_update`/`batch_delete`, stratégie `predicate`, `set:`/`where:`
+> déclaratifs + échappatoire `set_raw:`/`where_raw:`, calibrage adaptatif, réutilisation
+> réaction/monitoring, preflight (permission + avis RCSI), RCSI/SI dans `ServerInfo`. It2–It4
+> (`key_range`/curseur, calibrage RCSI fin + TUI, exactement-une-fois) restent à faire (cf. §7).
 
 ## 1. Objectif et contexte
 

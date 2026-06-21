@@ -41,6 +41,8 @@ func Generate(op Operation, res ResolvedOptions) (string, error) {
 		return generateDropConstraint(o), nil
 	case Shrink:
 		return generateShrink(o, res), nil
+	case BatchDML:
+		return generateBatchDML(o, res), nil
 	default:
 		return "", fmt.Errorf("%T: %w", op, ErrUnsupportedOperation)
 	}

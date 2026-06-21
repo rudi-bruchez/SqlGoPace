@@ -53,6 +53,15 @@ func TestCheckBlocking(t *testing.T) {
 	}
 }
 
+func TestCheckElevatedRights(t *testing.T) {
+	if got := preflight.CheckElevatedRights(true).Severity; got != preflight.Pass {
+		t.Errorf("CheckElevatedRights(true) = %v, want Pass", got)
+	}
+	if got := preflight.CheckElevatedRights(false).Severity; got != preflight.Fail {
+		t.Errorf("CheckElevatedRights(false) = %v, want Fail", got)
+	}
+}
+
 func TestCheckOperation(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -87,11 +96,13 @@ func TestCheckOperation(t *testing.T) {
 
 // fakeProber is a scripted Prober for testing Run without a database.
 type fakeProber struct {
-	logSpace    mssql.LogSpace
-	reuseWait   string
-	sessions    []mssql.Session
-	tableExists bool
-	indexExists bool
+	logSpace       mssql.LogSpace
+	reuseWait      string
+	sessions       []mssql.Session
+	tableExists    bool
+	indexExists    bool
+	elevatedAccess bool
+	dmlPermission  bool
 }
 
 func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) { return f.logSpace, nil }
@@ -111,13 +122,20 @@ func (f fakeProber) ColumnExists(context.Context, string, string, string) (bool,
 func (f fakeProber) ConstraintExists(context.Context, string, string, string) (bool, error) {
 	return false, nil
 }
+func (f fakeProber) HasElevatedDBAccess(context.Context) (bool, error) {
+	return f.elevatedAccess, nil
+}
+func (f fakeProber) HasDMLPermission(context.Context, string, string, string) (bool, error) {
+	return f.dmlPermission, nil
+}
 
 func healthyProber() fakeProber {
 	return fakeProber{
-		logSpace:    mssql.LogSpace{TotalBytes: 100, UsedPercent: 10},
-		reuseWait:   "NOTHING",
-		tableExists: true,
-		indexExists: true,
+		logSpace:       mssql.LogSpace{TotalBytes: 100, UsedPercent: 10},
+		reuseWait:      "NOTHING",
+		tableExists:    true,
+		indexExists:    true,
+		elevatedAccess: true,
 	}
 }
 
@@ -162,6 +180,48 @@ func TestRun(t *testing.T) {
 		}
 		if !rep.OK() {
 			t.Errorf("Run() report not OK for a shrink manifest:\n%v", rep.Checks)
+		}
+	})
+
+	t.Run("shrink without db_owner fails on permissions", func(t *testing.T) {
+		p := healthyProber()
+		p.elevatedAccess = false
+		shrinkManifest := &ddl.Manifest{Operations: []ddl.Operation{
+			ddl.Shrink{Type: "data", Files: "all"},
+		}}
+		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() should fail a shrink when the login lacks db_owner/sysadmin")
+		}
+	})
+
+	t.Run("check_db without db_owner fails on permissions", func(t *testing.T) {
+		p := healthyProber()
+		p.elevatedAccess = false
+		checkManifest := &ddl.Manifest{Operations: []ddl.Operation{
+			ddl.CheckDB{Database: "MyDb"},
+		}}
+		rep, err := preflight.Run(context.Background(), p, info, checkManifest, th)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() should fail a check_db when the login lacks db_owner/sysadmin")
+		}
+	})
+
+	t.Run("ordinary DDL is not gated on elevated rights", func(t *testing.T) {
+		p := healthyProber()
+		p.elevatedAccess = false // not probed for a plain rebuild manifest
+		rep, err := preflight.Run(context.Background(), p, info, manifest, th)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.OK() {
+			t.Errorf("Run() should not require db_owner for a rebuild manifest:\n%v", rep.Checks)
 		}
 	})
 

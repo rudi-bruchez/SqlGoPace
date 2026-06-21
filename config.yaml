@@ -70,4 +70,19 @@ shrink:
   self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
   log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
 
+# Tuning for batched DML (`batch_update` / `batch_delete`). Entirely OPTIONAL: omit the
+# whole block and every field takes its default. Global only — starting points and bounds
+# the driver's adaptive sizing varies. escalation_cap_rows is the batch ceiling applied
+# when the database has RCSI off, to stay below the ~5000-lock table-escalation threshold
+# that would otherwise freeze readers.
+batch_dml:
+  initial_small_rows:    1000    # estimated table < 100k rows
+  initial_medium_rows:   5000    # 100k–1M rows
+  initial_large_rows:   20000    # > 1M rows
+  min_rows:               100    # batch floor
+  max_rows:            100000    # batch ceiling (RCSI on)
+  escalation_cap_rows:   4000    # batch ceiling when RCSI is off
+  target_batch_seconds:     5    # aim each batch at a few seconds
+  self_wait_timeout_minutes: 5   # max total wait while stopped under pressure before a clean stop
+
 matrix_file: "./ddl_compatibility.yaml"

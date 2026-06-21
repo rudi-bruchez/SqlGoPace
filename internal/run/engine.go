@@ -38,6 +38,15 @@ type ShrinkDriver interface {
 
 var _ ShrinkDriver = (*ShrinkRunner)(nil)
 
+// BatchDMLDriver runs a batched UPDATE/DELETE, which like a shrink does not fit the
+// one-statement OpRunner model: it loops a per-batch statement at run time. The
+// engine routes ddl.BatchDML operations here. *BatchDMLRunner satisfies it.
+type BatchDMLDriver interface {
+	Run(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (BatchDMLResult, error)
+}
+
+var _ BatchDMLDriver = (*BatchDMLRunner)(nil)
+
 // SessionInfo provides the execution session signature for the crash-recovery
 // sidecar, including a CONTEXT_INFO marker so an orphaned session can be correlated
 // to its run reliably (a bare SPID is reused). *mssql.Conn satisfies it.
@@ -117,6 +126,7 @@ type Engine struct {
 	pf               Preflighter
 	runner           OpRunner
 	shrink           ShrinkDriver
+	batchDML         BatchDMLDriver
 	adr              bool
 	clk              Clock
 	session          SessionInfo
@@ -150,6 +160,12 @@ func WithADR(adr bool) EngineOption { return func(e *Engine) { e.adr = adr } }
 // OpRunner, whose indicative PlannedOperation.SQL is not the real per-chunk SQL —
 // so a shrink driver should always be wired when shrink manifests are expected.
 func WithShrinkRunner(d ShrinkDriver) EngineOption { return func(e *Engine) { e.shrink = d } }
+
+// WithBatchDMLRunner routes ddl.BatchDML operations to the batch-DML driver instead
+// of the OpRunner. Without it, a batch_update/batch_delete falls back to the
+// OpRunner, whose indicative PlannedOperation.SQL is not the real per-batch SQL — so
+// a batch-DML driver should always be wired when batch manifests are expected.
+func WithBatchDMLRunner(d BatchDMLDriver) EngineOption { return func(e *Engine) { e.batchDML = d } }
 
 // WithClock sets the clock (defaults to System).
 func WithClock(c Clock) EngineOption { return func(e *Engine) { e.clk = c } }
@@ -374,12 +390,27 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		var (
 			runErr        error
 			shrinkResults []ShrinkResult
+			batchResult   *BatchDMLResult
 		)
-		if sh, ok := step.Operation.(ddl.Shrink); ok && e.shrink != nil {
-			// Shrink is multi-statement and built at run time; route to the driver,
-			// passing the resolved options (only WALP is meaningful for a shrink).
-			shrinkResults, runErr = e.shrink.Run(ctx, sh, step.Options, ignore, sink)
-		} else {
+		switch op := step.Operation.(type) {
+		case ddl.Shrink:
+			if e.shrink != nil {
+				// Shrink is multi-statement and built at run time; route to the driver,
+				// passing the resolved options (only WALP is meaningful for a shrink).
+				shrinkResults, runErr = e.shrink.Run(ctx, op, step.Options, ignore, sink)
+			} else {
+				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			}
+		case ddl.BatchDML:
+			if e.batchDML != nil {
+				// Batched DML is a per-batch loop built at run time; route to its driver.
+				var br BatchDMLResult
+				br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, sink)
+				batchResult = &br
+			} else {
+				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			}
+		default:
 			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 		}
 		// Stop the narrator and wait for it to fully exit before reading `reactions`
@@ -398,6 +429,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			Waits:       waitLines,
 			WaitTotalMS: waitTotal,
 			Shrink:      shrinkReport(shrinkResults),
+			BatchDML:    batchDMLReport(batchResult),
 			DurationMS:  e.msSince(opStart),
 		}
 		if runErr != nil {
@@ -766,6 +798,20 @@ func shrinkReport(results []ShrinkResult) []report.ShrinkFileReport {
 		}
 	}
 	return out
+}
+
+// batchDMLReport maps the driver's batch result into the run report.
+func batchDMLReport(r *BatchDMLResult) *report.BatchDMLReport {
+	if r == nil {
+		return nil
+	}
+	return &report.BatchDMLReport{
+		Verb:      r.Verb,
+		Rows:      r.Rows,
+		Batches:   r.Batches,
+		FinalRows: r.FinalRows,
+		Reason:    r.Reason,
+	}
 }
 
 // cancelSafe reports whether canceling op under pressure is a clean stop with no

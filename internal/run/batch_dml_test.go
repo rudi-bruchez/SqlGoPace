@@ -1,0 +1,200 @@
+package run
+
+import (
+	"context"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+)
+
+// fakeBatchServer models a draining table for the batch-DML driver: each ExecRows
+// affects up to the statement's TOP (n) rows until none remain. It implements both
+// BatchExecutor and BatchDMLReader.
+type fakeBatchServer struct {
+	remaining int64
+	estRows   int64
+	waits     []mssql.SessionWait
+
+	execLog []string
+	killed  bool
+}
+
+func (s *fakeBatchServer) SPID() int                             { return 7 }
+func (s *fakeBatchServer) ExecDDL(context.Context, string) error { return nil }
+func (s *fakeBatchServer) Kill(context.Context, int) error       { s.killed = true; return nil }
+
+func (s *fakeBatchServer) ExecRows(_ context.Context, sql string) (int64, error) {
+	s.execLog = append(s.execLog, sql)
+	n := min(int64(parseTop(sql)), s.remaining)
+	s.remaining -= n
+	return n, nil
+}
+
+func (s *fakeBatchServer) TableRowEstimate(context.Context, string, string) (int64, error) {
+	return s.estRows, nil
+}
+
+func (s *fakeBatchServer) SessionWaits(context.Context, int) ([]mssql.SessionWait, error) {
+	return s.waits, nil
+}
+
+// parseTop extracts N from a statement containing "TOP (N)".
+func parseTop(sql string) int {
+	_, after, ok := strings.Cut(sql, "TOP (")
+	if !ok {
+		return 0
+	}
+	num, _, ok := strings.Cut(after, ")")
+	if !ok {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(num))
+	return n
+}
+
+func testBatchTuning() BatchTuning {
+	return BatchTuning{
+		InitialSmallRows:  1000,
+		InitialMediumRows: 5000,
+		InitialLargeRows:  20000,
+		MinRows:           100,
+		MaxRows:           100000,
+		EscalationCapRows: 4000,
+		TargetBatch:       5 * time.Second,
+		SelfWaitTimeout:   10 * time.Minute,
+	}
+}
+
+func newTestBatchRunner(s *fakeBatchServer, clk *ManualClock, rcsi bool) *BatchDMLRunner {
+	return NewBatchDMLRunner(s, s, noPressureSampler{}, clk, BatchDMLRunnerConfig{
+		Tuning:          testBatchTuning(),
+		RCSI:            rcsi,
+		PollInterval:    time.Hour, // pump never fires during the instant batches
+		LogPollInterval: time.Hour,
+		BlockingTimeout: time.Minute,
+		LogDrainTimeout: time.Minute,
+		KillGrace:       time.Second,
+	})
+}
+
+func TestBatchDMLConverges(t *testing.T) {
+	s := &fakeBatchServer{remaining: 12345, estRows: 12345}
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
+
+	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if res.Rows != 12345 {
+		t.Errorf("Rows = %d, want 12345", res.Rows)
+	}
+	if res.Batches == 0 {
+		t.Errorf("Batches = 0, want > 0")
+	}
+	if res.Reason != "" {
+		t.Errorf("Reason = %q, want empty (clean completion)", res.Reason)
+	}
+	if s.remaining != 0 {
+		t.Errorf("server remaining = %d, want 0", s.remaining)
+	}
+}
+
+func TestBatchDMLNoRows(t *testing.T) {
+	s := &fakeBatchServer{remaining: 0, estRows: 0}
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
+
+	op := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "T", SetRaw: "A = 1", WhereRaw: "A <> 1"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if res.Rows != 0 || res.Batches != 0 {
+		t.Errorf("got rows=%d batches=%d, want 0/0 (nothing matched)", res.Rows, res.Batches)
+	}
+	// One probing statement ran and affected nothing.
+	if len(s.execLog) != 1 {
+		t.Errorf("statements run = %d, want 1", len(s.execLog))
+	}
+}
+
+func TestBatchDMLRCSIOffCapsBatchSize(t *testing.T) {
+	// A large table: the large-tier initial (20000) and adaptive growth must both be
+	// held under the escalation cap (4000) when RCSI is off.
+	s := &fakeBatchServer{remaining: 50000, estRows: 2_000_000}
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), false)
+
+	op := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "T", SetRaw: "A = 1", WhereRaw: "A <> 1"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, sql := range s.execLog {
+		if top := parseTop(sql); top > testBatchTuning().EscalationCapRows {
+			t.Errorf("batch size %d exceeds the RCSI-off escalation cap %d (%s)", top, testBatchTuning().EscalationCapRows, sql)
+		}
+	}
+}
+
+func TestBatchDMLRCSIOnGrowsPastCap(t *testing.T) {
+	// With RCSI on, the cap is lifted: under no pressure the batch grows past the
+	// escalation cap toward MaxRows.
+	s := &fakeBatchServer{remaining: 200000, estRows: 2_000_000}
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
+
+	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var maxTop int
+	for _, sql := range s.execLog {
+		maxTop = max(maxTop, parseTop(sql))
+	}
+	if maxTop <= testBatchTuning().EscalationCapRows {
+		t.Errorf("max batch size = %d, want > escalation cap %d (RCSI on lifts it)", maxTop, testBatchTuning().EscalationCapRows)
+	}
+}
+
+func TestInitialBatchRows(t *testing.T) {
+	tn := testBatchTuning()
+	tests := []struct {
+		est  int64
+		want int
+	}{
+		{50_000, 1000},     // small tier
+		{500_000, 5000},    // medium tier
+		{5_000_000, 20000}, // large tier
+	}
+	for _, tt := range tests {
+		if got := InitialBatchRows(tt.est, tn); got != tt.want {
+			t.Errorf("InitialBatchRows(%d) = %d, want %d", tt.est, got, tt.want)
+		}
+	}
+}
+
+func TestAdjustBatchRows(t *testing.T) {
+	tn := testBatchTuning()
+	lo, hi := tn.MinRows, tn.MaxRows
+	tests := []struct {
+		name string
+		size int
+		w    WaitDeltas
+		want int
+	}{
+		{"reduce on writelog", 4000, WaitDeltas{WriteLogAvgMs: 20}, 2000},
+		{"reduce on blocking", 4000, WaitDeltas{BlockingSeconds: 60}, 2000},
+		{"grow when quiet", 4000, WaitDeltas{}, 8000},
+		{"clamp to ceiling", 80000, WaitDeltas{}, hi},
+		{"clamp to floor", 150, WaitDeltas{WriteLogAvgMs: 20}, lo},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := AdjustBatchRows(tt.size, time.Second, tt.w, tn.TargetBatch, lo, hi); got != tt.want {
+				t.Errorf("AdjustBatchRows = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}

@@ -31,6 +31,7 @@ type Config struct {
 	Notifications   NotificationsConfig   `yaml:"notifications"`
 	History         HistoryConfig         `yaml:"history"`
 	Shrink          ShrinkConfig          `yaml:"shrink"`
+	BatchDML        BatchDMLConfig        `yaml:"batch_dml"`
 	MatrixFile      string                `yaml:"matrix_file"`
 }
 
@@ -179,6 +180,50 @@ func (s ShrinkConfig) LogReuseWaitTimeout() time.Duration {
 	return time.Duration(s.LogReuseWaitTimeoutMinutes) * time.Minute
 }
 
+// BatchDMLConfig holds the tuning parameters for the chunked UPDATE/DELETE driver.
+// Like ShrinkConfig every field is optional (zero/negative → documented default) and
+// global only: the values are starting points and bounds the driver's adaptive
+// sizing varies. EscalationCapRows is the batch ceiling applied when the database has
+// RCSI off, to keep a batch below the ~5000-lock table-escalation threshold.
+type BatchDMLConfig struct {
+	InitialSmallRows       int `yaml:"initial_small_rows"`        // estimated table < 100k rows
+	InitialMediumRows      int `yaml:"initial_medium_rows"`       // 100k–1M rows
+	InitialLargeRows       int `yaml:"initial_large_rows"`        // > 1M rows
+	MinRows                int `yaml:"min_rows"`                  // batch floor
+	MaxRows                int `yaml:"max_rows"`                  // batch ceiling
+	EscalationCapRows      int `yaml:"escalation_cap_rows"`       // ceiling when RCSI is off (avoid table-lock escalation)
+	TargetBatchSeconds     int `yaml:"target_batch_seconds"`      // ideal per-batch duration
+	SelfWaitTimeoutMinutes int `yaml:"self_wait_timeout_minutes"` // max cumulative wait while stopped before a clean stop
+}
+
+// TargetBatch returns the ideal per-batch duration.
+func (b BatchDMLConfig) TargetBatch() time.Duration {
+	return time.Duration(b.TargetBatchSeconds) * time.Second
+}
+
+// SelfWaitTimeout returns the max cumulative wait while stopped under pressure
+// before the driver stops cleanly.
+func (b BatchDMLConfig) SelfWaitTimeout() time.Duration {
+	return time.Duration(b.SelfWaitTimeoutMinutes) * time.Minute
+}
+
+// applyDefaults fills any unset (zero or negative) field with its default.
+func (b *BatchDMLConfig) applyDefaults() {
+	setIf := func(p *int, def int) {
+		if *p <= 0 {
+			*p = def
+		}
+	}
+	setIf(&b.InitialSmallRows, 1000)
+	setIf(&b.InitialMediumRows, 5000)
+	setIf(&b.InitialLargeRows, 20000)
+	setIf(&b.MinRows, 100)
+	setIf(&b.MaxRows, 100000)
+	setIf(&b.EscalationCapRows, 4000)
+	setIf(&b.TargetBatchSeconds, 5)
+	setIf(&b.SelfWaitTimeoutMinutes, 5)
+}
+
 // NotificationsConfig holds webhook settings.
 type NotificationsConfig struct {
 	WebhookURL string   `yaml:"webhook_url"`
@@ -244,6 +289,7 @@ func (c *Config) applyDefaults() {
 		c.Monitoring.ReconnectTimeoutMinutes = 2
 	}
 	c.Shrink.applyDefaults()
+	c.BatchDML.applyDefaults()
 }
 
 // applyDefaults fills any unset (zero or negative) shrink field with its default,
@@ -312,6 +358,10 @@ func (c *Config) validate() error {
 	if c.Shrink.MinStepMB > c.Shrink.MaxStepMB {
 		return fmt.Errorf("shrink.min_step_mb (%d) must be <= max_step_mb (%d): %w",
 			c.Shrink.MinStepMB, c.Shrink.MaxStepMB, ErrInvalidConfig)
+	}
+	if c.BatchDML.MinRows > c.BatchDML.MaxRows {
+		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",
+			c.BatchDML.MinRows, c.BatchDML.MaxRows, ErrInvalidConfig)
 	}
 	return nil
 }
