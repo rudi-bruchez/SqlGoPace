@@ -25,6 +25,30 @@ Index des specs d'itération en attente de brainstorming puis d'implémentation.
   dans le sidecar `State`, ou fichier de contrôle dédié) et reprend à l'op suivante. Chaînon manquant
   entre `pause` (mi-instruction) et `kill` (brutal).
 
+- [ ] **[DML par lots : `UPDATE`/`DELETE` découpés](BATCH-DML.md)** — étend SqlGoPace au DML massif
+  (mettre une colonne à une valeur sur toute une table, purger une table) en **découpant en boucle de
+  lots** pour éviter l'escalade de verrous (~5000 → verrou X de table) et l'explosion du journal.
+  Calque du **driver de shrink** (boucle par chunks, calibrage adaptatif, réactions réutilisées).
+  Échappatoire `set_raw`/`where_raw` sous garde ; reprise après crash (predicate auto-limitant, puis
+  curseur `key_range`). **C'est ici que le test RCSI sert** : il décide à quel point l'escalade gêne
+  (lecteurs gelés si RCSI off vs version store tempdb si on).
+
+- [ ] **[Garde-fou tempdb (alerte + arrêt auto-attribué)](TEMPDB-GUARD.md)** — tempdb est partagé par
+  toute l'instance (rayon de souffle = toutes les bases). Propose : **preflight no-start** si tempdb
+  déjà au-dessus du seuil ; **alerte runtime** (TUI + log) sur seuil ; et surtout **arrêt conditionné
+  à l'auto-attribution** — on n'arrête (pause→cancel) que si tempdb est plein **ET** que c'est *nous*
+  (`sys.dm_db_session_space_usage` par SPID), sinon alerte seule (s'arrêter pour la faute d'un tiers
+  ne libère rien). Transversal : sert rebuild `SORT_IN_TEMPDB`, shrink, DML par lots. Version store
+  RCSI = angle mort assumé (alerte seule).
+
+- [ ] **[Observabilité des attentes (TUI live + log)](WAIT-OBSERVABILITY.md)** — surfacer **en temps
+  réel dans le TUI** (et déjà en synthèse dans le `.log`) les attentes de notre session via
+  `sys.dm_exec_session_wait_stats`. **Observabilité, pas réaction** : les attentes expliquent le
+  « pourquoi », elles ne pilotent rien (blocage/journal ont déjà des lectures dédiées ; le throttle
+  WRITELOG/PAGEIOLATCH existe déjà per-driver). Réutilise `SessionWaits`/`DiffWaits`/`CategorizeWaits`
+  existants — le neuf est le **panneau live** (delta glissant). Converge avec le step-sink de
+  `progress-tui.md`.
+
 ## Dépendances / ordre suggéré
 
 1. `progress-tui.md` en premier — le **step-sink** qu'il introduit est réutilisé par `remote-tui.md`
