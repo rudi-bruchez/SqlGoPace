@@ -114,6 +114,31 @@ Transaction-log protection still applies. It is per operation, so the rest of th
 the normal "yield when blocking" behavior. Pair it with `on_failure: continue` on the batch so
 one forced index does not change how the others react.
 
+For a **targeted** version — keep yielding to important sessions but ignore specific
+unimportant ones — use the top-level `ignore_blocked_sessions:` list instead (it applies to
+the whole manifest):
+
+```yaml
+ignore_blocked_sessions:
+  # All string fields are regexps (matched app-side). An entry matches when EVERY field it
+  # sets matches (AND); the list is OR'd. session_id is an exact match.
+  - app_name: "^SQLAgent"
+    login_name: "svc_reporting"   # ignore this job only under this login
+  - host_name: "BATCH0[0-9]"      # OR any session from these hosts
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: DISPATCH
+    index: ALL
+```
+
+A blocked session is yielded to unless it positively matches a rule (fail-safe). Prefer
+`app_name`/`login_name` over `session_id` (a SPID only identifies a connection that exists
+now). When the engine reacts to blocking it writes an advisory `<manifest>.blocked.yaml` next
+to the run report — ready-to-paste entries plus a full diagnostic block — so you can learn who
+blocked you and decide what to add. The engine never reads that file back; copying an entry
+into the manifest is a deliberate step.
+
 **You normally leave `options` empty.** The matrix (`ddl_compatibility.yaml`) decides
 what is legal and injects it. Key gates for `rebuild_index` (the common case):
 

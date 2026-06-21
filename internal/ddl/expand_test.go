@@ -89,10 +89,11 @@ func TestExpandPassesThroughNonAll(t *testing.T) {
 // fall back to fail-fast for a continue-mode manifest whenever the expander was wired.
 func TestExpandPreservesManifestFields(t *testing.T) {
 	m := &ddl.Manifest{
-		Description: "compress everything",
-		Database:    "MYDB",
-		OnFailure:   ddl.OnFailureContinue,
-		Operations:  []ddl.Operation{ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "ALL"}},
+		Description:           "compress everything",
+		Database:              "MYDB",
+		OnFailure:             ddl.OnFailureContinue,
+		IgnoreBlockedSessions: []ddl.IgnoredSession{{AppName: "^SQLAgent"}},
+		Operations:            []ddl.Operation{ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "ALL"}},
 	}
 	out, err := ddl.ExpandRebuildAll(m, indexes(
 		ddl.IndexDescriptor{Name: "PK_T", Clustered: true, Kind: ddl.KindRowstore},
@@ -105,6 +106,9 @@ func TestExpandPreservesManifestFields(t *testing.T) {
 	}
 	if !out.Continue() {
 		t.Errorf("expanded manifest OnFailure = %q, want continue preserved through expansion", out.OnFailure)
+	}
+	if diff := cmp.Diff(m.IgnoreBlockedSessions, out.IgnoreBlockedSessions); diff != "" {
+		t.Errorf("ignore_blocked_sessions dropped by expansion (-want +got):\n%s", diff)
 	}
 }
 

@@ -111,6 +111,34 @@ func TestParseOnFailure(t *testing.T) {
 	}
 }
 
+func TestParseIgnoreBlockedSessions(t *testing.T) {
+	y := `
+ignore_blocked_sessions:
+  - app_name: "^SQLAgent"
+    login_name: "svc_reporting"
+  - session_id: 57
+  - statement: "dbo\\.Report"
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	m, err := ddl.ParseManifest(strings.NewReader(y))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v", err)
+	}
+	id57 := 57
+	want := []ddl.IgnoredSession{
+		{AppName: "^SQLAgent", LoginName: "svc_reporting"},
+		{SessionID: &id57},
+		{Statement: `dbo\.Report`},
+	}
+	if diff := cmp.Diff(want, m.IgnoreBlockedSessions); diff != "" {
+		t.Errorf("IgnoreBlockedSessions mismatch (-want +got):\n%s", diff)
+	}
+}
+
 const maintenanceYAML = `
 description: "Maintenance operations"
 operations:
@@ -239,6 +267,21 @@ func TestParseManifestErrors(t *testing.T) {
 		{
 			name:    "invalid on_failure",
 			yaml:    "on_failure: kontinue\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "ignore_blocked_sessions empty entry",
+			yaml:    "ignore_blocked_sessions:\n  - {}\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "ignore_blocked_sessions bad regexp",
+			yaml:    "ignore_blocked_sessions:\n  - app_name: \"(\"\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "ignore_blocked_sessions non-positive session_id",
+			yaml:    "ignore_blocked_sessions:\n  - session_id: 0\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
 	}

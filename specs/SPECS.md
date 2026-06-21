@@ -114,6 +114,20 @@ honored. It is per operation (the rest of the batch keeps yielding), edition-ind
 about reactions, not injectable T-SQL), and traced under `--explain`. Typical use: force the one
 important index through in a `on_failure: continue` batch.
 
+**Top-level `ignore_blocked_sessions:`** is the *targeted* counterpart of `ignore_blocking`: a
+list of session matchers, applied to **every** operation in the manifest, naming sessions that
+are allowed to remain blocked. A matcher has `session_id` (exact int) and `app_name` /
+`host_name` / `login_name` / `statement` — **all string fields are regular expressions**,
+evaluated app-side (SQL Server has no regex before 2025). A session is ignorable when it matches
+**any** entry; an entry matches when **every** field it sets matches (AND-within, OR-across). The
+blocking detection (§8.2) excludes matching sessions before they ever count as pressure, so the
+operation still yields the moment it blocks a *non-matching* session. Only the **blocking**
+branch is affected — transaction-log pressure is always honored. Validated at load (each entry
+sets ≥1 field, each regexp compiles); it is the single durable source of exclusions (re-read live
+and carried into the recovery manifest — see §9). When the engine reacts to blocking it writes an
+advisory `<manifest>.blocked.yaml` next to the run report (ready-to-paste matcher entries +
+`observed:` diagnostics); the engine never reads it back.
+
 ### 1.4 Metadata-only operations
 
 Some operations are metadata-only changes (e.g. `add_column NOT NULL` with a **constant default** on
@@ -409,7 +423,10 @@ The tool knows its own `@@SPID`. It distinguishes two situations:
   **walk the chain up to the *head blocker*** (the direct blocker is not always the root).
 
 When our DDL blocks other sessions beyond `blocking_timeout_minutes`, we enter the reaction hierarchy
-(§9). We **log the text of the blocked queries**.
+(§9). We **log the text of the blocked queries**. Sessions matching the manifest's
+`ignore_blocked_sessions` (§1.3) are **excluded here**, before the timeout is even started, so an
+ignored blocker never counts as pressure; the engine still writes them, with full detail, to the
+advisory `<manifest>.blocked.yaml` capture when it does react to a non-ignored blocker.
 
 ### 8.3 Progress
 
@@ -470,6 +487,16 @@ from its pressure inputs: that operation never pauses/cancels *because it blocks
 its lock to completion and leaves the blocked sessions waiting. The **log** branch still applies (a
 log over cap still stops it). This is the deliberate inverse of the default "be a good citizen"
 posture, for the rare index that must go through regardless. See §1.3.
+
+**Manifest-level escape hatch — `ignore_blocked_sessions:`.** The same blocking-removal, but
+*targeted*: only sessions matching one of the listed matchers (§1.3) are removed from the blocking
+inputs, so the operation keeps yielding to everyone else. The filter is applied in the blocking
+detector (§8.2) — a matching blocked session is never counted — so it composes with the whole
+hierarchy unchanged. The log branch still applies. The matcher is re-read from the manifest on each
+blocking poll, so an entry added mid-run (by hand or by the TUI) takes effect *before* the next
+abort, without restarting; the live exclusions are carried into the recovery manifest so a resumed
+run remembers them. *(Live-reload and the TUI write-path are later iterations; the static list and
+the advisory `<manifest>.blocked.yaml` capture are implemented.)*
 
 ---
 

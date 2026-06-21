@@ -58,6 +58,14 @@ func (f *fakeWaits) SessionWaits(context.Context, int) ([]mssql.SessionWait, err
 	}
 }
 
+// fakeBlockerReader returns a fixed set of active sessions for the blocked-session
+// capture.
+type fakeBlockerReader struct{ sessions []mssql.Session }
+
+func (f fakeBlockerReader) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	return f.sessions, nil
+}
+
 type fakePreflighter struct {
 	report preflight.Report
 	err    error
@@ -349,6 +357,58 @@ func TestProcessAllResumableErrorWithoutPauseFails(t *testing.T) {
 		t.Errorf("Summary = %+v, want Failed:1", sum)
 	}
 	mustExist(t, filepath.Join(dirs.Failed, "010_a.yaml"))
+}
+
+func TestProcessAllCapturesBlockedSessions(t *testing.T) {
+	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF, emit: []run.ReactionEvent{
+		{Kind: "cancel", Detail: "blocking other sessions"},
+	}}
+	blockers := fakeBlockerReader{sessions: []mssql.Session{
+		{SPID: 53, BlockingSPID: 70, Login: "svc_report", Host: "BATCH01", Program: "ReportingService", ActiveQuery: "SELECT 1"},
+		{SPID: 54, BlockingSPID: 99}, // blocked by someone else — must not be captured
+	}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(blockers))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirs.Failed, "010_a.yaml.blocked.yaml"))
+	if err != nil {
+		t.Fatalf("read capture file: %v", err)
+	}
+	out := string(data)
+	for _, want := range []string{"# ignore_blocked_sessions:", "session_id: 53", "ReportingService", "observed:", "active_query"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("capture missing %q\n--- capture ---\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "session_id: 54") {
+		t.Errorf("capture must not include a session blocked by someone else\n%s", out)
+	}
+}
+
+func TestProcessAllCaptureExcludesIgnoredBlocker(t *testing.T) {
+	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF, emit: []run.ReactionEvent{
+		{Kind: "cancel", Detail: "blocking other sessions"},
+	}}
+	blockers := fakeBlockerReader{sessions: []mssql.Session{
+		{SPID: 53, BlockingSPID: 70, Program: "ReportingService"},
+	}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(blockers))
+	writeOnly(t, dirs, "200_ig.yaml", "description: ignore test\n"+
+		"ignore_blocked_sessions:\n  - app_name: \"^ReportingService$\"\n"+
+		"operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n")
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	// The only blocker matches an ignore rule, so nothing is captured.
+	mustNotExist(t, filepath.Join(dirs.Failed, "200_ig.yaml.blocked.yaml"))
 }
 
 func mustExist(t *testing.T, path string) {

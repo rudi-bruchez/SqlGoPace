@@ -93,7 +93,9 @@ func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait
 // noPressureSampler never reports blocking or log pressure.
 type noPressureSampler struct{}
 
-func (noPressureSampler) Blocking(context.Context) (bool, error) { return false, nil }
+func (noPressureSampler) Blocking(context.Context, IgnoredSessions) (bool, error) {
+	return false, nil
+}
 func (noPressureSampler) Log(context.Context) (LogSample, error) { return LogSample{}, nil }
 
 // parseChunkTarget extracts the integer target from a chunk statement of the form
@@ -148,7 +150,7 @@ func TestShrinkDataNoOp(t *testing.T) {
 	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
 
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -173,7 +175,7 @@ func TestShrinkDataTruncateOnlyEnough(t *testing.T) {
 	// target free 10% of used(400) => final 440; truncate to 500 > 440 still needs chunks,
 	// so make truncate land at/below final by using a larger free target.
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "100%"} // final = 800
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -191,7 +193,7 @@ func TestShrinkDataConverges(t *testing.T) {
 	r := newTestRunner(s, clk)
 
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final = 440
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -221,7 +223,7 @@ func TestShrinkDataNoProgressStops(t *testing.T) {
 		}
 	}
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, sink)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -242,7 +244,7 @@ func TestShrinkLogSimpleCheckpoint(t *testing.T) {
 	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
 
 	op := ddl.Shrink{Type: "log", Files: "Log", TargetFreeSpace: "10%"} // final = 110
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -271,7 +273,7 @@ func TestShrinkLogFullWaitsThenShrinks(t *testing.T) {
 	r := newTestRunner(s, clk)
 
 	op := ddl.Shrink{Type: "log", Files: "Log", TargetFreeSpace: "10%"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -301,7 +303,7 @@ func TestShrinkLogFullTimesOutCleanly(t *testing.T) {
 		}
 	}
 	op := ddl.Shrink{Type: "log", Files: "Log", TargetFreeSpace: "10%"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, sink)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}

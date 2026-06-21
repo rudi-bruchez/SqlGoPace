@@ -33,6 +33,17 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.OnFailure != "" {
 		addPair(root, "on_failure", scalarNode(string(m.OnFailure)))
 	}
+	if len(m.IgnoreBlockedSessions) > 0 {
+		seq := &yaml.Node{Kind: yaml.SequenceNode}
+		for i, s := range m.IgnoreBlockedSessions {
+			node, err := ignoredSessionNode(s)
+			if err != nil {
+				return nil, fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
+			}
+			seq.Content = append(seq.Content, node)
+		}
+		addPair(root, "ignore_blocked_sessions", seq)
+	}
 	addPair(root, "operations", operations)
 
 	var buf bytes.Buffer
@@ -56,6 +67,18 @@ func operationNode(op Operation) (*yaml.Node, error) {
 	}
 	compact(&node)
 	node.Content = append([]*yaml.Node{scalarNode("operation"), scalarNode(op.CommandType())}, node.Content...)
+	return &node, nil
+}
+
+// ignoredSessionNode encodes one ignore_blocked_sessions entry, dropping its unset
+// fields (nil session_id and empty regexps) so the rendered rule stays minimal and
+// round-trips through ParseManifest unchanged.
+func ignoredSessionNode(s IgnoredSession) (*yaml.Node, error) {
+	var node yaml.Node
+	if err := node.Encode(s); err != nil {
+		return nil, err
+	}
+	compact(&node)
 	return &node, nil
 }
 

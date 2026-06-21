@@ -32,7 +32,7 @@ type OpRunner interface {
 // OpRunner model: it reads DMVs at run time, builds per-chunk SQL, and loops. The
 // engine routes ddl.Shrink operations here. *ShrinkRunner satisfies it.
 type ShrinkDriver interface {
-	Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, sink ReactionSink) ([]ShrinkResult, error)
+	Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) ([]ShrinkResult, error)
 }
 
 var _ ShrinkDriver = (*ShrinkRunner)(nil)
@@ -79,6 +79,15 @@ type WaitReader interface {
 
 var _ WaitReader = (*mssql.Conn)(nil)
 
+// BlockerReader reads the active sessions so the engine can record which ones our
+// DDL was blocking when it reacted, for the advisory capture file. *mssql.Conn
+// satisfies it.
+type BlockerReader interface {
+	ActiveSessions(ctx context.Context) ([]mssql.Session, error)
+}
+
+var _ BlockerReader = (*mssql.Conn)(nil)
+
 // Summary counts the outcome of a ProcessAll run.
 type Summary struct {
 	Done        int
@@ -115,6 +124,7 @@ type Engine struct {
 	expander         IndexExpander
 	progress         ProgressReader
 	waits            WaitReader
+	blockers         BlockerReader
 	resumeCheck      ResumableProbe
 	reconnectTimeout time.Duration
 	database         string // when set, process only manifests for this database
@@ -159,6 +169,11 @@ func WithProgress(p ProgressReader) EngineOption { return func(e *Engine) { e.pr
 // WithWaits lets the engine record, per operation, which waits slowed it down
 // (from sys.dm_exec_session_wait_stats). Requires a session for the SPID.
 func WithWaits(w WaitReader) EngineOption { return func(e *Engine) { e.waits = w } }
+
+// WithBlockerReader lets the engine capture the sessions it was blocking when it
+// reacts, to an advisory <manifest>.blocked.yaml next to the run report. Requires a
+// session for the DDL's SPID.
+func WithBlockerReader(b BlockerReader) EngineOption { return func(e *Engine) { e.blockers = b } }
 
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
@@ -284,10 +299,19 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
+	// Sessions the operator allows to stay blocked, applied to every operation in the
+	// manifest. The regexps were validated at load, so an error here is defensive.
+	ignore, err := CompileIgnoredSessions(manifest.IgnoreBlockedSessions)
+	if err != nil {
+		rep.Error = "compile ignore_blocked_sessions: " + err.Error()
+		return e.finalize(ctx, name, rep, start, false)
+	}
+
 	var failedOps []ddl.Operation
+	captured := &blockerCapture{}
 	for i, step := range planned {
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, IgnoredSessions: ignore}
 
 		var reactions []report.ReactionLine
 		sink := func(ev ReactionEvent) {
@@ -301,6 +325,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			fmt.Fprintf(e.out, "-- %s %s: %s\n", ev.Kind, opTarget(step.Operation), detail)
 			if ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort" {
 				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
+				e.captureBlockers(ctx, ignore, captured, name)
 			}
 		}
 		waitsBefore := e.snapshotWaits(ctx)
@@ -311,7 +336,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if sh, ok := step.Operation.(ddl.Shrink); ok && e.shrink != nil {
 			// Shrink is multi-statement and built at run time; route to the driver,
 			// passing the resolved options (only WALP is meaningful for a shrink).
-			shrinkResults, runErr = e.shrink.Run(ctx, sh, step.Options, sink)
+			shrinkResults, runErr = e.shrink.Run(ctx, sh, step.Options, ignore, sink)
 		} else {
 			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 		}
@@ -376,6 +401,7 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 	} else if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
+	e.relocateCapture(name, dir)
 
 	if err := report.WriteFile(filepath.Join(dir, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
@@ -416,6 +442,7 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
+	e.relocateCapture(name, e.dirs.Failed)
 
 	recovery := &ddl.Manifest{
 		Description: recoveryDescription(m, name),

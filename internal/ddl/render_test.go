@@ -17,6 +17,11 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 		Description: "Maintenance plan for MYDB",
 		Database:    "MYDB",
 		OnFailure:   ddl.OnFailureContinue,
+		IgnoreBlockedSessions: []ddl.IgnoredSession{
+			{AppName: "^SQLAgent", LoginName: "svc_reporting"},
+			{SessionID: intPtr(57)},
+			{Statement: `dbo\.Report`},
+		},
 		Operations: []ddl.Operation{
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE"},
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_PART", Partition: intPtr(3), DataCompression: "ROW"},
@@ -53,7 +58,7 @@ func TestMarshalManifestOmitsEmpty(t *testing.T) {
 		t.Fatalf("MarshalManifest() error = %v", err)
 	}
 	out := string(data)
-	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:", "on_failure:"} {
+	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:", "on_failure:", "ignore_blocked_sessions:"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("output contains %q, want it omitted:\n%s", banned, out)
 		}

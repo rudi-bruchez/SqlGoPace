@@ -21,7 +21,7 @@ type fakeShrinkDriver struct {
 	emit    []run.ReactionEvent
 }
 
-func (f *fakeShrinkDriver) Run(_ context.Context, op ddl.Shrink, _ ddl.ResolvedOptions, sink run.ReactionSink) ([]run.ShrinkResult, error) {
+func (f *fakeShrinkDriver) Run(_ context.Context, op ddl.Shrink, _ ddl.ResolvedOptions, _ run.IgnoredSessions, sink run.ReactionSink) ([]run.ShrinkResult, error) {
 	f.calls++
 	f.gotType = op.Type
 	for _, ev := range f.emit {

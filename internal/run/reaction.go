@@ -59,6 +59,11 @@ type Capabilities struct {
 	// its lock through to completion even while blocking other sessions. Transaction-
 	// log pressure is still honored. Set per operation via the ignore_blocking option.
 	IgnoreBlocking bool
+	// IgnoredSessions lists sessions that are allowed to remain blocked by this run
+	// (the manifest's ignore_blocked_sessions). Blocking is only reacted to when a
+	// session matching none of these rules is blocked; transaction-log pressure is
+	// still honored regardless.
+	IgnoredSessions IgnoredSessions
 }
 
 // Action is the reaction the engine takes under pressure.

@@ -83,7 +83,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 	return runLoop(
 		sql,
 		func(stmt string) (Action, error) { return r.runStatement(ctx, stmt, caps, sink) },
-		func() error { return r.awaitRelief(ctx, sink) },
+		func() error { return r.awaitRelief(ctx, caps.IgnoredSessions, sink) },
 		func() (string, error) {
 			sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared"})
 			return ddl.ResumableControlSQL(op, "RESUME")
@@ -93,11 +93,11 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 
 // awaitRelief samples the server (via its own pump) until the pressure that
 // triggered a pause clears, enforcing the log-drain timeout.
-func (r *MonitoredRunner) awaitRelief(ctx context.Context, sink ReactionSink) error {
+func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoredSessions, sink ReactionSink) error {
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go r.pump(sampleCtx, samples)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, ignore)
 
 	return waitForRelief(ctx, r.clk, r.logDrainTimeout, samples, sink)
 }
@@ -145,7 +145,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go r.pump(sampleCtx, samples)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.IgnoredSessions)
 
 	action, pressure, err := supervise(ctx, r.clk, caps, r.blockingTimeout, samples, done)
 	if action == Continue {
@@ -195,42 +195,6 @@ func waitForRelief(ctx context.Context, clk Clock, logDrainTimeout time.Duration
 			}
 			if !s.BlockingOthers && !s.LogOverCap {
 				return nil
-			}
-		}
-	}
-}
-
-// pump polls blocking and transaction-log state on independent cadences and
-// forwards a combined snapshot (the latest known value of each) whenever either
-// poll fires.
-func (r *MonitoredRunner) pump(ctx context.Context, samples chan<- Sample) {
-	blockTicker := time.NewTicker(r.pollInterval)
-	defer blockTicker.Stop()
-	logTicker := time.NewTicker(r.logPollInterval)
-	defer logTicker.Stop()
-
-	var cur Sample
-	send := func() {
-		select {
-		case samples <- cur:
-		case <-ctx.Done():
-		}
-	}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-blockTicker.C:
-			if b, err := r.sampler.Blocking(ctx); err == nil {
-				cur.BlockingOthers = b
-				send()
-			}
-		case <-logTicker.C:
-			if l, err := r.sampler.Log(ctx); err == nil {
-				cur.LogOverCap = l.OverCap
-				cur.LogReuseWait = l.ReuseWait
-				send()
 			}
 		}
 	}

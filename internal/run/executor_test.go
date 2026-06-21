@@ -310,16 +310,41 @@ func (f fakeProbe) ActiveSessions(context.Context) ([]mssql.Session, error) {
 func TestServerSamplerBlocking(t *testing.T) {
 	t.Run("blocked by our spid", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57}}}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background())
+		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
 		if err != nil || !got {
 			t.Errorf("Blocking() = (%v, %v), want (true, nil)", got, err)
 		}
 	})
 	t.Run("blocked by someone else", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 99}}}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background())
+		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
 		if err != nil || got {
 			t.Errorf("Blocking() = (%v, %v), want (false, nil)", got, err)
+		}
+	})
+	t.Run("ignored blocker does not count", func(t *testing.T) {
+		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57, Program: "ReportingService"}}}
+		ignore, err := CompileIgnoredSessions([]ddl.IgnoredSession{{AppName: "Reporting.*"}})
+		if err != nil {
+			t.Fatalf("CompileIgnoredSessions() error = %v", err)
+		}
+		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
+		if err != nil || got {
+			t.Errorf("Blocking() = (%v, %v), want (false, nil) — only blocker is ignored", got, err)
+		}
+	})
+	t.Run("non-ignored blocker still counts", func(t *testing.T) {
+		probe := fakeProbe{sessions: []mssql.Session{
+			{SPID: 60, BlockingSPID: 57, Program: "ReportingService"},
+			{SPID: 61, BlockingSPID: 57, Program: "CriticalApp"},
+		}}
+		ignore, err := CompileIgnoredSessions([]ddl.IgnoredSession{{AppName: "Reporting.*"}})
+		if err != nil {
+			t.Fatalf("CompileIgnoredSessions() error = %v", err)
+		}
+		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
+		if err != nil || !got {
+			t.Errorf("Blocking() = (%v, %v), want (true, nil) — a non-ignored session is blocked", got, err)
 		}
 	})
 }

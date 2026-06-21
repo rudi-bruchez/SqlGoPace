@@ -156,6 +156,16 @@ and the compatibility matrix; per-operation `options:` blocks override them.
 description: "Recompress DISPATCH indexes and add a tracking column"
 database: MYDB          # optional; defaults to the connection's database
 on_failure: stop        # optional: stop (default, fail-fast) | continue (quarantine + recovery manifest)
+
+# Optional: sessions allowed to STAY blocked by these operations (the op holds its
+# lock through them instead of yielding). All string fields are regular expressions,
+# matched app-side. An entry matches when every field it sets matches (AND); the list
+# is OR'd. Unlike options.ignore_blocking (which ignores ALL blocking), this is
+# targeted. Transaction-log protection still applies. See "Ignoring unimportant
+# blocked sessions" below.
+ignore_blocked_sessions:
+  - app_name: "^SQLAgent"          # e.g. a nightly job that may wait
+  - login_name: "svc_(reporting|etl)"
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -191,6 +201,44 @@ operations:
 | `add_constraint`  | `ALTER TABLE … ADD CONSTRAINT … WITH (…)`  |
 | `drop_constraint` | `ALTER TABLE … DROP CONSTRAINT …`          |
 | `shrink`          | `DBCC SHRINKFILE (…) WITH (…)`             |
+
+### Ignoring unimportant blocked sessions
+
+By default SqlGoPace is a *good citizen*: when its DDL blocks another session past
+`blocking_timeout`, it yields (pause/resume or cancel). On a busy 24/7 database one
+trivial session — a report that wakes once an hour, a monitoring poll — can keep an
+operation from ever finishing: it runs, yields to the nuisance, restarts, yields
+again.
+
+`ignore_blocked_sessions:` (top-level, applies to every operation in the manifest)
+lets you name sessions that are allowed to **stay blocked**, so the operation holds
+its lock through them and keeps going. It is the *targeted* form of the blanket
+per-operation `options.ignore_blocking: true`. **Transaction-log protection is always
+honored** — only the *blocking* reaction is suppressed, and only for matching sessions.
+
+```yaml
+ignore_blocked_sessions:
+  # An entry matches when EVERY field it sets matches (AND); the list is OR'd.
+  # All string fields are regular expressions, evaluated app-side (SQL Server has
+  # no regex before 2025). session_id is an exact match.
+  - app_name: "^SQLAgent"                 # ignore the SQL Agent job…
+    login_name: "svc_reporting"           # …but only under this login (AND)
+  - host_name: "BATCH0[0-9]"              # OR any session from these hosts
+  - statement: "FROM dbo\\.AuditLog"      # OR one running this query
+  - session_id: 142                       # OR exactly this SPID (volatile — prefer the above)
+```
+
+A session is reacted to unless it positively matches a rule, so an overly narrow or
+absent list keeps the default "yield" behavior — fail-safe. Reach for `app_name` /
+`login_name` for durable rules; `session_id` only identifies a connection that exists
+right now.
+
+**Discovering who blocked you.** When the engine reacts to blocking, it writes an
+advisory `<manifest>.blocked.yaml` next to the run report listing the sessions it was
+blocking — both ready-to-paste `ignore_blocked_sessions:` entries (commented) and a
+full `observed:` diagnostic block (app/login/host/query, waits, times seen). SqlGoPace
+never reads this file back: copying an entry into the manifest is a deliberate step,
+so you never accidentally ignore real work.
 
 ### Shrinking files: `operation: shrink`
 

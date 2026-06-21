@@ -3,8 +3,11 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
+	"regexp"
 	"time"
 
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
@@ -36,10 +39,92 @@ type LogSample struct {
 }
 
 // Sampler reads the two monitored dimensions on independent cadences: blocking
-// (frequent) and transaction-log pressure (less frequent).
+// (frequent) and transaction-log pressure (less frequent). Blocking is told which
+// blocked sessions to ignore, so a session the operator allows to stay blocked does
+// not count as pressure.
 type Sampler interface {
-	Blocking(ctx context.Context) (bool, error)
+	Blocking(ctx context.Context, ignore IgnoredSessions) (bool, error)
 	Log(ctx context.Context) (LogSample, error)
+}
+
+// sessionRule is one compiled ignore_blocked_sessions entry. A zero sessionID or a
+// nil regexp means that field is unset (a wildcard). A session matches the rule when
+// every field it sets matches (AND).
+type sessionRule struct {
+	sessionID int
+	app       *regexp.Regexp
+	host      *regexp.Regexp
+	login     *regexp.Regexp
+	stmt      *regexp.Regexp
+}
+
+// IgnoredSessions is the compiled, run-time form of []ddl.IgnoredSession: a session
+// blocked by our DDL is ignored (allowed to stay blocked) when it matches any rule.
+type IgnoredSessions []sessionRule
+
+// CompileIgnoredSessions compiles manifest rules into a matcher. The regexps were
+// already validated at manifest load, so an error here is defensive.
+func CompileIgnoredSessions(rules []ddl.IgnoredSession) (IgnoredSessions, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	out := make(IgnoredSessions, 0, len(rules))
+	for i, r := range rules {
+		var rule sessionRule
+		if r.SessionID != nil {
+			rule.sessionID = *r.SessionID
+		}
+		for _, f := range []struct {
+			expr string
+			dst  **regexp.Regexp
+		}{
+			{r.AppName, &rule.app},
+			{r.HostName, &rule.host},
+			{r.LoginName, &rule.login},
+			{r.Statement, &rule.stmt},
+		} {
+			if f.expr == "" {
+				continue
+			}
+			re, err := regexp.Compile(f.expr)
+			if err != nil {
+				return nil, fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
+			}
+			*f.dst = re
+		}
+		out = append(out, rule)
+	}
+	return out, nil
+}
+
+// ignores reports whether the session matches any rule and so is allowed to stay
+// blocked.
+func (rs IgnoredSessions) ignores(s mssql.Session) bool {
+	for _, r := range rs {
+		if r.matches(s) {
+			return true
+		}
+	}
+	return false
+}
+
+// matches reports whether every field the rule sets matches the session: session_id
+// exactly, and each regexp against its attribute (statement against the active query,
+// falling back to the parent batch).
+func (r sessionRule) matches(s mssql.Session) bool {
+	switch {
+	case r.sessionID != 0 && s.SPID != r.sessionID:
+		return false
+	case r.app != nil && !r.app.MatchString(s.Program):
+		return false
+	case r.host != nil && !r.host.MatchString(s.Host):
+		return false
+	case r.login != nil && !r.login.MatchString(s.Login):
+		return false
+	case r.stmt != nil && !r.stmt.MatchString(s.ActiveQuery) && !r.stmt.MatchString(s.ParentQuery):
+		return false
+	}
+	return true
 }
 
 // ErrCancelled signals the operation was canceled under pressure and may be
@@ -91,6 +176,41 @@ func supervise(
 	}
 }
 
+// pumpSamples polls blocking and transaction-log state on independent cadences and
+// forwards a combined snapshot (the latest known value of each) whenever either poll
+// fires. Both MonitoredRunner and ShrinkRunner drive their monitoring through it.
+func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoredSessions) {
+	blockTicker := time.NewTicker(blockEvery)
+	defer blockTicker.Stop()
+	logTicker := time.NewTicker(logEvery)
+	defer logTicker.Stop()
+
+	var cur Sample
+	send := func() {
+		select {
+		case samples <- cur:
+		case <-ctx.Done():
+		}
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-blockTicker.C:
+			if b, err := sampler.Blocking(ctx, ignore); err == nil {
+				cur.BlockingOthers = b
+				send()
+			}
+		case <-logTicker.C:
+			if l, err := sampler.Log(ctx); err == nil {
+				cur.LogOverCap = l.OverCap
+				cur.LogReuseWait = l.ReuseWait
+				send()
+			}
+		}
+	}
+}
+
 // sampleProbe is the narrow set of server reads ServerSampler needs.
 type sampleProbe interface {
 	LogSpace(ctx context.Context) (mssql.LogSpace, error)
@@ -113,14 +233,17 @@ func NewServerSampler(probe sampleProbe, spid int, logMaxBytes int64, logMaxPerc
 
 var _ Sampler = (*ServerSampler)(nil)
 
-// Blocking reports whether any active session is blocked by our DDL.
-func (s *ServerSampler) Blocking(ctx context.Context) (bool, error) {
+// Blocking reports whether any active session is blocked by our DDL, excluding
+// sessions the operator allows to stay blocked (the ignore matcher). When the only
+// blocked sessions match an ignore rule, it reports false so the operation holds its
+// lock instead of yielding.
+func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (bool, error) {
 	sessions, err := s.probe.ActiveSessions(ctx)
 	if err != nil {
 		return false, err
 	}
 	for _, sess := range sessions {
-		if sess.BlockingSPID == s.spid {
+		if sess.BlockingSPID == s.spid && !ignore.ignores(sess) {
 			return true, nil
 		}
 	}

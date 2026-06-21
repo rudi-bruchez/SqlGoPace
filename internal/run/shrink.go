@@ -131,7 +131,7 @@ func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Cl
 // Run shrinks the file(s) the operation targets, sequentially. files:all expands to
 // every file of the operation's type (never two of a filegroup in parallel — the
 // sequential loop guarantees it). It returns one ShrinkResult per file.
-func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, sink ReactionSink) ([]ShrinkResult, error) {
+func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) ([]ShrinkResult, error) {
 	files, err := r.resolveFiles(ctx, op)
 	if err != nil {
 		return nil, err
@@ -147,7 +147,7 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 		if isLog {
 			result, ferr = r.shrinkLog(ctx, op, res, f, sink)
 		} else {
-			result, ferr = r.shrinkData(ctx, op, res, f, sink)
+			result, ferr = r.shrinkData(ctx, op, res, ignore, f, sink)
 		}
 		if ferr != nil {
 			return results, ferr
@@ -184,7 +184,7 @@ func (r *ShrinkRunner) resolveFiles(ctx context.Context, op ddl.Shrink) ([]mssql
 
 // shrinkData runs the data-file algorithm (design §7.1): no-op gating, a free
 // TRUNCATEONLY pass, then the chunk loop.
-func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, f mssql.FileSpace, sink ReactionSink) (ShrinkResult, error) {
+func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, f mssql.FileSpace, sink ReactionSink) (ShrinkResult, error) {
 	spec, err := ddl.ParseTargetFreeSpace(op.TargetFreeSpace)
 	if err != nil {
 		return ShrinkResult{}, err // already validated at parse time; defensive
@@ -225,7 +225,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
-		stopped, err := r.runChunk(ctx, f.Name, next, res, sink)
+		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink)
 		if err != nil {
 			return result, err
 		}
@@ -241,7 +241,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		// log-drain timeout is a clean stop (work preserved); a canceled context or
 		// any other error is propagated, not swallowed as success.
 		if stopped {
-			if err := r.awaitRelief(ctx, sink); err != nil {
+			if err := r.awaitRelief(ctx, ignore, sink); err != nil {
 				if errors.Is(err, ErrLogDrainTimeout) {
 					result.FinalMB = current
 					result.Reason = "stopped: log did not drain before timeout (work preserved)"
@@ -364,7 +364,7 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 // cancel, KILL via the pool as a fallback) with its committed work preserved;
 // stopped=false when the statement finished on its own (err carries a real DDL
 // failure, if any). It mirrors MonitoredRunner.runStatement.
-func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, sink ReactionSink) (stopped bool, err error) {
+func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) (stopped bool, err error) {
 	stmt := ddl.ShrinkChunkSQL(file, targetMB, res)
 
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -375,7 +375,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go r.pump(sampleCtx, samples)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
 
 	// A shrink chunk is cancel-safe: each internal ~32-page batch commits, so a stop
 	// preserves work and is re-entrant. It is never resumable in the ALTER sense.
@@ -400,46 +400,12 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 
 // awaitRelief samples until the pressure that stopped a chunk clears, enforcing the
 // log-drain timeout. Identical in shape to MonitoredRunner.awaitRelief.
-func (r *ShrinkRunner) awaitRelief(ctx context.Context, sink ReactionSink) error {
+func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoredSessions, sink ReactionSink) error {
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go r.pump(sampleCtx, samples)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
-}
-
-// pump polls blocking and log state on independent cadences and forwards a combined
-// snapshot whenever either fires (mirrors MonitoredRunner.pump).
-func (r *ShrinkRunner) pump(ctx context.Context, samples chan<- Sample) {
-	blockTicker := time.NewTicker(r.pollIntv)
-	defer blockTicker.Stop()
-	logTicker := time.NewTicker(r.logPoll)
-	defer logTicker.Stop()
-
-	var cur Sample
-	send := func() {
-		select {
-		case samples <- cur:
-		case <-ctx.Done():
-		}
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-blockTicker.C:
-			if b, err := r.sampler.Blocking(ctx); err == nil {
-				cur.BlockingOthers = b
-				send()
-			}
-		case <-logTicker.C:
-			if l, err := r.sampler.Log(ctx); err == nil {
-				cur.LogOverCap = l.OverCap
-				cur.LogReuseWait = l.ReuseWait
-				send()
-			}
-		}
-	}
 }
 
 func (r *ShrinkRunner) emitProgress(file string, start, current, final int) {

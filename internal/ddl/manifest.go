@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 
@@ -106,12 +107,56 @@ const (
 	OnFailureContinue OnFailure = "continue"
 )
 
+// IgnoredSession matches sessions that are allowed to remain blocked by our DDL
+// operation (the manifest's ignore_blocked_sessions list). All string fields are
+// regular expressions, evaluated app-side because SQL Server has no regex before
+// 2025. A session matches an entry when every field it sets matches (AND); the list
+// is OR'd, so a session is ignorable if it matches any entry. An entry must set at
+// least one field — an empty entry would match everything (equivalent to the blanket
+// ignore_blocking) and is rejected.
+type IgnoredSession struct {
+	SessionID *int   `yaml:"session_id"` // nil = unset; when set, exact match on the blocked SPID
+	AppName   string `yaml:"app_name"`   // regexp on program_name
+	HostName  string `yaml:"host_name"`  // regexp on host_name
+	LoginName string `yaml:"login_name"` // regexp on login_name
+	Statement string `yaml:"statement"`  // regexp on the blocked session's SQL text
+}
+
+// validate reports whether the entry is usable: at least one field set, a positive
+// session_id when present, and every non-empty regexp compiles (fail-fast at load).
+func (s IgnoredSession) validate() error {
+	if s.SessionID == nil && s.AppName == "" && s.HostName == "" && s.LoginName == "" && s.Statement == "" {
+		return fmt.Errorf("an entry must set at least one of session_id/app_name/host_name/login_name/statement: %w", ErrInvalidManifest)
+	}
+	if s.SessionID != nil && *s.SessionID <= 0 {
+		return fmt.Errorf("session_id must be positive, got %d: %w", *s.SessionID, ErrInvalidManifest)
+	}
+	for _, f := range []struct{ name, expr string }{
+		{"app_name", s.AppName},
+		{"host_name", s.HostName},
+		{"login_name", s.LoginName},
+		{"statement", s.Statement},
+	} {
+		if f.expr == "" {
+			continue
+		}
+		if _, err := regexp.Compile(f.expr); err != nil {
+			return fmt.Errorf("%s is not a valid regexp %q: %w", f.name, f.expr, ErrInvalidManifest)
+		}
+	}
+	return nil
+}
+
 // Manifest is one task: an ordered list of operations run sequentially.
 type Manifest struct {
 	Description string
 	Database    string
 	OnFailure   OnFailure // empty defaults to stop (fail-fast)
-	Operations  []Operation
+	// IgnoreBlockedSessions lists sessions allowed to remain blocked by this run's
+	// operations (see IgnoredSession). It is the single durable source of exclusions:
+	// read at start, re-read live during the run, and copied into the recovery manifest.
+	IgnoreBlockedSessions []IgnoredSession
+	Operations            []Operation
 }
 
 // Continue reports whether the manifest should keep going past a failed operation.
@@ -124,6 +169,11 @@ func (m *Manifest) Validate() error {
 	default:
 		return fmt.Errorf("on_failure must be %q or %q, got %q: %w",
 			OnFailureStop, OnFailureContinue, m.OnFailure, ErrInvalidManifest)
+	}
+	for i, s := range m.IgnoreBlockedSessions {
+		if err := s.validate(); err != nil {
+			return fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
+		}
 	}
 	if len(m.Operations) == 0 {
 		return fmt.Errorf("no operations: %w", ErrInvalidManifest)
@@ -140,10 +190,11 @@ func (m *Manifest) Validate() error {
 // type based on the "operation" discriminator field.
 func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
-		Description string      `yaml:"description"`
-		Database    string      `yaml:"database"`
-		OnFailure   string      `yaml:"on_failure"`
-		Operations  []yaml.Node `yaml:"operations"`
+		Description           string           `yaml:"description"`
+		Database              string           `yaml:"database"`
+		OnFailure             string           `yaml:"on_failure"`
+		IgnoreBlockedSessions []IgnoredSession `yaml:"ignore_blocked_sessions"`
+		Operations            []yaml.Node      `yaml:"operations"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
@@ -152,6 +203,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.Description = raw.Description
 	m.Database = raw.Database
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
+	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
 	m.Operations = make([]Operation, 0, len(raw.Operations))
 	for i := range raw.Operations {
 		op, err := decodeOperation(&raw.Operations[i])
