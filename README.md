@@ -334,7 +334,7 @@ sqlgopace --dry-run --assume-version 16 --assume-edition enterprise \
 | `--tui`             | Interactive incident console: live progress and blockers; `[x]` kill a blocker, `[i]` ignore one (writes a rule into the running manifest), `[k]` kill the DDL, `[p]` pause. |
 | `--auto`            | Analyse the database and run generated maintenance unattended (no review): writes the manifests into the queue, then processes it. Pairs with `--profile`/`--categories`/`--database`, or `--all-databases`/`--databases` for a server-wide run. See `plan`. |
 | `--dry-run`         | Render the final DDL without executing or taking any lock.                       |
-| `--explain`         | With `--dry-run`, show why each option was chosen (version/edition + matrix + config). |
+| `--explain`         | With `--dry-run`, show why each option was chosen (version/edition + matrix + config), and list any `ignore_blocked_sessions` rules. |
 | `--assume-version`  | Offline dry-run target major version (e.g. `16` for SQL Server 2022).            |
 | `--assume-edition`  | Target edition tier: `enterprise`, `standard`, `express`, `azure`.               |
 | `--matrix <path>`   | Override the compatibility matrix path (otherwise from config).                  |

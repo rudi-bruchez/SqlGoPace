@@ -122,6 +122,26 @@ type IgnoredSession struct {
 	Statement string `yaml:"statement"`  // regexp on the blocked session's SQL text
 }
 
+// String renders the rule for --explain: each field it sets as "field<op>value"
+// (session_id with "=", the regexp fields with "~"), joined by " AND ".
+func (s IgnoredSession) String() string {
+	var parts []string
+	if s.SessionID != nil {
+		parts = append(parts, fmt.Sprintf("session_id=%d", *s.SessionID))
+	}
+	for _, f := range []struct{ name, expr string }{
+		{"app_name", s.AppName},
+		{"host_name", s.HostName},
+		{"login_name", s.LoginName},
+		{"statement", s.Statement},
+	} {
+		if f.expr != "" {
+			parts = append(parts, f.name+"~"+f.expr)
+		}
+	}
+	return strings.Join(parts, " AND ")
+}
+
 // validate reports whether the entry is usable: at least one field set, a positive
 // session_id when present, and every non-empty regexp compiles (fail-fast at load).
 func (s IgnoredSession) validate() error {

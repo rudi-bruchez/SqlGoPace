@@ -693,6 +693,14 @@ func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []dd
 		fmt.Fprintf(w, "-- manifest: %s\n", source)
 	}
 
+	if explain && len(manifest.IgnoreBlockedSessions) > 0 {
+		fmt.Fprintln(w, "-- ignore_blocked_sessions (allowed to stay blocked; a session matches any one entry):")
+		for i, s := range manifest.IgnoreBlockedSessions {
+			fmt.Fprintf(w, "--     [%d] %s\n", i+1, s)
+		}
+		fmt.Fprintln(w)
+	}
+
 	for i, step := range planned {
 		fmt.Fprintf(w, "-- [%d] %s %s\n",
 			i+1, step.Operation.CommandType(), step.Operation.Target())

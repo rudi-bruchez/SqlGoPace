@@ -125,6 +125,27 @@ func TestRunExplain(t *testing.T) {
 	}
 }
 
+func TestRunExplainIgnoreBlockedSessions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "010_ig.yaml")
+	body := "ignore_blocked_sessions:\n  - app_name: \"^SQLAgent\"\n    login_name: \"svc\"\n  - session_id: 142\n" +
+		"operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--dry-run", "--explain", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, path}
+	if err := cli(&out, io.Discard, args); err != nil {
+		t.Fatalf("run(explain) error = %v", err)
+	}
+	s := out.String()
+	for _, want := range []string{"ignore_blocked_sessions", "app_name~^SQLAgent AND login_name~svc", "session_id=142"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("explain output missing %q:\n%s", want, s)
+		}
+	}
+}
+
 func TestRunVersion(t *testing.T) {
 	var out bytes.Buffer
 	if err := cli(&out, io.Discard, []string{"--version"}); err != nil {
