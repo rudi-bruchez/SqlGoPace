@@ -98,6 +98,10 @@ const (
 	ActionExtend
 	// ActionSnapshot writes the current state to the log.
 	ActionSnapshot
+	// ActionIgnoreBlocker adds an ignore rule for the selected session to the running
+	// manifest (so the DDL holds its lock through it). Criterion/Value/SPID carry the
+	// chosen match.
+	ActionIgnoreBlocker
 	// ActionQuit leaves the console.
 	ActionQuit
 )
@@ -105,8 +109,23 @@ const (
 // Action is an operator intent, dispatched to the host via the action channel.
 type Action struct {
 	Kind ActionKind
-	SPID int // set for ActionKillBlocker
+	SPID int // set for ActionKillBlocker and ActionIgnoreBlocker
+
+	// Criterion and Value carry the ignore match for ActionIgnoreBlocker: Criterion is
+	// "session_id" | "app_name" | "login_name" | "host_name"; Value is the observed
+	// attribute (empty for session_id, which uses SPID).
+	Criterion string
+	Value     string
 }
+
+// inputMode is the console's key-handling mode: normal, or prompting for the ignore
+// criterion after the operator pressed "i".
+type inputMode int
+
+const (
+	modeNormal inputMode = iota
+	modeCriterion
+)
 
 // Model is the incident console state.
 type Model struct {
@@ -120,6 +139,8 @@ type Model struct {
 	waits           []WaitCategory
 	waitTotalMS     int64
 	cursor          int
+	mode            inputMode
+	notice          string // last host feedback line (e.g. "ignoring SPID 53 …")
 	actions         chan<- Action
 	quitting        bool
 }
@@ -153,6 +174,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Operation != "" {
 			m.operation = msg.Operation
 		}
+	case LogMsg:
+		m.notice = msg.Line
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -160,6 +183,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.mode == modeCriterion {
+		return m.handleCriterionKey(msg)
+	}
 	switch msg.String() {
 	case "q", "ctrl+c":
 		m.quitting = true
@@ -172,6 +198,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down":
 		if m.cursor < len(m.blockers)-1 {
 			m.cursor++
+		}
+	case "i":
+		if len(m.blockers) > 0 {
+			m.mode = modeCriterion
 		}
 	case "x":
 		if len(m.blockers) > 0 {
@@ -188,6 +218,32 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.emit(Action{Kind: ActionSnapshot})
 	}
+	return m, nil
+}
+
+// handleCriterionKey handles the "ignore this session by …" sub-prompt: it emits an
+// ActionIgnoreBlocker for the selected blocker and the chosen criterion, then returns
+// to normal mode. Esc/q cancels; any other key keeps the prompt open.
+func (m Model) handleCriterionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.cursor >= len(m.blockers) { // the selection vanished while prompting
+		m.mode = modeNormal
+		return m, nil
+	}
+	bl := m.blockers[m.cursor]
+	switch msg.String() {
+	case "esc", "q":
+	case "s":
+		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "session_id"})
+	case "a":
+		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "app_name", Value: bl.Program})
+	case "l":
+		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "login_name", Value: bl.Login})
+	case "h":
+		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "host_name", Value: bl.Host})
+	default:
+		return m, nil // unrecognized key: stay in the prompt
+	}
+	m.mode = modeNormal
 	return m, nil
 }
 
@@ -241,8 +297,16 @@ func (m Model) View() string {
 		}
 	}
 
-	b.WriteString("\n" + helpStyle.Render(
-		"[↑/↓] select  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [s] snapshot  [q] quit"))
+	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [s] snapshot  [q] quit"
+	if m.mode == modeCriterion && m.cursor < len(m.blockers) {
+		bl := m.blockers[m.cursor]
+		help = fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
+			bl.SPID, bl.Program, bl.Login, bl.Host)
+	}
+	b.WriteString("\n" + helpStyle.Render(help))
+	if m.notice != "" {
+		b.WriteString("\n" + m.notice)
+	}
 	return b.String()
 }
 

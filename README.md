@@ -244,7 +244,9 @@ so you never accidentally ignore real work.
 on every blocking poll. If an operation stalls on a blocker you decide is safe, edit the manifest
 in `02.processing/` to add the rule and the operation **continues without a restart** — the new
 exclusion takes effect before the next abort. It is also folded into the recovery manifest, so a
-later resumed run remembers it.
+later resumed run remembers it. In the interactive console (`--tui`), select a blocked session and
+press **`i`**, then pick the criterion (`s` session_id / `a` app_name / `l` login_name / `h`
+host_name) — the rule is written into the running manifest for you and hot-reloaded.
 
 ### Shrinking files: `operation: shrink`
 
@@ -327,7 +329,7 @@ sqlgopace --dry-run --assume-version 16 --assume-edition enterprise \
 |---------------------|---------------------------------------------------------------------------------|
 | *(none)*            | Silent run; everything is traced to a `.log` next to each processed manifest.   |
 | `--config <path>`   | Config file (connection, directories, policy, matrix path). Required to run.    |
-| `--tui`             | Interactive incident console: live progress, blockers, and operator actions.    |
+| `--tui`             | Interactive incident console: live progress and blockers; `[x]` kill a blocker, `[i]` ignore one (writes a rule into the running manifest), `[k]` kill the DDL, `[p]` pause. |
 | `--auto`            | Analyse the database and run generated maintenance unattended (no review): writes the manifests into the queue, then processes it. Pairs with `--profile`/`--categories`/`--database`, or `--all-databases`/`--databases` for a server-wide run. See `plan`. |
 | `--dry-run`         | Render the final DDL without executing or taking any lock.                       |
 | `--explain`         | With `--dry-run`, show why each option was chosen (version/edition + matrix + config). |

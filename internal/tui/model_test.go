@@ -112,3 +112,56 @@ func TestModelQuit(t *testing.T) {
 		t.Errorf("q action = %+v ok=%t, want Quit", a, ok)
 	}
 }
+
+func TestModelIgnoreFlowEmitsAction(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", false, actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
+		{SPID: 53, Program: "ReportingService", Login: "svc", Host: "BATCH01"},
+	}})
+	m, _ = send(m, key("i")) // open the ignore-criterion prompt
+	_, _ = send(m, key("a")) // ignore by app_name
+
+	a, ok := drain(t, actions)
+	if !ok {
+		t.Fatal("no action emitted")
+	}
+	if a.Kind != tui.ActionIgnoreBlocker || a.Criterion != "app_name" || a.Value != "ReportingService" || a.SPID != 53 {
+		t.Errorf("emitted %+v, want app_name ignore for SPID 53 ReportingService", a)
+	}
+}
+
+func TestModelIgnorePromptCancel(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", false, actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 53, Program: "X"}}})
+	m, _ = send(m, key("i"))
+	m, _ = send(m, tea.KeyMsg{Type: tea.KeyEsc}) // cancel the prompt
+
+	if a, ok := drain(t, actions); ok {
+		t.Errorf("cancel should emit nothing, got %+v", a)
+	}
+	if v := m.View(); !strings.Contains(v, "[i] ignore") {
+		t.Errorf("after cancel the normal help (with [i] ignore) should show:\n%s", v)
+	}
+}
+
+func TestModelIgnorePromptShowsCriteria(t *testing.T) {
+	m := tui.New("op", false, make(chan tui.Action, 1))
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 7, Program: "Rep", Login: "svc", Host: "h1"}}})
+	m, _ = send(m, key("i"))
+	v := m.View()
+	for _, want := range []string{"ignore SPID 7 as:", "[a] app=Rep", "[l] login=svc", "[h] host=h1"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("criterion prompt missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelLogMsgShownAsNotice(t *testing.T) {
+	m := tui.New("op", false, nil)
+	m, _ = send(m, tui.LogMsg{Line: "ignoring SPID 53 by app_name"})
+	if v := m.View(); !strings.Contains(v, "ignoring SPID 53 by app_name") {
+		t.Errorf("LogMsg should appear in the view:\n%s", v)
+	}
+}

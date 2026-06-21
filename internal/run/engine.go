@@ -127,8 +127,9 @@ type Engine struct {
 	blockers         BlockerReader
 	resumeCheck      ResumableProbe
 	reconnectTimeout time.Duration
-	database         string // when set, process only manifests for this database
-	liveReload       bool   // re-read ignore_blocked_sessions from the manifest mid-run
+	database         string            // when set, process only manifests for this database
+	liveReload       bool              // re-read ignore_blocked_sessions from the manifest mid-run
+	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
 	out              io.Writer
 }
 
@@ -180,6 +181,13 @@ func WithBlockerReader(b BlockerReader) EngineOption { return func(e *Engine) { 
 // blocking poll, so an exclusion added during the run (by hand or by the TUI) takes
 // effect before the operation would abort — without restarting it.
 func WithLiveReload() EngineOption { return func(e *Engine) { e.liveReload = true } }
+
+// WithManifestObserver registers a callback notified of the path of the manifest the
+// engine is currently processing ("" between manifests), so a host (the TUI) can write
+// an ignore rule into the running manifest. Pairs with WithLiveReload.
+func WithManifestObserver(f func(path string)) EngineOption {
+	return func(e *Engine) { e.manifestObserver = f }
+}
 
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
@@ -270,6 +278,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		fmt.Fprintf(e.out, "skip %s: %v\n", name, err)
 		return outcomeFailed
 	}
+	e.setCurrentManifest(procPath)
+	defer e.setCurrentManifest("")
 	e.writeSidecar(ctx, name)
 
 	manifest, err := ddl.LoadManifestFile(procPath)
@@ -584,6 +594,14 @@ func (e *Engine) resumableInterruption(ctx context.Context, op ddl.Operation) bo
 		func() { time.Sleep(reconnectProbeInterval) },
 	)
 	return res.paused || !res.conclusive
+}
+
+// setCurrentManifest notifies the manifest observer (if any) of the in-flight
+// manifest path, so a host can edit it while it runs.
+func (e *Engine) setCurrentManifest(path string) {
+	if e.manifestObserver != nil {
+		e.manifestObserver(path)
+	}
 }
 
 func (e *Engine) now() string               { return e.clk.Now().UTC().Format(time.RFC3339) }

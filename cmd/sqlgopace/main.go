@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
@@ -258,10 +259,18 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			fmt.Fprintf(stdout, "-- database %s\n", db)
 		}
 
-		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history)
+		var (
+			current *currentManifest
+			extra   []run.EngineOption
+		)
+		if useTUI {
+			current = &currentManifest{}
+			extra = append(extra, run.WithManifestObserver(current.set))
+		}
+		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, extra...)
 		var sum run.Summary
 		if useTUI {
-			sum, err = runWithTUI(ctx, dbConn, engine, cfg.Monitoring.ProgressPoll())
+			sum, err = runWithTUI(ctx, dbConn, engine, current, cfg.Monitoring.ProgressPoll())
 		} else {
 			sum, err = engine.ProcessAll(ctx)
 		}
@@ -294,7 +303,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 // buildEngine wires a run.Engine for one database's connection, sharing the given
 // history (may be nil) and reading policy, monitoring, and notification settings
 // from cfg. It is called once per database in a multi-database run.
-func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History) *run.Engine {
+func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, extra ...run.EngineOption) *run.Engine {
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
@@ -341,6 +350,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
+	opts = append(opts, extra...)
 	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
 }
 
@@ -430,14 +440,14 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, pollInterval time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, pollInterval time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", false, actions))
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
 	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval)
-	go dispatchActions(feedCtx, conn, conn.SPID(), actions)
+	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, actions)
 
 	type result struct {
 		summary run.Summary
@@ -513,8 +523,29 @@ func waitsMsg(waits []mssql.SessionWait) tui.WaitsMsg {
 	return tui.WaitsMsg{Categories: out, TotalMS: total}
 }
 
-// dispatchActions routes operator intents to the server.
-func dispatchActions(ctx context.Context, conn *mssql.Conn, ddlSPID int, actions <-chan tui.Action) {
+// currentManifest holds the path of the manifest the engine is processing, set via
+// the engine's manifest observer and read by the action dispatcher so the TUI can
+// write an ignore rule into the running manifest.
+type currentManifest struct {
+	mu   sync.Mutex
+	path string
+}
+
+func (c *currentManifest) set(path string) {
+	c.mu.Lock()
+	c.path = path
+	c.mu.Unlock()
+}
+
+func (c *currentManifest) get() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.path
+}
+
+// dispatchActions routes operator intents to the server (kill) or to the running
+// manifest (ignore a blocked session).
+func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, current *currentManifest, actions <-chan tui.Action) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -525,9 +556,32 @@ func dispatchActions(ctx context.Context, conn *mssql.Conn, ddlSPID int, actions
 				_ = conn.Kill(ctx, ddlSPID)
 			case tui.ActionKillBlocker:
 				_ = conn.Kill(ctx, a.SPID)
+			case tui.ActionIgnoreBlocker:
+				ignoreBlocker(program, current, a)
 			}
 		}
 	}
+}
+
+// ignoreBlocker writes a one-criterion ignore rule into the running manifest. The
+// engine hot-reloads it (WithLiveReload), so the operation stops yielding to that
+// session. The outcome is echoed to the console.
+func ignoreBlocker(program *tui.Program, current *currentManifest, a tui.Action) {
+	rule, ok := ddl.IgnoredSessionFor(a.Criterion, a.Value, a.SPID)
+	if !ok {
+		program.Send(tui.LogMsg{Line: "ignore: nothing to match on for that session"})
+		return
+	}
+	path := current.get()
+	if path == "" {
+		program.Send(tui.LogMsg{Line: "ignore: no manifest is running"})
+		return
+	}
+	if err := ddl.AppendIgnoredSession(path, rule); err != nil {
+		program.Send(tui.LogMsg{Line: "ignore: " + err.Error()})
+		return
+	}
+	program.Send(tui.LogMsg{Line: fmt.Sprintf("ignoring SPID %d by %s — added to manifest; holding the lock", a.SPID, a.Criterion)})
 }
 
 // loadConfig loads the config file when one is given, else returns nil.

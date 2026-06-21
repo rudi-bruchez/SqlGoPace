@@ -433,6 +433,24 @@ func TestRecoveryManifestCarriesIgnoreRules(t *testing.T) {
 	}
 }
 
+func TestManifestObserverReportsInflightPath(t *testing.T) {
+	// The observer must see the in-processing path while a manifest runs and "" after,
+	// so the TUI knows which file to edit.
+	var seen []string
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithManifestObserver(func(p string) { seen = append(seen, p) }))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	want := filepath.Join(dirs.Processing, "010_a.yaml")
+	if len(seen) != 2 || seen[0] != want || seen[1] != "" {
+		t.Errorf("observer saw %v, want [%q, \"\"]", seen, want)
+	}
+}
+
 func mustExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {
