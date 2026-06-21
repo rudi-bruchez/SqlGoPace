@@ -129,6 +129,17 @@ type IgnoredSession struct {
 	Statement string `yaml:"statement"`  // regexp on the blocked session's SQL text
 }
 
+// regexpFields returns the rule's regexp criteria paired with their names, in a
+// stable order, so validation, rendering, and matching agree on the field set.
+func (s IgnoredSession) regexpFields() []struct{ name, expr string } {
+	return []struct{ name, expr string }{
+		{"app_name", s.AppName},
+		{"host_name", s.HostName},
+		{"login_name", s.LoginName},
+		{"statement", s.Statement},
+	}
+}
+
 // String renders the rule for --explain: each field it sets as "field<op>value"
 // (session_id with "=", the regexp fields with "~"), joined by " AND ".
 func (s IgnoredSession) String() string {
@@ -136,12 +147,7 @@ func (s IgnoredSession) String() string {
 	if s.SessionID != nil {
 		parts = append(parts, fmt.Sprintf("session_id=%d", *s.SessionID))
 	}
-	for _, f := range []struct{ name, expr string }{
-		{"app_name", s.AppName},
-		{"host_name", s.HostName},
-		{"login_name", s.LoginName},
-		{"statement", s.Statement},
-	} {
+	for _, f := range s.regexpFields() {
 		if f.expr != "" {
 			parts = append(parts, f.name+"~"+f.expr)
 		}
@@ -158,12 +164,7 @@ func (s IgnoredSession) validate() error {
 	if s.SessionID != nil && *s.SessionID <= 0 {
 		return fmt.Errorf("session_id must be positive, got %d: %w", *s.SessionID, ErrInvalidManifest)
 	}
-	for _, f := range []struct{ name, expr string }{
-		{"app_name", s.AppName},
-		{"host_name", s.HostName},
-		{"login_name", s.LoginName},
-		{"statement", s.Statement},
-	} {
+	for _, f := range s.regexpFields() {
 		if f.expr == "" {
 			continue
 		}
