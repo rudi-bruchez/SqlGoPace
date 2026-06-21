@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -130,8 +131,13 @@ type Engine struct {
 	database         string            // when set, process only manifests for this database
 	liveReload       bool              // re-read ignore_blocked_sessions from the manifest mid-run
 	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
+	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
 	out              io.Writer
 }
+
+// defaultHoldPoll is how often the engine narrates the ignored sessions it is holding
+// the lock through, when a blocker reader is wired.
+const defaultHoldPoll = 30 * time.Second
 
 // EngineOption configures optional Engine behavior.
 type EngineOption func(*Engine)
@@ -189,6 +195,11 @@ func WithManifestObserver(f func(path string)) EngineOption {
 	return func(e *Engine) { e.manifestObserver = f }
 }
 
+// WithHoldPoll sets how often the engine narrates the ignored sessions it is holding
+// the lock through (default 30s). Zero disables held-through narration. Requires a
+// blocker reader and a session.
+func WithHoldPoll(d time.Duration) EngineOption { return func(e *Engine) { e.holdPoll = d } }
+
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
 func WithResumeCheck(p ResumableProbe) EngineOption { return func(e *Engine) { e.resumeCheck = p } }
@@ -210,15 +221,16 @@ func WithDatabase(name string) EngineOption { return func(e *Engine) { e.databas
 // dependencies; optional behavior is supplied via options.
 func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, pf Preflighter, runner OpRunner, opts ...EngineOption) *Engine {
 	e := &Engine{
-		dirs:   dirs,
-		queue:  NewQueue(dirs),
-		target: target,
-		matrix: matrix,
-		policy: policy,
-		pf:     pf,
-		runner: runner,
-		clk:    System,
-		out:    io.Discard,
+		dirs:     dirs,
+		queue:    NewQueue(dirs),
+		target:   target,
+		matrix:   matrix,
+		policy:   policy,
+		pf:       pf,
+		runner:   runner,
+		clk:      System,
+		holdPoll: defaultHoldPoll,
+		out:      io.Discard,
 	}
 	for _, opt := range opts {
 		opt(e)
@@ -329,7 +341,12 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore}
 
-		var reactions []report.ReactionLine
+		// The sink is called from the runner (this goroutine) and from the held-through
+		// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
+		var (
+			reactions  []report.ReactionLine
+			reactionMu sync.Mutex
+		)
 		sink := func(ev ReactionEvent) {
 			detail := ev.Detail
 			if isInterruption(ev.Kind) {
@@ -337,14 +354,22 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 					detail = fmt.Sprintf("%s (at %.0f%%)", detail, pct)
 				}
 			}
+			reactionMu.Lock()
 			reactions = append(reactions, report.ReactionLine{Kind: ev.Kind, At: e.now(), Detail: detail})
 			fmt.Fprintf(e.out, "-- %s %s: %s\n", ev.Kind, opTarget(step.Operation), detail)
+			reactionMu.Unlock()
 			if ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort" {
 				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
 				e.captureBlockers(ctx, ignore, captured, name)
 			}
 		}
 		waitsBefore := e.snapshotWaits(ctx)
+
+		// Narrate, once each, the ignored sessions we hold the lock through, so the run
+		// log shows we are deliberately blocking them (otherwise it is a silent non-event).
+		holdCtx, stopHold := context.WithCancel(ctx)
+		go e.narrateHeld(holdCtx, ignore, sink)
+
 		var (
 			runErr        error
 			shrinkResults []ShrinkResult
@@ -356,6 +381,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		} else {
 			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 		}
+		stopHold()
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
 
 		opRep := report.OperationReport{

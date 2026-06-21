@@ -57,3 +57,24 @@ func TestCompileIgnoredSessionsBadRegexp(t *testing.T) {
 		t.Fatal("CompileIgnoredSessions() error = nil, want a regexp compile error")
 	}
 }
+
+func TestNewHeldBlockers(t *testing.T) {
+	ignore, err := CompileIgnoredSessions([]ddl.IgnoredSession{{AppName: "^Reporting"}})
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	sessions := []mssql.Session{
+		{SPID: 53, BlockingSPID: 70, Program: "ReportingService"}, // ignored + blocked by us → held
+		{SPID: 54, BlockingSPID: 70, Program: "CriticalApp"},      // not ignored → not held
+		{SPID: 55, BlockingSPID: 99, Program: "ReportingService"}, // blocked by someone else
+	}
+	seen := map[string]bool{}
+	got := newHeldBlockers(sessions, 70, ignore, seen)
+	if len(got) != 1 || got[0].SPID != 53 {
+		t.Fatalf("newHeldBlockers = %+v, want only SPID 53", got)
+	}
+	// Already narrated: a second pass yields nothing (deduped via seen).
+	if again := newHeldBlockers(sessions, 70, ignore, seen); len(again) != 0 {
+		t.Errorf("second newHeldBlockers = %+v, want none (deduped)", again)
+	}
+}

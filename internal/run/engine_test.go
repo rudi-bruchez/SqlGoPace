@@ -6,13 +6,54 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
+
+// syncBuffer is a goroutine-safe io.Writer, so a test can read the engine's narration
+// output while the engine's sink writes it from another goroutine.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// waitForOutputRunner keeps the operation "running" until sub appears in buf (or a
+// safety deadline), so a held-through narration emitted by the engine's poller is
+// observed before the operation completes. Deterministic: it returns on content, not a
+// fixed sleep.
+type waitForOutputRunner struct {
+	buf *syncBuffer
+	sub string
+}
+
+func (r waitForOutputRunner) Run(_ context.Context, _ ddl.Operation, _ string, _ run.Capabilities, _ run.ReactionSink) error {
+	deadline := time.Now().Add(2 * time.Second)
+	for !strings.Contains(r.buf.String(), r.sub) {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return nil
+}
 
 type fakeSession struct{ spid int }
 
@@ -448,6 +489,28 @@ func TestManifestObserverReportsInflightPath(t *testing.T) {
 	want := filepath.Join(dirs.Processing, "010_a.yaml")
 	if len(seen) != 2 || seen[0] != want || seen[1] != "" {
 		t.Errorf("observer saw %v, want [%q, \"\"]", seen, want)
+	}
+}
+
+func TestNarrateHeldThroughIgnored(t *testing.T) {
+	buf := &syncBuffer{}
+	blockers := fakeBlockerReader{sessions: []mssql.Session{
+		{SPID: 53, BlockingSPID: 70, Program: "ReportingService"},
+	}}
+	runner := waitForOutputRunner{buf: buf, sub: "holding the lock"}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(blockers),
+		run.WithHoldPoll(2*time.Millisecond),
+		run.WithOutput(buf))
+	writeOnly(t, dirs, "400_hold.yaml", "ignore_blocked_sessions:\n  - app_name: \"^ReportingService$\"\n"+
+		"operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n")
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if out := buf.String(); !strings.Contains(out, "holding the lock through ignored session SPID 53") {
+		t.Errorf("run output missing held-through narration:\n%s", out)
 	}
 }
 

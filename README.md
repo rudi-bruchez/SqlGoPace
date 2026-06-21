@@ -231,7 +231,9 @@ ignore_blocked_sessions:
 A session is reacted to unless it positively matches a rule, so an overly narrow or
 absent list keeps the default "yield" behavior — fail-safe. Reach for `app_name` /
 `login_name` for durable rules; `session_id` only identifies a connection that exists
-right now.
+right now. While an operation holds its lock through an ignored session, the run log
+records it (`hold: holding the lock through ignored session SPID …`), so the
+suppression is never silent.
 
 **Discovering who blocked you.** When the engine reacts to blocking, it writes an
 advisory `<manifest>.blocked.yaml` next to the run report listing the sessions it was

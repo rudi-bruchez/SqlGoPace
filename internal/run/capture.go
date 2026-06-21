@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
@@ -72,6 +73,54 @@ func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *
 	if changed {
 		e.flushCapture(name, acc)
 	}
+}
+
+// narrateHeld periodically narrates, once each, the ignored sessions our DDL is
+// holding its lock through, so the run log shows we are deliberately blocking them
+// (otherwise it is a silent non-event). It runs for the duration of one operation and
+// is a no-op without a blocker reader, a session, or a positive poll interval.
+func (e *Engine) narrateHeld(ctx context.Context, ignore IgnoreSource, sink ReactionSink) {
+	if e.blockers == nil || e.session == nil || e.holdPoll <= 0 {
+		return
+	}
+	ticker := time.NewTicker(e.holdPoll)
+	defer ticker.Stop()
+	seen := make(map[string]bool)
+	spid := e.session.SPID()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sessions, err := e.blockers.ActiveSessions(ctx)
+			if err != nil {
+				continue
+			}
+			for _, s := range newHeldBlockers(sessions, spid, currentRules(ignore), seen) {
+				sink(ReactionEvent{Kind: "hold", Detail: fmt.Sprintf(
+					"holding the lock through ignored session SPID %d (login=%s host=%s app=%s)",
+					s.SPID, s.Login, s.Host, s.Program)})
+			}
+		}
+	}
+}
+
+// newHeldBlockers returns the ignored sessions our DDL (spid) is currently blocking
+// that have not been narrated yet, marking them seen so each is narrated once.
+func newHeldBlockers(sessions []mssql.Session, spid int, ignore IgnoredSessions, seen map[string]bool) []mssql.Session {
+	var out []mssql.Session
+	for _, s := range sessions {
+		if s.BlockingSPID != spid || !ignore.ignores(s) {
+			continue
+		}
+		key := fmt.Sprintf("%d|%s|%s|%s", s.SPID, s.Login, s.Host, s.Program)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, s)
+	}
+	return out
 }
 
 // flushCapture writes the accumulated capture next to the manifest in processing, so
