@@ -368,7 +368,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// Narrate, once each, the ignored sessions we hold the lock through, so the run
 		// log shows we are deliberately blocking them (otherwise it is a silent non-event).
 		holdCtx, stopHold := context.WithCancel(ctx)
-		go e.narrateHeld(holdCtx, ignore, sink)
+		holdDone := make(chan struct{})
+		go func() { defer close(holdDone); e.narrateHeld(holdCtx, ignore, sink) }()
 
 		var (
 			runErr        error
@@ -381,7 +382,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		} else {
 			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 		}
+		// Stop the narrator and wait for it to fully exit before reading `reactions`
+		// below, so a late sink() append cannot race with the read.
 		stopHold()
+		<-holdDone
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
 
 		opRep := report.OperationReport{
