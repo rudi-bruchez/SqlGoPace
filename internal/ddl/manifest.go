@@ -102,6 +102,18 @@ func (l *Literal) UnmarshalYAML(value *yaml.Node) error {
 	return nil
 }
 
+// MarshalYAML renders the literal back to a bare scalar (not the {raw,string}
+// struct), so a manifest carrying a Literal — an add_column default or a batch
+// set value — round-trips through MarshalManifest. A string keeps its !!str tag so
+// it re-parses as a string; other scalars are emitted untagged for type inference.
+func (l Literal) MarshalYAML() (any, error) {
+	node := &yaml.Node{Kind: yaml.ScalarNode, Value: l.Raw}
+	if l.String {
+		node.Tag = "!!str"
+	}
+	return node, nil
+}
+
 // OnFailure controls what the engine does when an operation fails. The empty
 // value means stop (fail-fast), preserving the default behavior.
 type OnFailure string
@@ -703,14 +715,17 @@ type BatchSpec struct {
 	InitialRows *int   `yaml:"initial_rows"` // optional starting batch size; auto-sized when nil
 }
 
-// validate reports whether the batch spec is usable for this iteration.
+// IsKeyRange reports whether the spec selects the key_range walk strategy.
+func (b BatchSpec) IsKeyRange() bool {
+	return strings.EqualFold(strings.TrimSpace(b.Strategy), "key_range")
+}
+
+// validate reports whether the batch spec is usable.
 func (b BatchSpec) validate() error {
 	switch strings.ToLower(strings.TrimSpace(b.Strategy)) {
-	case "", "predicate":
-	case "key_range":
-		return fmt.Errorf("batch.strategy %q is planned for a later iteration; use \"predicate\": %w", b.Strategy, ErrInvalidManifest)
+	case "", "predicate", "key_range":
 	default:
-		return fmt.Errorf("batch.strategy must be \"predicate\", got %q: %w", b.Strategy, ErrInvalidManifest)
+		return fmt.Errorf("batch.strategy must be \"predicate\" or \"key_range\", got %q: %w", b.Strategy, ErrInvalidManifest)
 	}
 	if b.InitialRows != nil && *b.InitialRows <= 0 {
 		return fmt.Errorf("batch.initial_rows must be positive, got %d: %w", *b.InitialRows, ErrInvalidManifest)
@@ -789,8 +804,19 @@ func (o BatchDML) Validate() error {
 	}
 	// A raw whole-table UPDATE cannot self-limit under the predicate strategy, so it
 	// would loop forever — require a self-limiting where_raw.
-	if o.Verb == "update" && hasSetRaw && !hasWhere && !hasWhereRaw {
+	if o.Verb == "update" && hasSetRaw && !hasWhere && !hasWhereRaw && !o.Batch.IsKeyRange() {
 		return fmt.Errorf("%s: set_raw without where/where_raw cannot self-limit (it would loop forever); add a self-limiting where_raw: %w", cmd, ErrInvalidManifest)
+	}
+
+	// The key_range walk persists a watermark and re-applies the boundary batch on a
+	// resume, so it is restricted to an idempotent literal UPDATE.
+	if o.Batch.IsKeyRange() {
+		switch {
+		case o.Verb != "update":
+			return fmt.Errorf("%s: key_range is only for batch_update (delete is already self-limiting under predicate): %w", cmd, ErrInvalidManifest)
+		case !hasSet:
+			return fmt.Errorf("%s: key_range requires a literal set: (a non-idempotent set_raw cannot be safely re-applied on resume): %w", cmd, ErrInvalidManifest)
+		}
 	}
 
 	return o.Batch.validate()

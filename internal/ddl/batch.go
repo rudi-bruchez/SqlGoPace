@@ -121,6 +121,15 @@ func sortedSetColumns(set map[string]Literal) []string {
 	return cols
 }
 
+// maxdopOption renders the trailing OPTION (MAXDOP n) query hint, or "" when MAXDOP
+// is not set.
+func maxdopOption(res ResolvedOptions) string {
+	if res.MaxDOP != nil {
+		return " OPTION (MAXDOP " + strconv.Itoa(*res.MaxDOP) + ")"
+	}
+	return ""
+}
+
 // batchStatement builds one predicate-strategy batch statement with the given TOP
 // token (a row count for execution, or a placeholder for the indicative plan SQL).
 func batchStatement(o BatchDML, topToken string, res ResolvedOptions) string {
@@ -128,15 +137,54 @@ func batchStatement(o BatchDML, topToken string, res ResolvedOptions) string {
 	if w := o.predicateWhere(); w != "" {
 		where = " WHERE " + w
 	}
-	opt := ""
-	if res.MaxDOP != nil {
-		opt = " OPTION (MAXDOP " + strconv.Itoa(*res.MaxDOP) + ")"
-	}
+	opt := maxdopOption(res)
 	table := qualified(o.Schema, o.Table)
 	if o.Verb == "delete" {
 		return fmt.Sprintf("DELETE TOP (%s) FROM %s%s%s;", topToken, table, where, opt)
 	}
 	return fmt.Sprintf("UPDATE TOP (%s) %s SET %s%s%s;", topToken, table, o.setClause(), where, opt)
+}
+
+// keyRangeWhere builds the WHERE body for a key_range statement: the lower bound
+// (key > watermark, omitted on the first batch), an optional upper bound (key <=
+// next), and the operator filter, all AND-ed. The watermark/next bounds are integer
+// literals the driver controls, so inlining them is safe.
+func keyRangeWhere(o BatchDML, key string, watermark int64, hasWatermark bool, upper *int64) string {
+	k := quoteIdent(key)
+	var parts []string
+	if hasWatermark {
+		parts = append(parts, fmt.Sprintf("%s > %d", k, watermark))
+	}
+	if upper != nil {
+		parts = append(parts, fmt.Sprintf("%s <= %d", k, *upper))
+	}
+	if uw := o.userWhere(); uw != "" {
+		parts = append(parts, "("+uw+")")
+	}
+	return strings.Join(parts, " AND ")
+}
+
+// BatchKeyRangeNextSQL returns the upper-bound key of the next batch: the
+// batchSize-th smallest key above the watermark that matches the filter, or NULL
+// when the walk is exhausted. The driver reads it as a nullable scalar.
+func BatchKeyRangeNextSQL(o BatchDML, key string, batchSize int, watermark int64, hasWatermark bool) string {
+	k := quoteIdent(key)
+	where := keyRangeWhere(o, key, watermark, hasWatermark, nil)
+	if where != "" {
+		where = " WHERE " + where
+	}
+	inner := fmt.Sprintf("SELECT TOP (%d) %s AS k FROM %s%s ORDER BY %s",
+		batchSize, k, qualified(o.Schema, o.Table), where, k)
+	return fmt.Sprintf("SELECT MAX(k) FROM (%s) x;", inner)
+}
+
+// BatchKeyRangeUpdateSQL updates the rows in (watermark, next] that match the filter.
+// Each key is processed exactly once across batches, so no self-limiting clause is
+// needed.
+func BatchKeyRangeUpdateSQL(o BatchDML, key string, watermark, next int64, hasWatermark bool, res ResolvedOptions) string {
+	where := keyRangeWhere(o, key, watermark, hasWatermark, &next)
+	return fmt.Sprintf("UPDATE %s SET %s WHERE %s%s;",
+		qualified(o.Schema, o.Table), o.setClause(), where, maxdopOption(res))
 }
 
 // BatchDMLChunkSQL builds one batch statement (predicate strategy): an UPDATE or

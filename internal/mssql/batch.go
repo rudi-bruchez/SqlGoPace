@@ -26,6 +26,58 @@ func (c *Conn) TableRowEstimate(ctx context.Context, schema, table string) (int6
 	return rows, nil
 }
 
+// KeyColumn is one column of a table's clustered key, in key order, with whether it
+// is an integer type — the only kind the key_range batch walk supports in this
+// iteration.
+type KeyColumn struct {
+	Name      string
+	IsInteger bool
+}
+
+const clusteringKeyColumnsSQL = `
+SELECT c.name,
+       CASE WHEN c.system_type_id IN (48, 52, 56, 127) THEN 1 ELSE 0 END  -- tinyint/smallint/int/bigint
+FROM sys.indexes i
+JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE i.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND i.index_id = 1       -- clustered index
+  AND ic.key_ordinal > 0   -- key columns only (exclude INCLUDE columns)
+ORDER BY ic.key_ordinal;`
+
+// ClusteringKeyColumns returns the clustered-index key columns of [schema].[table]
+// in key order. It is empty for a heap (no clustered index); the batch-DML driver
+// uses it to infer and type-check a key_range key.
+func (c *Conn) ClusteringKeyColumns(ctx context.Context, schema, table string) ([]KeyColumn, error) {
+	rows, err := c.pool.QueryContext(ctx, clusteringKeyColumnsSQL,
+		sql.Named("schema", schema), sql.Named("table", table))
+	if err != nil {
+		return nil, fmt.Errorf("clustering key columns %s.%s: %w", schema, table, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var cols []KeyColumn
+	for rows.Next() {
+		var k KeyColumn
+		if err := rows.Scan(&k.Name, &k.IsInteger); err != nil {
+			return nil, fmt.Errorf("scan key column: %w", err)
+		}
+		cols = append(cols, k)
+	}
+	return cols, rows.Err()
+}
+
+// QueryInt runs a scalar query on the execution connection and returns its integer
+// value, with ok=false when the scalar is NULL (or no row). The batch-DML key_range
+// walk uses it to read the next watermark (NULL means the walk is exhausted).
+func (c *Conn) QueryInt(ctx context.Context, statement string) (int64, bool, error) {
+	var v sql.NullInt64
+	if err := c.exec.QueryRowContext(ctx, statement).Scan(&v); err != nil {
+		return 0, false, fmt.Errorf("query int: %w", err)
+	}
+	return v.Int64, v.Valid, nil
+}
+
 const dmlPermissionSQL = `
 SELECT ISNULL(HAS_PERMS_BY_NAME(QUOTENAME(@schema) + '.' + QUOTENAME(@table), 'OBJECT', @perm), 0);`
 

@@ -169,7 +169,7 @@ func TestParseBatchDMLValidation(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "key_range strategy not yet supported",
+			name: "valid key_range literal update",
 			manifest: `operations:
   - operation: batch_update
     schema: dbo
@@ -177,6 +177,41 @@ func TestParseBatchDMLValidation(t *testing.T) {
     set: { A: 1 }
     confirm_full_table: true
     batch: { strategy: key_range, key: Id }
+`,
+		},
+		{
+			name: "key_range rejects delete",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: T
+    where:
+      - { column: A, op: '=', value: 1 }
+    batch: { strategy: key_range }
+`,
+			wantErr: true,
+		},
+		{
+			name: "key_range rejects set_raw",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: T
+    set_raw: "A = A + 1"
+    confirm_full_table: true
+    batch: { strategy: key_range, key: Id }
+`,
+			wantErr: true,
+		},
+		{
+			name: "unknown strategy",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: T
+    set: { A: 1 }
+    confirm_full_table: true
+    batch: { strategy: bogus }
 `,
 			wantErr: true,
 		},
@@ -311,6 +346,73 @@ func TestBatchDMLChunkSQL(t *testing.T) {
 				t.Errorf("BatchDMLChunkSQL\n got: %s\nwant: %s", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestBatchKeyRangeSQL(t *testing.T) {
+	op := parseOneOp(t, `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Status: 'Archived' }
+    confirm_full_table: true
+    batch: { strategy: key_range, key: OrderID }
+`).(ddl.BatchDML)
+
+	// First batch: no lower bound; next-key query orders and tops by the key.
+	if got, want := ddl.BatchKeyRangeNextSQL(op, "OrderID", 5000, 0, false),
+		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] ORDER BY [OrderID]) x;"; got != want {
+		t.Errorf("first next-key SQL\n got: %s\nwant: %s", got, want)
+	}
+	// Subsequent batch: lower bound on the watermark.
+	if got, want := ddl.BatchKeyRangeNextSQL(op, "OrderID", 5000, 1000, true),
+		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] WHERE [OrderID] > 1000 ORDER BY [OrderID]) x;"; got != want {
+		t.Errorf("next-key SQL with watermark\n got: %s\nwant: %s", got, want)
+	}
+	// Update of the (watermark, next] range — no self-limiting clause needed.
+	if got, want := ddl.BatchKeyRangeUpdateSQL(op, "OrderID", 1000, 2000, true, ddl.ResolvedOptions{}),
+		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] > 1000 AND [OrderID] <= 2000;"; got != want {
+		t.Errorf("range update SQL\n got: %s\nwant: %s", got, want)
+	}
+	// First-batch update has no lower bound.
+	if got, want := ddl.BatchKeyRangeUpdateSQL(op, "OrderID", 0, 2000, false, ddl.ResolvedOptions{}),
+		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] <= 2000;"; got != want {
+		t.Errorf("first range update SQL\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestMarshalManifestRoundTripsBatchDML(t *testing.T) {
+	src := `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set:
+      Status: Archived
+      Retries: 0
+    where:
+      - {column: Status, op: '=', value: Pending}
+    batch:
+      strategy: key_range
+      key: OrderID
+`
+	m, err := ddl.ParseManifest(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("ParseManifest: %v", err)
+	}
+	out, err := ddl.MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	// The rendered manifest must re-parse (in particular the literal set values must
+	// round-trip as scalars, not the {raw,string} struct).
+	m2, err := ddl.ParseManifest(strings.NewReader(string(out)))
+	if err != nil {
+		t.Fatalf("re-parse marshaled manifest: %v\n%s", err, out)
+	}
+	b1 := m.Operations[0].(ddl.BatchDML)
+	b2 := m2.Operations[0].(ddl.BatchDML)
+	if b2.Verb != b1.Verb || b2.Set["Status"] != b1.Set["Status"] || b2.Set["Retries"] != b1.Set["Retries"] || b2.Batch.Strategy != b1.Batch.Strategy || b2.Batch.Key != b1.Batch.Key {
+		t.Errorf("round-trip mismatch:\n before: %+v\n  after: %+v", b1, b2)
 	}
 }
 

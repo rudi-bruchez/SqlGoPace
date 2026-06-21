@@ -3,18 +3,22 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
-// BatchExecutor is an Executor that can also report rows affected, which the
-// batch-DML driver needs to detect when a predicate loop is exhausted. *mssql.Conn
-// satisfies it; the rest of the engine uses the narrower Executor.
+// BatchExecutor is an Executor that can also report rows affected (to detect when a
+// predicate loop is exhausted) and read a scalar integer (the next key_range
+// watermark). *mssql.Conn satisfies it; the rest of the engine uses the narrower
+// Executor.
 type BatchExecutor interface {
 	Executor
 	ExecRows(ctx context.Context, sql string) (int64, error)
+	QueryInt(ctx context.Context, sql string) (int64, bool, error)
 }
 
 // BatchDMLReader is the narrow set of runtime reads the batch-DML driver needs.
@@ -22,9 +26,26 @@ type BatchExecutor interface {
 type BatchDMLReader interface {
 	TableRowEstimate(ctx context.Context, schema, table string) (int64, error)
 	SessionWaits(ctx context.Context, spid int) ([]mssql.SessionWait, error)
+	ClusteringKeyColumns(ctx context.Context, schema, table string) ([]mssql.KeyColumn, error)
 }
 
 var _ BatchDMLReader = (*mssql.Conn)(nil)
+
+// WatermarkStore persists the key_range walk position so a crashed batch-DML run
+// resumes mid-table instead of restarting. The predicate strategy never touches it.
+// Save is best-effort: a failure only means a resume redoes from the last saved
+// point, which is safe for the idempotent literal update key_range requires.
+type WatermarkStore interface {
+	Load(ctx context.Context) (watermark int64, ok bool, err error)
+	Save(ctx context.Context, watermark int64) error
+}
+
+// noWatermark is the store passed for predicate-strategy operations (which never use
+// it) and in tests that do not exercise resume.
+type noWatermark struct{}
+
+func (noWatermark) Load(context.Context) (int64, bool, error) { return 0, false, nil }
+func (noWatermark) Save(context.Context, int64) error         { return nil }
 
 // BatchDMLProgress is the progress of one batch-DML operation, fed to the TUI.
 type BatchDMLProgress struct {
@@ -128,31 +149,26 @@ func NewBatchDMLRunner(exec BatchExecutor, reader BatchDMLReader, sampler Sample
 	return r
 }
 
-// Run executes the batch-DML operation: it loops the predicate statement, each
-// batch committed individually, until it affects no rows (the predicate is
-// exhausted). It returns a single BatchDMLResult.
-func (r *BatchDMLRunner) Run(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (BatchDMLResult, error) {
+// Run executes the batch-DML operation, dispatching on the chunking strategy: the
+// predicate loop (default) or the key_range walk (resumable via the watermark
+// store). It returns a single BatchDMLResult.
+func (r *BatchDMLRunner) Run(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, wm WatermarkStore, sink ReactionSink) (BatchDMLResult, error) {
+	if op.Batch.IsKeyRange() {
+		return r.runKeyRange(ctx, op, res, ignore, wm, sink)
+	}
+	return r.runPredicate(ctx, op, res, ignore, sink)
+}
+
+// runPredicate loops the self-limiting predicate statement, each batch committed
+// individually, until it affects no rows (the predicate is exhausted).
+func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (BatchDMLResult, error) {
 	result := BatchDMLResult{Schema: op.Schema, Table: op.Table, Verb: op.Verb}
 
 	// Best-effort estimate: 0 when unavailable just means the smallest initial tier.
 	est, _ := r.reader.TableRowEstimate(ctx, op.Schema, op.Table)
-
 	lo, hi := r.batchBounds()
-	size := InitialBatchRows(est, r.tuning)
-	if op.Batch.InitialRows != nil {
-		size = *op.Batch.InitialRows
-	}
-	size = clampRows(size, lo, hi)
-
-	// A batch is cancel-safe: a single UPDATE/DELETE TOP commits atomically, so a stop
-	// rolls it back cleanly and the already-committed batches survive. ignore_blocking
-	// and max_block_minutes flow through exactly as for monitored DDL.
-	caps := Capabilities{
-		CancelSafe:     true,
-		Ignore:         ignore,
-		IgnoreBlocking: res.IgnoreBlocking,
-		MaxBlock:       blockCap(res.MaxBlockMinutes),
-	}
+	size := r.initialSize(op, est, lo, hi)
+	caps := r.opCaps(res, ignore)
 
 	var stallWaited time.Duration
 	for {
@@ -166,21 +182,13 @@ func (r *BatchDMLRunner) Run(ctx context.Context, op ddl.BatchDML, res ddl.Resol
 		elapsed := r.clk.Since(t0)
 		after, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 
-		// A batch stopped under pressure: its work rolled back (nothing committed).
-		// Wait for relief, then retry the same batch. A log-drain timeout is a clean
-		// stop; bounded total wait avoids spinning if we keep getting blocked.
 		if stopped {
-			t1 := r.clk.Now()
-			if err := r.awaitRelief(ctx, ignore, sink); err != nil {
-				if errors.Is(err, ErrLogDrainTimeout) {
-					result.Reason = "stopped: log did not drain before timeout (committed batches preserved)"
-					return result, nil
-				}
+			stop, reason, err := r.handleStop(ctx, ignore, sink, &stallWaited)
+			if err != nil {
 				return result, err
 			}
-			stallWaited += r.clk.Since(t1)
-			if r.tuning.SelfWaitTimeout > 0 && stallWaited >= r.tuning.SelfWaitTimeout {
-				result.Reason = "stopped: blocked longer than the self-wait timeout (committed batches preserved)"
+			if stop {
+				result.Reason = reason
 				return result, nil
 			}
 			continue
@@ -195,9 +203,146 @@ func (r *BatchDMLRunner) Run(ctx context.Context, op ddl.BatchDML, res ddl.Resol
 		result.Batches++
 		stallWaited = 0
 		r.emitProgress(op, result.Rows, est)
-
 		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)
 	}
+}
+
+// runKeyRange walks the table in ascending key ranges, persisting the watermark after
+// each committed batch so a crash resumes mid-table. It is restricted (by validation)
+// to an idempotent literal UPDATE, so re-applying the boundary batch on resume is safe.
+func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, wm WatermarkStore, sink ReactionSink) (BatchDMLResult, error) {
+	result := BatchDMLResult{Schema: op.Schema, Table: op.Table, Verb: op.Verb}
+
+	key, err := r.resolveKeyColumn(ctx, op)
+	if err != nil {
+		return result, err
+	}
+	est, _ := r.reader.TableRowEstimate(ctx, op.Schema, op.Table)
+	lo, hi := r.batchBounds()
+	size := r.initialSize(op, est, lo, hi)
+
+	watermark, hasWM, err := wm.Load(ctx)
+	if err != nil {
+		return result, fmt.Errorf("batch_update key_range: load watermark: %w", err)
+	}
+	if hasWM {
+		sink(ReactionEvent{Kind: "resume", Detail: fmt.Sprintf("key_range resuming %s.%s from %s > %d", op.Schema, op.Table, key, watermark)})
+	}
+
+	caps := r.opCaps(res, ignore)
+	var stallWaited time.Duration
+	for {
+		next, ok, err := r.exec.QueryInt(ctx, ddl.BatchKeyRangeNextSQL(op, key, size, watermark, hasWM))
+		if err != nil {
+			return result, err
+		}
+		if !ok {
+			return result, nil // no key left above the watermark: the walk is done
+		}
+
+		stmt := ddl.BatchKeyRangeUpdateSQL(op, key, watermark, next, hasWM, res)
+		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
+		t0 := r.clk.Now()
+		stopped, rows, err := r.runBatch(ctx, stmt, caps, sink)
+		if err != nil {
+			return result, err
+		}
+		elapsed := r.clk.Since(t0)
+		after, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
+
+		if stopped {
+			stop, reason, err := r.handleStop(ctx, ignore, sink, &stallWaited)
+			if err != nil {
+				return result, err
+			}
+			if stop {
+				result.Reason = reason
+				return result, nil
+			}
+			continue // retry the same range
+		}
+
+		result.Rows += rows
+		result.Batches++
+		result.FinalRows = size
+		watermark, hasWM = next, true
+		_ = wm.Save(ctx, watermark) // best-effort; a resume redoes from the last saved point
+		stallWaited = 0
+		r.emitProgress(op, result.Rows, est)
+		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)
+	}
+}
+
+// resolveKeyColumn determines the key_range key: the explicit batch.key, else the
+// table's single clustered key column. This iteration supports only a single integer
+// key (composite or non-integer keys use the predicate strategy instead).
+func (r *BatchDMLRunner) resolveKeyColumn(ctx context.Context, op ddl.BatchDML) (string, error) {
+	cols, err := r.reader.ClusteringKeyColumns(ctx, op.Schema, op.Table)
+	if err != nil {
+		return "", err
+	}
+	if op.Batch.Key != "" {
+		for _, c := range cols {
+			if strings.EqualFold(c.Name, op.Batch.Key) {
+				if !c.IsInteger {
+					return "", fmt.Errorf("key_range: key %q is not an integer column (this iteration supports integer keys only)", op.Batch.Key)
+				}
+				return c.Name, nil
+			}
+		}
+		return "", fmt.Errorf("key_range: key %q is not the clustered key of %s.%s (this iteration requires the key to be the clustered/PK key)", op.Batch.Key, op.Schema, op.Table)
+	}
+	switch {
+	case len(cols) == 0:
+		return "", fmt.Errorf("key_range: %s.%s has no clustered key; specify batch.key or use the predicate strategy", op.Schema, op.Table)
+	case len(cols) > 1:
+		return "", fmt.Errorf("key_range: %s.%s has a composite clustered key; specify a single integer batch.key or use the predicate strategy", op.Schema, op.Table)
+	case !cols[0].IsInteger:
+		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not an integer (this iteration supports integer keys only)", cols[0].Name, op.Schema, op.Table)
+	}
+	return cols[0].Name, nil
+}
+
+// opCaps builds the reaction capabilities shared by both strategies. A batch is
+// cancel-safe (a single UPDATE/DELETE TOP commits atomically, so a stop rolls it
+// back cleanly and committed batches survive); ignore_blocking and max_block_minutes
+// flow through exactly as for monitored DDL.
+func (r *BatchDMLRunner) opCaps(res ddl.ResolvedOptions, ignore IgnoreSource) Capabilities {
+	return Capabilities{
+		CancelSafe:     true,
+		Ignore:         ignore,
+		IgnoreBlocking: res.IgnoreBlocking,
+		MaxBlock:       blockCap(res.MaxBlockMinutes),
+	}
+}
+
+// initialSize picks the starting batch size: the per-op override when set, else the
+// estimate-driven tier, clamped to the (RCSI-aware) bounds.
+func (r *BatchDMLRunner) initialSize(op ddl.BatchDML, est int64, lo, hi int) int {
+	size := InitialBatchRows(est, r.tuning)
+	if op.Batch.InitialRows != nil {
+		size = *op.Batch.InitialRows
+	}
+	return clampRows(size, lo, hi)
+}
+
+// handleStop waits for the pressure that stopped a batch to clear, then reports
+// whether the operation should stop cleanly (with a reason) rather than retry. A
+// log-drain timeout or exceeding the self-wait budget both end the run cleanly with
+// committed batches preserved.
+func (r *BatchDMLRunner) handleStop(ctx context.Context, ignore IgnoreSource, sink ReactionSink, stallWaited *time.Duration) (stop bool, reason string, err error) {
+	t1 := r.clk.Now()
+	if err := r.awaitRelief(ctx, ignore, sink); err != nil {
+		if errors.Is(err, ErrLogDrainTimeout) {
+			return true, "stopped: log did not drain before timeout (committed batches preserved)", nil
+		}
+		return false, "", err
+	}
+	*stallWaited += r.clk.Since(t1)
+	if r.tuning.SelfWaitTimeout > 0 && *stallWaited >= r.tuning.SelfWaitTimeout {
+		return true, "stopped: blocked longer than the self-wait timeout (committed batches preserved)", nil
+	}
+	return false, "", nil
 }
 
 // batchBounds returns the [min, max] batch size. With RCSI off, the ceiling is

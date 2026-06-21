@@ -42,6 +42,68 @@ func (s *fakeBatchServer) SessionWaits(context.Context, int) ([]mssql.SessionWai
 	return s.waits, nil
 }
 
+func (s *fakeBatchServer) QueryInt(context.Context, string) (int64, bool, error) {
+	return 0, false, nil
+}
+
+func (s *fakeBatchServer) ClusteringKeyColumns(context.Context, string, string) ([]mssql.KeyColumn, error) {
+	return nil, nil
+}
+
+// memWatermark is an in-memory WatermarkStore for the key_range tests.
+type memWatermark struct {
+	loadVal int64
+	loadOK  bool
+	saved   int64
+	saves   int
+}
+
+func (m *memWatermark) Load(context.Context) (int64, bool, error) { return m.loadVal, m.loadOK, nil }
+func (m *memWatermark) Save(_ context.Context, wm int64) error {
+	m.saved = wm
+	m.saves++
+	return nil
+}
+
+// fakeKeyServer models a table keyed 1..maxKey for the key_range walk: QueryInt
+// returns the next batch's upper bound (walkPos + TOP, capped) and ExecRows applies
+// the (walkPos, upper] range. It owns walkPos so the walk stays self-consistent.
+type fakeKeyServer struct {
+	maxKey  int64
+	walkPos int64
+	keyCols []mssql.KeyColumn
+	waits   []mssql.SessionWait
+
+	execLog []string
+	killed  bool
+}
+
+func (s *fakeKeyServer) SPID() int                             { return 8 }
+func (s *fakeKeyServer) ExecDDL(context.Context, string) error { return nil }
+func (s *fakeKeyServer) Kill(context.Context, int) error       { s.killed = true; return nil }
+func (s *fakeKeyServer) TableRowEstimate(context.Context, string, string) (int64, error) {
+	return s.maxKey, nil
+}
+func (s *fakeKeyServer) SessionWaits(context.Context, int) ([]mssql.SessionWait, error) {
+	return s.waits, nil
+}
+func (s *fakeKeyServer) ClusteringKeyColumns(context.Context, string, string) ([]mssql.KeyColumn, error) {
+	return s.keyCols, nil
+}
+func (s *fakeKeyServer) QueryInt(_ context.Context, sql string) (int64, bool, error) {
+	if s.walkPos >= s.maxKey {
+		return 0, false, nil
+	}
+	return min(s.walkPos+int64(parseTop(sql)), s.maxKey), true, nil
+}
+func (s *fakeKeyServer) ExecRows(_ context.Context, sql string) (int64, error) {
+	s.execLog = append(s.execLog, sql)
+	next := parseUpperBound(sql)
+	rows := next - s.walkPos
+	s.walkPos = next
+	return rows, nil
+}
+
 // parseTop extracts N from a statement containing "TOP (N)".
 func parseTop(sql string) int {
 	_, after, ok := strings.Cut(sql, "TOP (")
@@ -53,6 +115,20 @@ func parseTop(sql string) int {
 		return 0
 	}
 	n, _ := strconv.Atoi(strings.TrimSpace(num))
+	return n
+}
+
+// parseUpperBound extracts N from a key_range update's "<= N" upper bound.
+func parseUpperBound(sql string) int64 {
+	_, after, ok := strings.Cut(sql, "<= ")
+	if !ok {
+		return 0
+	}
+	end := 0
+	for end < len(after) && after[end] >= '0' && after[end] <= '9' {
+		end++
+	}
+	n, _ := strconv.ParseInt(after[:end], 10, 64)
 	return n
 }
 
@@ -69,8 +145,8 @@ func testBatchTuning() BatchTuning {
 	}
 }
 
-func newTestBatchRunner(s *fakeBatchServer, clk *ManualClock, rcsi bool) *BatchDMLRunner {
-	return NewBatchDMLRunner(s, s, noPressureSampler{}, clk, BatchDMLRunnerConfig{
+func newBatchRunner(exec BatchExecutor, reader BatchDMLReader, clk *ManualClock, rcsi bool) *BatchDMLRunner {
+	return NewBatchDMLRunner(exec, reader, noPressureSampler{}, clk, BatchDMLRunnerConfig{
 		Tuning:          testBatchTuning(),
 		RCSI:            rcsi,
 		PollInterval:    time.Hour, // pump never fires during the instant batches
@@ -81,12 +157,26 @@ func newTestBatchRunner(s *fakeBatchServer, clk *ManualClock, rcsi bool) *BatchD
 	})
 }
 
+func newTestBatchRunner(s *fakeBatchServer, clk *ManualClock, rcsi bool) *BatchDMLRunner {
+	return newBatchRunner(s, s, clk, rcsi)
+}
+
+// keyRangeOp is a literal whole-table UPDATE using the key_range strategy.
+func keyRangeOp() ddl.BatchDML {
+	return ddl.BatchDML{
+		Verb: "update", Schema: "dbo", Table: "T",
+		Set:              map[string]ddl.Literal{"Flag": {Raw: "1"}},
+		ConfirmFullTable: true,
+		Batch:            ddl.BatchSpec{Strategy: "key_range"},
+	}
+}
+
 func TestBatchDMLConverges(t *testing.T) {
 	s := &fakeBatchServer{remaining: 12345, estRows: 12345}
 	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
 
 	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -109,7 +199,7 @@ func TestBatchDMLNoRows(t *testing.T) {
 	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
 
 	op := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "T", SetRaw: "A = 1", WhereRaw: "A <> 1"}
-	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
@@ -129,7 +219,7 @@ func TestBatchDMLRCSIOffCapsBatchSize(t *testing.T) {
 	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), false)
 
 	op := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "T", SetRaw: "A = 1", WhereRaw: "A <> 1"}
-	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard); err != nil {
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	for _, sql := range s.execLog {
@@ -146,7 +236,7 @@ func TestBatchDMLRCSIOnGrowsPastCap(t *testing.T) {
 	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
 
 	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
-	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard); err != nil {
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard); err != nil {
 		t.Fatalf("Run() error = %v", err)
 	}
 	var maxTop int
@@ -155,6 +245,53 @@ func TestBatchDMLRCSIOnGrowsPastCap(t *testing.T) {
 	}
 	if maxTop <= testBatchTuning().EscalationCapRows {
 		t.Errorf("max batch size = %d, want > escalation cap %d (RCSI on lifts it)", maxTop, testBatchTuning().EscalationCapRows)
+	}
+}
+
+func TestBatchDMLKeyRangeWalksAndPersists(t *testing.T) {
+	s := &fakeKeyServer{maxKey: 25000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true}}}
+	store := &memWatermark{}
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	res, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, store, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if res.Rows != 25000 {
+		t.Errorf("Rows = %d, want 25000", res.Rows)
+	}
+	if res.Batches == 0 {
+		t.Errorf("Batches = 0, want > 0")
+	}
+	if res.Reason != "" {
+		t.Errorf("Reason = %q, want empty (clean completion)", res.Reason)
+	}
+	if store.saved != 25000 || store.saves == 0 {
+		t.Errorf("persisted watermark = %d after %d saves, want 25000 with saves > 0", store.saved, store.saves)
+	}
+}
+
+func TestBatchDMLKeyRangeResumes(t *testing.T) {
+	// A crash left the walk at key 20000 of 25000; the run resumes from the watermark.
+	s := &fakeKeyServer{maxKey: 25000, walkPos: 20000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true}}}
+	store := &memWatermark{loadVal: 20000, loadOK: true}
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	res, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, store, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if res.Rows != 5000 {
+		t.Errorf("Rows = %d, want 5000 (resumed at 20000 of 25000)", res.Rows)
+	}
+}
+
+func TestBatchDMLKeyRangeRejectsNonIntegerKey(t *testing.T) {
+	s := &fakeKeyServer{maxKey: 100, keyCols: []mssql.KeyColumn{{Name: "Code", IsInteger: false}}}
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	if _, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, &memWatermark{}, discard); err == nil {
+		t.Fatalf("Run() error = nil, want an error for a non-integer key")
 	}
 }
 

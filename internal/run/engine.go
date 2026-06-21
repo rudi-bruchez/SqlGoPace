@@ -40,9 +40,10 @@ var _ ShrinkDriver = (*ShrinkRunner)(nil)
 
 // BatchDMLDriver runs a batched UPDATE/DELETE, which like a shrink does not fit the
 // one-statement OpRunner model: it loops a per-batch statement at run time. The
-// engine routes ddl.BatchDML operations here. *BatchDMLRunner satisfies it.
+// engine routes ddl.BatchDML operations here, supplying a watermark store so a
+// key_range walk resumes mid-table after a crash. *BatchDMLRunner satisfies it.
 type BatchDMLDriver interface {
-	Run(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (BatchDMLResult, error)
+	Run(ctx context.Context, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, wm WatermarkStore, sink ReactionSink) (BatchDMLResult, error)
 }
 
 var _ BatchDMLDriver = (*BatchDMLRunner)(nil)
@@ -404,9 +405,15 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		case ddl.BatchDML:
 			if e.batchDML != nil {
 				// Batched DML is a per-batch loop built at run time; route to its driver.
+				// The watermark sidecar lets a key_range walk resume after a crash; it is
+				// removed once the walk returns (a crash skips that, preserving resume).
+				store := e.watermarkStore(name, i)
 				var br BatchDMLResult
-				br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, sink)
+				br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
 				batchResult = &br
+				if op.Batch.IsKeyRange() {
+					store.clear()
+				}
 			} else {
 				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 			}
