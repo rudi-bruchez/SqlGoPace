@@ -93,8 +93,8 @@ func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait
 // noPressureSampler never reports blocking or log pressure.
 type noPressureSampler struct{}
 
-func (noPressureSampler) Blocking(context.Context, IgnoredSessions) (bool, error) {
-	return false, nil
+func (noPressureSampler) Blocking(context.Context, IgnoredSessions) (BlockState, error) {
+	return BlockState{}, nil
 }
 func (noPressureSampler) Log(context.Context) (LogSample, error) { return LogSample{}, nil }
 

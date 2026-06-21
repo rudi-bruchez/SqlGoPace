@@ -204,6 +204,35 @@ func TestResolveIgnoreBlocking(t *testing.T) {
 	}
 }
 
+func TestResolveMaxBlockMinutes(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.RebuildIndex{
+		Schema: "dbo", Table: "T", Index: "IX",
+		Options: ddl.OptionOverrides{MaxBlockMinutes: intPtr(15)},
+	}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+	if got.MaxBlockMinutes != 15 {
+		t.Errorf("MaxBlockMinutes = %d, want 15", got.MaxBlockMinutes)
+	}
+	var found bool
+	for _, d := range decisions {
+		if d.Option == "max_block_minutes" && d.Value == "15" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("decisions missing a max_block_minutes=15 entry, want one for --explain")
+	}
+
+	// Absent or non-positive → no cap.
+	plain := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+	if got2, _ := ddl.Resolve(plain, target, m, ddl.Policy{}); got2.MaxBlockMinutes != 0 {
+		t.Errorf("MaxBlockMinutes = %d with no override, want 0", got2.MaxBlockMinutes)
+	}
+}
+
 func TestResolveNoOptionsForPlainOperation(t *testing.T) {
 	m := resolveMatrix()
 	op := ddl.AddColumn{Schema: "dbo", Table: "T", Column: "C", DataType: "BIT"}

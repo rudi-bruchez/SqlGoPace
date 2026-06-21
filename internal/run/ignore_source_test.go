@@ -102,8 +102,8 @@ func TestLiveReloadFlipsBlocking(t *testing.T) {
 	probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57, Program: "ReportingService"}}}
 	sampler := NewServerSampler(probe, 57, 1000, 80)
 
-	if b, err := sampler.Blocking(context.Background(), src.Current()); err != nil || !b {
-		t.Fatalf("Blocking() = (%v, %v), want (true, nil) before the rule is added", b, err)
+	if b, err := sampler.Blocking(context.Background(), src.Current()); err != nil || !b.Unignored {
+		t.Fatalf("Blocking() = (%+v, %v), want Unignored:true before the rule is added", b, err)
 	}
 
 	if err := os.WriteFile(path, []byte("ignore_blocked_sessions:\n  - app_name: \"^Reporting\"\n"+opTail), 0o644); err != nil {
@@ -111,7 +111,7 @@ func TestLiveReloadFlipsBlocking(t *testing.T) {
 	}
 	bumpMtime(t, path)
 
-	if b, err := sampler.Blocking(context.Background(), src.Current()); err != nil || b {
-		t.Errorf("Blocking() = (%v, %v), want (false, nil) — live reload suppressed it", b, err)
+	if b, err := sampler.Blocking(context.Background(), src.Current()); err != nil || b.Unignored {
+		t.Errorf("Blocking() = (%+v, %v), want Unignored:false — live reload suppressed the reaction", b, err)
 	}
 }

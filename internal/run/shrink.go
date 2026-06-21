@@ -379,7 +379,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 
 	// A shrink chunk is cancel-safe: each internal ~32-page batch commits, so a stop
 	// preserves work and is re-entrant. It is never resumable in the ALTER sense.
-	caps := Capabilities{CancelSafe: true}
+	caps := Capabilities{CancelSafe: true, MaxBlock: blockCap(res.MaxBlockMinutes)}
 	action, pressure, serr := supervise(ctx, r.clk, caps, r.blockTO, samples, done)
 	if action == Continue {
 		return false, serr

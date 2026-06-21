@@ -27,7 +27,8 @@ var _ Executor = (*mssql.Conn)(nil)
 // log state are polled on independent intervals, so a snapshot carries the latest
 // known value of each.
 type Sample struct {
-	BlockingOthers bool   // our DDL is blocking other sessions
+	BlockingOthers bool   // our DDL is blocking a session not allowed to stay blocked
+	Blocking       bool   // our DDL is blocking any session, ignored or not (max_block cap)
 	LogOverCap     bool   // the transaction log is over its configured cap
 	LogReuseWait   string // why the log cannot truncate (only set when over cap)
 }
@@ -38,13 +39,31 @@ type LogSample struct {
 	ReuseWait string // log_reuse_wait_desc, populated only when over cap
 }
 
+// BlockState summarizes how our DDL is blocking other sessions in one poll: Any is
+// true when it blocks at least one session (ignored or not), driving the max_block
+// safety cap; Unignored is true when it blocks a session not allowed to stay blocked,
+// driving the normal yield reaction.
+type BlockState struct {
+	Any       bool
+	Unignored bool
+}
+
 // Sampler reads the two monitored dimensions on independent cadences: blocking
 // (frequent) and transaction-log pressure (less frequent). Blocking is told which
 // blocked sessions to ignore, so a session the operator allows to stay blocked does
-// not count as pressure.
+// not count toward the yield reaction (but still counts toward the max_block cap).
 type Sampler interface {
-	Blocking(ctx context.Context, ignore IgnoredSessions) (bool, error)
+	Blocking(ctx context.Context, ignore IgnoredSessions) (BlockState, error)
 	Log(ctx context.Context) (LogSample, error)
+}
+
+// blockCap converts a max_block_minutes value into a duration; 0 (or negative) means
+// no cap.
+func blockCap(minutes int) time.Duration {
+	if minutes <= 0 {
+		return 0
+	}
+	return time.Duration(minutes) * time.Minute
 }
 
 // sessionRule is one compiled ignore_blocked_sessions entry. A zero sessionID or a
@@ -145,7 +164,7 @@ func supervise(
 	samples <-chan Sample,
 	done <-chan error,
 ) (Action, Pressure, error) {
-	var blockingStart time.Time
+	var blockingStart, blockedSince time.Time
 
 	for {
 		select {
@@ -154,12 +173,22 @@ func supervise(
 		case err := <-done:
 			return Continue, Pressure{}, err
 		case s := <-samples:
+			// Timer for the normal reaction: blocking a session not allowed to stay
+			// blocked, debounced over blockingTimeout.
 			if s.BlockingOthers {
 				if blockingStart.IsZero() {
 					blockingStart = clk.Now()
 				}
 			} else {
 				blockingStart = time.Time{}
+			}
+			// Timer for the max_block safety cap: blocking ANY session, ignored or not.
+			if s.Blocking {
+				if blockedSince.IsZero() {
+					blockedSince = clk.Now()
+				}
+			} else {
+				blockedSince = time.Time{}
 			}
 
 			pressure := Pressure{
@@ -168,6 +197,12 @@ func supervise(
 				BlockingOthers: !caps.IgnoreBlocking && !blockingStart.IsZero() && clk.Since(blockingStart) >= blockingTimeout,
 				LogOverCap:     s.LogOverCap,
 				LogReuseWait:   s.LogReuseWait,
+			}
+			// The safety cap overrides every ignore policy: after MaxBlock of continuous
+			// blocking, yield even if the blocker is ignored.
+			if caps.MaxBlock > 0 && !blockedSince.IsZero() && clk.Since(blockedSince) >= caps.MaxBlock {
+				pressure.BlockingOthers = true
+				pressure.Capped = true
 			}
 			if action := DecideReaction(pressure, caps); action != Continue {
 				return action, pressure, nil
@@ -199,8 +234,9 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, bl
 		case <-ctx.Done():
 			return
 		case <-blockTicker.C:
-			if b, err := sampler.Blocking(ctx, currentRules(ignore)); err == nil {
-				cur.BlockingOthers = b
+			if st, err := sampler.Blocking(ctx, currentRules(ignore)); err == nil {
+				cur.Blocking = st.Any
+				cur.BlockingOthers = st.Unignored
 				send()
 			}
 		case <-logTicker.C:
@@ -235,21 +271,27 @@ func NewServerSampler(probe sampleProbe, spid int, logMaxBytes int64, logMaxPerc
 
 var _ Sampler = (*ServerSampler)(nil)
 
-// Blocking reports whether any active session is blocked by our DDL, excluding
-// sessions the operator allows to stay blocked (the ignore matcher). When the only
-// blocked sessions match an ignore rule, it reports false so the operation holds its
-// lock instead of yielding.
-func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (bool, error) {
+// Blocking reports how our DDL is blocking other sessions: Any when it blocks at
+// least one session (ignored or not), Unignored when it blocks a session the operator
+// has not allowed to stay blocked. The yield reaction keys off Unignored; the
+// max_block safety cap keys off Any.
+func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (BlockState, error) {
 	sessions, err := s.probe.ActiveSessions(ctx)
 	if err != nil {
-		return false, err
+		return BlockState{}, err
 	}
+	var st BlockState
 	for _, sess := range sessions {
-		if sess.BlockingSPID == s.spid && !ignore.ignores(sess) {
-			return true, nil
+		if sess.BlockingSPID != s.spid {
+			continue
+		}
+		st.Any = true
+		if !ignore.ignores(sess) {
+			st.Unignored = true
+			break
 		}
 	}
-	return false, nil
+	return st, nil
 }
 
 // Log reports whether the transaction log is over its cap and, when it is, why it

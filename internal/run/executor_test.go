@@ -58,16 +58,17 @@ func TestCancelSafe(t *testing.T) {
 var testStart = time.Date(2026, 6, 10, 12, 0, 0, 0, time.UTC)
 
 type superviseResult struct {
-	action Action
-	err    error
+	action   Action
+	pressure Pressure
+	err      error
 }
 
 // runSupervise starts supervise in a goroutine and returns its result channel.
 func runSupervise(clk Clock, caps Capabilities, samples chan Sample, done chan error) <-chan superviseResult {
 	out := make(chan superviseResult, 1)
 	go func() {
-		a, _, e := supervise(context.Background(), clk, caps, 60*time.Second, samples, done)
-		out <- superviseResult{a, e}
+		a, p, e := supervise(context.Background(), clk, caps, 60*time.Second, samples, done)
+		out <- superviseResult{a, p, e}
 	}()
 	return out
 }
@@ -135,6 +136,40 @@ func TestSuperviseIgnoreBlockingHoldsLock(t *testing.T) {
 	}
 }
 
+func TestSuperviseMaxBlockCapYieldsThroughIgnored(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	clk := NewManualClock(testStart)
+	// ignore_blocking would hold the lock forever, but max_block caps it.
+	out := runSupervise(clk, Capabilities{IgnoreBlocking: true, MaxBlock: 5 * time.Minute}, samples, done)
+
+	samples <- Sample{Blocking: true} // blocking only an ignored session (no BlockingOthers)
+	clk.Advance(6 * time.Minute)
+	samples <- Sample{Blocking: true} // 6m >= 5m cap -> yield even though it is ignored
+
+	got := <-out
+	if got.action != Cancel || !got.pressure.Capped {
+		t.Errorf("supervise() = (%v, capped=%v), want (Cancel, capped=true)", got.action, got.pressure.Capped)
+	}
+}
+
+func TestSuperviseMaxBlockCapNotReachedHoldsLock(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	clk := NewManualClock(testStart)
+	out := runSupervise(clk, Capabilities{IgnoreBlocking: true, MaxBlock: 30 * time.Minute}, samples, done)
+
+	samples <- Sample{Blocking: true}
+	clk.Advance(5 * time.Minute)
+	samples <- Sample{Blocking: true} // 5m < 30m cap -> still holding
+	done <- nil                       // statement finishes on its own
+
+	got := <-out
+	if got.action != Continue || got.err != nil {
+		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — under the cap", got.action, got.err)
+	}
+}
+
 func TestSuperviseIgnoreBlockingStillHonorsLog(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
@@ -156,8 +191,8 @@ func TestSuperviseContextCancel(t *testing.T) {
 	out := make(chan superviseResult, 1)
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		a, _, e := supervise(ctx, NewManualClock(testStart), Capabilities{}, 60*time.Second, samples, done)
-		out <- superviseResult{a, e}
+		a, p, e := supervise(ctx, NewManualClock(testStart), Capabilities{}, 60*time.Second, samples, done)
+		out <- superviseResult{a, p, e}
 	}()
 
 	cancel()
@@ -311,29 +346,29 @@ func TestServerSamplerBlocking(t *testing.T) {
 	t.Run("blocked by our spid", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57}}}
 		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
-		if err != nil || !got {
-			t.Errorf("Blocking() = (%v, %v), want (true, nil)", got, err)
+		if err != nil || !got.Unignored || !got.Any {
+			t.Errorf("Blocking() = (%+v, %v), want {Any:true Unignored:true}", got, err)
 		}
 	})
 	t.Run("blocked by someone else", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 99}}}
 		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
-		if err != nil || got {
-			t.Errorf("Blocking() = (%v, %v), want (false, nil)", got, err)
+		if err != nil || got.Any || got.Unignored {
+			t.Errorf("Blocking() = (%+v, %v), want all false", got, err)
 		}
 	})
-	t.Run("ignored blocker does not count", func(t *testing.T) {
+	t.Run("ignored blocker counts toward Any but not Unignored", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57, Program: "ReportingService"}}}
 		ignore, err := CompileIgnoredSessions([]ddl.IgnoredSession{{AppName: "Reporting.*"}})
 		if err != nil {
 			t.Fatalf("CompileIgnoredSessions() error = %v", err)
 		}
 		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
-		if err != nil || got {
-			t.Errorf("Blocking() = (%v, %v), want (false, nil) — only blocker is ignored", got, err)
+		if err != nil || got.Unignored || !got.Any {
+			t.Errorf("Blocking() = (%+v, %v), want {Any:true Unignored:false} — held through an ignored session", got, err)
 		}
 	})
-	t.Run("non-ignored blocker still counts", func(t *testing.T) {
+	t.Run("non-ignored blocker counts as Unignored", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{
 			{SPID: 60, BlockingSPID: 57, Program: "ReportingService"},
 			{SPID: 61, BlockingSPID: 57, Program: "CriticalApp"},
@@ -343,8 +378,8 @@ func TestServerSamplerBlocking(t *testing.T) {
 			t.Fatalf("CompileIgnoredSessions() error = %v", err)
 		}
 		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
-		if err != nil || !got {
-			t.Errorf("Blocking() = (%v, %v), want (true, nil) — a non-ignored session is blocked", got, err)
+		if err != nil || !got.Unignored {
+			t.Errorf("Blocking() = (%+v, %v), want Unignored:true — a non-ignored session is blocked", got, err)
 		}
 	})
 }

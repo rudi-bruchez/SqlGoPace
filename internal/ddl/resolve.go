@@ -41,6 +41,11 @@ type ResolvedOptions struct {
 	// the engine does not yield the operation when it blocks other sessions. It is
 	// not a T-SQL option; it flows to the runner's Capabilities.
 	IgnoreBlocking bool
+
+	// MaxBlockMinutes is the per-operation safety cap (0 = none): after this many
+	// minutes of continuous blocking, the operation yields even if the blocker is
+	// ignored. Like IgnoreBlocking it flows to the runner's Capabilities.
+	MaxBlockMinutes int
 }
 
 // Decision records why one option was set the way it was, for --explain output.
@@ -148,6 +153,9 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 		}
 	}
 	res.IgnoreBlocking = ov.IgnoreBlocking != nil && *ov.IgnoreBlocking
+	if ov.MaxBlockMinutes != nil && *ov.MaxBlockMinutes > 0 {
+		res.MaxBlockMinutes = *ov.MaxBlockMinutes
+	}
 
 	// Build the decision trail in a stable order.
 	var decisions []Decision
@@ -165,6 +173,9 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	}
 	if res.IgnoreBlocking {
 		add(true, "ignore_blocking", "ON", "set by override: hold the lock through blocking (reaction policy, not a WITH option)")
+	}
+	if res.MaxBlockMinutes > 0 {
+		add(true, "max_block_minutes", strconv.Itoa(res.MaxBlockMinutes), "set by override: yield after this long even if the blocker is ignored (safety cap)")
 	}
 
 	return res, decisions

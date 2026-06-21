@@ -495,7 +495,13 @@ detector (§8.2) — a matching blocked session is never counted — so it compo
 hierarchy unchanged. The log branch still applies. The matcher is re-read from the manifest on each
 blocking poll, so an entry added mid-run (by hand or by the TUI) takes effect *before* the next
 abort, without restarting; the live exclusions are carried into the recovery manifest so a resumed
-run remembers them. In `--tui`, selecting a blocked session and pressing `i` (then a criterion)
+run remembers them.
+
+**Per-operation safety cap — `options.max_block_minutes`.** A backstop against a too-broad ignore
+rule: the monitor tracks the duration we are blocking *any* session (ignored or not), and once it
+exceeds `max_block_minutes` the operation yields regardless of `ignore_blocking` or
+`ignore_blocked_sessions` (the reaction is marked "max block time exceeded"). The log branch is
+unaffected. Unset/zero means no cap. In `--tui`, selecting a blocked session and pressing `i` (then a criterion)
 writes the rule into the running manifest via a structured atomic rewrite, which the live reload
 then picks up.
 

@@ -134,7 +134,9 @@ operations:
 
 A blocked session is yielded to unless it positively matches a rule (fail-safe). Prefer
 `app_name`/`login_name` over `session_id` (a SPID only identifies a connection that exists
-now). When the engine reacts to blocking it writes an advisory `<manifest>.blocked.yaml` next
+now). As a backstop, `options.max_block_minutes: N` on an operation makes it yield after `N`
+minutes of continuous blocking **even if the blocker is ignored** — protection against a
+too-broad rule. When the engine reacts to blocking it writes an advisory `<manifest>.blocked.yaml` next
 to the run report — ready-to-paste entries plus a full diagnostic block — so you can learn who
 blocked you and decide what to add. The engine never reads that file back; copying an entry
 into the manifest is a deliberate step.

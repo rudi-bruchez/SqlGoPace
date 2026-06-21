@@ -75,6 +75,13 @@ type OptionOverrides struct {
 	// (it holds its lock through to completion). Transaction-log protection still
 	// applies. Use it to force an important rebuild through despite blocking.
 	IgnoreBlocking *bool `yaml:"ignore_blocking"`
+
+	// MaxBlockMinutes is a reaction-policy safety cap (not a T-SQL option): after this
+	// many minutes of continuous blocking, the operation yields even if the blocked
+	// session is allowed by ignore_blocked_sessions / ignore_blocking. It backstops a
+	// too-broad ignore rule that would otherwise block real work indefinitely. Unset
+	// or zero means no cap.
+	MaxBlockMinutes *int `yaml:"max_block_minutes"`
 }
 
 // Literal is a constant scalar default value as written in the manifest. It

@@ -339,7 +339,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	captured := &blockerCapture{}
 	for i, step := range planned {
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes)}
 
 		// The sink is called from the runner (this goroutine) and from the held-through
 		// narrator (a sibling goroutine), so the shared report state is mutex-guarded.

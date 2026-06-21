@@ -176,8 +176,10 @@ operations:
     # left empty → injected automatically per version/edition + matrix + config
     options:
       maxdop: 4              # explicit override for THIS operation
-      # ignore_blocking: true  # reaction policy: hold the lock through blocking,
-      #                        # leaving other sessions blocked (force this index through)
+      # ignore_blocking: true   # reaction policy: hold the lock through blocking,
+      #                         # leaving other sessions blocked (force this index through)
+      # max_block_minutes: 30   # safety cap: yield after 30 min of blocking even if the
+      #                         # blocker is ignored (backstop a too-broad ignore rule)
 
   - operation: add_column
     schema: dbo
@@ -234,6 +236,11 @@ absent list keeps the default "yield" behavior — fail-safe. Reach for `app_nam
 right now. While an operation holds its lock through an ignored session, the run log
 records it (`hold: holding the lock through ignored session SPID …`), so the
 suppression is never silent.
+
+As a backstop against a too-broad rule, set `options.max_block_minutes: N` on an
+operation: after `N` minutes of continuous blocking it yields **even if the blocker is
+ignored** (`ignore_blocked_sessions` or `ignore_blocking`). Transaction-log protection
+is unaffected.
 
 **Discovering who blocked you.** When the engine reacts to blocking, it writes an
 advisory `<manifest>.blocked.yaml` next to the run report listing the sessions it was

@@ -1,6 +1,9 @@
 package run
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 
 // Pressure describes why the engine may need to react: the DDL is blocking other
 // sessions beyond the configured timeout, or the transaction log is over its cap.
@@ -8,6 +11,7 @@ type Pressure struct {
 	BlockingOthers bool
 	LogOverCap     bool
 	LogReuseWait   string // log_reuse_wait_desc when over cap, for the reaction detail
+	Capped         bool   // the reaction was forced by the max_block safety cap
 }
 
 // Any reports whether any pressure is present.
@@ -15,6 +19,14 @@ func (p Pressure) Any() bool { return p.BlockingOthers || p.LogOverCap }
 
 // Detail describes the pressure for a reaction log entry.
 func (p Pressure) Detail() string {
+	base := p.reason()
+	if p.Capped {
+		return "max block time exceeded — " + base
+	}
+	return base
+}
+
+func (p Pressure) reason() string {
 	switch {
 	case p.BlockingOthers && p.LogOverCap:
 		return fmt.Sprintf("blocking other sessions and transaction log over cap%s", reuseWaitSuffix(p.LogReuseWait))
@@ -64,6 +76,10 @@ type Capabilities struct {
 	// effect. Blocking is only reacted to when a session matching none of the current
 	// rules is blocked; transaction-log pressure is still honored regardless.
 	Ignore IgnoreSource
+	// MaxBlock is the per-operation safety cap (0 = none): after this long blocking any
+	// session, the operation yields even if the blocker is ignored. It backstops a
+	// too-broad ignore rule. Set via the max_block_minutes option.
+	MaxBlock time.Duration
 }
 
 // Action is the reaction the engine takes under pressure.
