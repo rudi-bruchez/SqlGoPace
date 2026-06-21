@@ -240,6 +240,12 @@ full `observed:` diagnostic block (app/login/host/query, waits, times seen). Sql
 never reads this file back: copying an entry into the manifest is a deliberate step,
 so you never accidentally ignore real work.
 
+**Adding a rule mid-run.** SqlGoPace re-reads the running manifest's `ignore_blocked_sessions`
+on every blocking poll. If an operation stalls on a blocker you decide is safe, edit the manifest
+in `02.processing/` to add the rule and the operation **continues without a restart** — the new
+exclusion takes effect before the next abort. It is also folded into the recovery manifest, so a
+later resumed run remembers it.
+
 ### Shrinking files: `operation: shrink`
 
 `shrink` reclaims space from a database's **data** or **log** files with `DBCC SHRINKFILE`,

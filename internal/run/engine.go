@@ -32,7 +32,7 @@ type OpRunner interface {
 // OpRunner model: it reads DMVs at run time, builds per-chunk SQL, and loops. The
 // engine routes ddl.Shrink operations here. *ShrinkRunner satisfies it.
 type ShrinkDriver interface {
-	Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) ([]ShrinkResult, error)
+	Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error)
 }
 
 var _ ShrinkDriver = (*ShrinkRunner)(nil)
@@ -128,6 +128,7 @@ type Engine struct {
 	resumeCheck      ResumableProbe
 	reconnectTimeout time.Duration
 	database         string // when set, process only manifests for this database
+	liveReload       bool   // re-read ignore_blocked_sessions from the manifest mid-run
 	out              io.Writer
 }
 
@@ -174,6 +175,11 @@ func WithWaits(w WaitReader) EngineOption { return func(e *Engine) { e.waits = w
 // reacts, to an advisory <manifest>.blocked.yaml next to the run report. Requires a
 // session for the DDL's SPID.
 func WithBlockerReader(b BlockerReader) EngineOption { return func(e *Engine) { e.blockers = b } }
+
+// WithLiveReload re-reads the running manifest's ignore_blocked_sessions on each
+// blocking poll, so an exclusion added during the run (by hand or by the TUI) takes
+// effect before the operation would abort — without restarting it.
+func WithLiveReload() EngineOption { return func(e *Engine) { e.liveReload = true } }
 
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
@@ -301,7 +307,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 
 	// Sessions the operator allows to stay blocked, applied to every operation in the
 	// manifest. The regexps were validated at load, so an error here is defensive.
-	ignore, err := CompileIgnoredSessions(manifest.IgnoreBlockedSessions)
+	ignore, err := e.ignoreSource(name, manifest.IgnoreBlockedSessions)
 	if err != nil {
 		rep.Error = "compile ignore_blocked_sessions: " + err.Error()
 		return e.finalize(ctx, name, rep, start, false)
@@ -311,7 +317,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	captured := &blockerCapture{}
 	for i, step := range planned {
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, IgnoredSessions: ignore}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore}
 
 		var reactions []report.ReactionLine
 		sink := func(ev ReactionEvent) {
@@ -383,6 +389,22 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
 }
 
+// ignoreSource builds the run's ignore matcher from the manifest rules. With live
+// reload enabled it returns a source that re-reads the in-processing manifest each
+// blocking poll (so a rule added mid-run is honored before the next abort); otherwise
+// it is a fixed snapshot. The rules are validated at load, so a compile error here is
+// defensive.
+func (e *Engine) ignoreSource(name string, rules []ddl.IgnoredSession) (IgnoreSource, error) {
+	compiled, err := CompileIgnoredSessions(rules)
+	if err != nil {
+		return nil, err
+	}
+	if e.liveReload {
+		return newManifestSource(filepath.Join(e.dirs.Processing, name), compiled), nil
+	}
+	return staticIgnore{rules: compiled}, nil
+}
+
 // finalize records a terminal outcome: moves the manifest, writes the report,
 // notifies, and persists history.
 func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunReport, start time.Time, success bool) runOutcome {
@@ -439,16 +461,22 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "PARTIAL"
 
+	// Carry the ignore_blocked_sessions into the recovery manifest so a resumed run
+	// remembers them — including any rule added mid-run, read from the in-processing
+	// manifest before the queue move takes it away.
+	ignore := e.latestIgnoreRules(name, m)
+
 	if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
 	e.relocateCapture(name, e.dirs.Failed)
 
 	recovery := &ddl.Manifest{
-		Description: recoveryDescription(m, name),
-		Database:    m.Database,
-		OnFailure:   ddl.OnFailureContinue,
-		Operations:  failed,
+		Description:           recoveryDescription(m, name),
+		Database:              m.Database,
+		OnFailure:             ddl.OnFailureContinue,
+		IgnoreBlockedSessions: ignore,
+		Operations:            failed,
 	}
 	recName := name + ".recovery.yaml"
 	rep.Error = fmt.Sprintf("%d of %d operation(s) failed; recovery manifest: %s", len(failed), len(rep.Operations), recName)
@@ -464,6 +492,16 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 
 	fmt.Fprintf(e.out, "partial: %s — %d failed op(s) quarantined to %s\n", name, len(failed), recName)
 	return outcomeFailed
+}
+
+// latestIgnoreRules returns the manifest's ignore_blocked_sessions, preferring the
+// current on-disk copy in processing (which reflects any mid-run edit) and falling
+// back to the in-memory manifest when it cannot be re-read.
+func (e *Engine) latestIgnoreRules(name string, m *ddl.Manifest) []ddl.IgnoredSession {
+	if latest, err := ddl.LoadManifestFile(filepath.Join(e.dirs.Processing, name)); err == nil {
+		return latest.IgnoreBlockedSessions
+	}
+	return m.IgnoreBlockedSessions
 }
 
 // writeRecovery renders a recovery manifest to YAML and writes it.

@@ -178,8 +178,10 @@ func supervise(
 
 // pumpSamples polls blocking and transaction-log state on independent cadences and
 // forwards a combined snapshot (the latest known value of each) whenever either poll
-// fires. Both MonitoredRunner and ShrinkRunner drive their monitoring through it.
-func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoredSessions) {
+// fires. Both MonitoredRunner and ShrinkRunner drive their monitoring through it. The
+// ignore matcher is re-read from the source on every blocking poll, so a rule added to
+// the manifest mid-run is honored before the operation would abort.
+func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoreSource) {
 	blockTicker := time.NewTicker(blockEvery)
 	defer blockTicker.Stop()
 	logTicker := time.NewTicker(logEvery)
@@ -197,7 +199,7 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, bl
 		case <-ctx.Done():
 			return
 		case <-blockTicker.C:
-			if b, err := sampler.Blocking(ctx, ignore); err == nil {
+			if b, err := sampler.Blocking(ctx, currentRules(ignore)); err == nil {
 				cur.BlockingOthers = b
 				send()
 			}

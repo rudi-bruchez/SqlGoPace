@@ -83,7 +83,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 	return runLoop(
 		sql,
 		func(stmt string) (Action, error) { return r.runStatement(ctx, stmt, caps, sink) },
-		func() error { return r.awaitRelief(ctx, caps.IgnoredSessions, sink) },
+		func() error { return r.awaitRelief(ctx, caps.Ignore, sink) },
 		func() (string, error) {
 			sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared"})
 			return ddl.ResumableControlSQL(op, "RESUME")
@@ -93,7 +93,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 
 // awaitRelief samples the server (via its own pump) until the pressure that
 // triggered a pause clears, enforcing the log-drain timeout.
-func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoredSessions, sink ReactionSink) error {
+func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sink ReactionSink) error {
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
@@ -145,7 +145,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.IgnoredSessions)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.Ignore)
 
 	action, pressure, err := supervise(ctx, r.clk, caps, r.blockingTimeout, samples, done)
 	if action == Continue {

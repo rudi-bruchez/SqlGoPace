@@ -131,7 +131,7 @@ func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Cl
 // Run shrinks the file(s) the operation targets, sequentially. files:all expands to
 // every file of the operation's type (never two of a filegroup in parallel — the
 // sequential loop guarantees it). It returns one ShrinkResult per file.
-func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) ([]ShrinkResult, error) {
+func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error) {
 	files, err := r.resolveFiles(ctx, op)
 	if err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func (r *ShrinkRunner) resolveFiles(ctx context.Context, op ddl.Shrink) ([]mssql
 
 // shrinkData runs the data-file algorithm (design §7.1): no-op gating, a free
 // TRUNCATEONLY pass, then the chunk loop.
-func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoredSessions, f mssql.FileSpace, sink ReactionSink) (ShrinkResult, error) {
+func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, f mssql.FileSpace, sink ReactionSink) (ShrinkResult, error) {
 	spec, err := ddl.ParseTargetFreeSpace(op.TargetFreeSpace)
 	if err != nil {
 		return ShrinkResult{}, err // already validated at parse time; defensive
@@ -364,7 +364,7 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 // cancel, KILL via the pool as a fallback) with its committed work preserved;
 // stopped=false when the statement finished on its own (err carries a real DDL
 // failure, if any). It mirrors MonitoredRunner.runStatement.
-func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoredSessions, sink ReactionSink) (stopped bool, err error) {
+func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (stopped bool, err error) {
 	stmt := ddl.ShrinkChunkSQL(file, targetMB, res)
 
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -400,7 +400,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 
 // awaitRelief samples until the pressure that stopped a chunk clears, enforcing the
 // log-drain timeout. Identical in shape to MonitoredRunner.awaitRelief.
-func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoredSessions, sink ReactionSink) error {
+func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sink ReactionSink) error {
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)

@@ -411,6 +411,28 @@ func TestProcessAllCaptureExcludesIgnoredBlocker(t *testing.T) {
 	mustNotExist(t, filepath.Join(dirs.Failed, "200_ig.yaml.blocked.yaml"))
 }
 
+func TestRecoveryManifestCarriesIgnoreRules(t *testing.T) {
+	// A continue-mode run with a failed op writes a recovery manifest; it must carry
+	// the manifest's ignore_blocked_sessions so a resumed run still ignores them.
+	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+	writeOnly(t, dirs, "300_ig.yaml", "description: ig\non_failure: continue\n"+
+		"ignore_blocked_sessions:\n  - app_name: \"^SQLAgent\"\n"+
+		"operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n")
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	rec, err := ddl.LoadManifestFile(filepath.Join(dirs.Failed, "300_ig.yaml.recovery.yaml"))
+	if err != nil {
+		t.Fatalf("load recovery manifest: %v", err)
+	}
+	if len(rec.IgnoreBlockedSessions) != 1 || rec.IgnoreBlockedSessions[0].AppName != "^SQLAgent" {
+		t.Errorf("recovery ignore rules = %+v, want a single ^SQLAgent rule", rec.IgnoreBlockedSessions)
+	}
+}
+
 func mustExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {

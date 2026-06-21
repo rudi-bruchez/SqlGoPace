@@ -495,8 +495,8 @@ detector (§8.2) — a matching blocked session is never counted — so it compo
 hierarchy unchanged. The log branch still applies. The matcher is re-read from the manifest on each
 blocking poll, so an entry added mid-run (by hand or by the TUI) takes effect *before* the next
 abort, without restarting; the live exclusions are carried into the recovery manifest so a resumed
-run remembers them. *(Live-reload and the TUI write-path are later iterations; the static list and
-the advisory `<manifest>.blocked.yaml` capture are implemented.)*
+run remembers them. *(The static list, the advisory `<manifest>.blocked.yaml` capture, and the
+mid-run live reload are implemented; the TUI select-to-ignore write-path is a later iteration.)*
 
 ---
 

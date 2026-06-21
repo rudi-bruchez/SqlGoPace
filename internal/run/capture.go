@@ -50,7 +50,7 @@ func (c *blockerCapture) len() int { return len(c.order) }
 // captureBlockers records the sessions our DDL is currently blocking — excluding the
 // ones the operator allows to stay blocked — into acc, and flushes the capture file.
 // Best-effort: a no-op without a blocker reader or an execution session.
-func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoredSessions, acc *blockerCapture, name string) {
+func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *blockerCapture, name string) {
 	if e.blockers == nil || e.session == nil {
 		return
 	}
@@ -58,11 +58,12 @@ func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoredSessions, ac
 	if err != nil {
 		return
 	}
+	rules := currentRules(ignore)
 	spid := e.session.SPID()
 	now := e.now()
 	changed := false
 	for _, s := range sessions {
-		if s.BlockingSPID != spid || ignore.ignores(s) {
+		if s.BlockingSPID != spid || rules.ignores(s) {
 			continue
 		}
 		acc.add(s, now)
