@@ -96,7 +96,10 @@ dedicated test database — never a shared/sensitive one. The footprint is small
 - **`DBCC SHRINKFILE`** (the `shrink` operation / `TestE2EShrinkData`) requires
   `db_owner` on the test database (or `sysadmin`). `db_ddladmin` is **not** enough
   to shrink files. The shrink reads (file space, `sys.dm_db_log_info`) are covered
-  by the database-level access already granted plus `VIEW SERVER STATE`.
+  by the database-level access already granted plus `VIEW SERVER STATE`. A login
+  lacking `db_owner`/`sysadmin` now fails **preflight** with a clear `permissions`
+  check (before any DBCC is issued), not with an opaque execution-time error. The
+  same gate applies to `check_db` (DBCC CHECKDB also needs `db_owner`/`sysadmin`).
 
 ## What is covered
 

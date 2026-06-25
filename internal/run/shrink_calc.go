@@ -85,15 +85,9 @@ func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning)
 	return clampStep(step, t.MinStepMB, t.MaxStepMB)
 }
 
-// clampStep bounds step to [min, max].
-func clampStep(step, min, max int) int {
-	if step < min {
-		return min
-	}
-	if step > max {
-		return max
-	}
-	return step
+// clampStep bounds step to [lo, hi].
+func clampStep(step, lo, hi int) int {
+	return min(max(step, lo), hi)
 }
 
 // NextTargetMB is the target size for the next chunk: one step below current, but

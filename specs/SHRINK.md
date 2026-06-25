@@ -30,7 +30,7 @@ périmètre) et fait le maximum pour qu'elle reste **non bloquante, mesurée, re
 ### Hors périmètre v1 (→ Phase 2, §12)
 
 - Rapport de fragmentation avant/après et génération automatique de manifests de
-  défragmentation.
+  défragmentation (enchaînement maintenance post-shrink ; design arrêté §12.1).
 - Mode `EMPTYFILE` + `ALTER DATABASE … REMOVE FILE`.
 - Détection des fichiers shrinkables côté sous-commande `plan` (planner).
 - Pré-allocation/redimensionnement du journal en un bloc après shrink (contrôle des VLF).
@@ -172,6 +172,16 @@ Décision selon le modèle de récupération (**responsabilité limitée, décis
     `AVAILABILITY_REPLICA`, `DATABASE_MIRRORING`) peuvent ne jamais se résoudre : la même
     attente bornée s'applique, la raison rapportée à chaque cycle permet à l'opérateur
     d'interrompre, et le timeout garantit qu'on ne pend pas indéfiniment.
+
+### 5.3 Permissions
+
+`DBCC SHRINKFILE` exige `db_owner` (dans la base ciblée) ou `sysadmin` — `db_ddladmin`
+ne suffit pas. Le preflight le **vérifie de façon proactive** (sonde
+`IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1`) et émet un `Check`
+`permissions` : un login sans le droit échoue **avant tout DBCC**, avec un message
+actionnable rédigé par l'outil, au lieu d'une erreur d'exécution opaque. Le même contrôle
+couvre `check_db` (DBCC CHECKDB requiert les mêmes droits). La sonde ne tourne qu'une fois
+par manifest, et seulement si une opération à droits élevés est présente.
 
 ## 6. Expansion `files: all`
 
@@ -354,17 +364,76 @@ injoignable (ex. devenue secondaire AG) est laissé pour un run ultérieur. Aucu
 | 9002 | Erreur | Transaction log full | Pause + réduire le stepsize (§8.4) |
 | Pas de réduction | Normal | Espace libre absent ou pas en fin de fichier | TRUNCATEONLY déjà tenté ; no-progress → arrêt propre |
 | Log non shrinkable | Normal | VLF actifs en fin, ou `log_reuse_wait ≠ NOTHING` | Attente bornée que le log se libère (§5.2), jamais de BACKUP LOG ; abandon propre au timeout |
+| Droits insuffisants | Erreur (DBCC) | Login non `db_owner`/`sysadmin` sur la base | **Capté en preflight** (§5.3) : `Check` `permissions` en échec, message actionnable, avant tout DBCC |
 
 ## 12. Phase 2 (hors v1)
 
-- **Fragmentation avant/après** : `sys.dm_db_index_physical_stats` ; comparer et **générer
-  des manifests `rebuild_index`/`reorganize_index` dans `01.to_run`** (réutilisation du
-  pipeline et du planner) ; option d'automatisation.
+- **Fragmentation avant/après & enchaînement maintenance** : `sys.dm_db_index_physical_stats` ;
+  comparer et **générer des manifests `rebuild_index`/`reorganize_index` dans `01.to_run`**
+  (réutilisation du pipeline et du planner) ; automatisation **post-shrink**. Design arrêté en §12.1.
 - **`EMPTYFILE`** : migration du contenu vers les autres fichiers du filegroup, puis
   `ALTER DATABASE … REMOVE FILE`.
 - **Détection côté `plan`** : repérage des fichiers shrinkables comme la maintenance.
 - **Pré-allocation du journal** après shrink (un seul `ALTER DATABASE … MODIFY FILE`) pour
   contrôler le nombre de VLF.
+
+### 12.1 Enchaînement maintenance post-shrink (design arrêté pour Phase 2)
+
+**Besoin.** Un shrink de **données** fragmente les index par construction (les pages sont
+déplacées vers l'avant du fichier, ce qui désordonne l'ordre physique des index). Il est donc
+naturel de vouloir le **faire suivre d'une défragmentation**. La question posée : « ajouter une
+option dans l'opération `shrink` pour enchaîner automatiquement un `plan --auto` ? ».
+
+**Décision de couche — ce n'est PAS un champ de l'opération `shrink`.** Trois raisons arrêtent
+ce choix :
+
+1. **Une `operation` est une unité DDL déclarative et mono-objet** (parse → resolve → generate
+   → plan). L'enchaînement « fais X puis génère/exécute Y » est de l'**orchestration**, qui vit
+   dans `cmd/sqlgopace` et le moteur, pas dans la définition d'une opération. Mettre un
+   `maintain_after: true` dans le YAML du shrink mélangerait les deux niveaux.
+2. **Pas de couplage `run → maint`.** Aujourd'hui `internal/run` n'importe pas `internal/maint`
+   (séparation pure-core / planner). Faire appeler le planificateur depuis `processOne`
+   introduirait ce couplage dans le chemin chaud du moteur. À éviter.
+3. **Le seam existe déjà.** `--auto` (`runAuto`, `cmd/sqlgopace/plan.go`) *est* le mécanisme
+   « analyser la base connectée → générer des manifests de maintenance dans `to_run` → laisser
+   le moteur les traiter comme n'importe quel manifest ». On le **réutilise**, on ne le duplique
+   pas.
+
+**Piège SQL Server décisif — le `REBUILD` re-grossit le fichier.** Un `ALTER INDEX … REBUILD`
+a besoin d'un espace de travail ≈ la taille du plus gros index/partition reconstruit ; sur un
+fichier qu'on vient de shrinker, il **re-fait croître le fichier de données** et peut donc
+**annuler une partie de l'espace récupéré**. `REORGANIZE` est in-place (pas de re-croissance
+notable). Conséquence directe sur le design : l'enchaînement post-shrink **biaise `REORGANIZE`
+par défaut**, et `REBUILD` n'est émis que sur **opt-in explicite** de l'opérateur, accompagné de
+l'avertissement « le rebuild re-grossit le fichier ». C'est précisément le genre d'arbitrage qui
+doit **rester relu par un humain** plutôt que caché derrière un booléen d'opération.
+
+**Forme retenue.** Une orchestration au niveau **run**, pas opération, et un **manifest relu,
+pas une exécution silencieuse** :
+
+- Un flag de run, p. ex. `--maintain-after-shrink` (nom à confirmer à l'implémentation).
+- **Périmètre** : ne s'applique qu'après un shrink **`data`** réussi (un shrink `log` ne
+  fragmente pas les index → rien à enchaîner). Restreint aux **bases effectivement shrinkées**
+  dans le run.
+- **Mesure post-shrink** : la fragmentation est lue **après** la fin du shrink (état réel
+  post-déplacement de pages), via le planner existant (`internal/maint` + `dm_db_index_physical_stats`).
+- **Génération** : le planner produit un manifest de défrag déposé dans `to_run/` (réutilisation
+  de `runAuto`/`writeManifests`), **biaisé `REORGANIZE`** (voir piège ci-dessus).
+- **Relu par défaut** : le manifest généré **attend en file** pour relecture. Il ne **s'exécute**
+  que si le run est déjà en `--auto` (cohérent avec la sémantique « `--auto` = non supervisé »).
+  Sans `--auto`, on a déposé un manifest reviewable, rien de plus.
+- **`REBUILD`** : seulement si un opt-in explicite est fourni (p. ex. `--post-shrink-allow-rebuild`,
+  ou un profil de maintenance dédié `reorganize-only` levé volontairement). Sinon, `REORGANIZE`
+  uniquement.
+
+**Ce que ça réutilise (rien de neuf côté exécution).** Le planner (`internal/maint`), le pipeline
+`ddl`/`render`, `writeManifests`, et le moteur + monitoring + réactions existants. Aucun nouveau
+chemin d'exécution ni nouvelle dépendance dans le cœur pur : l'ajout est circonscrit à la couche
+`cmd/sqlgopace` (le flag, l'appel au planner après le shrink, l'écriture du manifest).
+
+**Alternative écartée.** Un champ `maintain_after` sur l'opération `shrink` : rejeté pour les
+raisons de couche (1–3) et parce qu'il rendrait l'auto-rebuild trop facile à déclencher sans
+relecture, en contradiction avec le piège du re-grossissement.
 
 ## 13. Requêtes de référence
 
@@ -417,5 +486,9 @@ WHERE wait_type IN ('PAGEIOLATCH_EX','PAGEIOLATCH_SH','WRITELOG',
 - Aucun point bloquant. Conventions arrêtées : `targetfreespace` en % de l'espace **utilisé**
   (`final = ceil(used × (1 + N/100))`, §2) ; défauts du driver figés (§7.3). Ces défauts
   restent à valider empiriquement lors des tests e2e (calibration I/O réelle).
+- **Enchaînement maintenance post-shrink** : design tranché (§12.1) — orchestration au niveau
+  run (flag `--maintain-after-shrink`) réutilisant `--auto`, manifest relu déposé dans `to_run`,
+  biais `REORGANIZE` (le `REBUILD` re-grossit le fichier), **pas** un champ d'opération. Reste à
+  confirmer à l'implémentation : nom exact du flag et forme de l'opt-in `REBUILD`.
 </content>
 </invoke>

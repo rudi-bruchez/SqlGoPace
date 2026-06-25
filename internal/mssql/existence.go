@@ -16,6 +16,18 @@ func (c *Conn) existsScalar(ctx context.Context, query string, args ...any) (boo
 	return n > 0, nil
 }
 
+const elevatedAccessSQL = `
+SELECT CASE WHEN IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1
+            THEN 1 ELSE 0 END;`
+
+// HasElevatedDBAccess reports whether the current login is a member of db_owner
+// in the connected database or of the sysadmin server role — the privilege that
+// DBCC SHRINKFILE and DBCC CHECKDB both require. Checked in preflight so a missing
+// grant fails the manifest with an actionable message before any DBCC is issued.
+func (c *Conn) HasElevatedDBAccess(ctx context.Context) (bool, error) {
+	return c.existsScalar(ctx, elevatedAccessSQL)
+}
+
 const tableExistsSQL = `
 SELECT CASE WHEN OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table), 'U') IS NOT NULL
             THEN 1 ELSE 0 END;`

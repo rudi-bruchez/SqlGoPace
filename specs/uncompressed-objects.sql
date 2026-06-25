@@ -14,7 +14,7 @@ GO
 
 DECLARE @table_name sysname = '%';
 DECLARE @compressionType varchar(10) = 'PAGE';
-DECLARE @online bit = 1;
+DECLARE @online bit = 0;
 DECLARE @resumable bit = 0;
 DECLARE @backuplog bit = 0;
 DECLARE @maxdop tinyint = 2;

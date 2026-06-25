@@ -56,6 +56,12 @@ mandatory for monitoring).
   no build flags. CI can override via `-ldflags "-X ...internal/version.override=X.Y.Z"`.
 - **Windows binary lock**: `bin/sqlgopace.exe` is locked while running — stop a running instance
   before rebuilding to the same path.
+- **Simplify after building.** After a feature lands (and tests pass), run a `/simplify` pass over
+  the diff before committing — collapse the layers/duplication that accrete during development.
+  KISS is easier to enforce in cleanup than to maintain while building.
+- **Lint config is golangci-lint v2** (`.golangci.yml`, `version: "2"`). errcheck/govet/staticcheck/
+  ineffassign/unused are in the v2 default set and are not listed. Comments/identifiers use **US
+  spelling** (normalized in 46cf1f4).
 
 ## Architecture
 
@@ -72,6 +78,8 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   (`PlannedOperation` per op). `matrix.go` loads `ddl_compatibility.yaml` (option eligibility
   keyed by SQL major version × edition `Tier`, with `requires` dependencies). `expand.go`
   turns `index: ALL` into one op per index. `control.go` builds RESUMABLE pause/resume SQL.
+  `shrink.go` parses `targetfreespace` (percent or absolute MB) and builds per-chunk
+  `DBCC SHRINKFILE` SQL — the only op whose statements are generated at run time, not up front.
 - **`internal/maint`** — maintenance *decisions*: `profile.go` parses `maintenance_profile.yaml`;
   `decide.go` turns DMV facts + thresholds into maintenance operations (reorganize/rebuild,
   compression, heaps, statistics, checkdb). The `plan` subcommand feeds this into `ddl`/`render`
@@ -89,6 +97,14 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   server; `runLoop` applies the reaction decision (continue / wait for relief / cancel / pause →
   resume). Pausing a resumable is done by **aborting the running statement** (cancel), then
   resuming — not a separate `ALTER INDEX PAUSE`.
+- **`shrink.go` + `shrink_calc.go`** (`ShrinkRunner`) is a **second, parallel driver**: a shrink is
+  a chunked `DBCC SHRINKFILE` loop, not one DDL statement, so it does not go through
+  `MonitoredRunner`. The engine routes `ddl.Shrink` ops to whatever satisfies `ShrinkDriver`
+  (wired via `WithShrinkRunner`; `*ShrinkRunner` is the production impl) — `processOne` branches on
+  `step.Operation.(ddl.Shrink)`. `shrink_calc.go` holds the pure step-size math (`InitialStepMB`,
+  `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting (only
+  `WAIT_AT_LOW_PRIORITY` is meaningful for a shrink). Reads come through the narrow `ShrinkReader`
+  interface (`*mssql.Conn` in prod, fakes in tests).
 - **`recovery.go`** (`Recoverer`) reconciles anything left in `02.processing/` after a crash
   (adopt a live op, resume a paused resumable, or requeue). Database-aware: each in-flight op
   records its database; an orphan whose DB is unreachable (e.g. now an AG secondary) is left
@@ -98,11 +114,16 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
 ### SQL-touching adapters & I/O
 
 - **`internal/mssql`** — connection (`conn.go`), target `Detect` (`server.go`), DMV reads
-  (`dmv.go`, `waits.go`, `analysis.go`, `indexes.go`, `databases.go`, `recovery.go`). This is the
+  (`dmv.go`, `waits.go`, `analysis.go`, `indexes.go`, `databases.go`, `recovery.go`,
+  `shrink.go` — file-space/size + log-reuse reads for the shrink driver). This is the
   only package that issues SQL directly; everything DB-specific lives here behind interfaces the
   core consumes.
 - **`internal/config`** — `config.yaml` parsing + `${VAR}` env injection.
-- **`internal/preflight`** — pre-run checks (free space, tempdb, AG send-queue).
+- **`internal/preflight`** — pre-run checks (free space, tempdb, AG send-queue). Database- and
+  file-scoped operations (`check_db`, `shrink`) have empty `Schema`/`Table`, so they **skip the
+  `schema.table` existence check** in both `CheckOperation` and `objectExistence` — the engine
+  validates the database/file at run time (fixed in 028602a; was failing with `table [].[] does
+  not exist`).
 - **`internal/report`** — `.log` run reports, optional SQLite history (`history.go`), webhook
   `notify.go`.
 - **`internal/tui`** — Bubble Tea incident console (`--tui`); `cmd/sqlgopace/main.go` feeds it.
@@ -121,5 +142,6 @@ which `--version` produced each run.
 
 `specs/` holds the design docs: `SPECS.md` (core engine), `MAINTENANCE.md` (the `plan`
 subcommand / maintenance planner, including multi-database mode §17), `IMPLEMENTATION.md`,
-and `SHRINK.md` (in-progress feature). These are the source of truth for intended behaviour —
+and `SHRINK.md` (the shrink driver — now implemented; see the `ShrinkRunner` notes above). These
+are the source of truth for intended behaviour —
 consult the relevant spec before changing engine, planner, or reaction semantics.
