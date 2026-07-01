@@ -71,6 +71,7 @@ type OperationReport struct {
 	SQL         string             `json:"sql"`
 	Options     []OptionDecision   `json:"options,omitempty"`
 	Reactions   []ReactionLine     `json:"reactions,omitempty"`
+	PeakBlocked int                `json:"peak_blocked,omitempty"`
 	Waits       []WaitLine         `json:"waits,omitempty"`
 	WaitTotalMS int64              `json:"wait_total_ms,omitempty"`
 	Shrink      []ShrinkFileReport `json:"shrink,omitempty"`
@@ -121,6 +122,9 @@ func Write(w io.Writer, r RunReport) error {
 			}
 			for _, rx := range op.Reactions {
 				fmt.Fprintf(w, "      reaction: %s at %s (%s)\n", rx.Kind, rx.At, rx.Detail)
+			}
+			if op.PeakBlocked > 0 {
+				fmt.Fprintf(w, "      peak blocked: %d session(s)\n", op.PeakBlocked)
 			}
 			if len(op.Waits) > 0 {
 				fmt.Fprintf(w, "      waits (total %dms):\n", op.WaitTotalMS)

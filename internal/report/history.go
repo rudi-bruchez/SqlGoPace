@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 
 	// Register the pure-Go "sqlite" driver.
 	_ "modernc.org/sqlite"
@@ -11,13 +12,14 @@ import (
 
 // RunRecord is one row of run history.
 type RunRecord struct {
-	Manifest   string
-	Outcome    string
-	StartedAt  string
-	FinishedAt string
-	Operations int
-	DurationMS int64
-	Error      string
+	Manifest    string
+	Outcome     string
+	StartedAt   string
+	FinishedAt  string
+	Operations  int
+	DurationMS  int64
+	PeakBlocked int // most sessions any one operation blocked at once during the run
+	Error       string
 }
 
 // History persists run records to a SQLite database.
@@ -62,6 +64,14 @@ var schemaStatements = []string{
 );`,
 }
 
+// columnMigrations add columns that postdate a table's original definition.
+// CREATE TABLE IF NOT EXISTS never alters an existing table, so a new column must be
+// added with ALTER TABLE. Each is idempotent: a duplicate-column error on a database
+// that already has the column is expected and ignored.
+var columnMigrations = []string{
+	`ALTER TABLE runs ADD COLUMN peak_blocked INTEGER;`,
+}
+
 // OpenHistory opens (creating if needed) the SQLite history database at path.
 func OpenHistory(path string) (*History, error) {
 	db, err := sql.Open("sqlite", path)
@@ -74,15 +84,21 @@ func OpenHistory(path string) (*History, error) {
 			return nil, fmt.Errorf("init history schema: %w", err)
 		}
 	}
+	for _, stmt := range columnMigrations {
+		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+			_ = db.Close()
+			return nil, fmt.Errorf("migrate history schema: %w", err)
+		}
+	}
 	return &History{db: db}, nil
 }
 
 // Record inserts one run record.
 func (h *History) Record(ctx context.Context, r RunRecord) error {
-	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, error)
-	           VALUES (?, ?, ?, ?, ?, ?, ?);`
+	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, peak_blocked, error)
+	           VALUES (?, ?, ?, ?, ?, ?, ?, ?);`
 	if _, err := h.db.ExecContext(ctx, q,
-		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.Error); err != nil {
+		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.PeakBlocked, r.Error); err != nil {
 		return fmt.Errorf("record run: %w", err)
 	}
 	return nil

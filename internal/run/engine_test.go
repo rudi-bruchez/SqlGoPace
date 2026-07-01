@@ -431,6 +431,37 @@ func TestProcessAllCapturesBlockedSessions(t *testing.T) {
 	}
 }
 
+func TestProcessAllRecordsPeakBlocked(t *testing.T) {
+	runner := &fakeOpRunner{emit: []run.ReactionEvent{
+		{Kind: "pause", Detail: "blocking other sessions"},
+	}}
+	blockers := fakeBlockerReader{sessions: []mssql.Session{
+		{SPID: 53, BlockingSPID: 70, Program: "A"},
+		{SPID: 55, BlockingSPID: 70, Program: "B"},
+		{SPID: 54, BlockingSPID: 99}, // blocked by someone else — must not count
+	}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(blockers))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_a.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	out := string(data)
+	// The two sessions we block are folded into the reaction narration and recorded
+	// as the operation's peak; the session blocked by someone else is excluded.
+	for _, want := range []string{"blocking 2 session(s)", "peak blocked: 2 session(s)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log missing %q\n--- log ---\n%s", want, out)
+		}
+	}
+}
+
 func TestProcessAllCaptureExcludesIgnoredBlocker(t *testing.T) {
 	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF, emit: []run.ReactionEvent{
 		{Kind: "cancel", Detail: "blocking other sessions"},

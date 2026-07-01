@@ -49,30 +49,33 @@ func (c *blockerCapture) add(s mssql.Session, now string) {
 func (c *blockerCapture) len() int { return len(c.order) }
 
 // captureBlockers records the sessions our DDL is currently blocking — excluding the
-// ones the operator allows to stay blocked — into acc, and flushes the capture file.
-// Best-effort: a no-op without a blocker reader or an execution session.
-func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *blockerCapture, name string) {
+// ones the operator allows to stay blocked — into acc, flushes the capture file, and
+// returns how many such sessions it saw this call (the current simultaneous count,
+// which drives the per-operation peak and the reaction narration). Best-effort: 0
+// without a blocker reader or an execution session.
+func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *blockerCapture, name string) int {
 	if e.blockers == nil || e.session == nil {
-		return
+		return 0
 	}
 	sessions, err := e.blockers.ActiveSessions(ctx)
 	if err != nil {
-		return
+		return 0
 	}
 	rules := currentRules(ignore)
 	spid := e.session.SPID()
 	now := e.now()
-	changed := false
+	blocked := 0
 	for _, s := range sessions {
 		if s.BlockingSPID != spid || rules.ignores(s) {
 			continue
 		}
 		acc.add(s, now)
-		changed = true
+		blocked++
 	}
-	if changed {
+	if blocked > 0 {
 		e.flushCapture(name, acc)
 	}
+	return blocked
 }
 
 // narrateHeld periodically narrates, once each, the ignored sessions our DDL is

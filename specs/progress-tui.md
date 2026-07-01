@@ -1,12 +1,16 @@
 # Spec métier — Progression d'un manifeste (compteur, chrono, bloqués)
 
-> **Statut : pièce maîtresse (§3.0 step-sink) implémentée.** Le *step-sink* moteur
-> (`run.WithStepSink` / `run.StepEvent`, émis en haut/bas de la boucle d'ops) alimente **stdout**
-> (`-- [i/N] cmd cible — started` / `— <outcome> in Xs`, items 1+2) et le **TUI** (compteur op i/N +
-> chrono live via un tick 1 s ; item 2). Livré avec BATCH-DML It3. Restent (DRAFT) : item 3 côté
-> non-TUI (compte/pic de sessions bloquées en stdout/history) et la persistance i/N dans `State`.
-> Créé le 2026-06-17, suite à l'essai de compression `030_compress_exampledb_indexes.yaml`
-> (74 rebuilds offline sur `EXAMPLEDB`), où l'on a constaté l'absence de progression lisible.
+> **Statut : items 1, 2 et 3 implémentés.** Le *step-sink* moteur (`run.WithStepSink` /
+> `run.StepEvent`, émis en haut/bas de la boucle d'ops) alimente **stdout** (`-- [i/N] cmd cible —
+> started` / `— <outcome> in Xs`, items 1+2) et le **TUI** (compteur op i/N + chrono live via un tick
+> 1 s ; item 2) — livré avec BATCH-DML It3. **Item 3** : sur chaque réaction (pause/cancel/abort) le
+> compte de sessions bloquées est intégré à la narration (`… ; blocking N session(s)`, stdout +
+> `.log`), le **pic par op** est enregistré dans le `.log` (`peak blocked: N session(s)`) et le pic
+> manifeste dans l'history (colonne `runs.peak_blocked`, via migration `ALTER TABLE`). Reste (DRAFT) :
+> la persistance i/N dans `State` (§3.1, pour un affichage de reprise — à arbitrer avec le skip
+> métadonnée de `crash-resumable.md`). Créé le 2026-06-17, suite à l'essai de compression
+> `030_compress_exampledb_indexes.yaml` (74 rebuilds offline sur `EXAMPLEDB`), où l'on a constaté
+> l'absence de progression lisible.
 
 ## 1. Objectif
 

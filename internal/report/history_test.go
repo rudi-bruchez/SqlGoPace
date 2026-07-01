@@ -2,6 +2,7 @@ package report_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -38,6 +39,48 @@ func TestHistoryRecord(t *testing.T) {
 	}
 	if n != 2 {
 		t.Errorf("Count() = %d, want 2", n)
+	}
+}
+
+// TestHistoryPeakBlockedMigration guards that a run-history DB predating the
+// peak_blocked column is migrated on open (ALTER TABLE ADD COLUMN) and that the value
+// then persists — CREATE TABLE IF NOT EXISTS alone would not add the column.
+func TestHistoryPeakBlockedMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.db")
+	ctx := context.Background()
+
+	// Simulate a pre-existing runs table without peak_blocked.
+	old, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ExecContext(ctx, `CREATE TABLE runs (
+	    id INTEGER PRIMARY KEY AUTOINCREMENT, manifest TEXT NOT NULL, outcome TEXT NOT NULL,
+	    started_at TEXT, finished_at TEXT, operations INTEGER, duration_ms INTEGER, error TEXT);`); err != nil {
+		t.Fatal(err)
+	}
+	_ = old.Close()
+
+	h, err := report.OpenHistory(path) // must add the missing column, not fail
+	if err != nil {
+		t.Fatalf("OpenHistory() migrate error = %v", err)
+	}
+	if err := h.Record(ctx, report.RunRecord{Manifest: "m.yaml", Outcome: "SUCCESS", PeakBlocked: 4}); err != nil {
+		t.Fatalf("Record() error = %v", err)
+	}
+	_ = h.Close()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	var peak int
+	if err := db.QueryRowContext(ctx, "SELECT peak_blocked FROM runs LIMIT 1").Scan(&peak); err != nil {
+		t.Fatalf("read peak_blocked: %v", err)
+	}
+	if peak != 4 {
+		t.Errorf("peak_blocked = %d, want 4", peak)
 	}
 }
 

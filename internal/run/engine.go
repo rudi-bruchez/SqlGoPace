@@ -372,8 +372,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// The sink is called from the runner (this goroutine) and from the held-through
 		// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
 		var (
-			reactions  []report.ReactionLine
-			reactionMu sync.Mutex
+			reactions   []report.ReactionLine
+			peakBlocked int
+			reactionMu  sync.Mutex
 		)
 		sink := func(ev ReactionEvent) {
 			detail := ev.Detail
@@ -382,13 +383,25 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 					detail = fmt.Sprintf("%s (at %.0f%%)", detail, pct)
 				}
 			}
+			// On a yield/escalation, snapshot the sessions we are blocking: fold the
+			// count into the narration and track the operation's peak for the report.
+			capture := ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort"
+			var blocked int
+			if capture {
+				blocked = e.captureBlockers(ctx, ignore, captured, name)
+				if blocked > 0 {
+					detail = fmt.Sprintf("%s; blocking %d session(s)", detail, blocked)
+				}
+			}
 			reactionMu.Lock()
 			reactions = append(reactions, report.ReactionLine{Kind: ev.Kind, At: e.now(), Detail: detail})
 			fmt.Fprintf(e.out, "-- %s %s: %s\n", ev.Kind, opTarget(step.Operation), detail)
+			if blocked > peakBlocked {
+				peakBlocked = blocked
+			}
 			reactionMu.Unlock()
-			if ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort" {
+			if capture {
 				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
-				e.captureBlockers(ctx, ignore, captured, name)
 			}
 		}
 		waitsBefore := e.snapshotWaits(ctx)
@@ -444,6 +457,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			SQL:         step.SQL,
 			Options:     optionDecisions(step.Decisions),
 			Reactions:   reactions,
+			PeakBlocked: peakBlocked,
 			Waits:       waitLines,
 			WaitTotalMS: waitTotal,
 			Shrink:      shrinkReport(shrinkResults),
@@ -703,14 +717,21 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 	if e.history == nil {
 		return
 	}
+	peak := 0
+	for _, op := range rep.Operations {
+		if op.PeakBlocked > peak {
+			peak = op.PeakBlocked
+		}
+	}
 	rec := report.RunRecord{
-		Manifest:   rep.Manifest,
-		Outcome:    rep.Outcome,
-		StartedAt:  rep.StartedAt,
-		FinishedAt: rep.FinishedAt,
-		Operations: len(rep.Operations),
-		DurationMS: rep.DurationMS,
-		Error:      rep.Error,
+		Manifest:    rep.Manifest,
+		Outcome:     rep.Outcome,
+		StartedAt:   rep.StartedAt,
+		FinishedAt:  rep.FinishedAt,
+		Operations:  len(rep.Operations),
+		DurationMS:  rep.DurationMS,
+		PeakBlocked: peak,
+		Error:       rep.Error,
 	}
 	if err := e.history.Record(ctx, rec); err != nil {
 		fmt.Fprintf(e.out, "history %s: %v\n", rep.Manifest, err)

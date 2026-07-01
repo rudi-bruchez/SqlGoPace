@@ -25,6 +25,7 @@ func sampleReport() report.RunReport {
 			SQL:         "ALTER INDEX [IX] ON [dbo].[T] REBUILD;",
 			Outcome:     "success",
 			DurationMS:  1100,
+			PeakBlocked: 2,
 			Options: []report.OptionDecision{
 				{Option: "online", Value: "ON", Reason: "supported by target (auto)"},
 			},
@@ -44,6 +45,7 @@ func TestWriteHumanAndJSON(t *testing.T) {
 		"manifest: 010_a.yaml",
 		"SUCCESS",
 		"rebuild_index dbo.T.IX",
+		"peak blocked: 2 session(s)",
 		"online = ON",
 		"ALTER INDEX [IX] ON [dbo].[T] REBUILD;",
 	} {
