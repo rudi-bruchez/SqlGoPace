@@ -267,12 +267,21 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 				fmt.Fprintln(stdout, "-- interrupt: stopping now")
 			}
 			cancelRun()
+			signal.Stop(sigCh) // restore default SIGINT so a further Ctrl+C can force-quit a hung run
 		}
 	}()
 
 	var total run.Summary
 	var runErr error
 	for _, db := range targets {
+		// A graceful stop applies across the whole run: once drained, do not start the
+		// remaining databases (each would otherwise open a connection only to stop at once).
+		if drain.Draining() {
+			if !useTUI {
+				fmt.Fprintln(stdout, "-- drained: not starting the remaining databases")
+			}
+			break
+		}
 		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString)
 		if cerr != nil {
 			fmt.Fprintf(stdout, "-- skip database %s: %v\n", db, cerr)
