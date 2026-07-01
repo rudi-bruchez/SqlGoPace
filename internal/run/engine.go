@@ -335,8 +335,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	e.setCurrentManifest(procPath)
 	defer e.setCurrentManifest("")
 	// The cursor is non-zero when a previous drained/interrupted run of this manifest
-	// left one: those operations are already done and are skipped below.
-	resumeFrom := e.writeSidecar(ctx, name)
+	// left one: those operations are already done and are skipped below. resumed is true
+	// when a sidecar already existed (this run continues an interrupted one), gating the
+	// ALTER INDEX … RESUME of a paused resumable at the boundary operation.
+	resumeFrom, resumed := e.writeSidecar(ctx, name)
 
 	manifest, err := ddl.LoadManifestFile(procPath)
 	if err != nil {
@@ -457,6 +459,20 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		holdDone := make(chan struct{})
 		go func() { defer close(holdDone); e.narrateHeld(holdCtx, ignore, sink) }()
 
+		// Crash-resume: when this run continues an interrupted one and the boundary
+		// operation left a paused resumable on the server, adopt it with ALTER INDEX …
+		// RESUME instead of a fresh REBUILD (which SQL Server rejects while a resumable
+		// is paused), reusing the server-side progress. Only the boundary operation of a
+		// resumed manifest is eligible, so a foreign paused resumable on a fresh run or a
+		// not-yet-started operation is never adopted with the wrong options.
+		stmt := step.SQL
+		if resumed && i == resumeFrom && caps.Resumable {
+			if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
+				stmt = resume
+				sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
+			}
+		}
+
 		var (
 			runErr        error
 			shrinkResults []ShrinkResult
@@ -487,7 +503,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 			}
 		default:
-			runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
 		}
 		// Stop the narrator and wait for it to fully exit before reading `reactions`
 		// below, so a late sink() append cannot race with the read.
@@ -786,6 +802,28 @@ func (e *Engine) resumableInterruption(ctx context.Context, op ddl.Operation) bo
 	return res.paused || !res.conclusive
 }
 
+// resumeStatement returns an ALTER INDEX … RESUME for op when the server already holds a
+// paused resumable operation for its index — left by a crash or kill mid-rebuild — so a
+// resumed run continues from the server-side progress instead of issuing a fresh REBUILD,
+// which SQL Server rejects while a resumable is paused. ok is false when no probe is
+// wired, when nothing is paused (or the probe errors), or when op does not support
+// resumable control; the caller then runs the planned REBUILD.
+func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation) (string, bool) {
+	if e.resumeCheck == nil {
+		return "", false
+	}
+	ref := op.Target()
+	paused, err := e.resumeCheck.PausedResumable(ctx, ref.Schema, ref.Table, ref.Name)
+	if err != nil || !paused {
+		return "", false
+	}
+	stmt, err := ddl.ResumableControlSQL(op, "RESUME")
+	if err != nil {
+		return "", false
+	}
+	return stmt, true
+}
+
 // setCurrentManifest notifies the manifest observer (if any) of the in-flight
 // manifest path, so a host can edit it while it runs.
 func (e *Engine) setCurrentManifest(path string) {
@@ -840,14 +878,16 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 // an orphaned session can be correlated to its run beyond the reusable SPID. Any
 // resume cursor left by a previous drained/interrupted run of this manifest is
 // preserved and returned (the number of operations already completed, to skip on this
-// run). With no session it does not write, but still reads and returns the cursor.
-func (e *Engine) writeSidecar(ctx context.Context, name string) int {
-	resumeFrom := 0
+// run). resumed reports whether such a sidecar already existed at claim — i.e. this run
+// is resuming an interrupted one — which gates issuing ALTER INDEX … RESUME (only the
+// boundary operation of a genuinely resumed manifest may adopt a paused resumable). With
+// no session it does not write, but still reads and returns the cursor and resumed flag.
+func (e *Engine) writeSidecar(ctx context.Context, name string) (resumeFrom int, resumed bool) {
 	if st, err := ReadState(e.sidecarPath(name)); err == nil {
-		resumeFrom = st.ResumeFromOp // preserve a previous run's resume cursor
+		resumeFrom, resumed = st.ResumeFromOp, true // a prior run of this manifest was interrupted
 	}
 	if e.session == nil {
-		return resumeFrom
+		return resumeFrom, resumed
 	}
 	login, err := e.session.LoginTime(ctx)
 	if err != nil {
@@ -868,7 +908,7 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) int {
 	if err := WriteState(e.sidecarPath(name), state); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
 	}
-	return resumeFrom
+	return resumeFrom, resumed
 }
 
 // advanceCursor records that operation i is durably done by moving the crash-resume

@@ -17,8 +17,18 @@
 > `i < curseur`. Un *crash* (≠ drain) renseigne donc maintenant le curseur : la reprise repart de
 > l'op suivante, sans dépendre du skip métadonnée (§9), qui reste complémentaire (préfixe compression
 > bon marché). L'**arrêt propre sur Ctrl+C (§3.1) est fait** (`graceful-stop.md` : 1× drain / 2× hard).
-> **Non encore implémenté** : le vrai `ALTER INDEX … RESUME` (§4.2), l'orchestration `abort-resumable`
-> (§3.6). Une itération de conception reste requise pour le RESUME.
+> **Le vrai `ALTER INDEX … RESUME` (§4.2) est IMPLÉMENTÉ** : au re-run d'un manifeste **repris**
+> (un sidecar existait au claim → flag `resumed` retourné par `writeSidecar`), si l'**op à la frontière
+> du curseur** (`i == resumeFrom`) porte un resumable **PAUSED** côté serveur (`PausedResumable`), le
+> moteur émet `ALTER INDEX … RESUME` (`resumeStatement` → `ddl.ResumableControlSQL(op,"RESUME")`) au
+> lieu du REBUILD — que SQL Server rejetterait tant qu'un resumable est en pause — en réutilisant tout
+> le `MonitoredRunner` (qui sait déjà la boucle pause/reprise). Garde-fou anti-« resumable étranger » :
+> jamais de RESUME sur un manifeste **frais** ni sur une op **jamais démarrée** (options potentiellement
+> différentes). La recovery **conserve le sidecar** au requeue quand `action == Resume` (resumable en
+> pause) ou curseur > 0, pour que le re-run se reconnaisse comme repris. Dégradation propre (S2 :
+> Standard/heap, pas de resumable) : l'op redémarre, mais le curseur évite de refaire les précédentes.
+> **Non encore implémenté** : l'orchestration automatique `abort-resumable` (§3.6, purge d'un resumable
+> en pause *étranger* incompatible — reste manuel via la sous-commande).
 >
 > Créé le 2026-06-17, à la suite d'un essai de compression de masse (manifeste
 > `01.to_run/030_compress_exampledb_indexes.yaml`, 74 index EXAMPLEDB).

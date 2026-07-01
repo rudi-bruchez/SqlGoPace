@@ -19,8 +19,10 @@ type RecoveryAction int
 const (
 	// Restart re-runs the manifest from the beginning (idempotent guards protect).
 	Restart RecoveryAction = iota
-	// Resume continues a resumable operation; re-enqueued for an idempotent re-run
-	// in this version (true RESUME is a refinement).
+	// Resume continues a paused resumable operation: the manifest is re-enqueued with
+	// its sidecar kept, so the re-run recognizes it as resumed and issues ALTER INDEX …
+	// RESUME on the boundary operation (reusing the server-side progress) instead of a
+	// fresh REBUILD.
 	Resume
 	// Adopt leaves a still-running orphan session alone to avoid double execution.
 	Adopt
@@ -176,8 +178,11 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 			fmt.Fprintf(r.out, "recovery: %s — orphan SPID %d still running; left in processing\n", manifest, st.SPID)
 			sum.Adopted++
 		case Resume, Restart:
-			fmt.Fprintf(r.out, "recovery: %s — %s (re-enqueued for idempotent re-run)\n", manifest, action)
-			if err := r.requeue(manifest, statePath, st.ResumeFromOp > 0); err != nil {
+			fmt.Fprintf(r.out, "recovery: %s — %s (re-enqueued for the next run)\n", manifest, action)
+			// Keep the sidecar when the next run needs it: to skip completed operations
+			// (cursor set) or to adopt a paused resumable at the boundary op (Resume).
+			keepSidecar := action == Resume || st.ResumeFromOp > 0
+			if err := r.requeue(manifest, statePath, keepSidecar); err != nil {
 				return RecoverySummary{}, err
 			}
 			sum.Requeued++
@@ -227,19 +232,20 @@ func factsWith(ctx context.Context, probe RecoveryProbe, st State) (RecoveryFact
 	return RecoveryFacts{OrphanAlive: matchesOrphan(id, st), ResumableExists: paused}, nil
 }
 
-// requeue moves a manifest back to to_run for a fresh run. keepCursor preserves the
-// State sidecar so a drained/interrupted run's resume cursor survives into the re-run;
-// otherwise the sidecar is removed (a clean restart from the first operation).
-func (r *Recoverer) requeue(manifest, statePath string, keepCursor bool) error {
+// requeue moves a manifest back to to_run for a fresh run. keepSidecar preserves the
+// State sidecar so the re-run can honor it — skipping completed operations via the resume
+// cursor, and adopting a paused resumable (which marks the run as resumed) via ALTER INDEX
+// … RESUME; otherwise the sidecar is removed (a clean restart from the first operation).
+func (r *Recoverer) requeue(manifest, statePath string, keepSidecar bool) error {
 	if err := r.queue.Requeue(manifest); err != nil {
-		// A prior requeue that kept the cursor may already have moved the manifest (a
+		// A prior requeue that kept the sidecar may already have moved the manifest (a
 		// crash between that requeue and the re-run's claim). If it is already in
 		// to_run, the engine will pick it up — not an error.
 		if !r.queue.InToRun(manifest) {
 			return err
 		}
 	}
-	if keepCursor {
+	if keepSidecar {
 		return nil
 	}
 	return RemoveState(statePath)

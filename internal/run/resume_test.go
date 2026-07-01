@@ -112,6 +112,54 @@ func TestResumeCursorAdvancesProgressively(t *testing.T) {
 	}
 }
 
+// sqlCapturingRunner records the statement it is handed for each operation, so a test
+// can assert the engine issued ALTER INDEX … RESUME rather than a fresh REBUILD.
+type sqlCapturingRunner struct{ sqls []string }
+
+func (r *sqlCapturingRunner) Run(_ context.Context, _ ddl.Operation, sql string, _ run.Capabilities, _ run.ReactionSink) error {
+	r.sqls = append(r.sqls, sql)
+	return nil
+}
+
+func TestResumeAdoptsPausedResumableAtBoundary(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(fakeResumeCheck{paused: true}))
+	// A prior run of this manifest was interrupted mid-rebuild, leaving a sidecar; the
+	// server still holds the paused resumable. setupEngine seeded a single rebuild_index.
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml"})
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(runner.sqls) != 1 {
+		t.Fatalf("runner ran %d statements, want 1", len(runner.sqls))
+	}
+	if !strings.Contains(runner.sqls[0], "RESUME") {
+		t.Errorf("boundary op should RESUME the paused resumable, got: %q", runner.sqls[0])
+	}
+}
+
+func TestFreshRunDoesNotAdoptForeignPausedResumable(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, _ := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(fakeResumeCheck{paused: true}))
+	// No sidecar: a genuinely fresh manifest. Even though the server reports a paused
+	// resumable on the index, a fresh run must issue its own REBUILD — never RESUME a
+	// foreign paused operation, which could carry different options.
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(runner.sqls) != 1 {
+		t.Fatalf("runner ran %d statements, want 1", len(runner.sqls))
+	}
+	if strings.Contains(runner.sqls[0], "RESUME") {
+		t.Errorf("fresh run must not RESUME a foreign paused resumable, got: %q", runner.sqls[0])
+	}
+}
+
 func TestWriteSidecarPreservesCursor(t *testing.T) {
 	// A fresh sidecar write on a manifest that carries a cursor must keep it (so a
 	// re-run started by recovery does not lose the resume point).

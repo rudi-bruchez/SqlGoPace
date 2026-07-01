@@ -140,6 +140,35 @@ func TestRecovererKeepsCursorOnRequeue(t *testing.T) {
 	}
 }
 
+func TestRecovererKeepsSidecarForPausedResumable(t *testing.T) {
+	// Interrupted during the first operation (cursor 0) but a resumable is paused on the
+	// server: the sidecar must survive the requeue so the re-run recognizes the resume and
+	// issues ALTER INDEX … RESUME instead of a fresh REBUILD that SQL Server would reject.
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"} // ResumeFromOp 0
+	dirs, name := setupRecovery(t, st)
+
+	// Dead session (not adopted) + a paused resumable → DecideRecovery = Resume.
+	probe := fakeRecoveryProbe{
+		id:  mssql.SessionIdentity{Exists: false},
+		ops: []mssql.ResumableOp{{StateDesc: "PAUSED"}},
+	}
+	r := NewRecoverer(dirs, probe, io.Discard)
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if sum.Requeued != 1 {
+		t.Errorf("Requeued = %d, want 1", sum.Requeued)
+	}
+	if _, err := os.Stat(filepath.Join(dirs.ToRun, name)); err != nil {
+		t.Errorf("manifest not requeued to to_run: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dirs.Processing, name+stateSuffix)); err != nil {
+		t.Errorf("sidecar should be kept for a paused resumable despite cursor 0: %v", err)
+	}
+}
+
 func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
 	// An orphan from DB2 must be reconciled against the DB2 probe, not the
 	// connected one. The connected probe would Adopt (alive); the DB2 probe sees
