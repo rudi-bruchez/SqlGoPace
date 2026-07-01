@@ -295,14 +295,14 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var (
 			current *currentManifest
 			fwd     *tuiForwarder
-			extra   = []run.EngineOption{run.WithDrainSignal(drain)}
+			extra   []run.EngineOption
 		)
 		if useTUI {
 			current = &currentManifest{}
 			fwd = &tuiForwarder{}
 			extra = append(extra, run.WithManifestObserver(current.set))
 		}
-		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, extra...)
+		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain, extra...)
 		var sum run.Summary
 		if useTUI {
 			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, requestDrain, cfg.Monitoring.ProgressPoll())
@@ -338,7 +338,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 // buildEngine wires a run.Engine for one database's connection, sharing the given
 // history (may be nil) and reading policy, monitoring, and notification settings
 // from cfg. It is called once per database in a multi-database run.
-func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, extra ...run.EngineOption) *run.Engine {
+func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, drain <-chan struct{}, extra ...run.EngineOption) *run.Engine {
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
@@ -364,7 +364,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
 		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
-	}))
+	}), run.WithShrinkStop(drain))
 	// Progress goes to the TUI when the console is running, else to stdout/log. The
 	// step sink follows the same rule (in TUI mode engineOut is io.Discard anyway).
 	batchProgress := func(p run.BatchDMLProgress) {
@@ -383,7 +383,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
 		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
-	}, run.WithBatchDMLProgress(batchProgress))
+	}, run.WithBatchDMLProgress(batchProgress), run.WithBatchDMLStop(drain))
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
@@ -399,6 +399,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithShrinkRunner(shrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
 		run.WithCompressionReader(conn),
+		run.WithDrainSignal(drain),
 		run.WithOutput(engineOut),
 		run.WithStepSink(stepSink),
 	}

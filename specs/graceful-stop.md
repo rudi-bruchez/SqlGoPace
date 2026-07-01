@@ -22,9 +22,14 @@
 > progressivement par opération** (`advanceCursor`, `crash-resumable.md` §6), pas seulement au drain :
 > un *crash* renseigne donc le curseur comme un drain, et `WriteState` est rendu **atomique**
 > (temp+rename) puisque le sidecar est réécrit après chaque op. Le **skip métadonnée** (`crash-resumable.md`
-> §9) reste complémentaire (rend le préfixe compression bon marché). **Non implémenté (§3.2, §6)** : le
-> drain **par chunk** pendant un shrink (et le stop pendant un batch-DML) ; annuler un drain. Créé le
-> 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
+> §9) reste complémentaire (rend le préfixe compression bon marché). **Le stop par chunk (§3.2) est
+> implémenté aussi pour shrink et batch-DML** : ces drivers chunkés reçoivent le signal via
+> `WithShrinkStop`/`WithBatchDMLStop` (câblés dans `buildEngine`) et vérifient `stopRequested(r.stop)`
+> **entre deux chunks/batches** (chacun est committé) ; ils finissent le chunk courant puis renvoient
+> `ErrStopped` avec résultats partiels — le moteur finalise en interrupted (laissé en processing), et le
+> prochain run reprend (shrink idempotent par espace libre ; predicate auto-limitant ; key_range depuis
+> le watermark, que le moteur **ne purge pas** sur `ErrStopped`). **Non implémenté (§6)** : annuler un
+> drain. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
 
 ## 1. Objectif
 

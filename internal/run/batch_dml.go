@@ -116,6 +116,7 @@ type BatchDMLRunner struct {
 	killGr   time.Duration
 
 	progress func(BatchDMLProgress)
+	stop     <-chan struct{} // graceful stop: finish the current batch, then stop
 }
 
 // BatchDMLOption customizes a BatchDMLRunner.
@@ -124,6 +125,14 @@ type BatchDMLOption func(*BatchDMLRunner)
 // WithBatchDMLProgress sets the progress callback (fed to the TUI by the engine).
 func WithBatchDMLProgress(f func(BatchDMLProgress)) BatchDMLOption {
 	return func(r *BatchDMLRunner) { r.progress = f }
+}
+
+// WithBatchDMLStop wires the engine's graceful-stop signal: once it is closed, the driver
+// finishes the current batch (already committed) and stops, returning ErrStopped so the
+// run is left in processing and the next run resumes (predicate self-limiting, key_range
+// from the persisted watermark).
+func WithBatchDMLStop(stop <-chan struct{}) BatchDMLOption {
+	return func(r *BatchDMLRunner) { r.stop = stop }
 }
 
 // NewBatchDMLRunner builds a BatchDMLRunner. A zero LogPollInterval falls back to
@@ -175,6 +184,12 @@ func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res 
 
 	var stallWaited time.Duration
 	for {
+		// Graceful stop: each batch commits, so stopping between batches preserves work;
+		// the self-limiting predicate makes the next run continue naturally.
+		if stopRequested(r.stop) {
+			result.Reason = "stopped: graceful stop (work committed per batch)"
+			return result, ErrStopped
+		}
 		stmt := ddl.BatchDMLChunkSQL(op, size, res)
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
@@ -235,6 +250,12 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 	caps := r.opCaps(res, ignore)
 	var stallWaited time.Duration
 	for {
+		// Graceful stop: the watermark is persisted after each committed batch (below), so
+		// stopping between batches lets the next run resume from the last saved key.
+		if stopRequested(r.stop) {
+			result.Reason = "stopped: graceful stop (work committed per batch)"
+			return result, ErrStopped
+		}
 		next, ok, err := r.exec.QueryInt(ctx, ddl.BatchKeyRangeNextSQL(op, key, size, watermark, hasWM))
 		if err != nil {
 			return result, err

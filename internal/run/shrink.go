@@ -92,6 +92,7 @@ type ShrinkRunner struct {
 
 	progress func(ShrinkProgress)
 	wait     func(ctx context.Context, d time.Duration) error
+	stop     <-chan struct{} // graceful stop: finish the current chunk, then stop
 }
 
 // ShrinkOption customizes a ShrinkRunner.
@@ -100,6 +101,13 @@ type ShrinkOption func(*ShrinkRunner)
 // WithShrinkProgress sets the progress callback (fed to the TUI by the engine).
 func WithShrinkProgress(f func(ShrinkProgress)) ShrinkOption {
 	return func(r *ShrinkRunner) { r.progress = f }
+}
+
+// WithShrinkStop wires the engine's graceful-stop signal: once it is closed, the driver
+// finishes the current chunk (already committed) and stops, returning ErrStopped so the
+// run is left in processing and the next run resumes the shrink from the current size.
+func WithShrinkStop(stop <-chan struct{}) ShrinkOption {
+	return func(r *ShrinkRunner) { r.stop = stop }
 }
 
 // NewShrinkRunner builds a ShrinkRunner. A zero LogPollInterval falls back to the
@@ -140,6 +148,11 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 
 	results := make([]ShrinkResult, 0, len(files))
 	for _, f := range files {
+		// Graceful stop: a running file's chunk loop stops itself between chunks (below);
+		// here we stop before starting the next file, leaving the rest for the next run.
+		if stopRequested(r.stop) {
+			return results, ErrStopped
+		}
 		var (
 			result ShrinkResult
 			ferr   error
@@ -150,6 +163,10 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 			result, ferr = r.shrinkData(ctx, op, res, ignore, f, sink)
 		}
 		if ferr != nil {
+			// On a graceful stop the partial file result is still worth recording.
+			if errors.Is(ferr, ErrStopped) {
+				results = append(results, result)
+			}
 			return results, ferr
 		}
 		results = append(results, result)
@@ -221,6 +238,13 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	var stallWaited time.Duration
 
 	for current > final {
+		// Graceful stop: each chunk commits, so stopping between chunks preserves work;
+		// the next run resumes the shrink from the current (already reduced) size.
+		if stopRequested(r.stop) {
+			result.FinalMB = current
+			result.Reason = "stopped: graceful stop (work preserved)"
+			return result, ErrStopped
+		}
 		next := NextTargetMB(current, step, final)
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())

@@ -518,12 +518,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				if e.batchDML != nil {
 					// Batched DML is a per-batch loop built at run time; route to its driver.
 					// The watermark sidecar lets a key_range walk resume after a crash; it is
-					// removed once the walk returns (a crash skips that, preserving resume).
+					// removed once the walk completes (a crash — or a graceful stop, which
+					// returns ErrStopped — skips that, preserving resume).
 					store := e.watermarkStore(name, i)
 					var br BatchDMLResult
 					br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
 					batchResult = &br
-					if op.Batch.IsKeyRange() {
+					if op.Batch.IsKeyRange() && !errors.Is(runErr, ErrStopped) {
 						store.clear()
 					}
 				} else {
@@ -568,7 +569,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 				rep.Operations = append(rep.Operations, opRep)
 				if stopped {
-					rep.Error = fmt.Sprintf("operation %d (%s) paused on graceful stop — resumes on the next run", i, step.Operation.CommandType())
+					rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i, step.Operation.CommandType())
 				} else {
 					rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
 				}
@@ -752,14 +753,7 @@ func (e *Engine) recordSkipped(stepEv StepEvent, step ddl.PlannedOperation, opSt
 // draining reports whether a graceful stop has been requested. The drain channel is
 // closed (not sent to) on request, so once closed every check reads ready — the signal
 // is latched. A nil channel (no drain wired) is never ready, so this is false.
-func (e *Engine) draining() bool {
-	select {
-	case <-e.drain:
-		return true
-	default:
-		return false
-	}
-}
+func (e *Engine) draining() bool { return stopRequested(e.drain) }
 
 // finalizeDrained records a graceful stop after `done` of `total` operations: the
 // manifest stays in processing (not done/failed) so the next run resumes it. The resume

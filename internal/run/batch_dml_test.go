@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -21,6 +22,8 @@ type fakeBatchServer struct {
 
 	execLog []string
 	killed  bool
+
+	onExec func(sql string) // test hook, called at the start of each ExecRows
 }
 
 func (s *fakeBatchServer) SPID() int                             { return 7 }
@@ -28,6 +31,9 @@ func (s *fakeBatchServer) ExecDDL(context.Context, string) error { return nil }
 func (s *fakeBatchServer) Kill(context.Context, int) error       { s.killed = true; return nil }
 
 func (s *fakeBatchServer) ExecRows(_ context.Context, sql string) (int64, error) {
+	if s.onExec != nil {
+		s.onExec(sql)
+	}
 	s.execLog = append(s.execLog, sql)
 	n := min(int64(parseTop(sql)), s.remaining)
 	s.remaining -= n
@@ -191,6 +197,37 @@ func TestBatchDMLConverges(t *testing.T) {
 	}
 	if s.remaining != 0 {
 		t.Errorf("server remaining = %d, want 0", s.remaining)
+	}
+}
+
+func TestBatchPredicateStopsBetweenBatches(t *testing.T) {
+	stop := make(chan struct{})
+	s := &fakeBatchServer{remaining: 100000, estRows: 100000}
+	// Close the graceful-stop signal when the first batch runs, so the loop commits that
+	// batch and stops before the next one.
+	closed := false
+	s.onExec = func(string) {
+		if !closed {
+			closed = true
+			close(stop)
+		}
+	}
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
+	r.stop = stop
+
+	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard)
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run() error = %v, want ErrStopped", err)
+	}
+	if res.Batches != 1 {
+		t.Errorf("Batches = %d, want 1 (the current batch committed, the next did not start)", res.Batches)
+	}
+	if !strings.Contains(res.Reason, "graceful stop") {
+		t.Errorf("Reason = %q, want it to mention the graceful stop", res.Reason)
+	}
+	if s.remaining == 0 {
+		t.Errorf("server drained fully; want a partial stop with rows remaining")
 	}
 }
 

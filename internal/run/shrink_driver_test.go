@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
@@ -32,11 +33,16 @@ type fakeServer struct {
 	execLog  []string
 	killed   bool
 	reuseIdx int
+
+	onExec func(sql string) // test hook, called at the start of each ExecDDL
 }
 
 func (s *fakeServer) SPID() int { return 99 }
 
 func (s *fakeServer) ExecDDL(_ context.Context, sql string) error {
+	if s.onExec != nil {
+		s.onExec(sql)
+	}
 	s.execLog = append(s.execLog, sql)
 	switch {
 	case strings.Contains(sql, "TRUNCATEONLY"):
@@ -144,6 +150,37 @@ func newTestRunner(s *fakeServer, clk *ManualClock) *ShrinkRunner {
 }
 
 func discard(ReactionEvent) {}
+
+func TestShrinkStopsBetweenChunks(t *testing.T) {
+	stop := make(chan struct{})
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 2000, usedMB: 200}
+	// Close the graceful-stop signal when the first chunk runs, so the loop finishes that
+	// chunk and stops before the next one.
+	closed := false
+	s.onExec = func(sql string) {
+		if !closed && strings.Contains(sql, "DBCC SHRINKFILE") && !strings.Contains(sql, "TRUNCATEONLY") {
+			closed = true
+			close(stop)
+		}
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.stop = stop
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // small target → many chunks
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run() error = %v, want ErrStopped", err)
+	}
+	if len(res) != 1 {
+		t.Fatalf("got %d results, want 1 (the partial file)", len(res))
+	}
+	if res[0].Chunks != 1 {
+		t.Errorf("Chunks = %d, want 1 (the current chunk finished, the next did not start)", res[0].Chunks)
+	}
+	if !strings.Contains(res[0].Reason, "graceful stop") {
+		t.Errorf("Reason = %q, want it to mention the graceful stop", res[0].Reason)
+	}
+}
 
 func TestShrinkDataNoOp(t *testing.T) {
 	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 1000} // no free space

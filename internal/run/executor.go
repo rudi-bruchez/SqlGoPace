@@ -154,6 +154,17 @@ var ErrCancelled = errors.New("operation canceled under pressure")
 // stop) and the run should stop without resuming; the next run continues it via RESUME.
 var ErrStopped = errors.New("operation paused on graceful stop")
 
+// stopRequested reports whether a graceful stop has been signaled: the channel is closed
+// (latched), so once closed every check reads ready. A nil channel is never ready.
+func stopRequested(stop <-chan struct{}) bool {
+	select {
+	case <-stop:
+		return true
+	default:
+		return false
+	}
+}
+
 // supervise monitors one running statement and returns the reaction to take,
 // along with the pressure that triggered it. It returns (Continue, _, err) when
 // the statement finishes on its own (err is nil on success) or the context is
