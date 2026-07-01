@@ -89,6 +89,25 @@ func setupRecovery(t *testing.T, st State) (Dirs, string) {
 	return dirs, name
 }
 
+func TestRecoverSweepsStrayTempFiles(t *testing.T) {
+	// #13: a crash between CreateTemp and Rename can leave a hidden .sqlgopace-*.tmp in
+	// processing; recovery must sweep it.
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
+	dirs, _ := setupRecovery(t, st)
+	tmp := filepath.Join(dirs.Processing, ".sqlgopace-abc123.tmp")
+	if err := os.WriteFile(tmp, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	r := NewRecoverer(dirs, fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}, io.Discard)
+	if _, err := r.Recover(context.Background()); err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if _, err := os.Stat(tmp); !os.IsNotExist(err) {
+		t.Errorf("stray temp file was not swept (err=%v)", err)
+	}
+}
+
 func TestRecovererRequeuesOnRestart(t *testing.T) {
 	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
 	dirs, name := setupRecovery(t, st)

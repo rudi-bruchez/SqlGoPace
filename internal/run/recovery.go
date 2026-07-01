@@ -137,6 +137,17 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 		return RecoverySummary{}, fmt.Errorf("scan processing: %w", err)
 	}
 
+	// Sweep stray atomic-write temp files a crash may have left between CreateTemp and Rename
+	// (sidecar/watermark writes rewrite these per operation): nothing consumes them and they
+	// would only accrue.
+	for _, e := range entries {
+		if n := e.Name(); strings.HasPrefix(n, ".sqlgopace-") && strings.HasSuffix(n, ".tmp") {
+			if err := os.Remove(filepath.Join(r.dirs.Processing, n)); err != nil && !os.IsNotExist(err) {
+				fmt.Fprintf(r.out, "recovery: remove temp %s: %v\n", n, err)
+			}
+		}
+	}
+
 	// Probes opened per database are cached and closed at the end.
 	cache := make(map[string]RecoveryProbe)
 	var closers []func()
