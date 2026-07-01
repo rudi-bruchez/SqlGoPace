@@ -80,6 +80,12 @@ type Capabilities struct {
 	// session, the operation yields even if the blocker is ignored. It backstops a
 	// too-broad ignore rule. Set via the max_block_minutes option.
 	MaxBlock time.Duration
+	// Stop, once ready (closed), requests a graceful stop: a resumable operation is paused
+	// (work preserved) and the run stops without resuming, leaving it to continue via
+	// ALTER INDEX … RESUME on the next run. It is the engine's drain signal (nil when no
+	// drain is wired). Only a resumable operation is paused; a non-resumable one runs to
+	// completion, and the drain then stops the run at the next operation boundary.
+	Stop <-chan struct{}
 }
 
 // Action is the reaction the engine takes under pressure.
@@ -92,6 +98,9 @@ const (
 	Pause
 	// Cancel means cancel the Go context and KILL as a fallback.
 	Cancel
+	// Stop means PAUSE the resumable operation on operator request (graceful stop) and
+	// stop the run without resuming; the next run continues it via ALTER INDEX … RESUME.
+	Stop
 )
 
 // String returns the action name.
@@ -103,6 +112,8 @@ func (a Action) String() string {
 		return "pause"
 	case Cancel:
 		return "cancel"
+	case Stop:
+		return "stop"
 	default:
 		return "unknown"
 	}
@@ -129,6 +140,9 @@ func DecideReaction(p Pressure, c Capabilities) Action {
 func reactionEvent(action Action, p Pressure, c Capabilities) ReactionEvent {
 	if action == Pause {
 		return ReactionEvent{Kind: "pause", Detail: p.Detail()}
+	}
+	if action == Stop {
+		return ReactionEvent{Kind: "pause", Detail: "graceful stop requested — pausing the resumable operation to resume on the next run"}
 	}
 	detail := p.Detail()
 	if c.CancelSafe {

@@ -150,6 +150,10 @@ func (r sessionRule) matches(s mssql.Session) bool {
 // retried by the caller.
 var ErrCancelled = errors.New("operation canceled under pressure")
 
+// ErrStopped signals a resumable operation was paused on operator request (graceful
+// stop) and the run should stop without resuming; the next run continues it via RESUME.
+var ErrStopped = errors.New("operation paused on graceful stop")
+
 // supervise monitors one running statement and returns the reaction to take,
 // along with the pressure that triggered it. It returns (Continue, _, err) when
 // the statement finishes on its own (err is nil on success) or the context is
@@ -166,10 +170,19 @@ func supervise(
 ) (Action, Pressure, error) {
 	var blockingStart, blockedSince time.Time
 
+	// A graceful stop pauses a resumable operation on request; a non-resumable one is left
+	// to finish (a nil channel never fires), so the drain stops the run at the next boundary.
+	var stop <-chan struct{}
+	if caps.Resumable {
+		stop = caps.Stop
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			return Continue, Pressure{}, ctx.Err()
+		case <-stop:
+			return Stop, Pressure{}, nil
 		case err := <-done:
 			return Continue, Pressure{}, err
 		case s := <-samples:

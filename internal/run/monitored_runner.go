@@ -114,6 +114,10 @@ func runLoop(sql string, runStatement func(string) (Action, error), waitForRelie
 		switch action {
 		case Cancel:
 			return ErrCancelled
+		case Stop:
+			// Graceful stop: the statement was paused (runStatement stopped it, preserving
+			// the resumable's work). Return without resuming; the next run continues it.
+			return ErrStopped
 		case Pause:
 			if err := waitForRelief(); err != nil {
 				return err

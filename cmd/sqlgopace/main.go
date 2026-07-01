@@ -240,9 +240,10 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		}
 	}
 
-	// Graceful stop: the first Ctrl+C drains (finish the current operation, then stop,
-	// leaving the rest to resume next run); a second Ctrl+C cancels the run context for
-	// an immediate hard stop. In TUI mode the console's "d" key drives the same drain.
+	// Graceful stop: the first Ctrl+C drains — a running resumable operation is paused now
+	// (its work preserved, resumed next run), a non-resumable one finishes, then the run
+	// stops before the next operation. A second Ctrl+C cancels the run context for an
+	// immediate hard stop. In TUI mode the console's "d" key drives the same drain.
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
 	drain := make(chan struct{})
@@ -258,7 +259,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		case <-sigCh:
 			requestDrain()
 			if !useTUI {
-				fmt.Fprintln(stdout, "-- interrupt: draining — will stop after the current operation (Ctrl+C again to stop now)")
+				fmt.Fprintln(stdout, "-- interrupt: draining — pausing a running resumable now (resumes next run) or finishing a non-resumable op, then stopping (Ctrl+C again to abort now)")
 			}
 		}
 		select {

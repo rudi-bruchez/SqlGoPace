@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -410,7 +411,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned))
 		}
 		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes)}
+		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
 
 		// Manifest-level progress: the started event is emitted now; a finished event
 		// derived from it is emitted at each terminal outcome below.
@@ -554,17 +555,23 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		}
 		if runErr != nil {
 			opRep.Error = runErr.Error()
-			// An unexpected error on a resumable operation that left a PAUSED
-			// resumable rebuild behind (session killed / connection lost / server
-			// restart) is recoverable, not a failure: keep the manifest and sidecar
-			// in processing so the next run resumes it. A pre-run rejection (prepErr, a
-			// blocking resumable the manifest did not opt in to clear) is a deterministic
-			// failure, not a session-loss interruption, so it is excluded here.
-			if prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation) {
+			// A resumable operation left PAUSED is a clean interruption, not a failure:
+			// keep the manifest and sidecar in processing so the next run continues it via
+			// ALTER INDEX … RESUME. Two ways to get here: an operator graceful stop
+			// (ErrStopped), or a session loss / server restart that resumableInterruption
+			// confirms left a paused resumable. A pre-run rejection (prepErr, a blocking
+			// resumable the manifest did not opt in to clear) is a deterministic failure and
+			// is excluded from the resumableInterruption path.
+			stopped := errors.Is(runErr, ErrStopped)
+			if stopped || (prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation)) {
 				opRep.Outcome = "interrupted"
 				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 				rep.Operations = append(rep.Operations, opRep)
-				rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
+				if stopped {
+					rep.Error = fmt.Sprintf("operation %d (%s) paused on graceful stop — resumes on the next run", i, step.Operation.CommandType())
+				} else {
+					rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
+				}
 				return e.finalizeInterrupted(ctx, name, rep, start)
 			}
 			opRep.Outcome = "failed"

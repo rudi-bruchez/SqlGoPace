@@ -202,6 +202,43 @@ func TestSuperviseContextCancel(t *testing.T) {
 	}
 }
 
+func TestSuperviseStopPausesResumable(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	stop := make(chan struct{})
+	close(stop) // a graceful stop was requested
+	out := make(chan superviseResult, 1)
+	go func() {
+		a, p, e := supervise(context.Background(), NewManualClock(testStart), Capabilities{Resumable: true, Stop: stop}, 60*time.Second, samples, done)
+		out <- superviseResult{a, p, e}
+	}()
+
+	got := <-out
+	if got.action != Stop || got.err != nil {
+		t.Errorf("supervise() = (%v, %v), want (Stop, nil)", got.action, got.err)
+	}
+}
+
+func TestSuperviseStopIgnoredWhenNotResumable(t *testing.T) {
+	samples := make(chan Sample)
+	done := make(chan error)
+	stop := make(chan struct{})
+	close(stop)
+	out := make(chan superviseResult, 1)
+	go func() {
+		a, p, e := supervise(context.Background(), NewManualClock(testStart), Capabilities{Stop: stop}, 60*time.Second, samples, done)
+		out <- superviseResult{a, p, e}
+	}()
+
+	// A non-resumable operation cannot be paused, so the stop is ignored and the op runs
+	// to completion (the drain then stops the run at the next operation boundary).
+	done <- nil
+	got := <-out
+	if got.action != Continue || got.err != nil {
+		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — stop ignored for a non-resumable op", got.action, got.err)
+	}
+}
+
 // stmtRun records the statements runLoop ran and replays a scripted sequence of
 // reactions, one per statement.
 type stmtRun struct {
@@ -251,6 +288,17 @@ func TestRunLoopCancelIsRetryable(t *testing.T) {
 	}
 	if s.relief != 0 {
 		t.Errorf("waitForRelief called %d times on cancel, want 0", s.relief)
+	}
+}
+
+func TestRunLoopStopReturnsErrStopped(t *testing.T) {
+	// A graceful stop pauses the statement and returns without resuming.
+	s := &stmtRun{actions: []Action{Stop}, errs: []error{nil}}
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, ErrStopped) {
+		t.Errorf("runLoop() = %v, want ErrStopped", err)
+	}
+	if s.relief != 0 {
+		t.Errorf("waitForRelief called %d times on stop, want 0 (no resume)", s.relief)
 	}
 }
 

@@ -1,11 +1,18 @@
 # Spec métier — Arrêt en douceur (drain) après l'instruction en cours
 
-> **Statut : v1 implémenté (drain sans curseur `State`).** Le moteur expose `WithDrainSignal(<-chan
-> struct{})` ; une fois le canal **fermé** (signal latché), il finit l'op en cours puis s'arrête
-> **avant la suivante** (`finalizeDrained` : manifeste laissé en `02.processing/`, compté
-> `Interrupted`), et n'entame plus les manifestes restants. Déclencheurs : **Ctrl+C 1× = drain / 2× =
-> hard stop** (handler `os/signal` dans `cmd/sqlgopace/main.go`, `sync.Once` pour fermer le canal une
-> fois, 2ᵉ signal → `cancelRun()`), et l'action TUI **`d`** (`ActionDrain` → statut `DRAINING`).
+> **Statut : v1 implémenté, avec pause d'un resumable en cours.** Le moteur expose `WithDrainSignal(<-chan
+> struct{})` ; une fois le canal **fermé** (signal latché), il s'arrête **avant l'op suivante**
+> (`finalizeDrained` : manifeste laissé en `02.processing/`, compté `Interrupted`) et n'entame plus les
+> manifestes restants. **Nouveau (§3.2) : une opération resumable EN COURS est mise en pause immédiatement**
+> au lieu d'attendre sa fin — le signal drain est passé au `MonitoredRunner` via `Capabilities.Stop` ;
+> `supervise` renvoie une action **`Stop`** pour un op resumable quand le canal se ferme ; `runLoop`
+> traduit `Stop` en sentinel **`ErrStopped`** (geste de pause existant = annulation du contexte d'exécution
+> = *attention* qui met le resumable en pause, puis on **ne reprend pas**) ; le moteur classe `ErrStopped`
+> en interruption propre (`finalizeInterrupted`, manifeste+sidecar laissés), et le prochain run **RESUME**
+> (cf. `crash-resumable.md` §4.2). Un op **non-resumable** ignore le stop (il finit ; le drain stoppe au
+> prochain bord d'op). Shrink/batch : hors périmètre (drivers distincts). Déclencheurs : **Ctrl+C 1× =
+> drain / 2× = hard stop** (handler `os/signal` dans `cmd/sqlgopace/main.go`, `sync.Once` pour fermer le
+> canal une fois, 2ᵉ signal → `cancelRun()`), et l'action TUI **`d`** (`ActionDrain` → statut `DRAINING`).
 > Reprise : le **curseur d'opération** `State.ResumeFromOp` (§3.3.1) est écrit par `finalizeDrained`
 > (= nb d'ops faites) ; la recovery **conserve** le sidecar au requeue quand le curseur > 0
 > (`requeue(..., keepCursor)` + `queue.InToRun` pour tolérer un manifeste déjà re-enfilé) ; au re-run
@@ -16,8 +23,8 @@
 > un *crash* renseigne donc le curseur comme un drain, et `WriteState` est rendu **atomique**
 > (temp+rename) puisque le sidecar est réécrit après chaque op. Le **skip métadonnée** (`crash-resumable.md`
 > §9) reste complémentaire (rend le préfixe compression bon marché). **Non implémenté (§3.2, §6)** : le
-> drain **par chunk** pendant un shrink ; annuler un drain. Créé le 2026-06-17, suite au besoin d'arrêter
-> un run **sans avorter l'opération en cours**.
+> drain **par chunk** pendant un shrink (et le stop pendant un batch-DML) ; annuler un drain. Créé le
+> 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
 
 ## 1. Objectif
 
