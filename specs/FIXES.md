@@ -1,8 +1,18 @@
 # FIXES — code review of the 12 unpushed commits (`origin/main..HEAD`)
 
-> **Status:** review complete, fixes NOT yet implemented. This document persists (1) the
-> full review findings and (2) a self-contained implementation plan for findings #1–#4, so a
-> fresh session can implement them without re-deriving anything. Written 2026-07-01.
+> **Status:** review complete. **Fixes #1, #2, #3, #4 (plus #5 and #7, folded into #1) are
+> IMPLEMENTED, tested, and committed** on `main` (not pushed):
+> - `f71316a` — #4 (TUI join engine goroutine before closing the connection)
+> - `edc2e98` — #2, #3 (plan-fingerprint validated resume cursor; `State.PlanFingerprint`)
+> - `affd51c` — #1, #5, #7 (own paused resumable by recorded identity; `State.Paused`)
+> - `6a1fcfe` — simplify pass (one `updateSidecar` helper)
+>
+> **Still open:** #6, #8–#14 and the cleanup list below (none implemented). This document persists
+> (1) the full review findings and (2) the implementation plan for #1–#4. Written 2026-07-01.
+>
+> Note on #3: fixed conservatively via the plan fingerprint — a re-expanded `ALTER INDEX ALL`
+> hashes differently, so the run restarts clean rather than skipping the wrong op. The deeper
+> op-identity keying (redo only what changed) remains a future refinement.
 
 ## How to regenerate the review context in a new session
 
