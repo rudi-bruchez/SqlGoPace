@@ -587,7 +587,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				// and have caps.Resumable false.
 				if caps.Resumable {
 					ref := step.Operation.Target()
-					e.setPausedResumable(name, &PausedResumable{Op: i, Schema: ref.Schema, Table: ref.Table, Index: ref.Name})
+					rec := &PausedResumable{Op: i, Schema: ref.Schema, Table: ref.Table, Index: ref.Name}
+					e.updateSidecar(name, func(s *State) { s.Paused = rec })
 				}
 				opRep.Outcome = "interrupted"
 				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
@@ -617,7 +618,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// This operation completed, so clear any paused-resumable record it carried (a RESUME
 		// that finished): the server no longer holds it.
 		if st.Paused != nil && st.Paused.Op == i {
-			e.setPausedResumable(name, nil)
+			e.updateSidecar(name, func(s *State) { s.Paused = nil })
 			st.Paused = nil
 		}
 		e.advanceCursor(name, &cursor, i)
@@ -1026,20 +1027,22 @@ func (e *Engine) advanceCursor(name string, cursor *int, i int) {
 	if *cursor != i {
 		return
 	}
-	*cursor = i + 1
-	e.saveResumeCursor(name, *cursor)
+	next := i + 1
+	*cursor = next
+	e.updateSidecar(name, func(s *State) { s.ResumeFromOp = next })
 }
 
-// saveResumeCursor updates the sidecar's resume cursor in place (best-effort: a no-op
-// when there is no sidecar to update).
-func (e *Engine) saveResumeCursor(name string, resumeFrom int) {
+// updateSidecar applies mutate to the manifest's sidecar state and rewrites it, in place
+// (best-effort: a no-op when there is no sidecar to update). Used to record resume progress —
+// the cursor, plan fingerprint, and paused-resumable record — after each operation.
+func (e *Engine) updateSidecar(name string, mutate func(*State)) {
 	st, err := ReadState(e.sidecarPath(name))
 	if err != nil {
 		return
 	}
-	st.ResumeFromOp = resumeFrom
+	mutate(&st)
 	if err := WriteState(e.sidecarPath(name), st); err != nil {
-		fmt.Fprintf(e.out, "sidecar %s: cursor: %v\n", name, err)
+		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
 	}
 }
 
@@ -1059,22 +1062,9 @@ func (e *Engine) reconcileResumePlan(name string, st State, planned []ddl.Planne
 			e.clearWatermarks(name)
 		}
 	}
-	e.bindResumeState(name, resumeFrom, fp)
+	rf := resumeFrom
+	e.updateSidecar(name, func(s *State) { s.ResumeFromOp = rf; s.PlanFingerprint = fp })
 	return resumeFrom
-}
-
-// bindResumeState records the resume cursor and plan fingerprint on the sidecar in place
-// (best-effort: a no-op when there is no sidecar to update).
-func (e *Engine) bindResumeState(name string, resumeFrom int, fingerprint string) {
-	st, err := ReadState(e.sidecarPath(name))
-	if err != nil {
-		return
-	}
-	st.ResumeFromOp = resumeFrom
-	st.PlanFingerprint = fingerprint
-	if err := WriteState(e.sidecarPath(name), st); err != nil {
-		fmt.Fprintf(e.out, "sidecar %s: fingerprint: %v\n", name, err)
-	}
 }
 
 // ownsPausedResumable reports whether the sidecar's paused-resumable record identifies operation
@@ -1088,19 +1078,6 @@ func ownsPausedResumable(p *PausedResumable, i int, op ddl.Operation) bool {
 	return strings.EqualFold(p.Schema, ref.Schema) &&
 		strings.EqualFold(p.Table, ref.Table) &&
 		strings.EqualFold(p.Index, ref.Name)
-}
-
-// setPausedResumable records (or, with a nil record, clears) the manifest's own paused resumable
-// on the sidecar in place (best-effort: a no-op when there is no sidecar to update).
-func (e *Engine) setPausedResumable(name string, p *PausedResumable) {
-	st, err := ReadState(e.sidecarPath(name))
-	if err != nil {
-		return
-	}
-	st.Paused = p
-	if err := WriteState(e.sidecarPath(name), st); err != nil {
-		fmt.Fprintf(e.out, "sidecar %s: paused: %v\n", name, err)
-	}
 }
 
 // planFingerprint hashes the ordered identity (command + target) of the planned operations, so
