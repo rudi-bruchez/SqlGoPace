@@ -355,6 +355,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithShrinkRunner(shrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
 		run.WithOutput(engineOut),
+		run.WithStepSink(stepSinkTo(engineOut)),
 	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
@@ -364,6 +365,22 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	}
 	opts = append(opts, extra...)
 	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+}
+
+// stepSinkTo formats manifest-level step events to w: one line when an operation
+// starts and one when it finishes (with outcome and duration). This is the main
+// progress signal for a non-TUI (background) run; in TUI mode w is io.Discard and
+// the console shows the same "op i/N" counter instead.
+func stepSinkTo(w io.Writer) func(run.StepEvent) {
+	return func(ev run.StepEvent) {
+		switch ev.Phase {
+		case run.StepStarted:
+			fmt.Fprintf(w, "-- [%d/%d] %s %s — started\n", ev.Index, ev.Total, ev.Command, ev.Target)
+		case run.StepFinished:
+			fmt.Fprintf(w, "-- [%d/%d] %s %s — %s in %s\n",
+				ev.Index, ev.Total, ev.Command, ev.Target, ev.Outcome, ev.Duration.Round(time.Second))
+		}
+	}
 }
 
 // batchTuning maps the batch-DML config block to the run-side tuning carrier

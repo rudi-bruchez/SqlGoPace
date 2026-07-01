@@ -143,6 +143,7 @@ type Engine struct {
 	liveReload       bool              // re-read ignore_blocked_sessions from the manifest mid-run
 	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
+	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
 	out              io.Writer
 }
 
@@ -182,6 +183,11 @@ func WithHistory(h *report.History) EngineOption { return func(e *Engine) { e.hi
 
 // WithOutput sets the progress narration writer (defaults to io.Discard).
 func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w } }
+
+// WithStepSink registers a callback fed one StepEvent when each operation starts and
+// another when it finishes, so stdout and the TUI can show manifest-level progress
+// (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
+func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
 
 // WithExpander enables expanding "ALTER INDEX ALL" rebuilds into one rebuild per
 // concrete index. Without it, an ALL rebuild is run as a single statement.
@@ -358,6 +364,11 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes)}
 
+		// Manifest-level progress: the started event is emitted now; a finished event
+		// derived from it is emitted at each terminal outcome below.
+		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
+		e.emitStep(stepEv)
+
 		// The sink is called from the runner (this goroutine) and from the held-through
 		// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
 		var (
@@ -447,11 +458,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			// in processing so the next run resumes it.
 			if caps.Resumable && e.resumableInterruption(ctx, step.Operation) {
 				opRep.Outcome = "interrupted"
+				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 				rep.Operations = append(rep.Operations, opRep)
 				rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
 				return e.finalizeInterrupted(ctx, name, rep, start)
 			}
 			opRep.Outcome = "failed"
+			e.emitStep(stepEv.finished("failed", opDuration(opRep)))
 			rep.Operations = append(rep.Operations, opRep)
 			if !manifest.Continue() {
 				rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
@@ -463,6 +476,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			continue
 		}
 		opRep.Outcome = "success"
+		e.emitStep(stepEv.finished("success", opDuration(opRep)))
 		rep.Operations = append(rep.Operations, opRep)
 	}
 	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
