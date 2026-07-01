@@ -29,6 +29,22 @@ type State struct {
 	// skipped (which would report SUCCESS having executed nothing). Empty on a legacy
 	// sidecar written before this field existed.
 	PlanFingerprint string `json:"plan_fingerprint,omitempty"`
+	// Paused records an operation this manifest left with a paused resumable rebuild on the
+	// server, so a resumed run continues exactly that operation via ALTER INDEX … RESUME by
+	// recorded identity — not by inferring ownership from the cursor position (which fails
+	// when a continue-on-failure gap freezes the cursor before the interrupted op). Nil when
+	// nothing was left paused.
+	Paused *PausedResumable `json:"paused,omitempty"`
+}
+
+// PausedResumable identifies the operation and target index of a paused resumable rebuild the
+// engine left on the server, so a resumed run can positively recognize its own paused work
+// (RESUME it) versus a foreign paused resumable (reject or ABORT per the opt-in).
+type PausedResumable struct {
+	Op     int    `json:"op"` // the plan index of the interrupted operation
+	Schema string `json:"schema"`
+	Table  string `json:"table"`
+	Index  string `json:"index"`
 }
 
 // WriteState writes the sidecar state as indented JSON. The write is atomic (temp

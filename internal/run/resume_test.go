@@ -149,14 +149,17 @@ operations:
     index: IX
 `
 
-func TestResumeAdoptsPausedResumableAtBoundary(t *testing.T) {
+func TestResumeAdoptsOwnPausedResumable(t *testing.T) {
 	runner := &sqlCapturingRunner{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
 		run.WithResumeCheck(&fakeResumeCheck{paused: true}))
-	// A prior run of this manifest was interrupted mid-rebuild, leaving a sidecar; the
-	// server still holds the paused resumable. setupEngine seeded a single rebuild_index.
-	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml"})
+	// A prior run recorded that operation 0 left its own paused resumable on dbo.T.IX
+	// (setupEngine seeded a single rebuild_index of that index); the server still holds it.
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{
+		Manifest: "010_a.yaml",
+		Paused:   &run.PausedResumable{Op: 0, Schema: "dbo", Table: "T", Index: "IX"},
+	})
 
 	if _, err := eng.ProcessAll(context.Background()); err != nil {
 		t.Fatalf("ProcessAll() error = %v", err)
@@ -165,7 +168,107 @@ func TestResumeAdoptsPausedResumableAtBoundary(t *testing.T) {
 		t.Fatalf("runner ran %d statements, want 1", len(runner.sqls))
 	}
 	if !strings.Contains(runner.sqls[0], "RESUME") {
-		t.Errorf("boundary op should RESUME the paused resumable, got: %q", runner.sqls[0])
+		t.Errorf("the recorded own paused resumable should RESUME, got: %q", runner.sqls[0])
+	}
+}
+
+// indexAwareResumeCheck reports a paused resumable only for a specific index, so a test can
+// model a server where one index (not another) holds a paused rebuild.
+type indexAwareResumeCheck struct{ pausedIndex string }
+
+func (c indexAwareResumeCheck) PausedResumable(_ context.Context, _, _, index string) (bool, error) {
+	return strings.EqualFold(index, c.pausedIndex), nil
+}
+
+func TestOwnPausedResumedWhenNotAtCursorBoundary(t *testing.T) {
+	// The headline #1 case: a continue-on-failure gap left the cursor behind the operation
+	// that actually paused its own resumable (op 1, index IX2), while op 0 (IX) is not paused.
+	// The paused op must be RESUMEd by recorded identity even though it is not at the cursor,
+	// and op 0 must run normally rather than being treated as a foreign blocker.
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(indexAwareResumeCheck{pausedIndex: "IX2"}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{
+		Manifest: "010_a.yaml",
+		Paused:   &run.PausedResumable{Op: 1, Schema: "dbo", Table: "T", Index: "IX2"},
+	})
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Done != 1 {
+		t.Fatalf("Summary = %+v, want Done:1 (op 0 runs, op 1 resumes — neither rejected)", sum)
+	}
+	if len(runner.sqls) != 2 {
+		t.Fatalf("runner ran %d statements, want 2", len(runner.sqls))
+	}
+	if strings.Contains(runner.sqls[0], "RESUME") {
+		t.Errorf("op 0 (IX, not paused) should run a fresh REBUILD, got: %q", runner.sqls[0])
+	}
+	if !strings.Contains(runner.sqls[1], "RESUME") {
+		t.Errorf("op 1 (IX2, our own paused resumable) should RESUME, got: %q", runner.sqls[1])
+	}
+}
+
+func TestForeignPausedNotAdoptedWithoutOwnRecord(t *testing.T) {
+	// #5: a manifest drained at an op boundary leaves no paused-resumable record. On re-run a
+	// foreign paused resumable happens to sit on the next op's index. It must NOT be adopted
+	// (never RESUME); without the opt-in it fails with the actionable message.
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(indexAwareResumeCheck{pausedIndex: "IX2"}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Cursor past op 0 (drained after it), but NO Paused record: op 1's paused resumable is foreign.
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml", ResumeFromOp: 1})
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Failed != 1 {
+		t.Errorf("Summary = %+v, want Failed:1 (foreign paused resumable not adopted)", sum)
+	}
+	for _, s := range runner.sqls {
+		if strings.Contains(s, "RESUME") {
+			t.Errorf("a foreign paused resumable must never be RESUMEd, got: %q", s)
+		}
+	}
+	if log := readFailLog(t, dirs, "010_a.yaml"); !strings.Contains(log, "abort-resumable") {
+		t.Errorf("failure should point at abort-resumable, got:\n%s", log)
+	}
+}
+
+func TestInterruptedResumableRecordsPausedIdentity(t *testing.T) {
+	// A resumable operation paused by a graceful stop records its own identity in the sidecar,
+	// so the next run can resume it by identity.
+	drain := &run.DrainFlag{}
+	runner := &stopOnRunRunner{drain: drain}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithDrainSignal(drain.Draining),
+		run.WithSession(fakeSession{spid: 70}))
+	// setupEngine seeded a single rebuild_index of dbo.T.IX.
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Interrupted != 1 {
+		t.Fatalf("Summary = %+v, want Interrupted:1", sum)
+	}
+	st := readSidecarState(t, dirs, "010_a.yaml")
+	if st.Paused == nil {
+		t.Fatal("interrupted resumable did not record a Paused identity")
+	}
+	if st.Paused.Op != 0 || st.Paused.Index != "IX" {
+		t.Errorf("Paused = %+v, want {Op:0 … Index:IX}", st.Paused)
 	}
 }
 

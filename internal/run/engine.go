@@ -487,18 +487,24 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		go func() { defer close(holdDone); e.narrateHeld(holdCtx, ignore, sink) }()
 
 		// Resumable conflict handling before running the operation:
-		//   - the boundary op of a resumed manifest whose index is still paused continues
-		//     with ALTER INDEX … RESUME (reusing the server-side progress) instead of a
-		//     fresh REBUILD, which SQL Server rejects while a resumable is paused;
+		//   - an operation this manifest recorded as leaving its own paused resumable
+		//     continues with ALTER INDEX … RESUME (reusing the server-side progress) instead
+		//     of a fresh REBUILD, which SQL Server rejects while a resumable is paused;
 		//   - otherwise a stale/foreign paused resumable on the target index would block a
 		//     fresh REBUILD (Msg 10637): clear it with ABORT when the manifest opts in, else
 		//     fail the operation early with an actionable message.
-		// Only the boundary op of a resumed manifest may RESUME, so a foreign paused
-		// resumable is never adopted with the wrong options.
+		// Ownership is matched by the recorded identity (op index + target), not the cursor
+		// position, so a continue-on-failure gap that freezes the cursor before the paused op
+		// no longer misclassifies the manifest's own paused resumable as foreign — and a
+		// foreign paused resumable is never adopted, whatever the cursor.
 		stmt := step.SQL
 		var prepErr error
 		switch {
-		case resumed && i == resumeFrom && caps.Resumable:
+		case ownsPausedResumable(st.Paused, i, step.Operation):
+			// Our own paused resumable from a previous run: continue it whatever the current
+			// resolve says about resumability (a fresh REBUILD would be rejected while it is
+			// paused). If nothing is actually paused now, resumeStatement declines and the
+			// planned REBUILD runs (a clean restart).
 			if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
 				stmt = resume
 				sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
@@ -554,7 +560,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			Index:       i + 1,
 			CommandType: step.Operation.CommandType(),
 			Target:      opTarget(step.Operation),
-			SQL:         step.SQL,
+			SQL:         stmt, // the statement actually executed (RESUME when continuing a paused resumable)
 			Options:     optionDecisions(step.Decisions),
 			Reactions:   reactions,
 			PeakBlocked: peakBlocked,
@@ -575,6 +581,14 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			// is excluded from the resumableInterruption path.
 			stopped := errors.Is(runErr, ErrStopped)
 			if stopped || (prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation)) {
+				// Record which operation left its own paused resumable, so the next run resumes
+				// it by identity rather than cursor position. Only a resumable index rebuild
+				// leaves one; shrink/batch ErrStopped resume differently (free-space/watermark)
+				// and have caps.Resumable false.
+				if caps.Resumable {
+					ref := step.Operation.Target()
+					e.setPausedResumable(name, &PausedResumable{Op: i, Schema: ref.Schema, Table: ref.Table, Index: ref.Name})
+				}
 				opRep.Outcome = "interrupted"
 				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 				rep.Operations = append(rep.Operations, opRep)
@@ -600,6 +614,12 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		opRep.Outcome = "success"
 		e.emitStep(stepEv.finished("success", opDuration(opRep)))
 		rep.Operations = append(rep.Operations, opRep)
+		// This operation completed, so clear any paused-resumable record it carried (a RESUME
+		// that finished): the server no longer holds it.
+		if st.Paused != nil && st.Paused.Op == i {
+			e.setPausedResumable(name, nil)
+			st.Paused = nil
+		}
 		e.advanceCursor(name, &cursor, i)
 	}
 	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
@@ -975,9 +995,10 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) (st State, resum
 
 	marker := e.stampMarker(ctx, name)
 
-	// Re-stamp this run's session identity, but carry over the resume cursor and the plan
-	// fingerprint left by a prior interrupted run, so a resume still knows what is done and
-	// which plan the cursor was recorded against.
+	// Re-stamp this run's session identity, but carry over the resume cursor, the plan
+	// fingerprint, and any paused-resumable record left by a prior interrupted run, so a
+	// resume still knows what is done, which plan the cursor was recorded against, and which
+	// operation left its own paused resumable.
 	fresh := State{
 		Manifest:        name,
 		Database:        e.database,
@@ -987,6 +1008,7 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) (st State, resum
 		StartedAt:       e.now(),
 		ResumeFromOp:    st.ResumeFromOp,
 		PlanFingerprint: st.PlanFingerprint,
+		Paused:          st.Paused,
 	}
 	if err := WriteState(e.sidecarPath(name), fresh); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
@@ -1052,6 +1074,32 @@ func (e *Engine) bindResumeState(name string, resumeFrom int, fingerprint string
 	st.PlanFingerprint = fingerprint
 	if err := WriteState(e.sidecarPath(name), st); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: fingerprint: %v\n", name, err)
+	}
+}
+
+// ownsPausedResumable reports whether the sidecar's paused-resumable record identifies operation
+// i's exact target — i.e. this manifest left its own paused resumable here, so the run should
+// RESUME it rather than treat it as a foreign blocker.
+func ownsPausedResumable(p *PausedResumable, i int, op ddl.Operation) bool {
+	if p == nil || p.Op != i {
+		return false
+	}
+	ref := op.Target()
+	return strings.EqualFold(p.Schema, ref.Schema) &&
+		strings.EqualFold(p.Table, ref.Table) &&
+		strings.EqualFold(p.Index, ref.Name)
+}
+
+// setPausedResumable records (or, with a nil record, clears) the manifest's own paused resumable
+// on the sidecar in place (best-effort: a no-op when there is no sidecar to update).
+func (e *Engine) setPausedResumable(name string, p *PausedResumable) {
+	st, err := ReadState(e.sidecarPath(name))
+	if err != nil {
+		return
+	}
+	st.Paused = p
+	if err := WriteState(e.sidecarPath(name), st); err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: paused: %v\n", name, err)
 	}
 }
 
