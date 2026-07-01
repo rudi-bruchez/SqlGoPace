@@ -542,21 +542,31 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval)
 	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, drain, actions)
 
+	// The engine runs under its own cancelable context so that if the console dies first
+	// (program.Run returns an error) we can unwind ProcessAll before the caller closes the
+	// connection under a still-running statement.
+	engineCtx, cancelEngine := context.WithCancel(ctx)
+	defer cancelEngine()
 	type result struct {
 		summary run.Summary
 		err     error
 	}
 	done := make(chan result, 1)
 	go func() {
-		summary, err := engine.ProcessAll(ctx)
+		summary, err := engine.ProcessAll(engineCtx)
 		done <- result{summary, err}
 		program.Quit() // close the console when the run finishes
 	}()
 
-	if err := program.Run(); err != nil {
-		return run.Summary{}, err
+	runErr := program.Run()
+	if runErr != nil {
+		cancelEngine() // console died first: stop ProcessAll from touching the connection
 	}
+	// Always wait for the engine goroutine to return before the caller closes the connection.
 	r := <-done
+	if runErr != nil {
+		return run.Summary{}, runErr
+	}
 	return r.summary, r.err
 }
 
