@@ -80,12 +80,13 @@ type Capabilities struct {
 	// session, the operation yields even if the blocker is ignored. It backstops a
 	// too-broad ignore rule. Set via the max_block_minutes option.
 	MaxBlock time.Duration
-	// Stop, once ready (closed), requests a graceful stop: a resumable operation is paused
-	// (work preserved) and the run stops without resuming, leaving it to continue via
-	// ALTER INDEX … RESUME on the next run. It is the engine's drain signal (nil when no
-	// drain is wired). Only a resumable operation is paused; a non-resumable one runs to
-	// completion, and the drain then stops the run at the next operation boundary.
-	Stop <-chan struct{}
+	// Stop reports whether a graceful stop is requested (the DrainFlag's Draining method,
+	// cancellable). When it becomes true, a resumable operation is paused at the next
+	// monitoring poll — work preserved — and the run stops without resuming, leaving it to
+	// continue via ALTER INDEX … RESUME on the next run. Nil when no drain is wired. Only a
+	// resumable operation is paused; a non-resumable one runs to completion, and the drain
+	// then stops the run at the next operation boundary.
+	Stop func() bool
 }
 
 // Action is the reaction the engine takes under pressure.

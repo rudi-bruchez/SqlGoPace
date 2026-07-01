@@ -55,10 +55,10 @@ func TestResumeCursorSkipsCompletedOps(t *testing.T) {
 }
 
 func TestDrainWritesResumeCursor(t *testing.T) {
-	drain := make(chan struct{})
+	drain := &run.DrainFlag{}
 	runner := &closeOnFirstRunner{drain: drain}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
-		run.WithDrainSignal(drain),
+		run.WithDrainSignal(drain.Draining),
 		run.WithSession(fakeSession{spid: 70}))
 	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
 		t.Fatal(err)

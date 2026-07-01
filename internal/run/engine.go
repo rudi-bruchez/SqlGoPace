@@ -157,7 +157,7 @@ type Engine struct {
 	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
 	compression      CompressionReader // reads current index compression for skip_if_satisfied
-	drain            <-chan struct{}   // closed to request a graceful stop after the current op
+	drain            func() bool       // reports a requested graceful stop (cancellable DrainFlag)
 	out              io.Writer
 }
 
@@ -209,10 +209,12 @@ func WithCompressionReader(r CompressionReader) EngineOption {
 	return func(e *Engine) { e.compression = r }
 }
 
-// WithDrainSignal wires a graceful-stop channel: once it is closed, the engine finishes
-// the operation in flight, then stops before the next one — leaving the manifest in
-// processing for the next run to resume — instead of aborting mid-operation.
-func WithDrainSignal(ch <-chan struct{}) EngineOption { return func(e *Engine) { e.drain = ch } }
+// WithDrainSignal wires a graceful-stop predicate (the DrainFlag's Draining method): once
+// it reports true, the engine finishes the operation in flight, then stops before the next
+// one — leaving the manifest in processing for the next run to resume — instead of aborting
+// mid-operation. Because it is polled (not latched), a Cancel before the next check resumes
+// normal processing.
+func WithDrainSignal(fn func() bool) EngineOption { return func(e *Engine) { e.drain = fn } }
 
 // WithExpander enables expanding "ALTER INDEX ALL" rebuilds into one rebuild per
 // concrete index. Without it, an ALL rebuild is run as a single statement.
@@ -750,9 +752,9 @@ func (e *Engine) recordSkipped(stepEv StepEvent, step ddl.PlannedOperation, opSt
 	return opRep
 }
 
-// draining reports whether a graceful stop has been requested. The drain channel is
-// closed (not sent to) on request, so once closed every check reads ready — the signal
-// is latched. A nil channel (no drain wired) is never ready, so this is false.
+// draining reports whether a graceful stop is currently requested. The signal is the
+// cancellable DrainFlag predicate, polled at each operation boundary — so a Cancel before
+// the next check resumes normal processing. No drain wired (nil predicate) is never draining.
 func (e *Engine) draining() bool { return stopRequested(e.drain) }
 
 // finalizeDrained records a graceful stop after `done` of `total` operations: the

@@ -154,16 +154,10 @@ var ErrCancelled = errors.New("operation canceled under pressure")
 // stop) and the run should stop without resuming; the next run continues it via RESUME.
 var ErrStopped = errors.New("operation paused on graceful stop")
 
-// stopRequested reports whether a graceful stop has been signaled: the channel is closed
-// (latched), so once closed every check reads ready. A nil channel is never ready.
-func stopRequested(stop <-chan struct{}) bool {
-	select {
-	case <-stop:
-		return true
-	default:
-		return false
-	}
-}
+// stopRequested reports whether a graceful stop is currently requested. stop is the
+// DrainFlag's Draining method (cancellable), read at each operation, chunk, and poll
+// boundary. A nil predicate (no drain wired) is never draining.
+func stopRequested(stop func() bool) bool { return stop != nil && stop() }
 
 // supervise monitors one running statement and returns the reaction to take,
 // along with the pressure that triggered it. It returns (Continue, _, err) when
@@ -181,22 +175,19 @@ func supervise(
 ) (Action, Pressure, error) {
 	var blockingStart, blockedSince time.Time
 
-	// A graceful stop pauses a resumable operation on request; a non-resumable one is left
-	// to finish (a nil channel never fires), so the drain stops the run at the next boundary.
-	var stop <-chan struct{}
-	if caps.Resumable {
-		stop = caps.Stop
-	}
-
 	for {
 		select {
 		case <-ctx.Done():
 			return Continue, Pressure{}, ctx.Err()
-		case <-stop:
-			return Stop, Pressure{}, nil
 		case err := <-done:
 			return Continue, Pressure{}, err
 		case s := <-samples:
+			// A graceful stop pauses a resumable operation, checked on each monitoring poll
+			// so a Cancel before the next poll withdraws it. A non-resumable operation runs
+			// to completion (the drain stops the run at the next operation boundary).
+			if caps.Resumable && stopRequested(caps.Stop) {
+				return Stop, Pressure{}, nil
+			}
 			// Timer for the normal reaction: blocking a session not allowed to stay
 			// blocked, debounced over blockingTimeout.
 			if s.BlockingOthers {

@@ -116,7 +116,7 @@ type BatchDMLRunner struct {
 	killGr   time.Duration
 
 	progress func(BatchDMLProgress)
-	stop     <-chan struct{} // graceful stop: finish the current batch, then stop
+	stop     func() bool // graceful stop (cancellable): finish the current batch, then stop
 }
 
 // BatchDMLOption customizes a BatchDMLRunner.
@@ -127,11 +127,12 @@ func WithBatchDMLProgress(f func(BatchDMLProgress)) BatchDMLOption {
 	return func(r *BatchDMLRunner) { r.progress = f }
 }
 
-// WithBatchDMLStop wires the engine's graceful-stop signal: once it is closed, the driver
-// finishes the current batch (already committed) and stops, returning ErrStopped so the
-// run is left in processing and the next run resumes (predicate self-limiting, key_range
-// from the persisted watermark).
-func WithBatchDMLStop(stop <-chan struct{}) BatchDMLOption {
+// WithBatchDMLStop wires the engine's graceful-stop predicate (the DrainFlag's Draining
+// method): once it reports true, the driver finishes the current batch (already committed)
+// and stops, returning ErrStopped so the run is left in processing and the next run resumes
+// (predicate self-limiting, key_range from the persisted watermark). A Cancel before the
+// next batch resumes normally.
+func WithBatchDMLStop(stop func() bool) BatchDMLOption {
 	return func(r *BatchDMLRunner) { r.stop = stop }
 }
 

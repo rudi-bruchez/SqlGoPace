@@ -152,19 +152,17 @@ func newTestRunner(s *fakeServer, clk *ManualClock) *ShrinkRunner {
 func discard(ReactionEvent) {}
 
 func TestShrinkStopsBetweenChunks(t *testing.T) {
-	stop := make(chan struct{})
+	drain := &DrainFlag{}
 	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 2000, usedMB: 200}
-	// Close the graceful-stop signal when the first chunk runs, so the loop finishes that
-	// chunk and stops before the next one.
-	closed := false
+	// Request the graceful stop when the first chunk runs, so the loop finishes that chunk
+	// and stops before the next one.
 	s.onExec = func(sql string) {
-		if !closed && strings.Contains(sql, "DBCC SHRINKFILE") && !strings.Contains(sql, "TRUNCATEONLY") {
-			closed = true
-			close(stop)
+		if strings.Contains(sql, "DBCC SHRINKFILE") && !strings.Contains(sql, "TRUNCATEONLY") {
+			drain.Request()
 		}
 	}
 	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
-	r.stop = stop
+	r.stop = drain.Draining
 
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // small target → many chunks
 	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)

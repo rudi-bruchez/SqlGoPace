@@ -201,19 +201,13 @@ func TestBatchDMLConverges(t *testing.T) {
 }
 
 func TestBatchPredicateStopsBetweenBatches(t *testing.T) {
-	stop := make(chan struct{})
+	drain := &DrainFlag{}
 	s := &fakeBatchServer{remaining: 100000, estRows: 100000}
-	// Close the graceful-stop signal when the first batch runs, so the loop commits that
-	// batch and stops before the next one.
-	closed := false
-	s.onExec = func(string) {
-		if !closed {
-			closed = true
-			close(stop)
-		}
-	}
+	// Request the graceful stop when the first batch runs, so the loop commits that batch
+	// and stops before the next one.
+	s.onExec = func(string) { drain.Request() }
 	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
-	r.stop = stop
+	r.stop = drain.Draining
 
 	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
 	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard)

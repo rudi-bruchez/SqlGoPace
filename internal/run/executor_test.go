@@ -205,14 +205,10 @@ func TestSuperviseContextCancel(t *testing.T) {
 func TestSuperviseStopPausesResumable(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	stop := make(chan struct{})
-	close(stop) // a graceful stop was requested
-	out := make(chan superviseResult, 1)
-	go func() {
-		a, p, e := supervise(context.Background(), NewManualClock(testStart), Capabilities{Resumable: true, Stop: stop}, 60*time.Second, samples, done)
-		out <- superviseResult{a, p, e}
-	}()
+	draining := func() bool { return true } // a graceful stop is requested
+	out := runSupervise(NewManualClock(testStart), Capabilities{Resumable: true, Stop: draining}, samples, done)
 
+	samples <- Sample{} // the stop is observed on a monitoring poll (so a cancel could precede it)
 	got := <-out
 	if got.action != Stop || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Stop, nil)", got.action, got.err)
@@ -222,16 +218,12 @@ func TestSuperviseStopPausesResumable(t *testing.T) {
 func TestSuperviseStopIgnoredWhenNotResumable(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	stop := make(chan struct{})
-	close(stop)
-	out := make(chan superviseResult, 1)
-	go func() {
-		a, p, e := supervise(context.Background(), NewManualClock(testStart), Capabilities{Stop: stop}, 60*time.Second, samples, done)
-		out <- superviseResult{a, p, e}
-	}()
+	draining := func() bool { return true }
+	out := runSupervise(NewManualClock(testStart), Capabilities{Stop: draining}, samples, done)
 
-	// A non-resumable operation cannot be paused, so the stop is ignored and the op runs
-	// to completion (the drain then stops the run at the next operation boundary).
+	// A non-resumable operation cannot be paused, so the stop is ignored (even across a
+	// poll) and the op runs to completion (the drain stops the run at the next boundary).
+	samples <- Sample{}
 	done <- nil
 	got := <-out
 	if got.action != Continue || got.err != nil {

@@ -92,7 +92,7 @@ type ShrinkRunner struct {
 
 	progress func(ShrinkProgress)
 	wait     func(ctx context.Context, d time.Duration) error
-	stop     <-chan struct{} // graceful stop: finish the current chunk, then stop
+	stop     func() bool // graceful stop (cancellable): finish the current chunk, then stop
 }
 
 // ShrinkOption customizes a ShrinkRunner.
@@ -103,10 +103,11 @@ func WithShrinkProgress(f func(ShrinkProgress)) ShrinkOption {
 	return func(r *ShrinkRunner) { r.progress = f }
 }
 
-// WithShrinkStop wires the engine's graceful-stop signal: once it is closed, the driver
-// finishes the current chunk (already committed) and stops, returning ErrStopped so the
-// run is left in processing and the next run resumes the shrink from the current size.
-func WithShrinkStop(stop <-chan struct{}) ShrinkOption {
+// WithShrinkStop wires the engine's graceful-stop predicate (the DrainFlag's Draining
+// method): once it reports true, the driver finishes the current chunk (already committed)
+// and stops, returning ErrStopped so the run is left in processing and the next run resumes
+// the shrink from the current size. A Cancel before the next chunk resumes normally.
+func WithShrinkStop(stop func() bool) ShrinkOption {
 	return func(r *ShrinkRunner) { r.stop = stop }
 }
 

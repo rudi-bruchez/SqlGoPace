@@ -275,8 +275,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		m.emit(Action{Kind: ActionExtend})
 	case "d":
+		// Toggle: request a graceful stop, or cancel a pending one. The host performs the
+		// same toggle on the shared flag and confirms via StatusMsg.
 		m.emit(Action{Kind: ActionDrain})
-		m.status = StatusDraining // reflect intent immediately; the host confirms via StatusMsg
+		if m.status == StatusDraining {
+			m.status = StatusRunning // cancel the drain
+		} else {
+			m.status = StatusDraining
+		}
 	case "s":
 		m.emit(Action{Kind: ActionSnapshot})
 	}
@@ -372,7 +378,7 @@ func (m Model) View() string {
 		}
 	}
 
-	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [d] drain  [s] snapshot  [q] quit"
+	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [d] drain/cancel  [s] snapshot  [q] quit"
 	if m.mode == modeCriterion && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
 		help = fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",

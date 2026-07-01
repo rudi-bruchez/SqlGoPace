@@ -28,8 +28,16 @@
 > **entre deux chunks/batches** (chacun est committé) ; ils finissent le chunk courant puis renvoient
 > `ErrStopped` avec résultats partiels — le moteur finalise en interrupted (laissé en processing), et le
 > prochain run reprend (shrink idempotent par espace libre ; predicate auto-limitant ; key_range depuis
-> le watermark, que le moteur **ne purge pas** sur `ErrStopped`). **Non implémenté (§6)** : annuler un
-> drain. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
+> le watermark, que le moteur **ne purge pas** sur `ErrStopped`). **L'annulation d'un drain (§6) est
+> implémentée** : le signal latché (canal fermé) est remplacé par un `DrainFlag` (atomic bool,
+> `Request`/`Cancel`/`Draining`) ; tous les points de stop deviennent un prédicat **`func() bool`**
+> (`Capabilities.Stop`, `engine.drain`, champs `stop` des drivers) vérifié **aux bords** (op, chunk) et
+> sur le **tick de sampling** de `supervise` — donc un `Cancel` avant le prochain check retire la
+> demande. La touche TUI **`d` bascule** (drain ⇄ cancel, via `dispatchActions` sur le flag partagé) ;
+> Ctrl+C reste **one-way** (2× = hard stop), l'annulation étant une fonctionnalité TUI. Compromis : la
+> pause mid-statement d'un resumable est désormais **poll-delayed** (au lieu d'un réveil immédiat) pour
+> être annulable. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en
+> cours**. Cette spec est désormais **entièrement implémentée**.
 
 ## 1. Objectif
 
