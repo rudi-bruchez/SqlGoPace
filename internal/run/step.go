@@ -28,7 +28,8 @@ type StepEvent struct {
 	StartedAt    time.Time     // operation start; the elapsed-time anchor
 	Phase        StepPhase     // StepStarted | StepFinished
 	Duration     time.Duration // set on StepFinished
-	Outcome      string        // set on StepFinished: "success" | "failed" | "interrupted"
+	Outcome      string        // set on StepFinished: "success" | "failed" | "interrupted" | "skipped"
+	Detail       string        // optional note on StepFinished, e.g. a skip reason ("already PAGE")
 }
 
 // finished returns a StepFinished copy of a StepStarted event, filling in the outcome

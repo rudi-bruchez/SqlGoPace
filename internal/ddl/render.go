@@ -33,6 +33,9 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.OnFailure != "" {
 		addPair(root, "on_failure", scalarNode(string(m.OnFailure)))
 	}
+	if m.SkipIfSatisfied {
+		addPair(root, "skip_if_satisfied", scalarNode("true"))
+	}
 	if len(m.IgnoreBlockedSessions) > 0 {
 		seq := &yaml.Node{Kind: yaml.SequenceNode}
 		for i, s := range m.IgnoreBlockedSessions {

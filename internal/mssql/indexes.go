@@ -49,3 +49,45 @@ func (c *Conn) RebuildableIndexes(ctx context.Context, schema, table string) ([]
 	}
 	return out, nil
 }
+
+// PartitionCompression is one partition's current data_compression_desc
+// (NONE | ROW | PAGE | COLUMNSTORE | COLUMNSTORE_ARCHIVE).
+type PartitionCompression struct {
+	Partition int
+	Desc      string
+}
+
+const indexCompressionSQL = `
+SELECT p.partition_number, p.data_compression_desc
+FROM sys.indexes i
+JOIN sys.partitions p ON p.object_id = i.object_id AND p.index_id = i.index_id
+WHERE i.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND i.name = @index
+ORDER BY p.partition_number;`
+
+// IndexCompression returns the current compression of each partition of
+// [schema].[table].[index], in partition order. It is empty when the index does not
+// exist. The engine uses it to skip a rebuild whose target compression every relevant
+// partition already has (skip_if_satisfied).
+func (c *Conn) IndexCompression(ctx context.Context, schema, table, index string) ([]PartitionCompression, error) {
+	rows, err := c.pool.QueryContext(ctx, indexCompressionSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index))
+	if err != nil {
+		return nil, fmt.Errorf("index compression %s.%s.%s: %w", schema, table, index, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []PartitionCompression
+	for rows.Next() {
+		var (
+			p    PartitionCompression
+			desc sql.NullString
+		)
+		if err := rows.Scan(&p.Partition, &desc); err != nil {
+			return nil, fmt.Errorf("scan compression row: %w", err)
+		}
+		p.Desc = desc.String
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

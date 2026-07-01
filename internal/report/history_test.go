@@ -42,10 +42,10 @@ func TestHistoryRecord(t *testing.T) {
 	}
 }
 
-// TestHistoryPeakBlockedMigration guards that a run-history DB predating the
-// peak_blocked column is migrated on open (ALTER TABLE ADD COLUMN) and that the value
-// then persists — CREATE TABLE IF NOT EXISTS alone would not add the column.
-func TestHistoryPeakBlockedMigration(t *testing.T) {
+// TestHistoryColumnMigration guards that a run-history DB predating the peak_blocked
+// and skipped columns is migrated on open (ALTER TABLE ADD COLUMN) and that the values
+// then persist — CREATE TABLE IF NOT EXISTS alone would not add a column.
+func TestHistoryColumnMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "history.db")
 	ctx := context.Background()
 
@@ -65,7 +65,7 @@ func TestHistoryPeakBlockedMigration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenHistory() migrate error = %v", err)
 	}
-	if err := h.Record(ctx, report.RunRecord{Manifest: "m.yaml", Outcome: "SUCCESS", PeakBlocked: 4}); err != nil {
+	if err := h.Record(ctx, report.RunRecord{Manifest: "m.yaml", Outcome: "SUCCESS", PeakBlocked: 4, Skipped: 3}); err != nil {
 		t.Fatalf("Record() error = %v", err)
 	}
 	_ = h.Close()
@@ -75,12 +75,12 @@ func TestHistoryPeakBlockedMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	var peak int
-	if err := db.QueryRowContext(ctx, "SELECT peak_blocked FROM runs LIMIT 1").Scan(&peak); err != nil {
-		t.Fatalf("read peak_blocked: %v", err)
+	var peak, skipped int
+	if err := db.QueryRowContext(ctx, "SELECT peak_blocked, skipped FROM runs LIMIT 1").Scan(&peak, &skipped); err != nil {
+		t.Fatalf("read migrated columns: %v", err)
 	}
-	if peak != 4 {
-		t.Errorf("peak_blocked = %d, want 4", peak)
+	if peak != 4 || skipped != 3 {
+		t.Errorf("peak_blocked/skipped = %d/%d, want 4/3", peak, skipped)
 	}
 }
 

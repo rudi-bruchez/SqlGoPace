@@ -1,8 +1,16 @@
 # Spec métier — Reprise après interruption (« crash-resumable »)
 
-> **Statut : DRAFT — à brainstormer.** Ce document *acte le besoin* et consigne l'état
-> actuel observé. Il ne fige pas encore de design : une itération de conception
-> (brainstorming) est demandée avant implémentation.
+> **Statut : §9 (skip par métadonnées) IMPLÉMENTÉ ; le reste reste DRAFT.** Le flag manifeste
+> `skip_if_satisfied` (défaut off) fait qu'au run-time un `rebuild_index` dont **toutes les
+> partitions** portent déjà la `data_compression` cible est **skippé** (outcome `skipped`, une
+> ligne de log `— skipped in 0s (already PAGE)` / `.log` `skipped: already PAGE`, compteur history
+> `runs.skipped`). Lecture étroite `mssql.IndexCompression(schema,table,index)` par partition ;
+> comparaison pure `compressionSatisfied` (partition-aware) ; gardé côté moteur par
+> `WithCompressionReader`. Rend le re-jeu d'un manifeste de compression interrompu **bon marché**
+> (les ops déjà faites ne sont pas refaites) — cf. §9. **Non encore implémenté** : le vrai
+> `ALTER INDEX … RESUME` (§4.2), le curseur d'opération dans `State` (§3.4, rendu inutile pour le
+> cas compression par le skip), l'arrêt propre sur Ctrl+C (§3.1), l'orchestration `abort-resumable`
+> (§3.6). Une itération de conception reste requise pour ces volets.
 >
 > Créé le 2026-06-17, à la suite d'un essai de compression de masse (manifeste
 > `01.to_run/030_compress_exampledb_indexes.yaml`, 74 index EXAMPLEDB).

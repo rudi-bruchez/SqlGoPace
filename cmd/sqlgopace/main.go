@@ -364,6 +364,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithDatabase(info.Database),
 		run.WithShrinkRunner(shrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
+		run.WithCompressionReader(conn),
 		run.WithOutput(engineOut),
 		run.WithStepSink(stepSink),
 	}
@@ -387,8 +388,12 @@ func stepSinkTo(w io.Writer) func(run.StepEvent) {
 		case run.StepStarted:
 			fmt.Fprintf(w, "-- [%d/%d] %s %s — started\n", ev.Index, ev.Total, ev.Command, ev.Target)
 		case run.StepFinished:
-			fmt.Fprintf(w, "-- [%d/%d] %s %s — %s in %s\n",
-				ev.Index, ev.Total, ev.Command, ev.Target, ev.Outcome, ev.Duration.Round(time.Second))
+			detail := ""
+			if ev.Detail != "" {
+				detail = " (" + ev.Detail + ")"
+			}
+			fmt.Fprintf(w, "-- [%d/%d] %s %s — %s in %s%s\n",
+				ev.Index, ev.Total, ev.Command, ev.Target, ev.Outcome, ev.Duration.Round(time.Second), detail)
 		}
 	}
 }

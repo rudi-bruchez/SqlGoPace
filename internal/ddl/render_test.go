@@ -14,9 +14,10 @@ import (
 // generated operation must survive Marshal → Parse unchanged.
 func TestMarshalManifestRoundTrip(t *testing.T) {
 	in := &ddl.Manifest{
-		Description: "Maintenance plan for MYDB",
-		Database:    "MYDB",
-		OnFailure:   ddl.OnFailureContinue,
+		Description:     "Maintenance plan for MYDB",
+		Database:        "MYDB",
+		OnFailure:       ddl.OnFailureContinue,
+		SkipIfSatisfied: true,
 		IgnoreBlockedSessions: []ddl.IgnoredSession{
 			{AppName: "^SQLAgent", LoginName: "svc_reporting"},
 			{SessionID: intPtr(57)},
@@ -58,7 +59,7 @@ func TestMarshalManifestOmitsEmpty(t *testing.T) {
 		t.Fatalf("MarshalManifest() error = %v", err)
 	}
 	out := string(data)
-	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:", "on_failure:", "ignore_blocked_sessions:"} {
+	for _, banned := range []string{"null", "partition:", "lob_compaction:", "options:", "description:", "on_failure:", "ignore_blocked_sessions:", "skip_if_satisfied:"} {
 		if strings.Contains(out, banned) {
 			t.Errorf("output contains %q, want it omitted:\n%s", banned, out)
 		}

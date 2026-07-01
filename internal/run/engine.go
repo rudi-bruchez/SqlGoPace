@@ -144,6 +144,7 @@ type Engine struct {
 	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
+	compression      CompressionReader // reads current index compression for skip_if_satisfied
 	out              io.Writer
 }
 
@@ -188,6 +189,12 @@ func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w }
 // another when it finishes, so stdout and the TUI can show manifest-level progress
 // (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
 func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
+
+// WithCompressionReader lets the engine honor a manifest's skip_if_satisfied by
+// reading an index's current compression and skipping a rebuild already at its target.
+func WithCompressionReader(r CompressionReader) EngineOption {
+	return func(e *Engine) { e.compression = r }
+}
 
 // WithExpander enables expanding "ALTER INDEX ALL" rebuilds into one rebuild per
 // concrete index. Without it, an ALL rebuild is run as a single statement.
@@ -367,6 +374,26 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// Manifest-level progress: the started event is emitted now; a finished event
 		// derived from it is emitted at each terminal outcome below.
 		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
+
+		// skip_if_satisfied: a rebuild whose target compression already holds is a
+		// no-op; record it as skipped (near-zero cost) and move on. Emitting only the
+		// finished event keeps a re-run's log to one line per skipped operation.
+		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip {
+			opRep := report.OperationReport{
+				Index:       i + 1,
+				CommandType: step.Operation.CommandType(),
+				Target:      opTarget(step.Operation),
+				SQL:         step.SQL,
+				Options:     optionDecisions(step.Decisions),
+				Outcome:     "skipped",
+				Detail:      reason,
+				DurationMS:  e.msSince(opStart),
+			}
+			stepEv.Detail = reason
+			e.emitStep(stepEv.finished("skipped", opDuration(opRep)))
+			rep.Operations = append(rep.Operations, opRep)
+			continue
+		}
 		e.emitStep(stepEv)
 
 		// The sink is called from the runner (this goroutine) and from the held-through
@@ -717,10 +744,13 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 	if e.history == nil {
 		return
 	}
-	peak := 0
+	peak, skipped := 0, 0
 	for _, op := range rep.Operations {
 		if op.PeakBlocked > peak {
 			peak = op.PeakBlocked
+		}
+		if op.Outcome == "skipped" {
+			skipped++
 		}
 	}
 	rec := report.RunRecord{
@@ -731,6 +761,7 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 		Operations:  len(rep.Operations),
 		DurationMS:  rep.DurationMS,
 		PeakBlocked: peak,
+		Skipped:     skipped,
 		Error:       rep.Error,
 	}
 	if err := e.history.Record(ctx, rec); err != nil {

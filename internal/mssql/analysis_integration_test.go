@@ -93,6 +93,41 @@ func TestIntegrationObjectInventoryAndCompression(t *testing.T) {
 	}
 }
 
+func TestIntegrationIndexCompression(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	const table = "sgp_m3_comp"
+
+	exec(t, conn, ctx, "IF OBJECT_ID('dbo."+table+"') IS NOT NULL DROP TABLE dbo."+table)
+	exec(t, conn, ctx, "CREATE TABLE dbo."+table+" (id int IDENTITY CONSTRAINT PK_"+table+" PRIMARY KEY, pad varchar(400) NOT NULL)")
+	t.Cleanup(func() {
+		_ = conn.ExecDDL(context.Background(), "IF OBJECT_ID('dbo."+table+"') IS NOT NULL DROP TABLE dbo."+table)
+	})
+
+	// A fresh clustered index is uncompressed.
+	got, err := conn.IndexCompression(ctx, "dbo", table, "PK_"+table)
+	if err != nil {
+		t.Fatalf("IndexCompression() error = %v", err)
+	}
+	if len(got) != 1 || got[0].Partition != 1 || got[0].Desc != "NONE" {
+		t.Fatalf("IndexCompression() = %+v, want one partition NONE", got)
+	}
+
+	// After a PAGE rebuild the read reflects the new compression (the skip signal).
+	exec(t, conn, ctx, "ALTER INDEX PK_"+table+" ON dbo."+table+" REBUILD WITH (DATA_COMPRESSION = PAGE)")
+	got, err = conn.IndexCompression(ctx, "dbo", table, "PK_"+table)
+	if err != nil {
+		t.Fatalf("IndexCompression() after rebuild error = %v", err)
+	}
+	if len(got) != 1 || got[0].Desc != "PAGE" {
+		t.Errorf("IndexCompression() after PAGE rebuild = %+v, want PAGE", got)
+	}
+
+	// An unknown index yields no rows (never skip).
+	if got, err := conn.IndexCompression(ctx, "dbo", table, "does_not_exist"); err != nil || len(got) != 0 {
+		t.Errorf("IndexCompression(unknown) = %+v, err = %v; want empty, nil", got, err)
+	}
+}
+
 func TestIntegrationHeapForwardedRecords(t *testing.T) {
 	conn, ctx := openTestConn(t)
 	const table = "sgp_m3_heap"

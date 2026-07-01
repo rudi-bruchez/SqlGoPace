@@ -196,7 +196,12 @@ type Manifest struct {
 	// operations (see IgnoredSession). It is the single durable source of exclusions:
 	// read at start, re-read live during the run, and copied into the recovery manifest.
 	IgnoreBlockedSessions []IgnoredSession
-	Operations            []Operation
+	// SkipIfSatisfied makes an operation whose target state already holds a no-op at
+	// run time (currently: a rebuild_index whose data_compression every partition
+	// already has). Off by default, preserving the direct-run "do what I say" contract;
+	// a compression manifest re-run after an interruption sets it to skip finished work.
+	SkipIfSatisfied bool
+	Operations      []Operation
 }
 
 // Continue reports whether the manifest should keep going past a failed operation.
@@ -234,6 +239,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		Database              string           `yaml:"database"`
 		OnFailure             string           `yaml:"on_failure"`
 		IgnoreBlockedSessions []IgnoredSession `yaml:"ignore_blocked_sessions"`
+		SkipIfSatisfied       bool             `yaml:"skip_if_satisfied"`
 		Operations            []yaml.Node      `yaml:"operations"`
 	}
 	if err := value.Decode(&raw); err != nil {
@@ -244,6 +250,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.Database = raw.Database
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
+	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.Operations = make([]Operation, 0, len(raw.Operations))
 	for i := range raw.Operations {
 		op, err := decodeOperation(&raw.Operations[i])

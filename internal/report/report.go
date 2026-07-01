@@ -77,6 +77,7 @@ type OperationReport struct {
 	Shrink      []ShrinkFileReport `json:"shrink,omitempty"`
 	BatchDML    *BatchDMLReport    `json:"batch_dml,omitempty"`
 	Outcome     string             `json:"outcome"`
+	Detail      string             `json:"detail,omitempty"` // context for the outcome, e.g. a skip reason
 	Error       string             `json:"error,omitempty"`
 	DurationMS  int64              `json:"duration_ms"`
 }
@@ -116,7 +117,12 @@ func Write(w io.Writer, r RunReport) error {
 	if len(r.Operations) > 0 {
 		fmt.Fprintln(w, "\noperations:")
 		for _, op := range r.Operations {
-			fmt.Fprintf(w, "  [%d] %s %s — %s (%dms)\n", op.Index, op.CommandType, op.Target, op.Outcome, op.DurationMS)
+			detail := ""
+			if op.Detail != "" {
+				detail = ": " + op.Detail
+			}
+			fmt.Fprintf(w, "  [%d] %s %s — %s%s (%dms)\n",
+				op.Index, op.CommandType, op.Target, op.Outcome, detail, op.DurationMS)
 			for _, d := range op.Options {
 				fmt.Fprintf(w, "      %s = %s (%s)\n", d.Option, d.Value, d.Reason)
 			}

@@ -19,6 +19,7 @@ type RunRecord struct {
 	Operations  int
 	DurationMS  int64
 	PeakBlocked int // most sessions any one operation blocked at once during the run
+	Skipped     int // operations skipped as already-satisfied (skip_if_satisfied)
 	Error       string
 }
 
@@ -70,6 +71,7 @@ var schemaStatements = []string{
 // that already has the column is expected and ignored.
 var columnMigrations = []string{
 	`ALTER TABLE runs ADD COLUMN peak_blocked INTEGER;`,
+	`ALTER TABLE runs ADD COLUMN skipped INTEGER;`,
 }
 
 // OpenHistory opens (creating if needed) the SQLite history database at path.
@@ -95,10 +97,10 @@ func OpenHistory(path string) (*History, error) {
 
 // Record inserts one run record.
 func (h *History) Record(ctx context.Context, r RunRecord) error {
-	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, peak_blocked, error)
-	           VALUES (?, ?, ?, ?, ?, ?, ?, ?);`
+	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, peak_blocked, skipped, error)
+	           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	if _, err := h.db.ExecContext(ctx, q,
-		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.PeakBlocked, r.Error); err != nil {
+		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.PeakBlocked, r.Skipped, r.Error); err != nil {
 		return fmt.Errorf("record run: %w", err)
 	}
 	return nil
