@@ -17,6 +17,10 @@ type State struct {
 	Marker    string `json:"marker"`
 	Command   string `json:"command"`
 	StartedAt string `json:"started_at"`
+	// ResumeFromOp is the resume cursor: the number of operations already completed
+	// (the next op to run), left by a drained or interrupted run so the next run skips
+	// what is done. 0 (omitted) means start from the first operation.
+	ResumeFromOp int `json:"resume_from_op,omitempty"`
 }
 
 // WriteState writes the sidecar state as indented JSON.

@@ -112,6 +112,34 @@ func TestRecovererRequeuesOnRestart(t *testing.T) {
 	}
 }
 
+func TestRecovererKeepsCursorOnRequeue(t *testing.T) {
+	// A drained run left a resume cursor: requeue must move the manifest back to
+	// to_run but KEEP the sidecar, so the re-run resumes at the cursor.
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00", ResumeFromOp: 3}
+	dirs, name := setupRecovery(t, st)
+
+	probe := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}} // no live session → Restart
+	r := NewRecoverer(dirs, probe, io.Discard)
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if sum.Requeued != 1 {
+		t.Errorf("Requeued = %d, want 1", sum.Requeued)
+	}
+	if _, err := os.Stat(filepath.Join(dirs.ToRun, name)); err != nil {
+		t.Errorf("manifest not requeued to to_run: %v", err)
+	}
+	got, err := ReadState(filepath.Join(dirs.Processing, name+stateSuffix))
+	if err != nil {
+		t.Fatalf("sidecar with cursor should be kept after requeue: %v", err)
+	}
+	if got.ResumeFromOp != 3 {
+		t.Errorf("kept sidecar ResumeFromOp = %d, want 3", got.ResumeFromOp)
+	}
+}
+
 func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
 	// An orphan from DB2 must be reconciled against the DB2 probe, not the
 	// connected one. The connected probe would Adopt (alive); the DB2 probe sees

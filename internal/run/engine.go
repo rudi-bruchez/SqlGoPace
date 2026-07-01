@@ -334,7 +334,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	}
 	e.setCurrentManifest(procPath)
 	defer e.setCurrentManifest("")
-	e.writeSidecar(ctx, name)
+	// The cursor is non-zero when a previous drained/interrupted run of this manifest
+	// left one: those operations are already done and are skipped below.
+	resumeFrom := e.writeSidecar(ctx, name)
 
 	manifest, err := ddl.LoadManifestFile(procPath)
 	if err != nil {
@@ -392,23 +394,17 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// derived from it is emitted at each terminal outcome below.
 		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
 
+		// Resume cursor: operations before it were completed in a previous drained or
+		// interrupted run of this manifest, so skip them (near-zero cost).
+		if i < resumeFrom {
+			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, "already done in a previous run"))
+			continue
+		}
 		// skip_if_satisfied: a rebuild whose target compression already holds is a
-		// no-op; record it as skipped (near-zero cost) and move on. Emitting only the
-		// finished event keeps a re-run's log to one line per skipped operation.
+		// no-op; record it as skipped and move on. Emitting only the finished event
+		// keeps a re-run's log to one line per skipped operation.
 		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip {
-			opRep := report.OperationReport{
-				Index:       i + 1,
-				CommandType: step.Operation.CommandType(),
-				Target:      opTarget(step.Operation),
-				SQL:         step.SQL,
-				Options:     optionDecisions(step.Decisions),
-				Outcome:     "skipped",
-				Detail:      reason,
-				DurationMS:  e.msSince(opStart),
-			}
-			stepEv.Detail = reason
-			e.emitStep(stepEv.finished("skipped", opDuration(opRep)))
-			rep.Operations = append(rep.Operations, opRep)
+			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
 			continue
 		}
 		e.emitStep(stepEv)
@@ -675,6 +671,26 @@ func recoveryDescription(m *ddl.Manifest, name string) string {
 	return "Recovery for " + name
 }
 
+// recordSkipped builds the report entry for an operation skipped without running
+// (resume cursor or skip_if_satisfied) and emits its finished step event, so stdout,
+// the TUI, and the .log all show it as skipped with the reason. It never emits a
+// started event — a skip is instantaneous.
+func (e *Engine) recordSkipped(stepEv StepEvent, step ddl.PlannedOperation, opStart time.Time, reason string) report.OperationReport {
+	opRep := report.OperationReport{
+		Index:       stepEv.Index,
+		CommandType: step.Operation.CommandType(),
+		Target:      opTarget(step.Operation),
+		SQL:         step.SQL,
+		Options:     optionDecisions(step.Decisions),
+		Outcome:     "skipped",
+		Detail:      reason,
+		DurationMS:  e.msSince(opStart),
+	}
+	stepEv.Detail = reason
+	e.emitStep(stepEv.finished("skipped", opDuration(opRep)))
+	return opRep
+}
+
 // draining reports whether a graceful stop has been requested. The drain channel is
 // closed (not sent to) on request, so once closed every check reads ready — the signal
 // is latched. A nil channel (no drain wired) is never ready, so this is false.
@@ -695,6 +711,7 @@ func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.R
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"
 	rep.Error = fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total)
+	e.saveResumeCursor(name, done) // the next run skips the operations already completed
 	e.notify(ctx, "interrupted", name, rep.Error)
 	e.record(ctx, *rep)
 	fmt.Fprintf(e.out, "-- drained after operation %d/%d on %s — left in processing, resumes next run\n", done, total, name)
@@ -812,13 +829,19 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 	}
 }
 
-// writeSidecar records the run state next to the manifest so a crash can be
-// recovered. It also stamps a random CONTEXT_INFO marker on the execution session
-// so an orphaned session can be correlated to its run beyond the reusable SPID. It
-// is a best-effort no-op when no session is configured.
-func (e *Engine) writeSidecar(ctx context.Context, name string) {
+// writeSidecar records fresh run state next to the manifest so a crash can be
+// recovered. It also stamps a random CONTEXT_INFO marker on the execution session so
+// an orphaned session can be correlated to its run beyond the reusable SPID. Any
+// resume cursor left by a previous drained/interrupted run of this manifest is
+// preserved and returned (the number of operations already completed, to skip on this
+// run). With no session it does not write, but still reads and returns the cursor.
+func (e *Engine) writeSidecar(ctx context.Context, name string) int {
+	resumeFrom := 0
+	if st, err := ReadState(e.sidecarPath(name)); err == nil {
+		resumeFrom = st.ResumeFromOp // preserve a previous run's resume cursor
+	}
 	if e.session == nil {
-		return
+		return resumeFrom
 	}
 	login, err := e.session.LoginTime(ctx)
 	if err != nil {
@@ -828,15 +851,30 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) {
 	marker := e.stampMarker(ctx, name)
 
 	state := State{
-		Manifest:  name,
-		Database:  e.database,
-		SPID:      e.session.SPID(),
-		LoginTime: login,
-		Marker:    marker,
-		StartedAt: e.now(),
+		Manifest:     name,
+		Database:     e.database,
+		SPID:         e.session.SPID(),
+		LoginTime:    login,
+		Marker:       marker,
+		StartedAt:    e.now(),
+		ResumeFromOp: resumeFrom,
 	}
 	if err := WriteState(e.sidecarPath(name), state); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
+	}
+	return resumeFrom
+}
+
+// saveResumeCursor updates the sidecar's resume cursor in place (best-effort: a no-op
+// when there is no sidecar to update).
+func (e *Engine) saveResumeCursor(name string, resumeFrom int) {
+	st, err := ReadState(e.sidecarPath(name))
+	if err != nil {
+		return
+	}
+	st.ResumeFromOp = resumeFrom
+	if err := WriteState(e.sidecarPath(name), st); err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: cursor: %v\n", name, err)
 	}
 }
 

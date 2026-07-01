@@ -6,13 +6,16 @@
 > `Interrupted`), et n'entame plus les manifestes restants. Déclencheurs : **Ctrl+C 1× = drain / 2× =
 > hard stop** (handler `os/signal` dans `cmd/sqlgopace/main.go`, `sync.Once` pour fermer le canal une
 > fois, 2ᵉ signal → `cancelRun()`), et l'action TUI **`d`** (`ActionDrain` → statut `DRAINING`).
-> Reprise : le sidecar `State` (écrit au démarrage du manifeste) est conservé → la recovery re-enfile
-> (Restart) au run suivant, et le **skip métadonnée** (`crash-resumable.md` §9) rend les ops déjà
-> faites bon marché à re-jouer (couvre pleinement le cas compression). **Non implémenté (§3.3, §6)** :
-> le **curseur d'opération** dans `State` (`ResumeFromOp`) pour reprendre exactement à l'op suivante
-> sur les manifestes *non* compression (aujourd'hui re-jeu depuis le début, ops faites sautées par le
-> skip seulement) ; le drain **par chunk** pendant un shrink (§3.2) ; annuler un drain (§6). Créé le
-> 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
+> Reprise : le **curseur d'opération** `State.ResumeFromOp` (§3.3.1) est écrit par `finalizeDrained`
+> (= nb d'ops faites) ; la recovery **conserve** le sidecar au requeue quand le curseur > 0
+> (`requeue(..., keepCursor)` + `queue.InToRun` pour tolérer un manifeste déjà re-enfilé) ; au re-run
+> `writeSidecar` **préserve** le curseur et le retourne, et la boucle **saute** les ops `i < curseur`
+> (outcome `skipped`, raison « already done in a previous run ») — via le helper partagé
+> `recordSkipped` (mutualisé avec `skip_if_satisfied`). Le **skip métadonnée** (`crash-resumable.md`
+> §9) reste complémentaire (rend le préfixe compression bon marché même sans curseur). **Non
+> implémenté (§3.2, §6)** : l'écriture **progressive** du curseur par op (pour un *crash* — v1 est
+> drain-only ; cf. `crash-resumable.md` §6) ; le drain **par chunk** pendant un shrink ; annuler un
+> drain. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
 
 ## 1. Objectif
 

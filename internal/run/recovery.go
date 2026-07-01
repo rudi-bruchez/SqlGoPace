@@ -177,7 +177,7 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 			sum.Adopted++
 		case Resume, Restart:
 			fmt.Fprintf(r.out, "recovery: %s — %s (re-enqueued for idempotent re-run)\n", manifest, action)
-			if err := r.requeue(manifest, statePath); err != nil {
+			if err := r.requeue(manifest, statePath, st.ResumeFromOp > 0); err != nil {
 				return RecoverySummary{}, err
 			}
 			sum.Requeued++
@@ -227,9 +227,20 @@ func factsWith(ctx context.Context, probe RecoveryProbe, st State) (RecoveryFact
 	return RecoveryFacts{OrphanAlive: matchesOrphan(id, st), ResumableExists: paused}, nil
 }
 
-func (r *Recoverer) requeue(manifest, statePath string) error {
+// requeue moves a manifest back to to_run for a fresh run. keepCursor preserves the
+// State sidecar so a drained/interrupted run's resume cursor survives into the re-run;
+// otherwise the sidecar is removed (a clean restart from the first operation).
+func (r *Recoverer) requeue(manifest, statePath string, keepCursor bool) error {
 	if err := r.queue.Requeue(manifest); err != nil {
-		return err
+		// A prior requeue that kept the cursor may already have moved the manifest (a
+		// crash between that requeue and the re-run's claim). If it is already in
+		// to_run, the engine will pick it up — not an error.
+		if !r.queue.InToRun(manifest) {
+			return err
+		}
+	}
+	if keepCursor {
+		return nil
 	}
 	return RemoveState(statePath)
 }

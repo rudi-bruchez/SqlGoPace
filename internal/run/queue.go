@@ -91,6 +91,12 @@ func (q *Queue) Requeue(name string) error {
 	return err
 }
 
+// InToRun reports whether a manifest is currently waiting in to_run.
+func (q *Queue) InToRun(name string) bool {
+	_, err := os.Stat(filepath.Join(q.dirs.ToRun, name))
+	return err == nil
+}
+
 func (q *Queue) move(name, from, to string) (string, error) {
 	dst := filepath.Join(to, name)
 	if err := os.Rename(filepath.Join(from, name), dst); err != nil {
