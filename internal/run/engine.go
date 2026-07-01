@@ -800,12 +800,8 @@ func (e *Engine) draining() bool { return stopRequested(e.drain) }
 // cursor is already durable — advanceCursor persisted it after each completed operation —
 // so this only finalizes the report; it does not re-write the cursor.
 func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
-	rep.FinishedAt = e.now()
-	rep.DurationMS = e.msSince(start)
-	rep.Outcome = "INTERRUPTED"
 	rep.Error = fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total)
-	e.notify(ctx, "interrupted", name, rep.Error)
-	e.record(ctx, *rep)
+	e.recordInterrupted(ctx, name, rep, start)
 	fmt.Fprintf(e.out, "-- drained after operation %d/%d on %s — left in processing, resumes next run\n", done, total, name)
 	return outcomeInterrupted
 }
@@ -814,15 +810,20 @@ func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.R
 // sidecar are LEFT in processing so the next run's crash recovery resumes the
 // paused operation. No move and no sidecar removal happen here.
 func (e *Engine) finalizeInterrupted(ctx context.Context, name string, rep *report.RunReport, start time.Time) runOutcome {
+	e.recordInterrupted(ctx, name, rep, start)
+	fmt.Fprintf(e.out, "interrupted: %s — paused, left in processing for recovery\n", name)
+	return outcomeInterrupted
+}
+
+// recordInterrupted writes the shared bookkeeping for an interruption (report timestamps,
+// INTERRUPTED outcome, notify, and history) without moving the manifest — it is left in
+// processing. The caller sets rep.Error and prints its own log line.
+func (e *Engine) recordInterrupted(ctx context.Context, name string, rep *report.RunReport, start time.Time) {
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"
-
 	e.notify(ctx, "interrupted", name, rep.Error)
 	e.record(ctx, *rep)
-
-	fmt.Fprintf(e.out, "interrupted: %s — paused, left in processing for recovery\n", name)
-	return outcomeInterrupted
 }
 
 // reconnectProbeInterval is how often the resumable check is retried while the

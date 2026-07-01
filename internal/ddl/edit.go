@@ -2,9 +2,9 @@ package ddl
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
 	"regexp"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/fsutil"
 )
 
 // IgnoredSessionFor builds a single-criterion ignore rule, used by the TUI when the
@@ -60,7 +60,10 @@ func AppendIgnoredSession(path string, s IgnoredSession) error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(path, data)
+	if err := fsutil.AtomicWrite(path, data); err != nil {
+		return fmt.Errorf("write manifest %q: %w", path, err)
+	}
+	return nil
 }
 
 // sameIgnoredSession reports whether two rules are field-for-field equal (the *int
@@ -74,29 +77,4 @@ func sameIgnoredSession(a, b IgnoredSession) bool {
 	}
 	return a.AppName == b.AppName && a.HostName == b.HostName &&
 		a.LoginName == b.LoginName && a.Statement == b.Statement
-}
-
-// atomicWriteFile writes data to a temp file in the same directory and renames it over
-// path, so readers see either the old or the new complete file. os.Rename replaces the
-// destination on both POSIX and Windows.
-func atomicWriteFile(path string, data []byte) error {
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".sqlgopace-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp manifest: %w", err)
-	}
-	name := tmp.Name()
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		os.Remove(name)
-		return fmt.Errorf("write temp manifest: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(name)
-		return fmt.Errorf("close temp manifest: %w", err)
-	}
-	if err := os.Rename(name, path); err != nil {
-		os.Remove(name)
-		return fmt.Errorf("replace manifest: %w", err)
-	}
-	return nil
 }

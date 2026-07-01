@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/fsutil"
 )
 
 // watermarkFile is a file-backed WatermarkStore: it persists a key_range walk
@@ -41,7 +43,7 @@ func (w watermarkFile) Load(context.Context) (int64, bool, error) {
 // Save atomically writes the watermark (temp file + rename), so a crash mid-write
 // never leaves a torn value.
 func (w watermarkFile) Save(_ context.Context, watermark int64) error {
-	return atomicWriteFile(w.path, []byte(strconv.FormatInt(watermark, 10)))
+	return fsutil.AtomicWrite(w.path, []byte(strconv.FormatInt(watermark, 10)))
 }
 
 // clear removes the watermark file once a walk has returned (the manifest is being
