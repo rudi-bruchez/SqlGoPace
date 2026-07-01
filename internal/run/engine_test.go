@@ -64,10 +64,23 @@ func (f fakeSession) SetMarker(context.Context, [16]byte) error { return nil }
 type fakeResumeCheck struct {
 	paused bool
 	err    error // non-nil simulates an unreachable server (e.g. restarting)
+	// becomesPaused models a rebuild that is NOT paused when the operation starts (so it
+	// does not block a fresh rebuild) but IS paused after the session is killed (so the
+	// interruption is recoverable): the first PausedResumable call returns false, later
+	// calls return true.
+	becomesPaused bool
+	calls         int
 }
 
-func (f fakeResumeCheck) PausedResumable(context.Context, string, string, string) (bool, error) {
-	return f.paused, f.err
+func (f *fakeResumeCheck) PausedResumable(context.Context, string, string, string) (bool, error) {
+	f.calls++
+	if f.err != nil {
+		return false, f.err
+	}
+	if f.becomesPaused {
+		return f.calls > 1, nil
+	}
+	return f.paused, nil
 }
 
 type fakeProgress struct {
@@ -336,7 +349,8 @@ func TestProcessAllInterruptedResumableLeftForRecovery(t *testing.T) {
 	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF} // simulates a killed/lost session
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{paused: true}))
+		// Not paused when the op starts (no pre-run block), paused after the kill.
+		run.WithResumeCheck(&fakeResumeCheck{becomesPaused: true}))
 
 	sum, err := eng.ProcessAll(context.Background())
 	if err != nil {
@@ -370,7 +384,7 @@ func TestProcessAllResumableServerUnreachableIsInterrupted(t *testing.T) {
 	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{err: io.ErrClosedPipe}),
+		run.WithResumeCheck(&fakeResumeCheck{err: io.ErrClosedPipe}),
 		run.WithReconnectTimeout(0))
 
 	sum, err := eng.ProcessAll(context.Background())
@@ -388,7 +402,7 @@ func TestProcessAllResumableErrorWithoutPauseFails(t *testing.T) {
 	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{paused: false}))
+		run.WithResumeCheck(&fakeResumeCheck{paused: false}))
 
 	sum, err := eng.ProcessAll(context.Background())
 	if err != nil {

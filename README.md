@@ -367,6 +367,23 @@ sqlgopace abort-resumable --config config.yaml --include-running
 
 By default only `PAUSED` operations are aborted. The exit code is non-zero if any abort fails.
 
+During a run, a paused resumable on an index a manifest wants to rebuild is handled automatically:
+if it is **this manifest's own** interrupted operation, the run **resumes** it (`ALTER INDEX … RESUME`,
+reusing the server-side progress) instead of restarting. A **stale or foreign** paused resumable that
+would block a fresh rebuild fails the operation with a message pointing here — unless the manifest opts
+in with `abort_blocking_resumable: true`, which lets the engine clear it with `ALTER INDEX … ABORT`
+before rebuilding. The flag is off by default because aborting discards the paused operation's
+server-side progress — a deliberate choice on a shared database.
+
+```yaml
+abort_blocking_resumable: true    # clear a blocking foreign paused resumable before a fresh rebuild
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: Orders
+    index: IX_Orders
+```
+
 ### Maintenance: `plan`
 
 The `plan` subcommand turns SqlGoPace into a maintenance planner: it inspects the connected database

@@ -201,7 +201,13 @@ type Manifest struct {
 	// already has). Off by default, preserving the direct-run "do what I say" contract;
 	// a compression manifest re-run after an interruption sets it to skip finished work.
 	SkipIfSatisfied bool
-	Operations      []Operation
+	// AbortBlockingResumable lets the engine clear a stale/foreign paused resumable that
+	// blocks a fresh REBUILD of the target index (SQL Server Msg 10637), with ALTER INDEX
+	// … ABORT, before running the operation. Off by default (the run fails with an
+	// actionable message instead), because aborting discards the paused operation's
+	// server-side progress — a deliberate choice on a shared/production database.
+	AbortBlockingResumable bool
+	Operations             []Operation
 }
 
 // Continue reports whether the manifest should keep going past a failed operation.
@@ -235,12 +241,13 @@ func (m *Manifest) Validate() error {
 // type based on the "operation" discriminator field.
 func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	var raw struct {
-		Description           string           `yaml:"description"`
-		Database              string           `yaml:"database"`
-		OnFailure             string           `yaml:"on_failure"`
-		IgnoreBlockedSessions []IgnoredSession `yaml:"ignore_blocked_sessions"`
-		SkipIfSatisfied       bool             `yaml:"skip_if_satisfied"`
-		Operations            []yaml.Node      `yaml:"operations"`
+		Description            string           `yaml:"description"`
+		Database               string           `yaml:"database"`
+		OnFailure              string           `yaml:"on_failure"`
+		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
+		SkipIfSatisfied        bool             `yaml:"skip_if_satisfied"`
+		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
+		Operations             []yaml.Node      `yaml:"operations"`
 	}
 	if err := value.Decode(&raw); err != nil {
 		return err
@@ -251,6 +258,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
 	m.SkipIfSatisfied = raw.SkipIfSatisfied
+	m.AbortBlockingResumable = raw.AbortBlockingResumable
 	m.Operations = make([]Operation, 0, len(raw.Operations))
 	for i := range raw.Operations {
 		op, err := decodeOperation(&raw.Operations[i])

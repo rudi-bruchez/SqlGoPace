@@ -65,6 +65,16 @@ type ResumableProbe interface {
 
 var _ ResumableProbe = (*mssql.Conn)(nil)
 
+// ResumableAborter runs an ALTER INDEX … ABORT to clear a paused resumable operation,
+// discarding its server-side progress. The engine uses it, when a manifest opts in with
+// abort_blocking_resumable, to remove a stale/foreign paused resumable that would block a
+// fresh REBUILD (SQL Server Msg 10637). *mssql.Conn satisfies it via ExecDDL.
+type ResumableAborter interface {
+	ExecDDL(ctx context.Context, sql string) error
+}
+
+var _ ResumableAborter = (*mssql.Conn)(nil)
+
 // IndexExpander lists a table's concrete indexes so an "ALTER INDEX ALL" rebuild
 // can be expanded into one rebuild per index (clustered first), letting each carry
 // RESUMABLE. *mssql.Conn satisfies it.
@@ -138,6 +148,7 @@ type Engine struct {
 	waits            WaitReader
 	blockers         BlockerReader
 	resumeCheck      ResumableProbe
+	aborter          ResumableAborter // clears a blocking paused resumable (opt-in)
 	reconnectTimeout time.Duration
 	database         string            // when set, process only manifests for this database
 	liveReload       bool              // re-read ignore_blocked_sessions from the manifest mid-run
@@ -239,6 +250,11 @@ func WithHoldPoll(d time.Duration) EngineOption { return func(e *Engine) { e.hol
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
 func WithResumeCheck(p ResumableProbe) EngineOption { return func(e *Engine) { e.resumeCheck = p } }
+
+// WithResumableAborter lets the engine clear a stale/foreign paused resumable that blocks
+// a fresh REBUILD, when the manifest sets abort_blocking_resumable. Without it (or without
+// the flag) such a conflict fails the operation with an actionable message instead.
+func WithResumableAborter(a ResumableAborter) EngineOption { return func(e *Engine) { e.aborter = a } }
 
 // WithReconnectTimeout sets how long the resumable check retries while the server
 // is unreachable (e.g. restarting), before deciding from the available evidence.
@@ -459,18 +475,25 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		holdDone := make(chan struct{})
 		go func() { defer close(holdDone); e.narrateHeld(holdCtx, ignore, sink) }()
 
-		// Crash-resume: when this run continues an interrupted one and the boundary
-		// operation left a paused resumable on the server, adopt it with ALTER INDEX …
-		// RESUME instead of a fresh REBUILD (which SQL Server rejects while a resumable
-		// is paused), reusing the server-side progress. Only the boundary operation of a
-		// resumed manifest is eligible, so a foreign paused resumable on a fresh run or a
-		// not-yet-started operation is never adopted with the wrong options.
+		// Resumable conflict handling before running the operation:
+		//   - the boundary op of a resumed manifest whose index is still paused continues
+		//     with ALTER INDEX … RESUME (reusing the server-side progress) instead of a
+		//     fresh REBUILD, which SQL Server rejects while a resumable is paused;
+		//   - otherwise a stale/foreign paused resumable on the target index would block a
+		//     fresh REBUILD (Msg 10637): clear it with ABORT when the manifest opts in, else
+		//     fail the operation early with an actionable message.
+		// Only the boundary op of a resumed manifest may RESUME, so a foreign paused
+		// resumable is never adopted with the wrong options.
 		stmt := step.SQL
-		if resumed && i == resumeFrom && caps.Resumable {
+		var prepErr error
+		switch {
+		case resumed && i == resumeFrom && caps.Resumable:
 			if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
 				stmt = resume
 				sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
 			}
+		case e.blockingResumable(ctx, step.Operation):
+			prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, manifest.AbortBlockingResumable)
 		}
 
 		var (
@@ -478,32 +501,36 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			shrinkResults []ShrinkResult
 			batchResult   *BatchDMLResult
 		)
-		switch op := step.Operation.(type) {
-		case ddl.Shrink:
-			if e.shrink != nil {
-				// Shrink is multi-statement and built at run time; route to the driver,
-				// passing the resolved options (only WALP is meaningful for a shrink).
-				shrinkResults, runErr = e.shrink.Run(ctx, op, step.Options, ignore, sink)
-			} else {
-				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
-			}
-		case ddl.BatchDML:
-			if e.batchDML != nil {
-				// Batched DML is a per-batch loop built at run time; route to its driver.
-				// The watermark sidecar lets a key_range walk resume after a crash; it is
-				// removed once the walk returns (a crash skips that, preserving resume).
-				store := e.watermarkStore(name, i)
-				var br BatchDMLResult
-				br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
-				batchResult = &br
-				if op.Batch.IsKeyRange() {
-					store.clear()
+		if prepErr != nil {
+			runErr = prepErr
+		} else {
+			switch op := step.Operation.(type) {
+			case ddl.Shrink:
+				if e.shrink != nil {
+					// Shrink is multi-statement and built at run time; route to the driver,
+					// passing the resolved options (only WALP is meaningful for a shrink).
+					shrinkResults, runErr = e.shrink.Run(ctx, op, step.Options, ignore, sink)
+				} else {
+					runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 				}
-			} else {
-				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			case ddl.BatchDML:
+				if e.batchDML != nil {
+					// Batched DML is a per-batch loop built at run time; route to its driver.
+					// The watermark sidecar lets a key_range walk resume after a crash; it is
+					// removed once the walk returns (a crash skips that, preserving resume).
+					store := e.watermarkStore(name, i)
+					var br BatchDMLResult
+					br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
+					batchResult = &br
+					if op.Batch.IsKeyRange() {
+						store.clear()
+					}
+				} else {
+					runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+				}
+			default:
+				runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
 			}
-		default:
-			runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
 		}
 		// Stop the narrator and wait for it to fully exit before reading `reactions`
 		// below, so a late sink() append cannot race with the read.
@@ -530,8 +557,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			// An unexpected error on a resumable operation that left a PAUSED
 			// resumable rebuild behind (session killed / connection lost / server
 			// restart) is recoverable, not a failure: keep the manifest and sidecar
-			// in processing so the next run resumes it.
-			if caps.Resumable && e.resumableInterruption(ctx, step.Operation) {
+			// in processing so the next run resumes it. A pre-run rejection (prepErr, a
+			// blocking resumable the manifest did not opt in to clear) is a deterministic
+			// failure, not a session-loss interruption, so it is excluded here.
+			if prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation) {
 				opRep.Outcome = "interrupted"
 				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 				rep.Operations = append(rep.Operations, opRep)
@@ -822,6 +851,45 @@ func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation) (string,
 		return "", false
 	}
 	return stmt, true
+}
+
+// blockingResumable reports whether op's index currently holds a paused resumable that
+// would block a fresh REBUILD (SQL Server Msg 10637). It is false for a non-index
+// operation, when no probe is wired, or when nothing is paused.
+func (e *Engine) blockingResumable(ctx context.Context, op ddl.Operation) bool {
+	if e.resumeCheck == nil {
+		return false
+	}
+	if _, err := ddl.ResumableControlSQL(op, "ABORT"); err != nil {
+		return false // not an index operation
+	}
+	ref := op.Target()
+	paused, err := e.resumeCheck.PausedResumable(ctx, ref.Schema, ref.Table, ref.Name)
+	return err == nil && paused
+}
+
+// clearOrRejectBlockingResumable handles a paused resumable that blocks op's fresh
+// REBUILD. With the manifest opt-in it ABORTs the stale operation — discarding its
+// server-side progress so the rebuild proceeds with this manifest's own options — and
+// returns nil. Without the opt-in (or with no aborter wired) it returns an actionable
+// error so the operator resolves the conflict deliberately, since aborting is destructive
+// on a shared/production database.
+func (e *Engine) clearOrRejectBlockingResumable(ctx context.Context, op ddl.Operation, optIn bool) error {
+	if !optIn {
+		return fmt.Errorf("a paused resumable operation blocks this rebuild; resolve it with `sqlgopace abort-resumable` or set abort_blocking_resumable: true in the manifest")
+	}
+	if e.aborter == nil {
+		return fmt.Errorf("abort_blocking_resumable is set but no aborter is wired")
+	}
+	stmt, err := ddl.ResumableControlSQL(op, "ABORT")
+	if err != nil {
+		return err
+	}
+	if err := e.aborter.ExecDDL(ctx, stmt); err != nil {
+		return fmt.Errorf("abort blocking resumable: %w", err)
+	}
+	fmt.Fprintf(e.out, "-- aborted a stale paused resumable on %s before rebuild\n", opTarget(op))
+	return nil
 }
 
 // setCurrentManifest notifies the manifest observer (if any) of the in-flight

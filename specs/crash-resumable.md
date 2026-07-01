@@ -27,8 +27,17 @@
 > différentes). La recovery **conserve le sidecar** au requeue quand `action == Resume` (resumable en
 > pause) ou curseur > 0, pour que le re-run se reconnaisse comme repris. Dégradation propre (S2 :
 > Standard/heap, pas de resumable) : l'op redémarre, mais le curseur évite de refaire les précédentes.
-> **Non encore implémenté** : l'orchestration automatique `abort-resumable` (§3.6, purge d'un resumable
-> en pause *étranger* incompatible — reste manuel via la sous-commande).
+> **L'orchestration `abort-resumable` (§3.6) est IMPLÉMENTÉE, en opt-in** : un resumable en pause
+> *étranger/périmé* qui bloquerait un REBUILD à neuf (Msg 10637) est, quand le manifeste porte
+> `abort_blocking_resumable: true`, purgé par `ALTER INDEX … ABORT` (`clearOrRejectBlockingResumable`
+> → `ResumableAborter.ExecDDL`) avant le rebuild ; **sans** le flag, l'op échoue tôt avec un message
+> actionnable (« run `sqlgopace abort-resumable` or set abort_blocking_resumable: true »). Opt-in par
+> défaut car ABORT **détruit la progression serveur** — choix délibéré sur une base partagée/prod. La
+> détection est précise à l'index (`blockingResumable` = `PausedResumable` sur la cible), au moment de
+> l'exécution (symétrique du RESUME), pas un balayage dans le `Recoverer` (qui n'a pas l'index en vol et
+> détruirait un resumable qu'un manifeste en file reprendrait). Le rejet pré-run est un **échec** franc
+> (exclu de la reclassification « interrupted », sinon boucle infinie). Rien de bloquant ne reste ouvert
+> sur cette spec.
 >
 > Créé le 2026-06-17, à la suite d'un essai de compression de masse (manifeste
 > `01.to_run/030_compress_exampledb_indexes.yaml`, 74 index EXAMPLEDB).

@@ -392,6 +392,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithBlockerReader(conn),
 		run.WithLiveReload(),
 		run.WithResumeCheck(conn),
+		run.WithResumableAborter(conn),
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithDatabase(info.Database),
 		run.WithShrinkRunner(shrinkRunner),

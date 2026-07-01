@@ -134,6 +134,29 @@ func TestParseSkipIfSatisfied(t *testing.T) {
 	}
 }
 
+func TestParseAbortBlockingResumable(t *testing.T) {
+	op := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	for _, tt := range []struct {
+		name string
+		yaml string
+		want bool
+	}{
+		{name: "absent defaults false", yaml: "", want: false},
+		{name: "explicit true", yaml: "abort_blocking_resumable: true\n", want: true},
+		{name: "explicit false", yaml: "abort_blocking_resumable: false\n", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := ddl.ParseManifest(strings.NewReader(tt.yaml + op))
+			if err != nil {
+				t.Fatalf("ParseManifest() error = %v", err)
+			}
+			if m.AbortBlockingResumable != tt.want {
+				t.Errorf("AbortBlockingResumable = %v, want %v", m.AbortBlockingResumable, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseIgnoreBlockedSessions(t *testing.T) {
 	y := `
 ignore_blocked_sessions:

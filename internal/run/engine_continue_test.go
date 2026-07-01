@@ -234,7 +234,8 @@ func TestContinueModeResumableInterruptionWins(t *testing.T) {
 	runner := &seqOpRunner{errs: []error{io.ErrUnexpectedEOF}}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{paused: true}))
+		// Not paused when the op starts (no pre-run block), paused after the kill.
+		run.WithResumeCheck(&fakeResumeCheck{becomesPaused: true}))
 	writeOnly(t, dirs, "100_c.yaml", continueManifest)
 
 	sum, err := eng.ProcessAll(context.Background())

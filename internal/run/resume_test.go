@@ -121,11 +121,39 @@ func (r *sqlCapturingRunner) Run(_ context.Context, _ ddl.Operation, sql string,
 	return nil
 }
 
+// fakeAborter records the ALTER INDEX … ABORT statements the engine issues to clear a
+// blocking paused resumable.
+type fakeAborter struct{ sqls []string }
+
+func (f *fakeAborter) ExecDDL(_ context.Context, sql string) error {
+	f.sqls = append(f.sqls, sql)
+	return nil
+}
+
+func readFailLog(t *testing.T, dirs run.Dirs, manifest string) string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dirs.Failed, manifest+".log"))
+	if err != nil {
+		t.Fatalf("read fail log: %v", err)
+	}
+	return string(data)
+}
+
+const abortOptInManifest = `
+description: abort opt-in
+abort_blocking_resumable: true
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+
 func TestResumeAdoptsPausedResumableAtBoundary(t *testing.T) {
 	runner := &sqlCapturingRunner{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{paused: true}))
+		run.WithResumeCheck(&fakeResumeCheck{paused: true}))
 	// A prior run of this manifest was interrupted mid-rebuild, leaving a sidecar; the
 	// server still holds the paused resumable. setupEngine seeded a single rebuild_index.
 	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml"})
@@ -141,22 +169,57 @@ func TestResumeAdoptsPausedResumableAtBoundary(t *testing.T) {
 	}
 }
 
-func TestFreshRunDoesNotAdoptForeignPausedResumable(t *testing.T) {
+func TestBlockingResumableWithoutOptInFails(t *testing.T) {
 	runner := &sqlCapturingRunner{}
-	eng, _ := setupEngine(t, fakePreflighter{}, runner,
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(fakeResumeCheck{paused: true}))
-	// No sidecar: a genuinely fresh manifest. Even though the server reports a paused
-	// resumable on the index, a fresh run must issue its own REBUILD — never RESUME a
-	// foreign paused operation, which could carry different options.
-	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		run.WithResumeCheck(&fakeResumeCheck{paused: true}),
+		run.WithResumableAborter(&fakeAborter{}))
+	// Fresh manifest (no sidecar): a paused resumable on the index is foreign. Without the
+	// abort_blocking_resumable opt-in the run must NOT adopt it (never RESUME) — it fails
+	// early with an actionable message and never runs the rebuild.
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
 		t.Fatalf("ProcessAll() error = %v", err)
 	}
-	if len(runner.sqls) != 1 {
-		t.Fatalf("runner ran %d statements, want 1", len(runner.sqls))
+	if sum.Failed != 1 {
+		t.Errorf("Summary = %+v, want Failed:1", sum)
 	}
-	if strings.Contains(runner.sqls[0], "RESUME") {
-		t.Errorf("fresh run must not RESUME a foreign paused resumable, got: %q", runner.sqls[0])
+	if len(runner.sqls) != 0 {
+		t.Errorf("op must not run (least of all RESUME); ran: %v", runner.sqls)
+	}
+	if log := readFailLog(t, dirs, "010_a.yaml"); !strings.Contains(log, "abort-resumable") {
+		t.Errorf("failure should point at abort-resumable, got:\n%s", log)
+	}
+}
+
+func TestBlockingResumableOptInAborts(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	aborter := &fakeAborter{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true}),
+		run.WithResumableAborter(aborter))
+	// Fresh manifest that opts in: the blocking paused resumable is ABORTed, then the
+	// rebuild runs with this manifest's own options.
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(abortOptInManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Done != 1 {
+		t.Errorf("Summary = %+v, want Done:1", sum)
+	}
+	if len(aborter.sqls) != 1 || !strings.Contains(aborter.sqls[0], "ABORT") {
+		t.Errorf("expected exactly one ALTER INDEX … ABORT, got: %v", aborter.sqls)
+	}
+	// The run statement is the fresh REBUILD (it carries RESUMABLE as an option, so match
+	// on REBUILD rather than the absence of "RESUME"), not a bare ABORT/RESUME control.
+	if len(runner.sqls) != 1 || !strings.Contains(runner.sqls[0], "REBUILD") {
+		t.Errorf("expected the fresh REBUILD after the abort, got: %v", runner.sqls)
 	}
 }
 
