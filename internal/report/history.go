@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
 
 	// Register the pure-Go "sqlite" driver.
 	_ "modernc.org/sqlite"
@@ -65,13 +64,14 @@ var schemaStatements = []string{
 );`,
 }
 
-// columnMigrations add columns that postdate a table's original definition.
-// CREATE TABLE IF NOT EXISTS never alters an existing table, so a new column must be
-// added with ALTER TABLE. Each is idempotent: a duplicate-column error on a database
-// that already has the column is expected and ignored.
-var columnMigrations = []string{
-	`ALTER TABLE runs ADD COLUMN peak_blocked INTEGER;`,
-	`ALTER TABLE runs ADD COLUMN skipped INTEGER;`,
+// columnMigrations add columns that postdate the runs table's original definition.
+// CREATE TABLE IF NOT EXISTS never alters an existing table, so a new column is added with
+// ALTER TABLE — but only when it is actually missing (checked via pragma_table_info), so
+// re-opening an already-migrated database issues no failing ALTER and needs no reliance on
+// matching the driver's error text.
+var columnMigrations = []struct{ column, ddl string }{
+	{"peak_blocked", `ALTER TABLE runs ADD COLUMN peak_blocked INTEGER;`},
+	{"skipped", `ALTER TABLE runs ADD COLUMN skipped INTEGER;`},
 }
 
 // OpenHistory opens (creating if needed) the SQLite history database at path.
@@ -86,13 +86,31 @@ func OpenHistory(path string) (*History, error) {
 			return nil, fmt.Errorf("init history schema: %w", err)
 		}
 	}
-	for _, stmt := range columnMigrations {
-		if _, err := db.Exec(stmt); err != nil && !strings.Contains(err.Error(), "duplicate column") {
+	for _, m := range columnMigrations {
+		exists, err := runsColumnExists(db, m.column)
+		if err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("inspect history schema: %w", err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := db.Exec(m.ddl); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("migrate history schema: %w", err)
 		}
 	}
 	return &History{db: db}, nil
+}
+
+// runsColumnExists reports whether the runs table already has the named column, so a migration
+// ALTER is issued only when the column is missing (no reliance on matching driver error text).
+func runsColumnExists(db *sql.DB, column string) (bool, error) {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('runs') WHERE name = ?;`, column).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // Record inserts one run record.

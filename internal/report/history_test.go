@@ -84,6 +84,24 @@ func TestHistoryColumnMigration(t *testing.T) {
 	}
 }
 
+// TestHistoryReopenIsIdempotent guards #12: re-opening an already-migrated history DB must
+// not re-issue a failing ALTER (the migration now checks column existence rather than matching
+// the driver's "duplicate column" error text).
+func TestHistoryReopenIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.db")
+	h1, err := report.OpenHistory(path)
+	if err != nil {
+		t.Fatalf("first OpenHistory() error = %v", err)
+	}
+	_ = h1.Close()
+
+	h2, err := report.OpenHistory(path) // columns already present — must be a clean no-op
+	if err != nil {
+		t.Fatalf("re-open OpenHistory() error = %v", err)
+	}
+	t.Cleanup(func() { _ = h2.Close() })
+}
+
 func TestHistoryRecordMaintenance(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "history.db")
 	h, err := report.OpenHistory(path)
