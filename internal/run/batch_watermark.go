@@ -41,25 +41,7 @@ func (w watermarkFile) Load(context.Context) (int64, bool, error) {
 // Save atomically writes the watermark (temp file + rename), so a crash mid-write
 // never leaves a torn value.
 func (w watermarkFile) Save(_ context.Context, watermark int64) error {
-	f, err := os.CreateTemp(filepath.Dir(w.path), ".wm-*")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	if _, err := f.WriteString(strconv.FormatInt(watermark, 10)); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, w.path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return atomicWriteFile(w.path, []byte(strconv.FormatInt(watermark, 10)))
 }
 
 // clear removes the watermark file once a walk has returned (the manifest is being

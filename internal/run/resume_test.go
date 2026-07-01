@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
 
@@ -70,6 +71,44 @@ func TestDrainWritesResumeCursor(t *testing.T) {
 	st := readSidecarState(t, dirs, "010_a.yaml")
 	if st.ResumeFromOp != 1 {
 		t.Errorf("ResumeFromOp = %d, want 1", st.ResumeFromOp)
+	}
+}
+
+// cursorProbeRunner records the resume cursor persisted in the sidecar at the start of
+// the second operation, proving the cursor advances progressively after each completed
+// operation — not only when the run drains or finalizes (so a crash resumes correctly).
+type cursorProbeRunner struct {
+	dirs     run.Dirs
+	manifest string
+	calls    int
+	seen     int
+}
+
+func (r *cursorProbeRunner) Run(_ context.Context, _ ddl.Operation, _ string, _ run.Capabilities, _ run.ReactionSink) error {
+	r.calls++
+	if r.calls == 2 {
+		if st, err := run.ReadState(filepath.Join(r.dirs.Processing, r.manifest+".state.json")); err == nil {
+			r.seen = st.ResumeFromOp
+		}
+	}
+	return nil
+}
+
+func TestResumeCursorAdvancesProgressively(t *testing.T) {
+	runner := &cursorProbeRunner{manifest: "010_a.yaml"}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithSession(fakeSession{spid: 70}))
+	runner.dirs = dirs
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	// Operation 1 (index 0) completed before operation 2 started; its cursor must have
+	// been written to the sidecar by then, without any drain or finalize.
+	if runner.seen != 1 {
+		t.Errorf("cursor at start of op 2 = %d, want 1 (op 1 persisted progressively)", runner.seen)
 	}
 }
 

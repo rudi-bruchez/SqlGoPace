@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 )
 
 // State is the sidecar written next to a manifest while it executes. After a
@@ -23,14 +24,42 @@ type State struct {
 	ResumeFromOp int `json:"resume_from_op,omitempty"`
 }
 
-// WriteState writes the sidecar state as indented JSON.
+// WriteState writes the sidecar state as indented JSON. The write is atomic (temp
+// file + rename) because the engine rewrites it after every operation to advance the
+// resume cursor: a crash mid-write must never leave a torn sidecar that recovery
+// cannot parse.
 func WriteState(path string, s State) error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal run state: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := atomicWriteFile(path, data); err != nil {
 		return fmt.Errorf("write run state: %w", err)
+	}
+	return nil
+}
+
+// atomicWriteFile writes data to a temp file in path's directory and renames it over
+// path, so a reader — or a crash — sees either the old or the new complete file, never
+// a partial write. Used for the crash-recovery sidecars.
+func atomicWriteFile(path string, data []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".sqlgopace-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	return nil
 }

@@ -381,11 +381,15 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 
 	var failedOps []ddl.Operation
 	captured := &blockerCapture{}
+	// cursor is the crash-resume watermark: the number of leading operations durably
+	// done. It is advanced and persisted after each completed operation (below), so a
+	// crash — not just a drain — resumes at the next operation instead of replaying.
+	cursor := resumeFrom
 	for i, step := range planned {
 		// Graceful stop: the operation in flight has finished (we are at the top of the
 		// loop); stop before starting the next one and leave the manifest for recovery.
 		if e.draining() {
-			return e.finalizeDrained(ctx, name, rep, start, i, len(planned))
+			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned))
 		}
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes)}
@@ -405,6 +409,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// keeps a re-run's log to one line per skipped operation.
 		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip {
 			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
+			e.advanceCursor(name, &cursor, i)
 			continue
 		}
 		e.emitStep(stepEv)
@@ -532,6 +537,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		opRep.Outcome = "success"
 		e.emitStep(stepEv.finished("success", opDuration(opRep)))
 		rep.Operations = append(rep.Operations, opRep)
+		e.advanceCursor(name, &cursor, i)
 	}
 	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
 }
@@ -704,14 +710,14 @@ func (e *Engine) draining() bool {
 }
 
 // finalizeDrained records a graceful stop after `done` of `total` operations: the
-// manifest stays in processing (not done/failed) so the next run resumes it — helped
-// by skip_if_satisfied, which makes already-finished operations cheap to replay.
+// manifest stays in processing (not done/failed) so the next run resumes it. The resume
+// cursor is already durable — advanceCursor persisted it after each completed operation —
+// so this only finalizes the report; it does not re-write the cursor.
 func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"
 	rep.Error = fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total)
-	e.saveResumeCursor(name, done) // the next run skips the operations already completed
 	e.notify(ctx, "interrupted", name, rep.Error)
 	e.record(ctx, *rep)
 	fmt.Fprintf(e.out, "-- drained after operation %d/%d on %s — left in processing, resumes next run\n", done, total, name)
@@ -863,6 +869,20 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) int {
 		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
 	}
 	return resumeFrom
+}
+
+// advanceCursor records that operation i is durably done by moving the crash-resume
+// cursor to i+1 and persisting it, so a crash (not just a drain) resumes at the next
+// operation rather than replaying the manifest. It advances only when the cursor sits
+// exactly at i: once continue-on-failure quarantines an operation, the cursor freezes
+// at that gap, so a resumed run redoes the failed operation — and the idempotent ones
+// after it — instead of skipping past a failure that never produced its effect.
+func (e *Engine) advanceCursor(name string, cursor *int, i int) {
+	if *cursor != i {
+		return
+	}
+	*cursor = i + 1
+	e.saveResumeCursor(name, *cursor)
 }
 
 // saveResumeCursor updates the sidecar's resume cursor in place (best-effort: a no-op

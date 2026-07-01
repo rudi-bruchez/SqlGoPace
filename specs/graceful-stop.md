@@ -11,11 +11,13 @@
 > (`requeue(..., keepCursor)` + `queue.InToRun` pour tolérer un manifeste déjà re-enfilé) ; au re-run
 > `writeSidecar` **préserve** le curseur et le retourne, et la boucle **saute** les ops `i < curseur`
 > (outcome `skipped`, raison « already done in a previous run ») — via le helper partagé
-> `recordSkipped` (mutualisé avec `skip_if_satisfied`). Le **skip métadonnée** (`crash-resumable.md`
-> §9) reste complémentaire (rend le préfixe compression bon marché même sans curseur). **Non
-> implémenté (§3.2, §6)** : l'écriture **progressive** du curseur par op (pour un *crash* — v1 est
-> drain-only ; cf. `crash-resumable.md` §6) ; le drain **par chunk** pendant un shrink ; annuler un
-> drain. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
+> `recordSkipped` (mutualisé avec `skip_if_satisfied`). Le curseur est désormais **aussi écrit
+> progressivement par opération** (`advanceCursor`, `crash-resumable.md` §6), pas seulement au drain :
+> un *crash* renseigne donc le curseur comme un drain, et `WriteState` est rendu **atomique**
+> (temp+rename) puisque le sidecar est réécrit après chaque op. Le **skip métadonnée** (`crash-resumable.md`
+> §9) reste complémentaire (rend le préfixe compression bon marché). **Non implémenté (§3.2, §6)** : le
+> drain **par chunk** pendant un shrink ; annuler un drain. Créé le 2026-06-17, suite au besoin d'arrêter
+> un run **sans avorter l'opération en cours**.
 
 ## 1. Objectif
 

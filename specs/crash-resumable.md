@@ -8,14 +8,17 @@
 > comparaison pure `compressionSatisfied` (partition-aware) ; gardé côté moteur par
 > `WithCompressionReader`. Rend le re-jeu d'un manifeste de compression interrompu **bon marché**
 > (les ops déjà faites ne sont pas refaites) — cf. §9. **Le curseur d'opération `State.ResumeFromOp`
-> (§3.4/§6) existe désormais, mais drain-only** : écrit à l'arrêt propre (cf. `graceful-stop.md`),
-> conservé au requeue par la recovery, honoré au re-run (la boucle saute les ops `i < curseur`). Il
-> n'est **pas encore écrit progressivement par op**, donc un *crash* (≠ drain) ne le renseigne pas —
-> la reprise après crash s'appuie encore sur le skip métadonnée (§9) ou re-joue depuis le début.
-> L'**arrêt propre sur Ctrl+C (§3.1) est fait** (`graceful-stop.md` : 1× drain / 2× hard). **Non
-> encore implémenté** : l'écriture progressive du curseur (crash), le vrai `ALTER INDEX … RESUME`
-> (§4.2), l'orchestration `abort-resumable` (§3.6). Une itération de conception reste requise pour le
-> RESUME.
+> (§3.4/§6) est désormais écrit progressivement, donc crash-safe** : `advanceCursor` le fait avancer
+> à `i+1` **après chaque opération complétée** (succès ou skip) et le persiste (`WriteState` rendu
+> **atomique** temp+rename, pour qu'un crash en cours d'écriture ne laisse jamais un sidecar tronqué).
+> Il gèle sur un trou laissé par `on_failure: continue` (le curseur n'avance que si `*cursor == i`),
+> pour que le re-run rejoue l'op échouée et les idempotentes suivantes plutôt que de sauter un effet
+> jamais produit. La recovery le conserve au requeue (déjà en place), et le re-run saute les ops
+> `i < curseur`. Un *crash* (≠ drain) renseigne donc maintenant le curseur : la reprise repart de
+> l'op suivante, sans dépendre du skip métadonnée (§9), qui reste complémentaire (préfixe compression
+> bon marché). L'**arrêt propre sur Ctrl+C (§3.1) est fait** (`graceful-stop.md` : 1× drain / 2× hard).
+> **Non encore implémenté** : le vrai `ALTER INDEX … RESUME` (§4.2), l'orchestration `abort-resumable`
+> (§3.6). Une itération de conception reste requise pour le RESUME.
 >
 > Créé le 2026-06-17, à la suite d'un essai de compression de masse (manifeste
 > `01.to_run/030_compress_exampledb_indexes.yaml`, 74 index EXAMPLEDB).
