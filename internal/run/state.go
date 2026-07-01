@@ -22,6 +22,13 @@ type State struct {
 	// (the next op to run), left by a drained or interrupted run so the next run skips
 	// what is done. 0 (omitted) means start from the first operation.
 	ResumeFromOp int `json:"resume_from_op,omitempty"`
+	// PlanFingerprint identifies the plan the resume cursor was recorded against: a hash
+	// over the ordered (command, target) of every planned operation. A resumed run whose
+	// current plan hashes differently ignores the stale cursor and restarts from the first
+	// operation, so a shortened, reordered, or re-expanded manifest is never silently
+	// skipped (which would report SUCCESS having executed nothing). Empty on a legacy
+	// sidecar written before this field existed.
+	PlanFingerprint string `json:"plan_fingerprint,omitempty"`
 }
 
 // WriteState writes the sidecar state as indented JSON. The write is atomic (temp

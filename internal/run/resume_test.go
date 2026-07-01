@@ -223,6 +223,109 @@ func TestBlockingResumableOptInAborts(t *testing.T) {
 	}
 }
 
+func TestResumeCursorBeyondPlanRestartsClean(t *testing.T) {
+	// A stale sidecar carries a cursor past the current plan length (manifest replaced by a
+	// shorter one, or a leftover from a different manifest). The run must NOT skip every
+	// operation and report a false SUCCESS — it must restart from the first operation.
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml", ResumeFromOp: 5})
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if runner.calls != 2 {
+		t.Errorf("runner ran %d ops, want 2 (cursor past the plan is ignored, run restarts clean)", runner.calls)
+	}
+	if sum.Done != 1 {
+		t.Errorf("Summary = %+v, want Done:1 (both ops executed, not a false success)", sum)
+	}
+}
+
+func TestResumeFingerprintMismatchRestarts(t *testing.T) {
+	// The cursor was recorded against a different plan (fingerprint mismatch): the manifest
+	// changed since it was interrupted, so the leading op is redone rather than skipped.
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml", ResumeFromOp: 1, PlanFingerprint: "stale-does-not-match"})
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if runner.calls != 2 {
+		t.Errorf("runner ran %d ops, want 2 (fingerprint mismatch restarts from op 0)", runner.calls)
+	}
+}
+
+func TestFingerprintMismatchSweepsWatermarks(t *testing.T) {
+	// A stale key_range watermark from the prior (different) plan must be removed when the
+	// resume is invalidated, so a fresh walk does not resume from a wrong position.
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{Manifest: "010_a.yaml", ResumeFromOp: 1, PlanFingerprint: "stale"})
+	wm := filepath.Join(dirs.Processing, "010_a.yaml.op0.wm")
+	if err := os.WriteFile(wm, []byte("12345"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	mustNotExist(t, wm)
+}
+
+func TestResumeFingerprintMatchSkipsPrefix(t *testing.T) {
+	// Round-trip: a first run drains after op 0, recording the cursor AND the plan
+	// fingerprint. On the second run of the same (unchanged) manifest the fingerprint
+	// matches, so the completed op is skipped — proving a matching fingerprint does not
+	// over-correct into a clean restart.
+	drain := &run.DrainFlag{}
+	runner := &closeOnFirstRunner{drain: drain}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithDrainSignal(drain.Draining),
+		run.WithSession(fakeSession{spid: 70}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("first ProcessAll() error = %v", err)
+	}
+	// The sidecar now carries a real fingerprint bound to the plan.
+	if st := readSidecarState(t, dirs, "010_a.yaml"); st.PlanFingerprint == "" || st.ResumeFromOp != 1 {
+		t.Fatalf("after drain: State = %+v, want ResumeFromOp:1 and a non-empty fingerprint", st)
+	}
+
+	// Second run of the same manifest: cancel the drain and re-enqueue the manifest, leaving
+	// its sidecar in processing (as recovery would).
+	drain.Cancel()
+	if err := os.Rename(filepath.Join(dirs.Processing, "010_a.yaml"), filepath.Join(dirs.ToRun, "010_a.yaml")); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("second ProcessAll() error = %v", err)
+	}
+	if runner.calls != 2 {
+		t.Errorf("runner ran %d ops total, want 2 (op 0 in run 1, op 1 in run 2 — op 0 skipped on resume)", runner.calls)
+	}
+	if sum.Done != 1 {
+		t.Errorf("Summary = %+v, want Done:1", sum)
+	}
+	mustExist(t, filepath.Join(dirs.Done, "010_a.yaml"))
+}
+
 func TestWriteSidecarPreservesCursor(t *testing.T) {
 	// A fresh sidecar write on a manifest that carries a cursor must keep it (so a
 	// re-run started by recovery does not lose the resume point).

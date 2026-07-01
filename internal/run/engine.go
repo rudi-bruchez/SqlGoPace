@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -357,7 +358,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// left one: those operations are already done and are skipped below. resumed is true
 	// when a sidecar already existed (this run continues an interrupted one), gating the
 	// ALTER INDEX … RESUME of a paused resumable at the boundary operation.
-	resumeFrom, resumed := e.writeSidecar(ctx, name)
+	st, resumed := e.writeSidecar(ctx, name)
+	resumeFrom := st.ResumeFromOp
 
 	manifest, err := ddl.LoadManifestFile(procPath)
 	if err != nil {
@@ -391,6 +393,12 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		rep.Error = "plan: " + err.Error()
 		return e.finalize(ctx, name, rep, start, false)
 	}
+
+	// Validate the resume cursor against the current plan: a cursor past the plan length, or a
+	// plan that no longer matches the fingerprint the cursor was recorded against, means the
+	// manifest changed since it was interrupted — restart clean rather than silently skip
+	// operations (which would report SUCCESS having executed nothing).
+	resumeFrom = e.reconcileResumePlan(name, st, planned, resumeFrom, resumed)
 
 	// Sessions the operator allows to stay blocked, applied to every operation in the
 	// manifest. The regexps were validated at load, so an error here is defensive.
@@ -947,18 +955,18 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 // writeSidecar records fresh run state next to the manifest so a crash can be
 // recovered. It also stamps a random CONTEXT_INFO marker on the execution session so
 // an orphaned session can be correlated to its run beyond the reusable SPID. Any
-// resume cursor left by a previous drained/interrupted run of this manifest is
-// preserved and returned (the number of operations already completed, to skip on this
-// run). resumed reports whether such a sidecar already existed at claim — i.e. this run
-// is resuming an interrupted one — which gates issuing ALTER INDEX … RESUME (only the
-// boundary operation of a genuinely resumed manifest may adopt a paused resumable). With
-// no session it does not write, but still reads and returns the cursor and resumed flag.
-func (e *Engine) writeSidecar(ctx context.Context, name string) (resumeFrom int, resumed bool) {
-	if st, err := ReadState(e.sidecarPath(name)); err == nil {
-		resumeFrom, resumed = st.ResumeFromOp, true // a prior run of this manifest was interrupted
+// resume cursor and plan fingerprint left by a previous drained/interrupted run of this
+// manifest are preserved and returned in st (the cursor is the number of operations already
+// completed, to skip on this run). resumed reports whether such a sidecar already existed at
+// claim — i.e. this run is resuming an interrupted one — which the caller uses when reconciling
+// the cursor against the current plan and when handling a paused resumable. With no session it
+// does not write, but still reads and returns the prior state and resumed flag.
+func (e *Engine) writeSidecar(ctx context.Context, name string) (st State, resumed bool) {
+	if prior, err := ReadState(e.sidecarPath(name)); err == nil {
+		st, resumed = prior, true // a prior run of this manifest was interrupted
 	}
 	if e.session == nil {
-		return resumeFrom, resumed
+		return st, resumed
 	}
 	login, err := e.session.LoginTime(ctx)
 	if err != nil {
@@ -967,19 +975,23 @@ func (e *Engine) writeSidecar(ctx context.Context, name string) (resumeFrom int,
 
 	marker := e.stampMarker(ctx, name)
 
-	state := State{
-		Manifest:     name,
-		Database:     e.database,
-		SPID:         e.session.SPID(),
-		LoginTime:    login,
-		Marker:       marker,
-		StartedAt:    e.now(),
-		ResumeFromOp: resumeFrom,
+	// Re-stamp this run's session identity, but carry over the resume cursor and the plan
+	// fingerprint left by a prior interrupted run, so a resume still knows what is done and
+	// which plan the cursor was recorded against.
+	fresh := State{
+		Manifest:        name,
+		Database:        e.database,
+		SPID:            e.session.SPID(),
+		LoginTime:       login,
+		Marker:          marker,
+		StartedAt:       e.now(),
+		ResumeFromOp:    st.ResumeFromOp,
+		PlanFingerprint: st.PlanFingerprint,
 	}
-	if err := WriteState(e.sidecarPath(name), state); err != nil {
+	if err := WriteState(e.sidecarPath(name), fresh); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
 	}
-	return resumeFrom, resumed
+	return fresh, resumed
 }
 
 // advanceCursor records that operation i is durably done by moving the crash-resume
@@ -1006,6 +1018,61 @@ func (e *Engine) saveResumeCursor(name string, resumeFrom int) {
 	st.ResumeFromOp = resumeFrom
 	if err := WriteState(e.sidecarPath(name), st); err != nil {
 		fmt.Fprintf(e.out, "sidecar %s: cursor: %v\n", name, err)
+	}
+}
+
+// reconcileResumePlan validates the resume cursor against the current plan and (re)binds the
+// plan fingerprint to the sidecar. A cursor past the plan length, or a plan whose fingerprint
+// differs from the one the cursor was recorded against, means the manifest changed since it was
+// interrupted (edited, re-expanded, or a stale same-name sidecar): the cursor is dropped and the
+// run restarts from the first operation, sweeping any stale key_range watermarks. It returns the
+// (possibly reset) cursor to use for this run.
+func (e *Engine) reconcileResumePlan(name string, st State, planned []ddl.PlannedOperation, resumeFrom int, resumed bool) int {
+	fp := planFingerprint(planned)
+	if resumeFrom > 0 {
+		mismatch := resumeFrom > len(planned) || (resumed && st.PlanFingerprint != "" && st.PlanFingerprint != fp)
+		if mismatch {
+			fmt.Fprintf(e.out, "-- resume cursor no longer matches the plan (%d planned, cursor %d); restarting from the first operation\n", len(planned), resumeFrom)
+			resumeFrom = 0
+			e.clearWatermarks(name)
+		}
+	}
+	e.bindResumeState(name, resumeFrom, fp)
+	return resumeFrom
+}
+
+// bindResumeState records the resume cursor and plan fingerprint on the sidecar in place
+// (best-effort: a no-op when there is no sidecar to update).
+func (e *Engine) bindResumeState(name string, resumeFrom int, fingerprint string) {
+	st, err := ReadState(e.sidecarPath(name))
+	if err != nil {
+		return
+	}
+	st.ResumeFromOp = resumeFrom
+	st.PlanFingerprint = fingerprint
+	if err := WriteState(e.sidecarPath(name), st); err != nil {
+		fmt.Fprintf(e.out, "sidecar %s: fingerprint: %v\n", name, err)
+	}
+}
+
+// planFingerprint hashes the ordered identity (command + target) of the planned operations, so
+// a resumed run can detect that the plan changed since the cursor was recorded — a manifest
+// edited to fewer or reordered operations, an ALTER INDEX ALL that now expands to a different
+// set, or a stale same-name sidecar — and restart cleanly instead of skipping operations.
+func planFingerprint(planned []ddl.PlannedOperation) string {
+	h := sha256.New()
+	for _, s := range planned {
+		fmt.Fprintf(h, "%s\x00%s\n", s.Operation.CommandType(), opTarget(s.Operation))
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// clearWatermarks removes any key_range watermark sidecars for the manifest (name.opN.wm),
+// used when a resume is invalidated so a fresh walk does not read a stale position.
+func (e *Engine) clearWatermarks(name string) {
+	matches, _ := filepath.Glob(filepath.Join(e.dirs.Processing, name+".op*.wm"))
+	for _, m := range matches {
+		_ = os.Remove(m)
 	}
 }
 
