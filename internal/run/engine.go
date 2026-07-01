@@ -430,13 +430,14 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// Resume cursor: operations before it were completed in a previous drained or
 		// interrupted run of this manifest, so skip them (near-zero cost).
 		if i < resumeFrom {
-			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, "already done in a previous run"))
+			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, resumeSkipReason))
 			continue
 		}
-		// skip_if_satisfied: a rebuild whose target compression already holds is a
-		// no-op; record it as skipped and move on. Emitting only the finished event
-		// keeps a re-run's log to one line per skipped operation.
-		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip {
+		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
+		// unless this operation left its own paused resumable, which must be resumed/finished
+		// rather than skipped (skipping would orphan it paused on the server). Emitting only
+		// the finished event keeps a re-run's log to one line per skipped operation.
+		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip && !ownsPausedResumable(st.Paused, i, step.Operation) {
 			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
 			e.advanceCursor(name, &cursor, i)
 			continue
@@ -540,7 +541,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 					var br BatchDMLResult
 					br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
 					batchResult = &br
-					if op.Batch.IsKeyRange() && !errors.Is(runErr, ErrStopped) {
+					// Clear the watermark only on true completion; on any failure keep it so a
+					// manual re-run resumes mid-table (a graceful stop and a crash already
+					// preserve it — the walk is idempotent, so a resume never double-applies).
+					if op.Batch.IsKeyRange() && runErr == nil {
 						store.clear()
 					}
 				} else {
@@ -761,6 +765,11 @@ func recoveryDescription(m *ddl.Manifest, name string) string {
 	return "Recovery for " + name
 }
 
+// resumeSkipReason is the skip reason for an operation already completed in a previous run
+// (resume cursor). It is distinct from a skip_if_satisfied reason so the history's skipped
+// metric can exclude it — a resumed run re-marks its completed prefix skipped every cycle.
+const resumeSkipReason = "already done in a previous run"
+
 // recordSkipped builds the report entry for an operation skipped without running
 // (resume cursor or skip_if_satisfied) and emits its finished step event, so stdout,
 // the TUI, and the .log all show it as skipped with the reason. It never emits a
@@ -953,7 +962,9 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 		if op.PeakBlocked > peak {
 			peak = op.PeakBlocked
 		}
-		if op.Outcome == "skipped" {
+		// Count only skip_if_satisfied skips; resume-cursor skips (already done in a previous
+		// run) are not "satisfied" skips and would otherwise inflate the metric each resume.
+		if op.Outcome == "skipped" && op.Detail != resumeSkipReason {
 			skipped++
 		}
 	}

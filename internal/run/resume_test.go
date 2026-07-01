@@ -2,12 +2,14 @@ package run_test
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
 
@@ -270,6 +272,89 @@ func TestInterruptedResumableRecordsPausedIdentity(t *testing.T) {
 	if st.Paused.Op != 0 || st.Paused.Index != "IX" {
 		t.Errorf("Paused = %+v, want {Op:0 … Index:IX}", st.Paused)
 	}
+}
+
+func TestSkipIfSatisfiedDoesNotOrphanOwnPausedResumable(t *testing.T) {
+	// #6: skip_if_satisfied would skip a rebuild already at its target compression, but this
+	// op left its own paused resumable — skipping would orphan it. It must RESUME instead.
+	runner := &sqlCapturingRunner{}
+	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithCompressionReader(comp),
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(skipCompressManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSidecarState(t, dirs, "010_a.yaml", run.State{
+		Manifest: "010_a.yaml",
+		Paused:   &run.PausedResumable{Op: 0, Schema: "dbo", Table: "T", Index: "IX"},
+	})
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(runner.sqls) != 1 || !strings.Contains(runner.sqls[0], "RESUME") {
+		t.Errorf("op should RESUME its own paused resumable rather than be skipped, ran: %v", runner.sqls)
+	}
+}
+
+// fakeBatchDriver is a BatchDMLDriver returning a fixed error, to test how the engine treats
+// the key_range watermark on completion versus failure.
+type fakeBatchDriver struct{ err error }
+
+func (d fakeBatchDriver) Run(_ context.Context, op ddl.BatchDML, _ ddl.ResolvedOptions, _ run.IgnoreSource, _ run.WatermarkStore, _ run.ReactionSink) (run.BatchDMLResult, error) {
+	return run.BatchDMLResult{Schema: op.Schema, Table: op.Table, Verb: op.Verb}, d.err
+}
+
+const batchKeyRangeManifest = `
+description: batch key_range test
+operations:
+  - operation: batch_update
+    schema: dbo
+    table: T
+    set: { A: 1 }
+    confirm_full_table: true
+    batch: { strategy: key_range, key: Id }
+`
+
+func TestKeyRangeWatermarkKeptOnFailure(t *testing.T) {
+	// #8: a key_range batch that fails with a non-ErrStopped error must keep its watermark so
+	// a manual re-run resumes mid-table (only true completion clears it).
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithBatchDMLRunner(fakeBatchDriver{err: errors.New("boom")}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(batchKeyRangeManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wm := filepath.Join(dirs.Processing, "010_a.yaml.op0.wm")
+	if err := os.WriteFile(wm, []byte("999"), 0o644); err != nil { // a prior partial walk
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	mustExist(t, wm)
+}
+
+func TestKeyRangeWatermarkClearedOnSuccess(t *testing.T) {
+	// The success path still clears the watermark (guard against over-correcting #8).
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithBatchDMLRunner(fakeBatchDriver{err: nil}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(batchKeyRangeManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	wm := filepath.Join(dirs.Processing, "010_a.yaml.op0.wm")
+	if err := os.WriteFile(wm, []byte("999"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	mustNotExist(t, wm)
 }
 
 func TestBlockingResumableWithoutOptInFails(t *testing.T) {
