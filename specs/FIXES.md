@@ -1,18 +1,38 @@
 # FIXES — code review of the 12 unpushed commits (`origin/main..HEAD`)
 
-> **Status:** review complete. **Fixes #1, #2, #3, #4 (plus #5 and #7, folded into #1) are
-> IMPLEMENTED, tested, and committed** on `main` (not pushed):
+> **Status:** review complete. **ALL correctness findings (#1–#9, #11–#14) plus #5/#7 are
+> IMPLEMENTED, tested, and committed** on `main` (not pushed). #10 is resolved as by-design (see
+> below). Commits:
 > - `f71316a` — #4 (TUI join engine goroutine before closing the connection)
 > - `edc2e98` — #2, #3 (plan-fingerprint validated resume cursor; `State.PlanFingerprint`)
 > - `affd51c` — #1, #5, #7 (own paused resumable by recorded identity; `State.Paused`)
 > - `6a1fcfe` — simplify pass (one `updateSidecar` helper)
+> - `f53aba4` — #6, #8, #11 (skip doesn't orphan own resumable; watermark kept on failure; skip metric)
+> - `d986d40` — #9, #14 (drain across databases; Ctrl+C can still force-quit)
+> - `7f2caf9` — #12 (history migration by existence check, not error text)
+> - `4f9b09c` — #13 (recovery sweeps stray atomic-write temp files)
+> - `595a88f` — cleanup: `internal/fsutil.AtomicWrite` dedup + shared `recordInterrupted`
 >
-> **Still open:** #6, #8–#14 and the cleanup list below (none implemented). This document persists
-> (1) the full review findings and (2) the implementation plan for #1–#4. Written 2026-07-01.
+> **#10 (drain cancel can't un-pause a resumable) — resolved as BY-DESIGN, no code change.** The
+> cancellable-drain contract is "cancel takes effect if it lands before the next check." Once a
+> sampling poll observes the drain and pauses the resumable (attention sent, server paused), the
+> pause is committed; a later Cancel cannot un-pause it. The op is finalized interrupted and, thanks
+> to the #1 fix, RESUMEs correctly by recorded identity on the next run — no work lost, just deferred
+> to the next run for that one manifest. Continuing in-place would require re-entering the op loop
+> for a partially-run op (a risky restructure) for a narrow race window; not worth it.
+>
+> **Altitude/structural items intentionally NOT changed** (KISS; they refactor working
+> infrastructure without fixing a defect, and churn the just-fixed resumable-switch code): `Stop`
+> living in `Capabilities`; the two stop seams (`Capabilities.Stop` vs driver `stop` fields);
+> `prepErr` nesting in `processOne`; `blockingResumable` re-building the ABORT SQL as an index-op
+> probe; `skip_if_satisfied` as a hardcoded RebuildIndex+compression case (vs a generic
+> `Operation.Satisfied`). Left as future refinements.
 >
 > Note on #3: fixed conservatively via the plan fingerprint — a re-expanded `ALTER INDEX ALL`
 > hashes differently, so the run restarts clean rather than skipping the wrong op. The deeper
 > op-identity keying (redo only what changed) remains a future refinement.
+>
+> Written 2026-07-01.
 
 ## How to regenerate the review context in a new session
 
