@@ -212,6 +212,41 @@ func TestBatchDMLNoRows(t *testing.T) {
 	}
 }
 
+func TestBatchDMLProgressReportsBatchSize(t *testing.T) {
+	s := &fakeBatchServer{remaining: 3000, estRows: 3000}
+	var last BatchDMLProgress
+	var count int
+	r := NewBatchDMLRunner(s, s, noPressureSampler{}, NewManualClock(time.Unix(0, 0)), BatchDMLRunnerConfig{
+		Tuning: testBatchTuning(), RCSI: true,
+		PollInterval: time.Hour, LogPollInterval: time.Hour,
+		BlockingTimeout: time.Minute, LogDrainTimeout: time.Minute, KillGrace: time.Second,
+	}, WithBatchDMLProgress(func(p BatchDMLProgress) { last = p; count++ }))
+
+	op := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T", WhereRaw: "A = 1"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if count == 0 {
+		t.Fatal("progress callback never fired")
+	}
+	// BatchRows was left unset before It3 (always 0); it must now carry the batch size.
+	if last.BatchRows <= 0 {
+		t.Errorf("BatchRows = %d, want > 0", last.BatchRows)
+	}
+	if last.RowsDone != 3000 || last.EstRows != 3000 {
+		t.Errorf("RowsDone/EstRows = %d/%d, want 3000/3000", last.RowsDone, last.EstRows)
+	}
+}
+
+func TestPerSec(t *testing.T) {
+	if got := perSec(4000, 2*time.Second); got != 2000 {
+		t.Errorf("perSec(4000, 2s) = %v, want 2000", got)
+	}
+	if got := perSec(100, 0); got != 0 {
+		t.Errorf("perSec(100, 0) = %v, want 0 (guards divide-by-zero)", got)
+	}
+}
+
 func TestBatchDMLRCSIOffCapsBatchSize(t *testing.T) {
 	// A large table: the large-tier initial (20000) and adaptive growth must both be
 	// held under the escalation cap (4000) when RCSI is off.

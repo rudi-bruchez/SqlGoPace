@@ -47,13 +47,16 @@ type noWatermark struct{}
 func (noWatermark) Load(context.Context) (int64, bool, error) { return 0, false, nil }
 func (noWatermark) Save(context.Context, int64) error         { return nil }
 
-// BatchDMLProgress is the progress of one batch-DML operation, fed to the TUI.
+// BatchDMLProgress is the progress of one batch-DML operation, fed to the TUI. It is
+// emitted after each committed batch, so BatchRows is the size just used and
+// RowsPerSec is that batch's throughput (rows / batch elapsed).
 type BatchDMLProgress struct {
 	Schema, Table string
 	Verb          string
 	RowsDone      int64
 	EstRows       int64
 	BatchRows     int
+	RowsPerSec    float64
 }
 
 // Percent returns the fraction of the estimated rows processed, in [0,1]. The
@@ -202,7 +205,7 @@ func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res 
 		result.Rows += rows
 		result.Batches++
 		stallWaited = 0
-		r.emitProgress(op, result.Rows, est)
+		r.emitProgress(op, result.Rows, est, size, perSec(rows, elapsed))
 		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)
 	}
 }
@@ -268,7 +271,7 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 		watermark, hasWM = next, true
 		_ = wm.Save(ctx, watermark) // best-effort; a resume redoes from the last saved point
 		stallWaited = 0
-		r.emitProgress(op, result.Rows, est)
+		r.emitProgress(op, result.Rows, est, size, perSec(rows, elapsed))
 		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)
 	}
 }
@@ -408,11 +411,20 @@ func (r *BatchDMLRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, s
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 
-func (r *BatchDMLRunner) emitProgress(op ddl.BatchDML, rowsDone, estRows int64) {
-	if r.progress != nil {
-		r.progress(BatchDMLProgress{
-			Schema: op.Schema, Table: op.Table, Verb: op.Verb,
-			RowsDone: rowsDone, EstRows: estRows,
-		})
+func (r *BatchDMLRunner) emitProgress(op ddl.BatchDML, rowsDone, estRows int64, batchRows int, rate float64) {
+	if r.progress == nil {
+		return
 	}
+	r.progress(BatchDMLProgress{
+		Schema: op.Schema, Table: op.Table, Verb: op.Verb,
+		RowsDone: rowsDone, EstRows: estRows, BatchRows: batchRows, RowsPerSec: rate,
+	})
+}
+
+// perSec is the throughput of a batch: rows affected divided by its elapsed time.
+func perSec(rows int64, elapsed time.Duration) float64 {
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(rows) / elapsed.Seconds()
 }

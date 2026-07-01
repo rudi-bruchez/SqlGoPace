@@ -7,6 +7,7 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -75,14 +76,39 @@ type (
 		Categories []WaitCategory
 		TotalMS    int64
 	}
-	// StatusMsg updates the lifecycle status (and optionally the operation label).
+	// StatusMsg updates the lifecycle status (and optionally the operation label). A
+	// non-zero StepTotal sets the manifest-level "op i/N" counter; a non-zero
+	// StartedAt (re)starts the live elapsed timer for the current operation.
 	StatusMsg struct {
 		Status    Status
 		Operation string
+		StepIndex int
+		StepTotal int
+		StartedAt time.Time
+	}
+	// BatchMsg carries the running batch-DML operation's live progress (rows done vs
+	// estimate, current batch size, throughput). Distinct from ProgressMsg, whose
+	// percent comes from the server and is 0 for a batch loop.
+	BatchMsg struct {
+		Verb       string
+		Table      string // schema.table
+		RowsDone   int64
+		EstRows    int64
+		Percent    float64 // 0..1
+		BatchRows  int
+		RowsPerSec float64
 	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
 )
+
+// tickMsg drives the once-a-second re-render that keeps the elapsed timer live.
+type tickMsg time.Time
+
+// tick schedules the next elapsed-timer refresh.
+func tick() tea.Cmd {
+	return tea.Tick(time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
 
 // ActionKind is an operator intent emitted by key presses.
 type ActionKind int
@@ -132,9 +158,15 @@ type Model struct {
 	operation       string
 	resumable       bool
 	status          Status
+	stepIndex       int
+	stepTotal       int
+	startedAt       time.Time     // current operation's start; anchors the elapsed timer
+	elapsed         time.Duration // refreshed by the 1s tick
 	percent         float64
 	etaSeconds      int64
 	rollbackPercent float64
+	batch           BatchMsg
+	hasBatch        bool
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -151,8 +183,9 @@ func New(operation string, resumable bool, actions chan<- Action) Model {
 	return Model{operation: operation, resumable: resumable, status: StatusRunning, actions: actions}
 }
 
-// Init implements tea.Model; the host drives updates, so there is no initial cmd.
-func (m Model) Init() tea.Cmd { return nil }
+// Init implements tea.Model; it starts the once-a-second tick that keeps the
+// elapsed timer live. All other updates are host-driven.
+func (m Model) Init() tea.Cmd { return tick() }
 
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -174,6 +207,25 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Operation != "" {
 			m.operation = msg.Operation
 		}
+		if msg.StepTotal > 0 {
+			m.stepIndex, m.stepTotal = msg.StepIndex, msg.StepTotal
+		}
+		if !msg.StartedAt.IsZero() {
+			// A new operation started: reset the timer and drop the previous batch line.
+			m.startedAt = msg.StartedAt
+			m.elapsed = 0
+			m.hasBatch = false
+		}
+	case BatchMsg:
+		m.hasBatch = true
+		m.batch = msg
+	case tickMsg:
+		if !m.startedAt.IsZero() {
+			if t := time.Time(msg); !t.Before(m.startedAt) {
+				m.elapsed = t.Sub(m.startedAt)
+			}
+		}
+		return m, tick()
 	case LogMsg:
 		m.notice = msg.Line
 	case tea.KeyMsg:
@@ -268,7 +320,20 @@ var (
 func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("SqlGoPace — incident console") + "\n\n")
-	fmt.Fprintf(&b, "operation: %s   [%s]\n", m.operation, m.status)
+	op := m.operation
+	if m.stepTotal > 0 {
+		op = fmt.Sprintf("%d/%d %s", m.stepIndex, m.stepTotal, m.operation)
+	}
+	fmt.Fprintf(&b, "operation: %s   [%s]", op, m.status)
+	if m.elapsed > 0 {
+		fmt.Fprintf(&b, "   elapsed %s", formatElapsed(m.elapsed))
+	}
+	b.WriteString("\n")
+	if m.hasBatch {
+		fmt.Fprintf(&b, "batch %s %s: %d/%d rows (%.0f%%)   batch=%d   %.0f rows/s\n",
+			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
+			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
+	}
 	fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
 	if m.rollbackPercent > 0 {
 		fmt.Fprintf(&b, "   rollback: %.0f%%", m.rollbackPercent)
@@ -308,6 +373,20 @@ func (m Model) View() string {
 		b.WriteString("\n" + m.notice)
 	}
 	return b.String()
+}
+
+// formatElapsed renders a duration as mm:ss, or h:mm:ss past an hour.
+func formatElapsed(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	mn := d / time.Minute
+	d -= mn * time.Minute
+	s := d / time.Second
+	if h > 0 {
+		return fmt.Sprintf("%d:%02d:%02d", h, mn, s)
+	}
+	return fmt.Sprintf("%02d:%02d", mn, s)
 }
 
 func truncate(s string, n int) string {

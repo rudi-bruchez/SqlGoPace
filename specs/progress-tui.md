@@ -1,6 +1,10 @@
 # Spec métier — Progression d'un manifeste (compteur, chrono, bloqués)
 
-> **Statut : DRAFT — itération à concevoir/implémenter.** Acte le besoin et le design pressenti.
+> **Statut : pièce maîtresse (§3.0 step-sink) implémentée.** Le *step-sink* moteur
+> (`run.WithStepSink` / `run.StepEvent`, émis en haut/bas de la boucle d'ops) alimente **stdout**
+> (`-- [i/N] cmd cible — started` / `— <outcome> in Xs`, items 1+2) et le **TUI** (compteur op i/N +
+> chrono live via un tick 1 s ; item 2). Livré avec BATCH-DML It3. Restent (DRAFT) : item 3 côté
+> non-TUI (compte/pic de sessions bloquées en stdout/history) et la persistance i/N dans `State`.
 > Créé le 2026-06-17, suite à l'essai de compression `030_compress_exampledb_indexes.yaml`
 > (74 rebuilds offline sur `EXAMPLEDB`), où l'on a constaté l'absence de progression lisible.
 

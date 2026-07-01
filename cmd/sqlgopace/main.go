@@ -261,16 +261,18 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 
 		var (
 			current *currentManifest
+			fwd     *tuiForwarder
 			extra   []run.EngineOption
 		)
 		if useTUI {
 			current = &currentManifest{}
+			fwd = &tuiForwarder{}
 			extra = append(extra, run.WithManifestObserver(current.set))
 		}
-		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, extra...)
+		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, extra...)
 		var sum run.Summary
 		if useTUI {
-			sum, err = runWithTUI(ctx, dbConn, engine, current, cfg.Monitoring.ProgressPoll())
+			sum, err = runWithTUI(ctx, dbConn, engine, current, fwd, cfg.Monitoring.ProgressPoll())
 		} else {
 			sum, err = engine.ProcessAll(ctx)
 		}
@@ -303,7 +305,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 // buildEngine wires a run.Engine for one database's connection, sharing the given
 // history (may be nil) and reading policy, monitoring, and notification settings
 // from cfg. It is called once per database in a multi-database run.
-func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, extra ...run.EngineOption) *run.Engine {
+func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, extra ...run.EngineOption) *run.Engine {
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
@@ -330,6 +332,16 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		// dm_exec_requests percent used for other operations.
 		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
 	}))
+	// Progress goes to the TUI when the console is running, else to stdout/log. The
+	// step sink follows the same rule (in TUI mode engineOut is io.Discard anyway).
+	batchProgress := func(p run.BatchDMLProgress) {
+		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
+	}
+	stepSink := stepSinkTo(engineOut)
+	if fwd != nil {
+		batchProgress = fwd.batch
+		stepSink = fwd.step
+	}
 	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
 		Tuning:          batchTuning(cfg.BatchDML),
 		RCSI:            info.RCSIEnabled,
@@ -338,9 +350,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
 		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
-	}, run.WithBatchDMLProgress(func(p run.BatchDMLProgress) {
-		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
-	}))
+	}, run.WithBatchDMLProgress(batchProgress))
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
 		run.WithSession(conn),
@@ -355,7 +365,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithShrinkRunner(shrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
 		run.WithOutput(engineOut),
-		run.WithStepSink(stepSinkTo(engineOut)),
+		run.WithStepSink(stepSink),
 	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
@@ -484,9 +494,10 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, pollInterval time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, pollInterval time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", false, actions))
+	fwd.attach(program) // engine step/batch progress now reaches the console
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
@@ -565,6 +576,59 @@ func waitsMsg(waits []mssql.SessionWait) tui.WaitsMsg {
 		out[i] = tui.WaitCategory{Name: c.Name, WaitMS: c.WaitTimeMS, Tasks: c.Tasks}
 	}
 	return tui.WaitsMsg{Categories: out, TotalMS: total}
+}
+
+// tuiForwarder relays engine-side progress (per-operation step events and batch-DML
+// progress) to the incident console. The console's program is created after the
+// engine is built, so the forwarder holds a deferred reference, attached once the
+// console starts. attach happens-before the engine goroutine that drives send (the
+// step/batch callbacks fire only inside ProcessAll), so no lock is needed.
+type tuiForwarder struct {
+	program *tui.Program
+}
+
+func (f *tuiForwarder) attach(p *tui.Program) { f.program = p }
+
+func (f *tuiForwarder) send(msg any) {
+	if f.program != nil {
+		f.program.Send(msg)
+	}
+}
+
+// step forwards the start of an operation to the console.
+func (f *tuiForwarder) step(ev run.StepEvent) {
+	if msg, ok := stepStatusMsg(ev); ok {
+		f.send(msg)
+	}
+}
+
+// batch forwards batch-DML progress to the console.
+func (f *tuiForwarder) batch(p run.BatchDMLProgress) { f.send(batchMsg(p)) }
+
+// stepStatusMsg maps a step event to a console status update. Only the started event
+// maps (ok=true): it carries the label, the i/N counter and the timer anchor. The
+// finished event is dropped — the next operation's started event replaces the
+// display, and the run summary/log records outcomes.
+func stepStatusMsg(ev run.StepEvent) (tui.StatusMsg, bool) {
+	if ev.Phase != run.StepStarted {
+		return tui.StatusMsg{}, false
+	}
+	return tui.StatusMsg{
+		Status:    tui.StatusRunning,
+		Operation: ev.Command + " " + ev.Target,
+		StepIndex: ev.Index,
+		StepTotal: ev.Total,
+		StartedAt: ev.StartedAt,
+	}, true
+}
+
+// batchMsg maps batch-DML progress to a console BatchMsg.
+func batchMsg(p run.BatchDMLProgress) tui.BatchMsg {
+	return tui.BatchMsg{
+		Verb: p.Verb, Table: p.Schema + "." + p.Table,
+		RowsDone: p.RowsDone, EstRows: p.EstRows, Percent: p.Percent(),
+		BatchRows: p.BatchRows, RowsPerSec: p.RowsPerSec,
+	}
 }
 
 // currentManifest holds the path of the manifest the engine is processing, set via

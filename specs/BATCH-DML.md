@@ -1,12 +1,16 @@
 # BATCH-DML — `UPDATE` / `DELETE` découpés en lots
 
 > Source de vérité du comportement visé pour les opérations DML par lots.
-> **It1 + It2 implémentés.** It1 : `batch_update`/`batch_delete`, stratégie `predicate`, `set:`/`where:`
-> déclaratifs + échappatoire `set_raw:`/`where_raw:`, calibrage adaptatif, réutilisation
-> réaction/monitoring, preflight (permission + avis RCSI), RCSI/SI dans `ServerInfo`. It2 : stratégie
-> `key_range` (clé entière simple) avec **curseur persistant** (sidecar `.op<i>.wm` dans
-> `02.processing/`) pour reprise après crash, inférence de clé via `ClusteringKeyColumns`. It3–It4
-> (calibrage RCSI fin + TUI live, exactement-une-fois, clés composites/non entières) restent (cf. §7).
+> **It1 + It2 + It3 (TUI live) implémentés.** It1 : `batch_update`/`batch_delete`, stratégie
+> `predicate`, `set:`/`where:` déclaratifs + échappatoire `set_raw:`/`where_raw:`, calibrage adaptatif,
+> réutilisation réaction/monitoring, preflight (permission + avis RCSI), RCSI/SI dans `ServerInfo`. It2 :
+> stratégie `key_range` (clé entière simple) avec **curseur persistant** (sidecar `.op<i>.wm` dans
+> `02.processing/`) pour reprise après crash, inférence de clé via `ClusteringKeyColumns`. It3 :
+> **progression live** — un *step-sink* moteur (`WithStepSink`, cf. `specs/progress-tui.md`) alimente
+> stdout (`[i/N] cmd cible — started/… in Xs`) et le TUI (compteur op i/N, chrono live), plus une ligne
+> batch live (lignes faites/estimées, %, taille de lot, lignes/s ; `BatchDMLProgress` complété par
+> `RowsPerSec`). It3 restant / It4 (calibrage RCSI fin plus poussé, surfaçage DMV d'escalade,
+> exactement-une-fois, clés composites/non entières) : cf. §7.
 
 ## 1. Objectif et contexte
 

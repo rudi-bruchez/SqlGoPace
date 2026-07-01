@@ -61,6 +61,31 @@ func TestModelRendersWaits(t *testing.T) {
 	}
 }
 
+func TestModelShowsStepCounter(t *testing.T) {
+	m := tui.New("(running)", false, nil)
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, Operation: "rebuild_index dbo.T.IX", StepIndex: 12, StepTotal: 74})
+	v := m.View()
+	for _, want := range []string{"12/74", "rebuild_index dbo.T.IX"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelShowsBatchProgress(t *testing.T) {
+	m := tui.New("batch_update dbo.Orders", false, nil)
+	m, _ = send(m, tui.BatchMsg{
+		Verb: "update", Table: "dbo.Orders",
+		RowsDone: 1_200_000, EstRows: 5_000_000, Percent: 0.24, BatchRows: 4000, RowsPerSec: 8500,
+	})
+	v := m.View()
+	for _, want := range []string{"batch update dbo.Orders", "24%", "batch=4000", "rows/s"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() missing %q:\n%s", want, v)
+		}
+	}
+}
+
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", true, actions)
