@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -239,10 +240,41 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		}
 	}
 
+	// Graceful stop: the first Ctrl+C drains (finish the current operation, then stop,
+	// leaving the rest to resume next run); a second Ctrl+C cancels the run context for
+	// an immediate hard stop. In TUI mode the console's "d" key drives the same drain.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	drain := make(chan struct{})
+	var drainOnce sync.Once
+	requestDrain := func() { drainOnce.Do(func() { close(drain) }) }
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		select {
+		case <-runCtx.Done():
+			return
+		case <-sigCh:
+			requestDrain()
+			if !useTUI {
+				fmt.Fprintln(stdout, "-- interrupt: draining — will stop after the current operation (Ctrl+C again to stop now)")
+			}
+		}
+		select {
+		case <-runCtx.Done():
+		case <-sigCh:
+			if !useTUI {
+				fmt.Fprintln(stdout, "-- interrupt: stopping now")
+			}
+			cancelRun()
+		}
+	}()
+
 	var total run.Summary
 	var runErr error
 	for _, db := range targets {
-		dbConn, dbInfo, reused, cerr := connForDatabase(ctx, conn, info, db, cfg.Database.ConnectionString)
+		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString)
 		if cerr != nil {
 			fmt.Fprintf(stdout, "-- skip database %s: %v\n", db, cerr)
 			runErr = cerr
@@ -262,7 +294,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var (
 			current *currentManifest
 			fwd     *tuiForwarder
-			extra   []run.EngineOption
+			extra   = []run.EngineOption{run.WithDrainSignal(drain)}
 		)
 		if useTUI {
 			current = &currentManifest{}
@@ -272,9 +304,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, extra...)
 		var sum run.Summary
 		if useTUI {
-			sum, err = runWithTUI(ctx, dbConn, engine, current, fwd, cfg.Monitoring.ProgressPoll())
+			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, requestDrain, cfg.Monitoring.ProgressPoll())
 		} else {
-			sum, err = engine.ProcessAll(ctx)
+			sum, err = engine.ProcessAll(runCtx)
 		}
 		if !reused {
 			_ = dbConn.Close()
@@ -499,7 +531,7 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, pollInterval time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, requestDrain func(), pollInterval time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", false, actions))
 	fwd.attach(program) // engine step/batch progress now reaches the console
@@ -507,7 +539,7 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
 	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval)
-	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, actions)
+	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, requestDrain, actions)
 
 	type result struct {
 		summary run.Summary
@@ -658,7 +690,7 @@ func (c *currentManifest) get() string {
 
 // dispatchActions routes operator intents to the server (kill) or to the running
 // manifest (ignore a blocked session).
-func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, current *currentManifest, actions <-chan tui.Action) {
+func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, current *currentManifest, requestDrain func(), actions <-chan tui.Action) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -669,6 +701,9 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 				_ = conn.Kill(ctx, ddlSPID)
 			case tui.ActionKillBlocker:
 				_ = conn.Kill(ctx, a.SPID)
+			case tui.ActionDrain:
+				requestDrain()
+				program.Send(tui.StatusMsg{Status: tui.StatusDraining})
 			case tui.ActionIgnoreBlocker:
 				ignoreBlocker(program, current, a)
 			}

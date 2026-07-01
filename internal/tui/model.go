@@ -23,6 +23,9 @@ const (
 	StatusPaused
 	// StatusCancelling means a cancel/kill is in progress.
 	StatusCancelling
+	// StatusDraining means a graceful stop was requested: the run finishes the current
+	// operation, then stops before the next one.
+	StatusDraining
 	// StatusDone means the operation finished.
 	StatusDone
 )
@@ -36,6 +39,8 @@ func (s Status) String() string {
 		return "PAUSED"
 	case StatusCancelling:
 		return "CANCELING"
+	case StatusDraining:
+		return "DRAINING"
 	case StatusDone:
 		return "DONE"
 	default:
@@ -122,6 +127,8 @@ const (
 	ActionPause
 	// ActionExtend extends the blocking wait timer.
 	ActionExtend
+	// ActionDrain requests a graceful stop after the current operation.
+	ActionDrain
 	// ActionSnapshot writes the current state to the log.
 	ActionSnapshot
 	// ActionIgnoreBlocker adds an ignore rule for the selected session to the running
@@ -267,6 +274,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "e":
 		m.emit(Action{Kind: ActionExtend})
+	case "d":
+		m.emit(Action{Kind: ActionDrain})
+		m.status = StatusDraining // reflect intent immediately; the host confirms via StatusMsg
 	case "s":
 		m.emit(Action{Kind: ActionSnapshot})
 	}
@@ -362,7 +372,7 @@ func (m Model) View() string {
 		}
 	}
 
-	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [s] snapshot  [q] quit"
+	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [d] drain  [s] snapshot  [q] quit"
 	if m.mode == modeCriterion && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
 		help = fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",

@@ -1,7 +1,18 @@
 # Spec métier — Arrêt en douceur (drain) après l'instruction en cours
 
-> **Statut : DRAFT — itération à concevoir/implémenter.** Acte le besoin et le design pressenti.
-> Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
+> **Statut : v1 implémenté (drain sans curseur `State`).** Le moteur expose `WithDrainSignal(<-chan
+> struct{})` ; une fois le canal **fermé** (signal latché), il finit l'op en cours puis s'arrête
+> **avant la suivante** (`finalizeDrained` : manifeste laissé en `02.processing/`, compté
+> `Interrupted`), et n'entame plus les manifestes restants. Déclencheurs : **Ctrl+C 1× = drain / 2× =
+> hard stop** (handler `os/signal` dans `cmd/sqlgopace/main.go`, `sync.Once` pour fermer le canal une
+> fois, 2ᵉ signal → `cancelRun()`), et l'action TUI **`d`** (`ActionDrain` → statut `DRAINING`).
+> Reprise : le sidecar `State` (écrit au démarrage du manifeste) est conservé → la recovery re-enfile
+> (Restart) au run suivant, et le **skip métadonnée** (`crash-resumable.md` §9) rend les ops déjà
+> faites bon marché à re-jouer (couvre pleinement le cas compression). **Non implémenté (§3.3, §6)** :
+> le **curseur d'opération** dans `State` (`ResumeFromOp`) pour reprendre exactement à l'op suivante
+> sur les manifestes *non* compression (aujourd'hui re-jeu depuis le début, ops faites sautées par le
+> skip seulement) ; le drain **par chunk** pendant un shrink (§3.2) ; annuler un drain (§6). Créé le
+> 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en cours**.
 
 ## 1. Objectif
 

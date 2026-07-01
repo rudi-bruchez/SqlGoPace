@@ -117,6 +117,20 @@ func TestModelKillDDLAndPause(t *testing.T) {
 	}
 }
 
+func TestModelDrainAction(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", true, actions)
+	m, _ = send(m, key("d"))
+
+	a, ok := drain(t, actions)
+	if !ok || a.Kind != tui.ActionDrain {
+		t.Errorf("d = %+v ok=%t, want ActionDrain", a, ok)
+	}
+	if v := m.View(); !strings.Contains(v, "DRAINING") {
+		t.Errorf("View() should show DRAINING after 'd':\n%s", v)
+	}
+}
+
 func TestModelPauseIgnoredWhenNotResumable(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", false, actions) // not resumable

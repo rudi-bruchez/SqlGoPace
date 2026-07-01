@@ -145,6 +145,7 @@ type Engine struct {
 	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
 	compression      CompressionReader // reads current index compression for skip_if_satisfied
+	drain            <-chan struct{}   // closed to request a graceful stop after the current op
 	out              io.Writer
 }
 
@@ -195,6 +196,11 @@ func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.s
 func WithCompressionReader(r CompressionReader) EngineOption {
 	return func(e *Engine) { e.compression = r }
 }
+
+// WithDrainSignal wires a graceful-stop channel: once it is closed, the engine finishes
+// the operation in flight, then stops before the next one — leaving the manifest in
+// processing for the next run to resume — instead of aborting mid-operation.
+func WithDrainSignal(ch <-chan struct{}) EngineOption { return func(e *Engine) { e.drain = ch } }
 
 // WithExpander enables expanding "ALTER INDEX ALL" rebuilds into one rebuild per
 // concrete index. Without it, an ALL rebuild is run as a single statement.
@@ -280,6 +286,12 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 
 	var sum Summary
 	for _, name := range names {
+		// A graceful stop requested between manifests: stop before starting the next
+		// one (a manifest drained mid-flight is finalized inside processOne).
+		if e.draining() {
+			fmt.Fprintf(e.out, "-- drained — stopping before %s; remaining manifests left in queue\n", name)
+			break
+		}
 		if !e.ownsManifest(name) {
 			fmt.Fprintf(e.out, "skip %s: targets another database; left in queue (run is on %q)\n", name, e.database)
 			continue
@@ -368,6 +380,11 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	var failedOps []ddl.Operation
 	captured := &blockerCapture{}
 	for i, step := range planned {
+		// Graceful stop: the operation in flight has finished (we are at the top of the
+		// loop); stop before starting the next one and leave the manifest for recovery.
+		if e.draining() {
+			return e.finalizeDrained(ctx, name, rep, start, i, len(planned))
+		}
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes)}
 
@@ -656,6 +673,32 @@ func recoveryDescription(m *ddl.Manifest, name string) string {
 		return "Recovery for: " + m.Description
 	}
 	return "Recovery for " + name
+}
+
+// draining reports whether a graceful stop has been requested. The drain channel is
+// closed (not sent to) on request, so once closed every check reads ready — the signal
+// is latched. A nil channel (no drain wired) is never ready, so this is false.
+func (e *Engine) draining() bool {
+	select {
+	case <-e.drain:
+		return true
+	default:
+		return false
+	}
+}
+
+// finalizeDrained records a graceful stop after `done` of `total` operations: the
+// manifest stays in processing (not done/failed) so the next run resumes it — helped
+// by skip_if_satisfied, which makes already-finished operations cheap to replay.
+func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
+	rep.FinishedAt = e.now()
+	rep.DurationMS = e.msSince(start)
+	rep.Outcome = "INTERRUPTED"
+	rep.Error = fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total)
+	e.notify(ctx, "interrupted", name, rep.Error)
+	e.record(ctx, *rep)
+	fmt.Fprintf(e.out, "-- drained after operation %d/%d on %s — left in processing, resumes next run\n", done, total, name)
+	return outcomeInterrupted
 }
 
 // finalizeInterrupted records a recoverable interruption: the manifest and its
