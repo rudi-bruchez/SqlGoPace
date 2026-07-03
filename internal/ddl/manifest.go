@@ -207,7 +207,11 @@ type Manifest struct {
 	// actionable message instead), because aborting discards the paused operation's
 	// server-side progress — a deliberate choice on a shared/production database.
 	AbortBlockingResumable bool
-	Operations             []Operation
+	// Window, when set, restricts this manifest's operations to a recurring
+	// server-time window: outside it the manifest is deferred; a window closing
+	// mid-run stops cleanly at the next operation boundary (see run engine).
+	Window     *Window
+	Operations []Operation
 }
 
 // Continue reports whether the manifest should keep going past a failed operation.
@@ -224,6 +228,11 @@ func (m *Manifest) Validate() error {
 	for i, s := range m.IgnoreBlockedSessions {
 		if err := s.validate(); err != nil {
 			return fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
+		}
+	}
+	if m.Window != nil {
+		if err := m.Window.Validate(); err != nil {
+			return fmt.Errorf("window: %w", err)
 		}
 	}
 	if len(m.Operations) == 0 {
@@ -247,6 +256,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
 		SkipIfSatisfied        bool             `yaml:"skip_if_satisfied"`
 		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
+		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
 	}
 	if err := value.Decode(&raw); err != nil {
@@ -259,6 +269,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
 	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.AbortBlockingResumable = raw.AbortBlockingResumable
+	m.Window = raw.Window
 	m.Operations = make([]Operation, 0, len(raw.Operations))
 	for i := range raw.Operations {
 		op, err := decodeOperation(&raw.Operations[i])
