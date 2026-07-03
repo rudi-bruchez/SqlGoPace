@@ -55,8 +55,8 @@ func TestWindowContains(t *testing.T) {
 		{"overnight past midnight", overnight, at(1, 2, 0), true}, // Sunday 02:00
 		{"overnight at end (exclusive)", overnight, at(1, 5, 0), false},
 		{"overnight dead zone", overnight, at(0, 12, 0), false},
-		{"sat-night opens Sat evening", satNight, at(0, 23, 0), true},   // Sat 23:00
-		{"sat-night tail Sun morning", satNight, at(1, 2, 0), true},     // Sun 02:00 (opened Sat)
+		{"sat-night opens Sat evening", satNight, at(0, 23, 0), true},     // Sat 23:00
+		{"sat-night tail Sun morning", satNight, at(1, 2, 0), true},       // Sun 02:00 (opened Sat)
 		{"sat-night Sun evening excluded", satNight, at(1, 23, 0), false}, // opens Sun -> not allowed
 		{"sat-night Mon morning excluded", satNight, at(2, 2, 0), false},  // opened Sun -> not allowed
 	}
