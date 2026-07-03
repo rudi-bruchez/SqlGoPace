@@ -34,6 +34,15 @@ sqlgopace_history.db-*
 03.done/
 04.failed/
 
+# Client-specific work files (queue manifests, exported index lists) — never commit.
+# The whole to_run queue is ignored except the generic example manifest the tests load.
+01.to_run/*
+!01.to_run/.010_example_rebuild.yaml
+specs/to-compress.txt
+
+# Built binaries (make build -> bin/)
+bin/
+
 # Editor/IDE
 # .idea/
 # .vscode/
