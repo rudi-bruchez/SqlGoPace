@@ -361,11 +361,11 @@ func (e *Engine) deferredByWindow(ctx context.Context, name string) bool {
 	}
 	open, err := e.windowOpen(ctx, m.Window)
 	if err != nil {
-		fmt.Fprintf(e.out, "-- defer %s: cannot read server time (%v) — left in queue\n", name, err)
+		fmt.Fprintf(e.out, "-- defer %s: window not evaluated (%v) — left in queue\n", name, err)
 		return true
 	}
 	if !open {
-		fmt.Fprintf(e.out, "-- defer %s: outside window %s–%s %v — left in queue\n", name, m.Window.Start, m.Window.End, m.Window.Days)
+		fmt.Fprintf(e.out, "-- defer %s: outside window %s–%s %s — left in queue\n", name, m.Window.Start, m.Window.End, strings.Join(m.Window.Days, ","))
 		return true
 	}
 	return false
@@ -455,9 +455,6 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if e.draining() {
 			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned))
 		}
-		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-			return e.finalizeWindowClosed(ctx, name, rep, start, cursor, len(planned))
-		}
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
 
@@ -466,10 +463,15 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
 
 		// Resume cursor: operations before it were completed in a previous drained or
-		// interrupted run of this manifest, so skip them (near-zero cost).
+		// interrupted run of this manifest, so skip them (near-zero cost) — before the
+		// window check, so a resumed manifest does not read the server clock once per
+		// already-done operation.
 		if i < resumeFrom {
 			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, resumeSkipReason))
 			continue
+		}
+		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
+			return e.finalizeWindowClosed(ctx, name, rep, start, cursor, len(planned))
 		}
 		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
 		// unless this operation left its own paused resumable, which must be resumed/finished

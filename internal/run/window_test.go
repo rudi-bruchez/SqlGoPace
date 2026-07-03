@@ -47,6 +47,13 @@ func TestWindowOpen(t *testing.T) {
 	if _, err := run.ExportWindowOpen(engErr, context.Background(), win); err == nil {
 		t.Fatal("windowOpen with clock error: want error, got nil")
 	}
+
+	// window set but no server clock wired: a configuration error, not a clock read.
+	engNoClock, _ := setupEngine(t, fakePreflighter{}, &fakeOpRunner{})
+	open, err = run.ExportWindowOpen(engNoClock, context.Background(), win)
+	if err == nil || open {
+		t.Fatalf("windowOpen with no server clock = (%v, %v), want (false, non-nil error)", open, err)
+	}
 }
 
 func TestProcessAllDefersOutsideWindow(t *testing.T) {
