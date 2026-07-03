@@ -146,6 +146,35 @@ func TestRunExplainIgnoreBlockedSessions(t *testing.T) {
 	}
 }
 
+func TestDryRunAnnotatesWindow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "win.yaml")
+	const m = `
+description: windowed
+window:
+  start: "01:00"
+  end: "05:00"
+  days: [Sat, Sun]
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	if err := os.WriteFile(path, []byte(m), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	var out bytes.Buffer
+	args := []string{"--dry-run", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, path}
+	if err := cli(&out, io.Discard, args); err != nil {
+		t.Fatalf("run(dry-run) error = %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "window 01:00–05:00") {
+		t.Errorf("dry-run output missing window annotation:\n%s", out.String())
+	}
+}
+
 func TestRunVersion(t *testing.T) {
 	var out bytes.Buffer
 	if err := cli(&out, io.Discard, []string{"--version"}); err != nil {

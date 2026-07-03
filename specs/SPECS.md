@@ -605,6 +605,34 @@ A `PARTIAL` run counts as a failed manifest for the exit code (§16). A recovera
 contains the **expanded** per-index rebuilds (§1.6), so only the indexes that actually failed are
 retried.
 
+### 11.4 Execution windows (`window`)
+
+A manifest may declare an optional `window: { start, end, days }` (§1.1) restricting when its
+operations may run, evaluated against the SQL Server's own **local** wall clock (`SYSDATETIME()`)
+— never the tool's local time — read on the **monitoring connection** so the check is never
+blocked by the DDL in flight (§3). `end < start` denotes an overnight window crossing midnight;
+`days` (default: every day) selects the day the window **opens**. A window with `start == end` is
+rejected at manifest validation as ambiguous.
+
+Enforcement happens at three points, all conservative on a clock-read failure (treated as closed,
+i.e. defer/stop):
+
+1. **Pre-claim defer** in `ProcessAll`: before a manifest is even claimed into `02.processing/`,
+   its window is checked; if closed, the manifest is left untouched in `01.to_run/` and counted
+   as `Deferred` in the run summary. Scheduling the run itself (cron / Task Scheduler) is external
+   to the tool.
+2. **`processOne` entry check**: a manifest resumed from a previous interruption is re-checked
+   before preflight; if its window is already closed, the run stops immediately without
+   re-running preflight or planning.
+3. **Op-boundary (loop-top) check**: before each operation, reusing the same mechanism as a
+   graceful drain — the operation **in flight always finishes**, then the manifest stays in
+   `02.processing/` with its resume cursor (§11's fingerprinted cursor) unchanged, so the next run
+   inside a later window continues exactly where it left off, without discarding progress or
+   re-running completed operations.
+
+Offline `--dry-run` (no connection) cannot evaluate a window and instead annotates the rendered
+output.
+
 ---
 
 ## 12. TUI — incident console

@@ -416,6 +416,9 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
+	if conn != nil {
+		opts = append(opts, run.WithServerClock(conn))
+	}
 	opts = append(opts, extra...)
 	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
 }
@@ -865,6 +868,15 @@ func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []dd
 		fmt.Fprintf(w, "-- manifest: %s — %s\n", source, manifest.Description)
 	} else {
 		fmt.Fprintf(w, "-- manifest: %s\n", source)
+	}
+
+	if manifest.Window != nil {
+		win := manifest.Window
+		days := ""
+		if len(win.Days) > 0 {
+			days = " " + strings.Join(win.Days, ",")
+		}
+		fmt.Fprintf(w, "-- window %s–%s%s — enforced at runtime (server time; not evaluated in offline dry-run)\n", win.Start, win.End, days)
 	}
 
 	if explain && len(manifest.IgnoreBlockedSessions) > 0 {

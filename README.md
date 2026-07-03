@@ -190,6 +190,28 @@ operations:
     default: 0               # constant → metadata-only on Enterprise
 ```
 
+### `window` (optional)
+
+Restrict a manifest's operations to a recurring window, evaluated against the SQL
+Server's **local** clock (`SYSDATETIME()`):
+
+```yaml
+window:
+  start: "01:00"      # HH:MM, 24h, server local time
+  end:   "05:00"      # HH:MM
+  days:  [Sat, Sun]   # optional; Mon..Sun; default = every day
+```
+
+- `end < start` is an overnight window that crosses midnight (e.g. `22:00`–`05:00`).
+  `days` selects the day the window **opens**.
+- Outside the window, the manifest is **deferred** (left in `01.to_run`, not run) —
+  schedule the run (cron / Task Scheduler) to launch during the window.
+- If the window closes while the manifest is running, the **current operation
+  finishes**, then the run stops and the manifest stays in `02.processing` with its
+  resume cursor, continuing in the next window.
+- `start == end` is rejected. Offline `--dry-run` cannot evaluate the window (no
+  connection) and annotates it instead.
+
 ### Supported operations
 
 | `operation`       | Generated T-SQL                            |

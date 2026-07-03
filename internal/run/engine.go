@@ -116,6 +116,7 @@ type Summary struct {
 	Done        int
 	Failed      int
 	Interrupted int // paused and left for recovery (session killed / connection lost)
+	Deferred    int // manifests skipped this run because they were outside their window
 }
 
 // runOutcome is the result of processing one manifest.
@@ -159,6 +160,7 @@ type Engine struct {
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
 	compression      CompressionReader // reads current index compression for skip_if_satisfied
 	drain            func() bool       // reports a requested graceful stop (cancellable DrainFlag)
+	serverClock      ServerClock       // reads SQL Server local time for manifest windows
 	out              io.Writer
 }
 
@@ -316,6 +318,10 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 			fmt.Fprintf(e.out, "skip %s: targets another database; left in queue (run is on %q)\n", name, e.database)
 			continue
 		}
+		if e.deferredByWindow(ctx, name) {
+			sum.Deferred++
+			continue
+		}
 		switch e.processOne(ctx, name) {
 		case outcomeDone:
 			sum.Done++
@@ -341,6 +347,28 @@ func (e *Engine) ownsManifest(name string) bool {
 		return true
 	}
 	return m.Database == "" || strings.EqualFold(m.Database, e.database)
+}
+
+// deferredByWindow reports whether a manifest waiting in to_run should be skipped
+// this run because its server-time window is closed. It is conservative: a manifest
+// with a window whose server-clock read fails is deferred (never run at an unknown
+// time). A manifest that cannot be loaded is not deferred here — processOne surfaces
+// the load error.
+func (e *Engine) deferredByWindow(ctx context.Context, name string) bool {
+	m, err := ddl.LoadManifestFile(filepath.Join(e.dirs.ToRun, name))
+	if err != nil || m.Window == nil {
+		return false
+	}
+	open, err := e.windowOpen(ctx, m.Window)
+	if err != nil {
+		fmt.Fprintf(e.out, "-- defer %s: window not evaluated (%v) — left in queue\n", name, err)
+		return true
+	}
+	if !open {
+		fmt.Fprintf(e.out, "-- defer %s: outside window %s–%s %s — left in queue\n", name, m.Window.Start, m.Window.End, strings.Join(m.Window.Days, ","))
+		return true
+	}
+	return false
 }
 
 func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
@@ -375,6 +403,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			rep.Error = "expand ALL rebuild: " + err.Error()
 			return e.finalize(ctx, name, rep, start, false)
 		}
+	}
+
+	// A windowed manifest resumed while already outside its window stops before
+	// preflight — nothing to do until the window reopens. A clock error is treated
+	// conservatively as closed.
+	if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
+		return e.finalizeWindowClosed(ctx, name, rep, start, resumeFrom, len(manifest.Operations))
 	}
 
 	pfReport, err := e.pf.Check(ctx, manifest)
@@ -428,10 +463,15 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
 
 		// Resume cursor: operations before it were completed in a previous drained or
-		// interrupted run of this manifest, so skip them (near-zero cost).
+		// interrupted run of this manifest, so skip them (near-zero cost) — before the
+		// window check, so a resumed manifest does not read the server clock once per
+		// already-done operation.
 		if i < resumeFrom {
 			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, resumeSkipReason))
 			continue
+		}
+		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
+			return e.finalizeWindowClosed(ctx, name, rep, start, cursor, len(planned))
 		}
 		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
 		// unless this operation left its own paused resumable, which must be resumed/finished

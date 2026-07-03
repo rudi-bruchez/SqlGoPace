@@ -341,6 +341,59 @@ func TestParseManifestErrors(t *testing.T) {
 	}
 }
 
+func TestParseManifestWindow(t *testing.T) {
+	const withWindow = `
+description: windowed
+window:
+  start: "01:00"
+  end: "05:00"
+  days: [Sat, Sun]
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	m, err := ddl.ParseManifest(strings.NewReader(withWindow))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v", err)
+	}
+	if m.Window == nil || m.Window.Start != "01:00" || m.Window.End != "05:00" || len(m.Window.Days) != 2 {
+		t.Fatalf("Window = %+v, want start 01:00 end 05:00 with 2 days", m.Window)
+	}
+
+	const badWindow = `
+description: bad
+window:
+  start: "01:00"
+  end: "01:00"
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	if _, err := ddl.ParseManifest(strings.NewReader(badWindow)); err == nil {
+		t.Fatal("ParseManifest() with equal start/end: want error, got nil")
+	}
+
+	const noWindow = `
+description: none
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	m2, err := ddl.ParseManifest(strings.NewReader(noWindow))
+	if err != nil {
+		t.Fatalf("ParseManifest(no window) error = %v", err)
+	}
+	if m2.Window != nil {
+		t.Fatalf("Window = %+v, want nil when absent", m2.Window)
+	}
+}
+
 func TestLoadShippedExampleManifest(t *testing.T) {
 	// Shipped example is dot-prefixed so the runner treats it as disabled, but it
 	// must still parse as a valid manifest.
