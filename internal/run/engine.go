@@ -405,6 +405,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		}
 	}
 
+	// A windowed manifest resumed while already outside its window stops before
+	// preflight — nothing to do until the window reopens. A clock error is treated
+	// conservatively as closed.
+	if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
+		return e.finalizeWindowClosed(ctx, name, rep, start, resumeFrom, len(manifest.Operations))
+	}
+
 	pfReport, err := e.pf.Check(ctx, manifest)
 	rep.Preflight = checkLines(pfReport)
 	if err != nil {
@@ -447,6 +454,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// loop); stop before starting the next one and leave the manifest for recovery.
 		if e.draining() {
 			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned))
+		}
+		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
+			return e.finalizeWindowClosed(ctx, name, rep, start, cursor, len(planned))
 		}
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}

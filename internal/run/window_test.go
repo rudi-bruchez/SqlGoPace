@@ -89,3 +89,60 @@ operations:
 		t.Fatal("manifest must not be in processing")
 	}
 }
+
+func TestProcessOneStopsWhenWindowCloses(t *testing.T) {
+	// A clock that reports inside the window for the first read (entry), then
+	// outside for subsequent reads (op boundaries), simulating the window closing.
+	clk := &togglingClock{
+		times: []time.Time{
+			time.Date(2022, 1, 1, 4, 59, 0, 0, time.UTC), // entry: inside 01:00–05:00
+			time.Date(2022, 1, 1, 5, 1, 0, 0, time.UTC),  // boundary before op 0: closed
+		},
+	}
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithServerClock(clk))
+
+	const windowed = `
+description: windowed
+window:
+  start: "01:00"
+  end: "05:00"
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+`
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(windowed), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll: %v", err)
+	}
+	if sum.Interrupted != 1 {
+		t.Fatalf("Summary = %+v, want Interrupted:1", sum)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner.calls = %d, want 0 (window closed before op 0)", runner.calls)
+	}
+	// Left in processing for the next window (not done, not failed).
+	if _, err := os.Stat(filepath.Join(dirs.Processing, "010_a.yaml")); err != nil {
+		t.Fatalf("manifest should remain in processing: %v", err)
+	}
+}
+
+// togglingClock returns successive times, repeating the last one once exhausted.
+type togglingClock struct {
+	times []time.Time
+	i     int
+}
+
+func (c *togglingClock) ServerNow(context.Context) (time.Time, error) {
+	t := c.times[c.i]
+	if c.i < len(c.times)-1 {
+		c.i++
+	}
+	return t, nil
+}
