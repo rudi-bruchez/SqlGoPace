@@ -752,16 +752,17 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	}
 	e.relocateCapture(name, e.dirs.Failed)
 
-	recovery := &ddl.Manifest{
-		Description:           recoveryDescription(m, name),
-		Database:              m.Database,
-		OnFailure:             ddl.OnFailureContinue,
-		IgnoreBlockedSessions: ignore,
-		Operations:            failed,
-	}
+	// Copy the manifest so recovery-specific overrides are the only differences; this
+	// carries forward every other setting (execution window, skip_if_satisfied, …) that
+	// a resubmitted recovery run must still honor.
+	recovery := *m
+	recovery.Description = recoveryDescription(m, name)
+	recovery.OnFailure = ddl.OnFailureContinue
+	recovery.IgnoreBlockedSessions = ignore
+	recovery.Operations = failed
 	recName := name + ".recovery.yaml"
 	rep.Error = fmt.Sprintf("%d of %d operation(s) failed; recovery manifest: %s", len(failed), len(rep.Operations), recName)
-	if err := e.writeRecovery(filepath.Join(e.dirs.Failed, recName), recovery); err != nil {
+	if err := e.writeRecovery(filepath.Join(e.dirs.Failed, recName), &recovery); err != nil {
 		fmt.Fprintf(e.out, "write recovery manifest %s: %v\n", recName, err)
 	}
 

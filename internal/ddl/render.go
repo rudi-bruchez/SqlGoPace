@@ -39,6 +39,19 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.AbortBlockingResumable {
 		addPair(root, "abort_blocking_resumable", scalarNode("true"))
 	}
+	if m.Window != nil {
+		win := &yaml.Node{Kind: yaml.MappingNode}
+		addPair(win, "start", scalarNode(m.Window.Start))
+		addPair(win, "end", scalarNode(m.Window.End))
+		if len(m.Window.Days) > 0 {
+			days := &yaml.Node{Kind: yaml.SequenceNode}
+			for _, d := range m.Window.Days {
+				days.Content = append(days.Content, scalarNode(d))
+			}
+			addPair(win, "days", days)
+		}
+		addPair(root, "window", win)
+	}
 	if len(m.IgnoreBlockedSessions) > 0 {
 		seq := &yaml.Node{Kind: yaml.SequenceNode}
 		for i, s := range m.IgnoreBlockedSessions {

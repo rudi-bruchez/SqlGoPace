@@ -327,11 +327,15 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		total.Done += sum.Done
 		total.Failed += sum.Failed
 		total.Interrupted += sum.Interrupted
+		total.Deferred += sum.Deferred
 	}
 
-	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted\n", total.Done, total.Failed, total.Interrupted)
+	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted, %d deferred\n", total.Done, total.Failed, total.Interrupted, total.Deferred)
 	if total.Interrupted > 0 {
 		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", total.Interrupted)
+	}
+	if total.Deferred > 0 {
+		fmt.Fprintf(stdout, "-- %d manifest(s) deferred (outside their execution window); left in queue for a later run\n", total.Deferred)
 	}
 	if runErr != nil {
 		return runErr

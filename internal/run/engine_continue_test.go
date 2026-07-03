@@ -2,11 +2,13 @@ package run_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -201,6 +203,51 @@ func TestContinueModeAllFailedRecoversAll(t *testing.T) {
 	}
 	if len(rec.Operations) != 3 {
 		t.Errorf("recovery has %d operations, want 3 (all failed)", len(rec.Operations))
+	}
+}
+
+// TestContinueModeRecoveryPreservesWindow is a regression test: a windowed
+// continue-mode manifest, run inside its window with the expander wired (as in
+// production), must carry its execution window into the emitted recovery manifest.
+// The window was dropped twice — by ExpandAll and by the recovery-manifest builder —
+// so a resubmitted recovery ran at any time of day.
+func TestContinueModeRecoveryPreservesWindow(t *testing.T) {
+	inside := time.Date(2022, 1, 1, 3, 0, 0, 0, time.UTC) // Saturday 03:00, inside 01:00–05:00
+	const windowedContinue = `
+description: windowed continue
+on_failure: continue
+window:
+  start: "01:00"
+  end: "05:00"
+  days: [Sat]
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX2
+`
+	runner := &seqOpRunner{errs: []error{errors.New("blocked")}} // op 0 fails, op 1 succeeds
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithServerClock(fakeServerClock{now: inside}), run.WithExpander(fakeExpander{}))
+	writeOnly(t, dirs, "100_c.yaml", windowedContinue)
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Failed != 1 {
+		t.Fatalf("Summary = %+v, want Failed:1 (PARTIAL)", sum)
+	}
+	rec, err := ddl.LoadManifestFile(filepath.Join(dirs.Failed, "100_c.yaml.recovery.yaml"))
+	if err != nil {
+		t.Fatalf("load recovery manifest: %v", err)
+	}
+	if rec.Window == nil || rec.Window.Start != "01:00" || rec.Window.End != "05:00" || len(rec.Window.Days) != 1 {
+		t.Fatalf("recovery Window = %+v, want start 01:00 end 05:00 days [Sat] (must carry forward)", rec.Window)
 	}
 }
 

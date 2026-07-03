@@ -204,6 +204,52 @@ operations:
 	}
 }
 
+// TestWindowEnforcedWithExpanderWired is a regression test for the bug where
+// ExpandAll — always wired in production via WithExpander — rebuilt the manifest
+// and dropped the Window field, so the runtime window checks in processOne saw a
+// nil window and never fired (the manifest ran every operation regardless of the
+// window closing). With the expander wired and the window closing between ops, op 0
+// must run and op 1 must not, exactly as without the expander.
+func TestWindowEnforcedWithExpanderWired(t *testing.T) {
+	inside := time.Date(2022, 1, 1, 4, 0, 0, 0, time.UTC)
+	closed := time.Date(2022, 1, 1, 5, 1, 0, 0, time.UTC)
+	clk := &togglingClock{times: []time.Time{inside, inside, inside, closed}}
+
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithServerClock(clk), run.WithExpander(fakeExpander{}), run.WithSession(fakeSession{spid: 71}))
+
+	const windowedTwoOps = `
+description: windowed two-op
+window:
+  start: "01:00"
+  end: "05:00"
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX2
+`
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(windowedTwoOps), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll: %v", err)
+	}
+	if sum.Interrupted != 1 || sum.Done != 0 {
+		t.Fatalf("Summary = %+v, want Interrupted:1 Done:0 (window must be enforced despite the expander)", sum)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("runner.calls = %d, want 1 (op 0 ran; op 1 blocked by the closed window)", runner.calls)
+	}
+}
+
 // togglingClock returns successive times, repeating the last one once exhausted.
 type togglingClock struct {
 	times []time.Time

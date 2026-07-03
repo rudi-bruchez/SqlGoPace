@@ -24,6 +24,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 			{SessionID: intPtr(57)},
 			{Statement: `dbo\.Report`},
 		},
+		Window: &ddl.Window{Start: "22:00", End: "05:00", Days: []string{"Sat", "Sun"}},
 		Operations: []ddl.Operation{
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE"},
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_PART", Partition: intPtr(3), DataCompression: "ROW"},

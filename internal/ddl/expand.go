@@ -63,13 +63,12 @@ type IndexDescriptor struct {
 // compression model). An ALL rebuild over a table with no rebuildable index
 // expands to zero operations.
 func ExpandRebuildAll(m *Manifest, lookup func(schema, table string) ([]IndexDescriptor, error)) (*Manifest, error) {
-	out := &Manifest{
-		Description:           m.Description,
-		Database:              m.Database,
-		OnFailure:             m.OnFailure,
-		IgnoreBlockedSessions: m.IgnoreBlockedSessions,
-		Operations:            make([]Operation, 0, len(m.Operations)),
-	}
+	// Copy every manifest-level field, then rebuild only Operations. A field-by-field
+	// copy silently drops any field it omits — that bug already reverted on_failure to
+	// fail-fast once, and dropped the execution Window again; copying the whole struct
+	// makes new manifest fields carry through expansion by default.
+	out := *m
+	out.Operations = make([]Operation, 0, len(m.Operations))
 	for _, op := range m.Operations {
 		if !IsAllIndexRebuild(op) {
 			out.Operations = append(out.Operations, op)
@@ -84,7 +83,7 @@ func ExpandRebuildAll(m *Manifest, lookup func(schema, table string) ([]IndexDes
 			out.Operations = append(out.Operations, expandedRebuild(ri, idx))
 		}
 	}
-	return out, nil
+	return &out, nil
 }
 
 // expandedRebuild builds the per-index rebuild for one concrete index.
