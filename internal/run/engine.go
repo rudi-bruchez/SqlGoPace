@@ -318,6 +318,10 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 			fmt.Fprintf(e.out, "skip %s: targets another database; left in queue (run is on %q)\n", name, e.database)
 			continue
 		}
+		if e.deferredByWindow(ctx, name) {
+			sum.Deferred++
+			continue
+		}
 		switch e.processOne(ctx, name) {
 		case outcomeDone:
 			sum.Done++
@@ -343,6 +347,28 @@ func (e *Engine) ownsManifest(name string) bool {
 		return true
 	}
 	return m.Database == "" || strings.EqualFold(m.Database, e.database)
+}
+
+// deferredByWindow reports whether a manifest waiting in to_run should be skipped
+// this run because its server-time window is closed. It is conservative: a manifest
+// with a window whose server-clock read fails is deferred (never run at an unknown
+// time). A manifest that cannot be loaded is not deferred here — processOne surfaces
+// the load error.
+func (e *Engine) deferredByWindow(ctx context.Context, name string) bool {
+	m, err := ddl.LoadManifestFile(filepath.Join(e.dirs.ToRun, name))
+	if err != nil || m.Window == nil {
+		return false
+	}
+	open, err := e.windowOpen(ctx, m.Window)
+	if err != nil {
+		fmt.Fprintf(e.out, "-- defer %s: cannot read server time (%v) — left in queue\n", name, err)
+		return true
+	}
+	if !open {
+		fmt.Fprintf(e.out, "-- defer %s: outside window %s–%s %v — left in queue\n", name, m.Window.Start, m.Window.End, m.Window.Days)
+		return true
+	}
+	return false
 }
 
 func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
