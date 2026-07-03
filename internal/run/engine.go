@@ -116,6 +116,7 @@ type Summary struct {
 	Done        int
 	Failed      int
 	Interrupted int // paused and left for recovery (session killed / connection lost)
+	Deferred    int // manifests skipped this run because they were outside their window
 }
 
 // runOutcome is the result of processing one manifest.
@@ -159,6 +160,7 @@ type Engine struct {
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
 	compression      CompressionReader // reads current index compression for skip_if_satisfied
 	drain            func() bool       // reports a requested graceful stop (cancellable DrainFlag)
+	serverClock      ServerClock       // reads SQL Server local time for manifest windows
 	out              io.Writer
 }
 
