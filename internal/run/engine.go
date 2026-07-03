@@ -409,7 +409,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// preflight — nothing to do until the window reopens. A clock error is treated
 	// conservatively as closed.
 	if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-		return e.finalizeWindowClosed(ctx, name, rep, start, resumeFrom, len(manifest.Operations))
+		return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, "before this run's operations"))
 	}
 
 	pfReport, err := e.pf.Check(ctx, manifest)
@@ -471,7 +471,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			continue
 		}
 		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-			return e.finalizeWindowClosed(ctx, name, rep, start, cursor, len(planned))
+			return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", cursor, len(planned))))
 		}
 		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
 		// unless this operation left its own paused resumable, which must be resumed/finished
@@ -841,9 +841,18 @@ func (e *Engine) draining() bool { return stopRequested(e.drain) }
 // cursor is already durable — advanceCursor persisted it after each completed operation —
 // so this only finalizes the report; it does not re-write the cursor.
 func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
-	rep.Error = fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total)
+	return e.finalizeGracefulStop(ctx, name, rep, start,
+		fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total),
+		fmt.Sprintf("-- drained after operation %d/%d on %s — left in processing, resumes next run", done, total, name))
+}
+
+// finalizeGracefulStop records a graceful stop — a drain or a closed execution window —
+// leaving the manifest in processing with its resume cursor so the next run continues it.
+// errMsg goes to the report; logMsg is narrated to stdout.
+func (e *Engine) finalizeGracefulStop(ctx context.Context, name string, rep *report.RunReport, start time.Time, errMsg, logMsg string) runOutcome {
+	rep.Error = errMsg
 	e.recordInterrupted(ctx, name, rep, start)
-	fmt.Fprintf(e.out, "-- drained after operation %d/%d on %s — left in processing, resumes next run\n", done, total, name)
+	fmt.Fprintln(e.out, logMsg)
 	return outcomeInterrupted
 }
 

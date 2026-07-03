@@ -21,18 +21,25 @@ var weekdayNames = map[string]time.Weekday{
 	"thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday, "sun": time.Sunday,
 }
 
-// parseHHMM parses "HH:MM" into minutes since midnight (0–1439).
+// parseHHMM parses "HH:MM" into minutes since midnight (0–1439). Each field must be
+// exactly two ASCII digits, so non-canonical forms strconv.Atoi would otherwise accept
+// and silently normalize ("+1", "5", "01 ") are rejected instead.
 func parseHHMM(s string) (int, error) {
 	parts := strings.Split(strings.TrimSpace(s), ":")
-	if len(parts) != 2 {
-		return 0, fmt.Errorf("time %q is not HH:MM: %w", s, ErrInvalidManifest)
+	if len(parts) != 2 || !isTwoDigits(parts[0]) || !isTwoDigits(parts[1]) {
+		return 0, fmt.Errorf("time %q is not HH:MM (two digits each): %w", s, ErrInvalidManifest)
 	}
-	h, herr := strconv.Atoi(parts[0])
-	m, merr := strconv.Atoi(parts[1])
-	if herr != nil || merr != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+	h, _ := strconv.Atoi(parts[0])
+	m, _ := strconv.Atoi(parts[1])
+	if h > 23 || m > 59 {
 		return 0, fmt.Errorf("time %q is not a valid 24h HH:MM: %w", s, ErrInvalidManifest)
 	}
 	return h*60 + m, nil
+}
+
+// isTwoDigits reports whether s is exactly two ASCII digits.
+func isTwoDigits(s string) bool {
+	return len(s) == 2 && s[0] >= '0' && s[0] <= '9' && s[1] >= '0' && s[1] <= '9'
 }
 
 // parseWeekday parses a case-insensitive 3-letter weekday name.
@@ -42,6 +49,23 @@ func parseWeekday(s string) (time.Weekday, error) {
 		return 0, fmt.Errorf("unknown day %q (want Mon..Sun): %w", s, ErrInvalidManifest)
 	}
 	return d, nil
+}
+
+// parseDays returns the set of allowed weekdays, or nil for "every day" (empty input).
+// Names are parsed once so Contains does set lookups rather than re-parsing per call.
+// Invalid names are skipped — validation rejects them at load, so a validated window's
+// set is exact.
+func parseDays(days []string) map[time.Weekday]bool {
+	if len(days) == 0 {
+		return nil
+	}
+	set := make(map[time.Weekday]bool, len(days))
+	for _, name := range days {
+		if wd, err := parseWeekday(name); err == nil {
+			set[wd] = true
+		}
+	}
+	return set
 }
 
 // Validate checks the window's times and day names, and rejects a zero-length
@@ -78,17 +102,8 @@ func (w Window) Contains(t time.Time) bool {
 	today := t.Weekday()
 	yesterday := time.Weekday((int(today) + 6) % 7)
 
-	dayAllowed := func(d time.Weekday) bool {
-		if len(w.Days) == 0 {
-			return true
-		}
-		for _, name := range w.Days {
-			if wd, err := parseWeekday(name); err == nil && wd == d {
-				return true
-			}
-		}
-		return false
-	}
+	allowed := parseDays(w.Days) // nil => every day
+	dayAllowed := func(d time.Weekday) bool { return allowed == nil || allowed[d] }
 
 	if start < end { // same-day window [start, end)
 		return now >= start && now < end && dayAllowed(today)

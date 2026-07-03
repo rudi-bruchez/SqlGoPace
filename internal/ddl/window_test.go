@@ -20,6 +20,10 @@ func TestWindowValidate(t *testing.T) {
 		{"equal start/end", Window{Start: "01:00", End: "01:00"}, true},
 		{"unknown day", Window{Start: "01:00", End: "05:00", Days: []string{"Funday"}}, true},
 		{"empty start", Window{Start: "", End: "05:00"}, true},
+		{"leading plus", Window{Start: "+1:00", End: "05:00"}, true},
+		{"single-digit hour", Window{Start: "1:00", End: "05:00"}, true},
+		{"single-digit minute", Window{Start: "01:0", End: "05:00"}, true},
+		{"inner space", Window{Start: "01: 0", End: "05:00"}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

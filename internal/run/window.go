@@ -44,12 +44,21 @@ func (e *Engine) windowOpen(ctx context.Context, w *ddl.Window) (bool, error) {
 	return w.Contains(now), nil
 }
 
-// finalizeWindowClosed records a stop because the manifest's window closed after
-// `done` of `total` operations. Like a graceful drain, the manifest stays in
-// processing with its resume cursor so the next run inside the window continues.
-func (e *Engine) finalizeWindowClosed(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
-	rep.Error = fmt.Sprintf("window closed after operation %d/%d — resumes in the next window", done, total)
-	e.recordInterrupted(ctx, name, rep, start)
-	fmt.Fprintf(e.out, "-- window closed after operation %d/%d on %s — left in processing, resumes next window\n", done, total, name)
-	return outcomeInterrupted
+// windowStopReason describes why a windowed run stopped: a failed server-clock read
+// (so an operator is not told "window closed" when the real cause was connectivity), or
+// the window itself closing at the given point.
+func windowStopReason(err error, closedAt string) string {
+	if err != nil {
+		return fmt.Sprintf("could not read server time (%v)", err)
+	}
+	return "window closed " + closedAt
+}
+
+// finalizeWindowClosed records a graceful stop because the manifest's execution window
+// closed (or its clock could not be read). Like a drain, the manifest stays in processing
+// with its resume cursor so the next run inside the window continues.
+func (e *Engine) finalizeWindowClosed(ctx context.Context, name string, rep *report.RunReport, start time.Time, reason string) runOutcome {
+	return e.finalizeGracefulStop(ctx, name, rep, start,
+		reason+" — resumes in the next window",
+		fmt.Sprintf("-- %s: %s — left in processing, resumes next window", name, reason))
 }
