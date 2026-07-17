@@ -192,6 +192,17 @@ func effectiveIntent(manifestIntent ddl.Intent, op ddl.RebuildIndex) ddl.Intent 
 `Manifest.Intent` is validated like the field, and **must be emitted by `MarshalManifest`** — a
 manifest-level field needs an explicit `addPair` (`render.go:36-38` is the pattern).
 
+Only `intent` gets a manifest-level default, not the `data_compression` it sits next to —
+`intent: compression` factors out but `data_compression: PAGE` is still repeated per operation.
+The two look symmetric but their empty values are not. `Intent: ""` means "unset", with a safe
+default (runs); `DataCompression == ""` is a deliberate value — a defrag-only rebuild that emits
+no `DATA_COMPRESSION` clause (`generate.go`, `withClause`: `if dataCompression != ""`) and leaves
+the index's compression untouched. A manifest-level compression default would silently turn every
+un-annotated defrag rebuild into a compression rebuild. On a hand-written manifest the target is
+therefore repeated on each operation, by design; a compression campaign avoids the repetition by
+being generated, not hand-written (`COMPRESSION-SCOPE`), where the planner emits
+`data_compression` per operation.
+
 ### 4.4 Engine
 
 `skipSatisfied` (`skip.go:47`) trades its `enabled bool` for the manifest default:
