@@ -33,6 +33,9 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.OnFailure != "" {
 		addPair(root, "on_failure", scalarNode(string(m.OnFailure)))
 	}
+	if m.Intent != "" {
+		addPair(root, "intent", scalarNode(string(m.Intent)))
+	}
 	if m.SkipIfSatisfied {
 		addPair(root, "skip_if_satisfied", scalarNode("true"))
 	}

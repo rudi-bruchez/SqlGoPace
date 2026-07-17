@@ -204,6 +204,9 @@ type Manifest struct {
 	Description string
 	Database    string
 	OnFailure   OnFailure // empty defaults to stop (fail-fast)
+	// Intent is the default recorded on every rebuild_index that sets none of its own
+	// (see Intent). It is resolved where it is used, not pushed into operations at load.
+	Intent Intent
 	// IgnoreBlockedSessions lists sessions allowed to remain blocked by this run's
 	// operations (see IgnoredSession). It is the single durable source of exclusions:
 	// read at start, re-read live during the run, and copied into the recovery manifest.
@@ -237,6 +240,9 @@ func (m *Manifest) Validate() error {
 		return fmt.Errorf("on_failure must be %q or %q, got %q: %w",
 			OnFailureStop, OnFailureContinue, m.OnFailure, ErrInvalidManifest)
 	}
+	if err := validateIntent(m.Intent); err != nil {
+		return err
+	}
 	for i, s := range m.IgnoreBlockedSessions {
 		if err := s.validate(); err != nil {
 			return fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
@@ -265,6 +271,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		Description            string           `yaml:"description"`
 		Database               string           `yaml:"database"`
 		OnFailure              string           `yaml:"on_failure"`
+		Intent                 string           `yaml:"intent"`
 		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
 		SkipIfSatisfied        bool             `yaml:"skip_if_satisfied"`
 		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
@@ -281,6 +288,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.Description = raw.Description
 	m.Database = raw.Database
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
+	m.Intent = Intent(strings.TrimSpace(raw.Intent))
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
 	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.AbortBlockingResumable = raw.AbortBlockingResumable

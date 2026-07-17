@@ -46,3 +46,28 @@ func TestRebuildIndexRejectsUnknownIntent(t *testing.T) {
 		t.Errorf("error does not name the offending value: %v", err)
 	}
 }
+
+func TestParseManifestIntentDefault(t *testing.T) {
+	src := "intent: compression\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	m, err := ddl.ParseManifest(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v", err)
+	}
+	if m.Intent != ddl.IntentCompression {
+		t.Errorf("Manifest.Intent = %q, want %q", m.Intent, ddl.IntentCompression)
+	}
+	// The default is NOT pushed into the operation: the op keeps its own empty intent.
+	if got := m.Operations[0].(ddl.RebuildIndex).Intent; got != "" {
+		t.Errorf("operation Intent = %q, want empty (default resolves at use, not at load)", got)
+	}
+}
+
+func TestManifestRejectsUnknownIntent(t *testing.T) {
+	_, err := ddl.ParseManifest(strings.NewReader("intent: banana\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"))
+	if err == nil {
+		t.Fatal("ParseManifest() error = nil, want an invalid manifest-intent error")
+	}
+	if !strings.Contains(err.Error(), "banana") {
+		t.Errorf("error does not name the offending value: %v", err)
+	}
+}

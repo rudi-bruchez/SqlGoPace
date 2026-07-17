@@ -17,6 +17,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 		Description:            "Maintenance plan for MYDB",
 		Database:               "MYDB",
 		OnFailure:              ddl.OnFailureContinue,
+		Intent:                 ddl.IntentCompression,
 		SkipIfSatisfied:        true,
 		AbortBlockingResumable: true,
 		IgnoreBlockedSessions: []ddl.IgnoredSession{
@@ -26,7 +27,7 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 		},
 		Window: &ddl.Window{Start: "22:00", End: "05:00", Days: []string{"Sat", "Sun"}},
 		Operations: []ddl.Operation{
-			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE"},
+			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE", Intent: ddl.IntentFragmentation},
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_PART", Partition: intPtr(3), DataCompression: "ROW"},
 			ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX", LOBCompaction: true},
 			ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX2", Partition: intPtr(2)},
