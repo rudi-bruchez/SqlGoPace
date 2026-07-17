@@ -127,6 +127,17 @@ const (
 	OnFailureContinue OnFailure = "continue"
 )
 
+// Intent records why a rebuild was scheduled. A rebuild both applies a compression
+// target (a state, idempotent) and defragments (an act, never idempotent); only the
+// manifest knows which motivated it, and the engine cannot skip correctly without
+// being told. Empty means "unknown" and always runs.
+type Intent string
+
+const (
+	IntentCompression   Intent = "compression"
+	IntentFragmentation Intent = "fragmentation"
+)
+
 // IgnoredSession matches sessions that are allowed to remain blocked by our DDL
 // operation (the manifest's ignore_blocked_sessions list). All string fields are
 // regular expressions, evaluated app-side because SQL Server has no regex before
@@ -535,6 +546,17 @@ func requireFields(opType string, fields map[string]string) error {
 		opType, strings.Join(missing, ", "), ErrInvalidManifest)
 }
 
+// validateIntent accepts an empty intent (unset) or one of the two constants.
+func validateIntent(i Intent) error {
+	switch i {
+	case "", IntentCompression, IntentFragmentation:
+		return nil
+	default:
+		return fmt.Errorf("intent must be %q or %q, got %q: %w",
+			IntentCompression, IntentFragmentation, i, ErrInvalidManifest)
+	}
+}
+
 // --- Concrete operations -------------------------------------------------
 
 // RebuildIndex is ALTER INDEX ... REBUILD. Index may be "ALL" to expand to one
@@ -545,6 +567,7 @@ type RebuildIndex struct {
 	Index           string          `yaml:"index"`
 	Partition       *int            `yaml:"partition"` // nil = whole index; set = REBUILD PARTITION = n
 	DataCompression string          `yaml:"data_compression"`
+	Intent          Intent          `yaml:"intent,omitempty"`
 	Options         OptionOverrides `yaml:"options"`
 
 	// Kind is the index's storage kind, populated only when this rebuild was
@@ -559,9 +582,12 @@ func (o RebuildIndex) Target() ObjectRef {
 	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Index}
 }
 func (o RebuildIndex) Validate() error {
-	return requireFields("rebuild_index", map[string]string{
+	if err := requireFields("rebuild_index", map[string]string{
 		"schema": o.Schema, "table": o.Table, "index": o.Index,
-	})
+	}); err != nil {
+		return err
+	}
+	return validateIntent(o.Intent)
 }
 
 // CreateIndex is CREATE [UNIQUE] INDEX.

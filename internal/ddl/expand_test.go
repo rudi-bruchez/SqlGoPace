@@ -76,6 +76,7 @@ func TestExpandRebuildAllCarriesEveryField(t *testing.T) {
 		Schema: "dbo", Table: "BigFact", Index: "ALL",
 		Partition:       intPtr(3),
 		DataCompression: "PAGE",
+		Intent:          ddl.IntentCompression,
 		Options:         ddl.OptionOverrides{MaxDOP: intPtr(4)},
 	}
 	out, err := ddl.ExpandRebuildAll(

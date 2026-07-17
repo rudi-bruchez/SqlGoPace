@@ -1,0 +1,48 @@
+package ddl_test
+
+import (
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+)
+
+func TestParseRebuildIndexIntent(t *testing.T) {
+	tests := []struct {
+		name string
+		yaml string
+		want ddl.Intent
+	}{
+		{"unset", "", ""},
+		{"compression", "    intent: compression\n", ddl.IntentCompression},
+		{"fragmentation", "    intent: fragmentation\n", ddl.IntentFragmentation},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			src := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n" + tt.yaml
+			m, err := ddl.ParseManifest(strings.NewReader(src))
+			if err != nil {
+				t.Fatalf("ParseManifest() error = %v", err)
+			}
+			got := m.Operations[0].(ddl.RebuildIndex).Intent
+			if got != tt.want {
+				t.Errorf("Intent = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRebuildIndexRejectsUnknownIntent(t *testing.T) {
+	src := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n    intent: banana\n"
+	_, err := ddl.ParseManifest(strings.NewReader(src))
+	if err == nil {
+		t.Fatal("ParseManifest() error = nil, want an invalid-intent error")
+	}
+	if !errors.Is(err, ddl.ErrInvalidManifest) {
+		t.Errorf("error is not ErrInvalidManifest: %v", err)
+	}
+	if !strings.Contains(err.Error(), "banana") {
+		t.Errorf("error does not name the offending value: %v", err)
+	}
+}
