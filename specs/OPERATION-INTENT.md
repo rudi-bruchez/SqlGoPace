@@ -1,31 +1,26 @@
 # OPERATION-INTENT — why a rebuild was scheduled
 
-> Implemented first of two: `specs/COMPRESSION-SCOPE.md` needs the planner able to mark an
+> Implemented before `specs/COMPRESSION-SCOPE.md`, which needs the planner able to mark an
 > operation compression-motivated.
->
-> Every citation below is against mainline at `2e2c8ca`. An earlier draft was written against
-> a stale worktree copy and its line numbers were wrong throughout; the worktree is deleted
-> and gitignored.
 
 ## 1. Problem
 
 `rebuild_index` does two unrelated things:
 
-1. **Applies a compression target** — a state. Idempotent: if the index is already `PAGE`,
-   the goal holds and there is nothing to do.
+1. **Applies a compression target** — a state. Idempotent: if the index is already `PAGE`, the
+   goal holds and there is nothing to do.
 2. **Rebuilds the index** — defragments, rebuilds statistics at fullscan, reclaims pages. An
    act. It has no "already true".
 
-`skip_if_satisfied` (`internal/ddl/manifest.go:204`) is a **manifest-level** flag that makes
-`skipSatisfied` (`internal/run/skip.go:47`) skip any `rebuild_index` whose `data_compression`
-already holds. It cannot distinguish the two cases, because the manifest cannot express which
-one motivated the operation.
+The manifest cannot say which one motivated the operation, so the engine cannot decide whether
+an already-compressed index still needs rebuilding. `skip_if_satisfied`
+(`internal/ddl/manifest.go:204`) is a manifest-level flag that makes `skipSatisfied`
+(`internal/run/skip.go:47`) skip any `rebuild_index` whose `data_compression` already holds. It
+applies to every operation in the manifest, and it inspects only compression.
 
-### What the bug is NOT
+### When the skip is wrong
 
-An earlier draft claimed the planner emits fragmentation-motivated rebuilds carrying
-`data_compression`, which `skip_if_satisfied` then skips while the index stays 90% fragmented.
-**That does not happen.** `decideIndex` sets the field only on a real change
+The planner's fresh output is safe. `decideIndex` sets the field only on a real change
 (`internal/maint/decide.go:239-242`):
 
 ```go
@@ -35,36 +30,30 @@ if comp.change {
 }
 ```
 
-and `comp.change` is true only when the target differs from current (`decide.go:438-441`,
-and `decide.go:393` for the override pin). So on the planner's own fresh output:
+and `comp.change` is true only when the target differs from current (`decide.go:438-441`, and
+`decide.go:393` for the override pin). So a frag-only rebuild carries no `data_compression` and
+exits `skipSatisfied` at `skip.go:52`; a frag+compression rebuild carries one that differs from
+current by construction, so `compressionSatisfied` is false. Neither is ever skipped.
 
-- **frag-only rebuild** → `DataCompression == ""` → `skipSatisfied` returns at `skip.go:52`.
-  Never skipped.
-- **frag + compression change** → `DataCompression` set, but by construction ≠ current →
-  `compressionSatisfied` false. Never skipped.
-
-### What the bug is
-
-The skip misfires only when the manifest and the server have **drifted** since the operation
-was written — which is the flag's whole reason to exist (`manifest.go:200-203`: "a compression
-manifest re-run after an interruption sets it to skip finished work"). Three ways in:
+The skip misfires once the manifest and the server have **drifted** — which is what the flag
+exists for (`manifest.go:200-203`: "a compression manifest re-run after an interruption sets it
+to skip finished work"). Three ways in:
 
 1. **A dual-motive rebuild, re-run after drift.** `fragRebuild && comp.change` — scheduled for
    *both* 40% fragmentation and NONE→PAGE. If the compression lands and the run is retried
    (crash, drain, window close, or a continue-on-failure cursor gap replaying it), the
-   compression now matches, the op is skipped, and **the defrag never happens**. Reported as
-   `skipped: already PAGE`, outcome SUCCESS.
-2. **A hand-written manifest** that sets `data_compression` on an op meant to defragment.
-3. **A recovery/resumed run** of any of the above.
+   compression now matches, the operation is skipped, and **the defrag never happens**. The log
+   says `skipped: already PAGE`; the outcome is SUCCESS.
+2. **A hand-written manifest** setting `data_compression` on an operation meant to defragment.
+3. **A resumed or recovery run** of either.
 
-Narrow, but silent and mis-reported — and it is exactly the case the operator asked to
-control: *skip an already-compressed index only when the goal was compression.*
+Narrow, but silent and mis-reported.
 
 ### The asymmetry that decides the design
 
 | Setting wrong | Outcome |
 |---|---|
-| Skip disabled when it could have skipped | Re-compresses an already-compressed index. Wasted time, correct result, visible. |
+| Skip disabled when it could have skipped | Re-compresses an already-compressed index. Wasted time, correct result, visible in the log. |
 | Skip enabled when it should have run | Skips a needed rebuild. Wrong result, invisible, reported as success. |
 
 One wastes hours; the other lies. A manifest-level boolean cannot tell them apart, because the
@@ -81,14 +70,15 @@ if !fragRebuild { // rebuild is purely compression-motivated
 }
 ```
 
-`fragRebuild` (`decide.go:200`) separates **compression-only** (`!fragRebuild`, which past the
-`if !needRebuild` return at `decide.go:206` forces `comp.change`) from **fragmentation-involved**
-(`fragRebuild`, which may *also* change compression). It is not a motive: `fragRebuild &&
-comp.change` is dual-motive. But it is exactly the split the skip needs, because a dual-motive
-rebuild must run. The value is flattened into prose on `Decision.Reason`, which
-`OperationsByCategory` (`decide.go:115-123`) drops on the way to YAML; `MarshalManifest`
-(`internal/ddl/render.go:16-78`) emits no comments. A generated `020_maint_MyDb_index.yaml`
-cannot say why any line is in it.
+`fragRebuild` (`decide.go:200`) separates **compression-only** — `!fragRebuild`, which past the
+`if !needRebuild` return at `decide.go:206` forces `comp.change` — from
+**fragmentation-involved**, which may *also* change compression. It is not a motive:
+`fragRebuild && comp.change` is dual-motive. But it is the split the skip needs, because a
+dual-motive rebuild must run.
+
+The value is flattened into prose on `Decision.Reason`, which `OperationsByCategory`
+(`decide.go:115-123`) drops on the way to YAML; `MarshalManifest` (`internal/ddl/render.go:16-78`)
+emits no comments. A generated `020_maint_MyDb_index.yaml` cannot say why any line is in it.
 
 ## 2. Goals
 
@@ -101,14 +91,14 @@ cannot say why any line is in it.
 ## 3. Non-goals
 
 - **Intent on other operation types.** `reorganize_index` cannot set compression
-  (`manifest.go:687-693`, no `DataCompression` field); `add_column` and friends are
-  unambiguous. Only `rebuild_index` conflates a state and an act. **Note:** this is why
-  `COMPRESSION-SCOPE` must not rely on `rebuild_heap` carrying intent — see that spec §4.4.
-- **A general `Operation.Satisfied()` predicate.** `specs/FIXES.md` #28/#158 propose one. A
-  pure defrag rebuild has no target state to probe, so the predicate would be partial and its
-  absence indistinguishable from "not satisfied". Deferred, and this spec's `intent` does not
-  block it: a later predicate can read the same field.
-- **Fragmentation thresholds.** Already implemented, with Ola Hallengren's defaults:
+  (`manifest.go:687-693`, no `DataCompression` field); `add_column` and friends are unambiguous.
+  Only `rebuild_index` conflates a state and an act. `COMPRESSION-SCOPE` therefore cannot rely
+  on `rebuild_heap` carrying intent; see that spec §4.6.
+- **A general `Operation.Satisfied()` predicate** (`specs/FIXES.md` #28/#158). A pure defrag
+  rebuild has no target state to probe, so the predicate would be partial and its absence
+  indistinguishable from "not satisfied". Deferred — and not blocked: a later predicate can read
+  this field.
+- **Fragmentation thresholds.** Already implemented with Ola Hallengren's defaults:
   `page_count_floor: 1000`, `reorganize_from_percent: 5`, `rebuild_from_percent: 30`
   (`decide.go:195,200,201`; defaults `internal/maint/profile.go:298-305`).
 
@@ -116,8 +106,8 @@ cannot say why any line is in it.
 
 ### 4.1 The field
 
-`internal/ddl/manifest.go`, on `RebuildIndex` only. Add the field; keep the existing doc
-comments on `Partition` and `Kind`:
+On `RebuildIndex` only (`internal/ddl/manifest.go`), keeping the existing `Partition` and `Kind`
+doc comments:
 
 ```go
 type Intent string
@@ -133,17 +123,15 @@ const (
 Intent Intent `yaml:"intent,omitempty"`
 ```
 
-`operationNode` (`render.go:82-90`) encodes the struct, and `compact` (`render.go:108-126`)
-already drops empty scalars via `isEmptyScalar` (`render.go:129-143`), so an unset intent is
-absent from rendered YAML with or without `omitempty`. **No operation-level renderer change.**
+`Validate()` rejects any value but the two constants, naming the offending value. It does **not**
+reject `intent: compression` on an operation without `data_compression` — §4.3 explains why.
 
-`Validate()` rejects any value but the two constants. It does **not** reject
-`intent: compression` on an operation without `data_compression` — see §4.3.
+No operation-level renderer change: `operationNode` (`render.go:82-90`) encodes the struct, and
+`compact` (`render.go:108-126`) already drops empty scalars via `isEmptyScalar`
+(`render.go:129-143`).
 
-Expansion carries it: `expandedRebuild` (`internal/ddl/expand.go:90`) copies the whole
-operation as of `2e2c8ca` and overrides only `Index`/`Kind`, so a new field survives
-`index: ALL` by default. (Before that fix it would have been silently dropped — the bug that
-had already cost `on_failure` and `Window`.)
+Expansion carries it: `expandedRebuild` (`internal/ddl/expand.go:90`) copies the whole operation
+and overrides only `Index`/`Kind`, so a new field survives `index: ALL` by default.
 
 ### 4.2 Semantics
 
@@ -153,9 +141,9 @@ had already cost `on_failure` and `Window`.)
 | `fragmentation` | the goal is the act | **runs** |
 | *unset* | unknown | **runs** — safe default |
 
-Wasted work is recoverable; a silent skip is not.
+Unset runs, per the asymmetry in §1: wasted work is recoverable, a silent skip is not.
 
-### 4.3 Manifest-level default, resolved at use
+### 4.3 Manifest-level default
 
 A campaign should not repeat `intent: compression` on every operation:
 
@@ -176,17 +164,20 @@ operations:
     intent: fragmentation    # overrides the default
 ```
 
-**The default is resolved where it is used, not at load.** An earlier draft pushed it into
-every operation inside `UnmarshalYAML`; that is wrong three ways:
+Precedence: operation > manifest > unset (runs).
 
-- it breaks the `MarshalManifest`/`ParseManifest` round-trip that `render_test.go:15-52`
-  asserts, because parsed operations would carry intents the source operations lacked;
-- `Intent: ""` *is* the inherit signal, so an operation could never opt out downward;
-- combined with a validation rule it would make existing manifests unloadable —
-  `01.to_run/.010_test.yaml` is exactly that shape (a `rebuild_index` with
-  `data_compression` commented out).
+**The default resolves where it is used, not at load.** Three constraints force this:
 
-So resolution is a one-line helper at the single call site:
+- the `MarshalManifest`/`ParseManifest` round-trip asserted by `render_test.go:15-52` requires
+  parsed operations to match the source; a load-time push-down gives them intents the source
+  operations lacked;
+- `Intent: ""` is the inherit signal, so a pushed-down default leaves no way for an operation to
+  opt *out*;
+- a manifest may legitimately mix a compression default with operations that carry no
+  `data_compression` at all (`01.to_run/.010_test.yaml` is that shape), and those must stay
+  loadable.
+
+So resolution is one helper at the single call site:
 
 ```go
 // effectiveIntent resolves an operation's intent against the manifest default.
@@ -198,9 +189,8 @@ func effectiveIntent(manifestIntent ddl.Intent, op ddl.RebuildIndex) ddl.Intent 
 }
 ```
 
-Precedence: operation > manifest > unset (runs). `Manifest.Intent` is validated like the
-field, and **must be emitted by `MarshalManifest`** — a manifest-level field needs an explicit
-`addPair` (`render.go:36-38` is the pattern, currently used by `skip_if_satisfied`).
+`Manifest.Intent` is validated like the field, and **must be emitted by `MarshalManifest`** — a
+manifest-level field needs an explicit `addPair` (`render.go:36-38` is the pattern).
 
 ### 4.4 Engine
 
@@ -219,12 +209,12 @@ func (e *Engine) skipSatisfied(ctx context.Context, manifestIntent ddl.Intent, o
 }
 ```
 
-Call site `engine.go:480` passes `manifest.Intent` instead of `manifest.SkipIfSatisfied`. The
-`ownsPausedResumable` carve-out, the read-error-means-not-satisfied rule (`skip.go:56`), and
-`advanceCursor` on skip (`engine.go:482`) are unchanged.
+The call site (`engine.go:480`) passes `manifest.Intent`. The `ownsPausedResumable` carve-out,
+the read-error-means-not-satisfied rule (`skip.go:56`), and `advanceCursor` on skip
+(`engine.go:482`) are unchanged.
 
-A compression-intent operation needs no opt-in: it is a no-op by definition when its goal
-holds. The flag's only job was standing in for the intent the manifest could not express.
+A compression-intent operation needs no opt-in: it is a no-op by definition when its goal holds.
+The flag's only job was standing in for the intent the manifest could not express.
 
 ### 4.5 Planner
 
@@ -241,25 +231,25 @@ op := ddl.RebuildIndex{
 }
 ```
 
-A **dual-motive** rebuild (`fragRebuild && comp.change`) gets `IntentFragmentation` — it must
-run, and running is what fragmentation intent means. The planner emits per-operation intent
-and no manifest-level default: it knows each motive exactly.
+A dual-motive rebuild gets `IntentFragmentation`: it must run, and running is what fragmentation
+intent means. The planner emits per-operation intent and no manifest-level default — it knows
+each motive exactly.
 
-`renderDecisions` (`cmd/sqlgopace/plan.go:614-620`) prints `Decision.Reason`, which is built
-from the same `fragRebuild` at `decide.go:243-247`, so `--explain` already conveys the motive
-in prose. Adding the intent to that line is optional polish, not required.
+`renderDecisions` (`cmd/sqlgopace/plan.go:614-620`) prints `Decision.Reason`, built from the same
+`fragRebuild`, so `--explain` already conveys the motive in prose. Printing the field itself is
+optional polish.
 
 ### 4.6 Removing `skip_if_satisfied`
 
-Manifest decoding rejects unknown keys as of `0fc533c`, naming the key and its line, so a
-manifest still carrying the flag fails to load:
+Manifest decoding rejects unknown keys, naming the key and its line, so a manifest still carrying
+the flag fails to load:
 
 ```text
 decode manifest: line 4: unknown field "skip_if_satisfied": invalid manifest
 ```
 
-No deprecation scaffolding is needed. **But the removal is not two lines.** There are 46
-references across 15 files. Load-bearing:
+No deprecation scaffolding needed. The removal touches 46 references across 15 files. The
+load-bearing ones:
 
 | Site | What |
 |---|---|
@@ -268,25 +258,24 @@ references across 15 files. Load-bearing:
 | `internal/run/skip.go:45,47` | the `enabled` param and its doc |
 | `internal/run/engine.go:480` | call site |
 | `internal/run/engine.go:161,209,476,758,812,817,1038` | comments; **758** names the flag among settings a recovery run "must still honor" |
-| `internal/report/history.go:21` | `RunRecord.Skipped` is *defined* as "(skip_if_satisfied)" — see §6 |
+| `internal/report/history.go:21` | `RunRecord.Skipped` is *defined* as "(skip_if_satisfied)" — §6 |
 | `internal/mssql/indexes.go:71` | comment |
 
-Tests to migrate to `intent: compression`, not delete: `internal/run/skip_engine_test.go:26-89`
-(fixture + 3 tests, one of which `strings.Replace`s the flag out),
-`internal/run/resume_test.go:277` (**guards FIXES #6 — must survive**),
+Tests migrate to `intent: compression` rather than being deleted:
+`internal/run/skip_engine_test.go:26-89` (fixture + 3 tests, one of which `strings.Replace`s the
+flag out), `internal/run/resume_test.go:277` (**guards FIXES #6 — must survive**),
 `internal/ddl/manifest_test.go:114-131`, `internal/ddl/render_test.go:20,64`.
 
-Docs to rewrite: `README.md:73,92` — §7. `specs/crash-resumable.md:4,252` **normatively defines
-the flag and its default-off rationale**; `specs/graceful-stop.md:21`;
+Docs to rewrite: `README.md:73,92` (§7); `specs/crash-resumable.md:4,252`, which **normatively
+defines the flag and its default-off rationale**; `specs/graceful-stop.md:21`;
 `specs/FIXES.md:28,115-117,137,158,417` (#6 is defined by the flag, #11 by `RunRecord.Skipped`);
 `docs/superpowers/plans/2026-07-03-maintenance-window.md:992`.
 
 ## 5. Migration
 
-**No manifest uses the flag.** Verified across all 13 that parse in the queue
-(`030`/`031` = 74 ops, `032` = 33, `.033` = 38, `032`'s recovery = 21, two shrinks, and the
-`.010_*` examples). `02.processing/` is empty; nothing is in flight. Removing the flag breaks
-nothing that exists.
+No manifest uses the flag — verified across all 13 that parse in the queue (`030`/`031` at 74
+operations, `032` at 33, `.033` at 38, `032`'s recovery at 21, two shrinks, two examples).
+`02.processing/` is empty; nothing is in flight. Removing the flag breaks nothing that exists.
 
 Adding `intent: compression` to the `03X` campaign manifests is an improvement — it makes a
 re-run skip what is already PAGE — not a repair.
@@ -301,45 +290,45 @@ re-run skip what is already PAGE — not a repair.
 - **`planFingerprint` ignores intent** (`engine.go:1171`: `CommandType` + target only). Editing
   `intent:` on an interrupted manifest does not invalidate the resume cursor
   (`reconcileResumePlan`, `engine.go:1140`), so operations already skipped as satisfied stay
-  skipped. That is consistent with a target-only fingerprint, but it means the fix does not
-  retroactively reclaim skipped work: an operator who adds `intent: fragmentation`
-  mid-campaign must clear the sidecar to re-run those operations.
-- **`intent: fragmentation` is inert on a frag-only rebuild** — that op has
+  skipped. Consistent with a target-only fingerprint, but it means the fix does not retroactively
+  reclaim skipped work: an operator adding `intent: fragmentation` mid-campaign must clear the
+  sidecar to re-run those operations.
+- **`intent: fragmentation` is inert on a frag-only rebuild** — that operation has
   `DataCompression == ""` and already exits `skipSatisfied` at `skip.go:52`. The field only
-  changes behavior for the dual-motive case (§1). It is still worth writing: it documents the
-  motive, and it is what makes a *hand-written* manifest safe.
+  changes behavior for the dual-motive case (§1). It is still worth writing: it records the
+  motive, and it is what makes a hand-written manifest safe.
 - **The pure-defrag hole stands.** A `rebuild_index` with no `data_compression` has no target
-  state, so nothing can be skipped for it — a re-run always redoes the work. Out of scope; a
-  run-time fragmentation re-probe would be the fix (`FIXES.md` #28).
+  state, so nothing can be skipped for it — a re-run always redoes the work. A run-time
+  fragmentation re-probe would be the fix (`FIXES.md` #28).
 
 ## 7. Documentation
 
 `README.md:88-93` is a paragraph of operational advice built on the flag ("pair a windowed
 `continue` manifest with `skip_if_satisfied: true` so the already-done operations after the gap
-collapse to a catalog read"). It must be **rewritten** around `intent: compression`, not
-deleted — the advice remains true, the mechanism changes. `README.md:73`'s "`skip_if_satisfied`
-(below)" is a dangling forward reference to a section that never existed; the manifest-format
-section (`README.md:184-227`) documents `description`/`database`/`on_failure`/
-`ignore_blocked_sessions`/`operations` and never documented the flag. Document `intent`
-there — properly, this time.
+collapse to a catalog read"). It is **rewritten** around `intent: compression`, not deleted — the
+advice stays true, the mechanism changes.
+
+`README.md:73`'s "`skip_if_satisfied` (below)" is a dangling forward reference: the
+manifest-format section (`README.md:184-227`) documents `description`, `database`, `on_failure`,
+`ignore_blocked_sessions` and `operations`, and never documented the flag. Document `intent`
+there.
 
 ## 8. Testing
 
 Pure, no database.
 
-- `internal/ddl` — each intent value parses; an unknown value is rejected naming it;
+- **`internal/ddl`** — each intent value parses; an unknown value is rejected naming it;
   `MarshalManifest`→`ParseManifest` round-trips both `Manifest.Intent` and the operation field
-  (extend `render_test.go:15-52`); unset intent is absent from rendered YAML;
-  `ExpandRebuildAll` carries intent through `index: ALL` (the whole-struct diff added in
-  `2e2c8ca` covers it by construction).
-- `internal/maint` — via the **exported** `DecideIndex` (`decide.go:179`; `decideIndex` is
+  (extend `render_test.go:15-52`); unset intent is absent from rendered YAML; `ExpandRebuildAll`
+  carries intent through `index: ALL`.
+- **`internal/maint`** — via the exported `DecideIndex` (`decide.go:179`; `decideIndex` is
   unexported and every test package here is external): `IntentFragmentation` when
-  `frag >= rebuild_from_percent`, including the dual-motive case; `IntentCompression` when the
-  rebuild is compression-only. Table-driven over the ladder boundaries (below floor, <5, 5–30,
-  ≥30), asserted through `OperationsByCategory("index")` as `decide_test.go:445` already does.
-- `internal/run` — through `ProcessAll` with `fakeCompression` + `WithCompressionReader`
+  `frag >= rebuild_from_percent`, **including the dual-motive case**; `IntentCompression` when
+  the rebuild is compression-only. Table-driven over the ladder boundaries (below floor, <5,
+  5–30, ≥30), asserted through `OperationsByCategory("index")` as `decide_test.go:445` does.
+- **`internal/run`** — through `ProcessAll` with `fakeCompression` + `WithCompressionReader`
   (`skip_engine_test.go:21`): compression-intent + satisfied → skip; **fragmentation-intent +
   satisfied → runs** (the regression this spec exists to prevent); unset + satisfied → runs;
-  manifest default applies to an op with no intent; an op's own intent beats the default;
-  compression-intent + unsatisfied → runs; read error → runs; the `ownsPausedResumable`
-  carve-out still wins (`resume_test.go:277`).
+  the manifest default applies to an operation with no intent; an operation's own intent beats
+  the default; compression-intent + unsatisfied → runs; read error → runs; the
+  `ownsPausedResumable` carve-out still wins (`resume_test.go:277`).
