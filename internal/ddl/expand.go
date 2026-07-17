@@ -86,17 +86,19 @@ func ExpandRebuildAll(m *Manifest, lookup func(schema, table string) ([]IndexDes
 	return &out, nil
 }
 
-// expandedRebuild builds the per-index rebuild for one concrete index.
+// expandedRebuild builds the per-index rebuild for one concrete index. It copies the whole
+// operation and overrides only what expansion decides, for the same reason ExpandRebuildAll
+// copies the whole manifest: a field-by-field copy silently drops any field it omits. This
+// one dropped Partition, so `index: ALL` with `partition: 3` rebuilt every partition of
+// every index instead of partition 3 — more work, longer locks, reported as success.
 func expandedRebuild(src RebuildIndex, idx IndexDescriptor) RebuildIndex {
-	op := RebuildIndex{
-		Schema:  src.Schema,
-		Table:   src.Table,
-		Index:   idx.Name,
-		Options: src.Options,
-		Kind:    idx.Kind,
-	}
-	if idx.Kind.supportsOnlineRebuild() {
-		op.DataCompression = src.DataCompression
+	op := src
+	op.Index = idx.Name
+	op.Kind = idx.Kind
+	// data_compression is dropped for non-rowstore indexes, which use a different
+	// compression model.
+	if !idx.Kind.supportsOnlineRebuild() {
+		op.DataCompression = ""
 	}
 	return op
 }

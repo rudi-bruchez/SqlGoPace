@@ -67,6 +67,38 @@ func TestExpandRebuildAll(t *testing.T) {
 	}
 }
 
+// Expansion used to build each per-index rebuild field by field, which dropped Partition:
+// `index: ALL` with `partition: 3` silently rebuilt EVERY partition of every index — far
+// more work, far longer locks, reported as success. Guard every field expansion does not
+// deliberately override, so the next field added to RebuildIndex carries through by default.
+func TestExpandRebuildAllCarriesEveryField(t *testing.T) {
+	src := ddl.RebuildIndex{
+		Schema: "dbo", Table: "BigFact", Index: "ALL",
+		Partition:       intPtr(3),
+		DataCompression: "PAGE",
+		Options:         ddl.OptionOverrides{MaxDOP: intPtr(4)},
+	}
+	out, err := ddl.ExpandRebuildAll(
+		&ddl.Manifest{Operations: []ddl.Operation{src}},
+		indexes(ddl.IndexDescriptor{Name: "CIX", Clustered: true, Kind: ddl.KindRowstore}),
+	)
+	if err != nil {
+		t.Fatalf("ExpandRebuildAll() error = %v", err)
+	}
+
+	// Only Index and Kind are expansion's to decide; everything else must survive.
+	want := src
+	want.Index = "CIX"
+	want.Kind = ddl.KindRowstore
+	got := out.Operations[0].(ddl.RebuildIndex)
+	if diff := cmp.Diff(want, got); diff != "" {
+		t.Errorf("expansion changed a field it does not own (-want +got):\n%s", diff)
+	}
+	if got.Partition == nil || *got.Partition != 3 {
+		t.Errorf("Partition = %v, want 3 — a nil partition rebuilds every partition", got.Partition)
+	}
+}
+
 func TestExpandPassesThroughNonAll(t *testing.T) {
 	add := ddl.AddColumn{Schema: "dbo", Table: "T", Column: "C", DataType: "BIT"}
 	named := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX_one"}
