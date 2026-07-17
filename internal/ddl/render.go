@@ -36,9 +36,6 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 	if m.Intent != "" {
 		addPair(root, "intent", scalarNode(string(m.Intent)))
 	}
-	if m.SkipIfSatisfied {
-		addPair(root, "skip_if_satisfied", scalarNode("true"))
-	}
 	if m.AbortBlockingResumable {
 		addPair(root, "abort_blocking_resumable", scalarNode("true"))
 	}

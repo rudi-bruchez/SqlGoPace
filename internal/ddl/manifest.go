@@ -211,11 +211,6 @@ type Manifest struct {
 	// operations (see IgnoredSession). It is the single durable source of exclusions:
 	// read at start, re-read live during the run, and copied into the recovery manifest.
 	IgnoreBlockedSessions []IgnoredSession
-	// SkipIfSatisfied makes an operation whose target state already holds a no-op at
-	// run time (currently: a rebuild_index whose data_compression every partition
-	// already has). Off by default, preserving the direct-run "do what I say" contract;
-	// a compression manifest re-run after an interruption sets it to skip finished work.
-	SkipIfSatisfied bool
 	// AbortBlockingResumable lets the engine clear a stale/foreign paused resumable that
 	// blocks a fresh REBUILD of the target index (SQL Server Msg 10637), with ALTER INDEX
 	// … ABORT, before running the operation. Off by default (the run fails with an
@@ -273,7 +268,6 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		OnFailure              string           `yaml:"on_failure"`
 		Intent                 string           `yaml:"intent"`
 		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
-		SkipIfSatisfied        bool             `yaml:"skip_if_satisfied"`
 		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
 		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
@@ -290,7 +284,6 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
 	m.Intent = Intent(strings.TrimSpace(raw.Intent))
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
-	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.AbortBlockingResumable = raw.AbortBlockingResumable
 	m.Window = raw.Window
 	m.Operations = make([]Operation, 0, len(raw.Operations))

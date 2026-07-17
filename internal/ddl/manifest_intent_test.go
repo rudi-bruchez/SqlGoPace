@@ -71,3 +71,14 @@ func TestManifestRejectsUnknownIntent(t *testing.T) {
 		t.Errorf("error does not name the offending value: %v", err)
 	}
 }
+
+func TestManifestRejectsRemovedSkipIfSatisfied(t *testing.T) {
+	src := "skip_if_satisfied: true\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	_, err := ddl.ParseManifest(strings.NewReader(src))
+	if err == nil {
+		t.Fatal("ParseManifest() error = nil, want unknown-field for the removed flag")
+	}
+	if !strings.Contains(err.Error(), "skip_if_satisfied") {
+		t.Errorf("error does not name the removed flag: %v", err)
+	}
+}

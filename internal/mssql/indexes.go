@@ -68,7 +68,7 @@ ORDER BY p.partition_number;`
 // IndexCompression returns the current compression of each partition of
 // [schema].[table].[index], in partition order. It is empty when the index does not
 // exist. The engine uses it to skip a rebuild whose target compression every relevant
-// partition already has (skip_if_satisfied).
+// partition already has.
 func (c *Conn) IndexCompression(ctx context.Context, schema, table, index string) ([]PartitionCompression, error) {
 	rows, err := c.pool.QueryContext(ctx, indexCompressionSQL,
 		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index))

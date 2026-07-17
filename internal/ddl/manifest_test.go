@@ -111,29 +111,6 @@ func TestParseOnFailure(t *testing.T) {
 	}
 }
 
-func TestParseSkipIfSatisfied(t *testing.T) {
-	op := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
-	for _, tt := range []struct {
-		name string
-		yaml string
-		want bool
-	}{
-		{name: "absent defaults false", yaml: "", want: false},
-		{name: "explicit true", yaml: "skip_if_satisfied: true\n", want: true},
-		{name: "explicit false", yaml: "skip_if_satisfied: false\n", want: false},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			m, err := ddl.ParseManifest(strings.NewReader(tt.yaml + op))
-			if err != nil {
-				t.Fatalf("ParseManifest() error = %v", err)
-			}
-			if m.SkipIfSatisfied != tt.want {
-				t.Errorf("SkipIfSatisfied = %v, want %v", m.SkipIfSatisfied, tt.want)
-			}
-		})
-	}
-}
-
 func TestParseAbortBlockingResumable(t *testing.T) {
 	op := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
 	for _, tt := range []struct {

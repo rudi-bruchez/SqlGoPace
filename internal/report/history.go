@@ -18,7 +18,7 @@ type RunRecord struct {
 	Operations  int
 	DurationMS  int64
 	PeakBlocked int // most sessions any one operation blocked at once during the run
-	Skipped     int // operations skipped as already-satisfied (skip_if_satisfied); excludes resume-cursor skips
+	Skipped     int // operations skipped as already-satisfied (intent: compression at target); excludes resume-cursor skips
 	Error       string
 }
 
