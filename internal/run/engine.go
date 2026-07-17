@@ -158,7 +158,7 @@ type Engine struct {
 	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
-	compression      CompressionReader // reads current index compression for skip_if_satisfied
+	compression      CompressionReader // reads current index compression for the intent: compression skip
 	drain            func() bool       // reports a requested graceful stop (cancellable DrainFlag)
 	serverClock      ServerClock       // reads SQL Server local time for manifest windows
 	out              io.Writer
@@ -206,7 +206,7 @@ func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w }
 // (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
 func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
 
-// WithCompressionReader lets the engine honor a manifest's skip_if_satisfied by
+// WithCompressionReader lets the engine honor a rebuild's intent: compression by
 // reading an index's current compression and skipping a rebuild already at its target.
 func WithCompressionReader(r CompressionReader) EngineOption {
 	return func(e *Engine) { e.compression = r }
@@ -473,11 +473,11 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
 			return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", cursor, len(planned))), failedOps)
 		}
-		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
+		// intent: compression — a rebuild whose target compression already holds is a no-op,
 		// unless this operation left its own paused resumable, which must be resumed/finished
 		// rather than skipped (skipping would orphan it paused on the server). Emitting only
 		// the finished event keeps a re-run's log to one line per skipped operation.
-		if reason, skip := e.skipSatisfied(ctx, manifest.SkipIfSatisfied, step.Operation); skip && !ownsPausedResumable(st.Paused, i, step.Operation) {
+		if reason, skip := e.skipSatisfied(ctx, manifest.Intent, step.Operation); skip && !ownsPausedResumable(st.Paused, i, step.Operation) {
 			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
 			e.advanceCursor(name, &cursor, i)
 			continue
@@ -755,7 +755,7 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	e.relocateCapture(name, e.dirs.Failed)
 
 	// Copy the manifest so recovery-specific overrides are the only differences; this
-	// carries forward every other setting (execution window, skip_if_satisfied, …) that
+	// carries forward every other setting (execution window, intent, …) that
 	// a resubmitted recovery run must still honor.
 	recovery := *m
 	recovery.Description = recoveryDescription(m, name)
@@ -809,12 +809,12 @@ func recoveryDescription(m *ddl.Manifest, name string) string {
 }
 
 // resumeSkipReason is the skip reason for an operation already completed in a previous run
-// (resume cursor). It is distinct from a skip_if_satisfied reason so the history's skipped
-// metric can exclude it — a resumed run re-marks its completed prefix skipped every cycle.
+// (resume cursor). It is distinct from a compression-intent skip reason so the history's
+// skipped metric can exclude it — a resumed run re-marks its completed prefix skipped every cycle.
 const resumeSkipReason = "already done in a previous run"
 
 // recordSkipped builds the report entry for an operation skipped without running
-// (resume cursor or skip_if_satisfied) and emits its finished step event, so stdout,
+// (resume cursor or a compression-intent skip) and emits its finished step event, so stdout,
 // the TUI, and the .log all show it as skipped with the reason. It never emits a
 // started event — a skip is instantaneous.
 func (e *Engine) recordSkipped(stepEv StepEvent, step ddl.PlannedOperation, opStart time.Time, reason string) report.OperationReport {
@@ -1035,7 +1035,7 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 		if op.PeakBlocked > peak {
 			peak = op.PeakBlocked
 		}
-		// Count only skip_if_satisfied skips; resume-cursor skips (already done in a previous
+		// Count only compression-intent skips; resume-cursor skips (already done in a previous
 		// run) are not "satisfied" skips and would otherwise inflate the metric each resume.
 		if op.Outcome == "skipped" && op.Detail != resumeSkipReason {
 			skipped++

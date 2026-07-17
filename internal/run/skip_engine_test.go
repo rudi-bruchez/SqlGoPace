@@ -25,7 +25,7 @@ func (f *fakeCompression) IndexCompression(context.Context, string, string, stri
 
 const skipCompressManifest = `
 description: skip test
-skip_if_satisfied: true
+intent: compression
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -34,7 +34,7 @@ operations:
     data_compression: PAGE
 `
 
-func TestSkipIfSatisfiedSkipsSatisfiedRebuild(t *testing.T) {
+func TestCompressionIntentSkipsSatisfiedRebuild(t *testing.T) {
 	runner := &fakeOpRunner{}
 	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
@@ -65,7 +65,7 @@ func TestSkipIfSatisfiedSkipsSatisfiedRebuild(t *testing.T) {
 	}
 }
 
-func TestSkipIfSatisfiedRunsWhenNotSatisfied(t *testing.T) {
+func TestCompressionIntentRunsWhenNotSatisfied(t *testing.T) {
 	runner := &fakeOpRunner{}
 	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "NONE"}}}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
@@ -81,12 +81,12 @@ func TestSkipIfSatisfiedRunsWhenNotSatisfied(t *testing.T) {
 	}
 }
 
-func TestSkipIfSatisfiedOffByDefault(t *testing.T) {
-	// The same op without skip_if_satisfied must run even when already at target.
+func TestSkipUnsetIntentRunsEvenWhenSatisfied(t *testing.T) {
+	// No intent → unknown → runs, even at target. Skipping is opt-in via intent: compression.
 	runner := &fakeOpRunner{}
 	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
-	manifest := strings.Replace(skipCompressManifest, "skip_if_satisfied: true\n", "", 1)
+	manifest := strings.Replace(skipCompressManifest, "intent: compression\n", "", 1)
 	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -95,9 +95,45 @@ func TestSkipIfSatisfiedOffByDefault(t *testing.T) {
 		t.Fatalf("ProcessAll() error = %v", err)
 	}
 	if runner.calls != 1 {
-		t.Errorf("runner ran %d times, want 1 (skip is opt-in)", runner.calls)
+		t.Errorf("runner ran %d times, want 1 (unset intent runs)", runner.calls)
 	}
-	if comp.calls != 0 {
-		t.Errorf("IndexCompression called %d times, want 0 (skip disabled)", comp.calls)
+}
+
+func TestFragmentationIntentRunsEvenWhenSatisfied(t *testing.T) {
+	// The regression this feature exists to prevent: a rebuild whose compression already
+	// holds but whose intent is fragmentation MUST run — the defrag still needs doing.
+	runner := &fakeOpRunner{}
+	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
+	manifest := strings.Replace(skipCompressManifest, "intent: compression\n", "intent: fragmentation\n", 1)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if runner.calls != 1 {
+		t.Errorf("runner ran %d times, want 1 (fragmentation intent must run despite matching compression)", runner.calls)
+	}
+}
+
+func TestOperationIntentBeatsManifestDefault(t *testing.T) {
+	// Manifest default is compression, but the operation overrides to fragmentation → runs.
+	runner := &fakeOpRunner{}
+	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
+	manifest := strings.Replace(skipCompressManifest,
+		"    data_compression: PAGE\n",
+		"    data_compression: PAGE\n    intent: fragmentation\n", 1)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if runner.calls != 1 {
+		t.Errorf("runner ran %d times, want 1 (operation intent overrides the manifest default)", runner.calls)
 	}
 }

@@ -38,18 +38,27 @@ func compressionSatisfied(parts []mssql.PartitionCompression, target string, par
 	return matched > 0
 }
 
+// effectiveIntent resolves an operation's intent against the manifest default:
+// the operation's own intent if set, otherwise the manifest's.
+func effectiveIntent(manifestIntent ddl.Intent, op ddl.RebuildIndex) ddl.Intent {
+	if op.Intent != "" {
+		return op.Intent
+	}
+	return manifestIntent
+}
+
 // skipSatisfied reports whether an operation can be skipped because its target state
-// already holds, returning a short reason for the log. Only a rebuild_index carrying a
-// data_compression target is eligible: when every relevant partition is already at that
-// compression the rebuild is a no-op, so a re-run after an interruption reuses the
-// finished work cheaply. Gated by the manifest's skip_if_satisfied; a read error is
-// treated as "not satisfied" (do the rebuild), never a hard failure.
-func (e *Engine) skipSatisfied(ctx context.Context, enabled bool, op ddl.Operation) (string, bool) {
-	if !enabled || e.compression == nil {
+// already holds, returning a short reason for the log. Only a rebuild_index whose
+// effective intent is compression and whose data_compression every relevant partition
+// already has is eligible; then the rebuild is a no-op, so a re-run after an
+// interruption reuses the finished work cheaply. A read error is treated as "not
+// satisfied" (do the rebuild), never a hard failure.
+func (e *Engine) skipSatisfied(ctx context.Context, manifestIntent ddl.Intent, op ddl.Operation) (string, bool) {
+	if e.compression == nil {
 		return "", false
 	}
 	ri, ok := op.(ddl.RebuildIndex)
-	if !ok || ri.DataCompression == "" {
+	if !ok || ri.DataCompression == "" || effectiveIntent(manifestIntent, ri) != ddl.IntentCompression {
 		return "", false
 	}
 	parts, err := e.compression.IndexCompression(ctx, ri.Schema, ri.Table, ri.Index)

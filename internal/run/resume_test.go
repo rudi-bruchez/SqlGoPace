@@ -274,9 +274,9 @@ func TestInterruptedResumableRecordsPausedIdentity(t *testing.T) {
 	}
 }
 
-func TestSkipIfSatisfiedDoesNotOrphanOwnPausedResumable(t *testing.T) {
-	// #6: skip_if_satisfied would skip a rebuild already at its target compression, but this
-	// op left its own paused resumable — skipping would orphan it. It must RESUME instead.
+func TestCompressionSkipDoesNotOrphanOwnPausedResumable(t *testing.T) {
+	// #6: an intent: compression rebuild already at its target compression would be skipped,
+	// but this op left its own paused resumable — skipping would orphan it. It must RESUME.
 	runner := &sqlCapturingRunner{}
 	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
