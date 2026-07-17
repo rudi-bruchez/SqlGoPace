@@ -70,7 +70,8 @@ the previous run ended. There are three paths, and they behave differently:
 **Fail-fast (default).** The first failed operation sends the whole manifest to `04.failed/`
 untouched — no recovery manifest, and the resume cursor is discarded. Re-running it replays
 the operations that already succeeded. For a long batch this is the expensive path; reach for
-`on_failure: continue`, or for `skip_if_satisfied` (below) to make the replay cheap.
+`on_failure: continue`, or mark the operations `intent: compression` (see the manifest format)
+so a replay skips those already at target.
 
 **`on_failure: continue`.** Each failed operation is quarantined and the rest still run. The
 run ends as `PARTIAL`, and a re-runnable recovery manifest `<name>.recovery.yaml` — holding
@@ -89,8 +90,8 @@ The cursor is a watermark, not a set: it marks how many *leading* operations are
 `on_failure: continue` mode it therefore freezes at the first quarantined operation, so a
 resumed run retries that operation — and re-runs the successful ones after it. Those retries
 are what make the quarantine safe without a recovery manifest, but on a long batch they cost
-real work: pair a windowed `continue` manifest with `skip_if_satisfied: true` so the
-already-done operations after the gap collapse to a catalog read.
+real work: pair a windowed `continue` manifest with a manifest-level `intent: compression` so
+the already-done operations after the gap collapse to a catalog read.
 
 An interrupted run writes its report to `<name>.log` next to the manifest in
 `02.processing/`, so a campaign that only ever drains or runs out of window is still
@@ -192,6 +193,8 @@ and the compatibility matrix; per-operation `options:` blocks override them.
 description: "Recompress DISPATCH indexes and add a tracking column"
 database: MYDB          # optional; defaults to the connection's database
 on_failure: stop        # optional: stop (default, fail-fast) | continue (quarantine + recovery manifest)
+intent: compression     # optional manifest-level default for rebuild_index operations below
+                         # (compression | fragmentation); see "intent" below
 
 # Optional: sessions allowed to STAY blocked by these operations (the op holds its
 # lock through them instead of yielding). All string fields are regular expressions,
@@ -208,6 +211,8 @@ operations:
     table: DISPATCH
     index: IX_DISPATCH        # or "ALL" to rebuild every index on the table
     data_compression: PAGE
+    # intent: fragmentation  # would override the manifest-level default above for
+    #                        # just this operation; see "intent" below
     # online / resumable / wait_at_low_priority / maxdop / sort_in_tempdb:
     # left empty → injected automatically per version/edition + matrix + config
     options:
@@ -225,6 +230,30 @@ operations:
     nullable: false
     default: 0               # constant → metadata-only on Enterprise
 ```
+
+### `intent` (optional, `rebuild_index` only)
+
+A `rebuild_index` operation does two unrelated things: it applies a `data_compression`
+target (a state — idempotent, nothing to do if already there) and it rebuilds the index
+(an act — defragments, rebuilds statistics, reclaims pages; never idempotent). `intent`
+tells the engine which one motivated this operation, so a re-run knows whether skipping it
+is safe:
+
+- `intent: compression` — the goal is the compression state. If the index already carries
+  the target `data_compression` on every partition, the operation is **skipped** on a
+  re-run (a cheap catalog read, reported as `skipped: already PAGE`).
+- `intent: fragmentation` — the goal is the rebuild itself. The operation **always runs**,
+  even if its `data_compression` already matches — the defrag still needs doing.
+- Unset (default) — same as `fragmentation`: the operation always runs. This is the safe
+  default, because a wrongly-skipped rebuild is silent (reported as success) while a
+  wrongly-repeated one is only wasted time.
+
+`intent` can be set per operation, or once at the manifest level as a default that each
+`rebuild_index` operation inherits unless it sets its own (operation value wins; then
+manifest default; then unset). This replaces the old `skip_if_satisfied` manifest flag,
+which applied to every operation uniformly and could not tell a defrag rebuild from a
+compression rebuild; a manifest still carrying `skip_if_satisfied:` now fails to load.
+See `specs/OPERATION-INTENT.md` for the full design.
 
 ### `window` (optional)
 

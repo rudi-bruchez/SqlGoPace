@@ -18,7 +18,8 @@
 > (`requeue(..., keepCursor)` + `queue.InToRun` to tolerate a manifest that has already been requeued); on the re-run
 > `writeSidecar` **preserves** the cursor and returns it, and the loop **skips** ops `i < cursor`
 > (outcome `skipped`, reason "already done in a previous run") — via the shared helper
-> `recordSkipped` (shared with `skip_if_satisfied`). The cursor is now **also written
+> `recordSkipped` (shared with the intent-based compression skip, `specs/OPERATION-INTENT.md`).
+> The cursor is now **also written
 > incrementally per operation** (`advanceCursor`, `crash-resumable.md` §6), not only on drain:
 > a *crash* therefore populates the cursor just like a drain, and `WriteState` is made **atomic**
 > (temp+rename) since the sidecar is rewritten after every op. The **metadata skip** (`crash-resumable.md`

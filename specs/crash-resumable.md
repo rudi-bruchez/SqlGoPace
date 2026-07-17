@@ -1,10 +1,13 @@
 # Functional spec — Recovery after interruption ("crash-resumable")
 
-> **Status: §9 (metadata-based skip) IMPLEMENTED; the rest remains DRAFT.** The manifest flag
-> `skip_if_satisfied` (default off) makes a `rebuild_index` whose **every partition** already
-> carries the target `data_compression` **skipped** at run time (outcome `skipped`, one log
-> line `— skipped in 0s (already PAGE)` / `.log` `skipped: already PAGE`, history counter
-> `runs.skipped`). Narrow read `mssql.IndexCompression(schema,table,index)` per partition;
+> **Status: §9 (metadata-based skip) IMPLEMENTED; the rest remains DRAFT.** A `rebuild_index`
+> operation whose effective `intent` is `compression` (per-operation, with an optional
+> manifest-level default — see `specs/OPERATION-INTENT.md`) and whose **every partition**
+> already carries the target `data_compression` is **skipped** at run time (outcome `skipped`,
+> one log line `— skipped in 0s (already PAGE)` / `.log` `skipped: already PAGE`, history
+> counter `runs.skipped`). This supersedes the manifest-level flag once sketched in §9.4 below
+> (removed; a manifest carrying it now fails to load). Narrow read
+> `mssql.IndexCompression(schema,table,index)` per partition;
 > pure comparison `compressionSatisfied` (partition-aware); gated on the engine side by
 > `WithCompressionReader`. Makes re-running an interrupted compression manifest **cheap**
 > (ops already done are not redone) — see §9. **The operation cursor `State.ResumeFromOp`
@@ -248,9 +251,11 @@ therefore be redone by this mechanism, unless combined with a true RESUME (§6).
 ### 9.4 Decisions to settle
 
 1. **Compression ≠ defrag.** A `rebuild_index` may also aim at a defrag; skipping "already
-   compressed" would drop that defrag. → make the skip **opt-in** (manifest/CLI flag, e.g.
-   `skip_if_satisfied: true`), **default off**, to preserve the "do what I say" contract of a
-   direct run. For a pure *compression* manifest (the use case), we enable it.
+   compressed" would drop that defrag. → make the skip **opt-in**, keyed to the operation's
+   motive rather than a manifest-wide switch, to preserve the "do what I say" contract of a
+   direct run. **Superseded:** implemented as the per-operation `intent: compression` field,
+   with an optional manifest-level default — not the manifest/CLI boolean flag once sketched
+   here. See `specs/OPERATION-INTENT.md`.
 2. **Where.** At the **moment each op executes** (at run time, the way shrink generates its SQL),
    not at global preflight: we read the freshest state, which naturally handles the progress of a
    previous interrupted run.

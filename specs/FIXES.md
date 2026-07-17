@@ -25,7 +25,8 @@
 > infrastructure without fixing a defect, and churn the just-fixed resumable-switch code): `Stop`
 > living in `Capabilities`; the two stop seams (`Capabilities.Stop` vs driver `stop` fields);
 > `prepErr` nesting in `processOne`; `blockingResumable` re-building the ABORT SQL as an index-op
-> probe; `skip_if_satisfied` as a hardcoded RebuildIndex+compression case (vs a generic
+> probe; `skip_if_satisfied` (since removed; superseded by the per-operation `intent` field,
+> `specs/OPERATION-INTENT.md`) as a hardcoded RebuildIndex+compression case (vs a generic
 > `Operation.Satisfied`). Left as future refinements.
 >
 > Note on #3: fixed conservatively via the plan fingerprint — a re-expanded `ALTER INDEX ALL`
@@ -112,10 +113,15 @@ to sit on the next op's index, `resumed && i==resumeFrom && caps.Resumable` matc
 RESUME on it — completing a rebuild with **unknown options** and marking success. Same root as #1;
 **the #1 fix (record identity of our own paused op) fixes this too.**
 
-### #6 — `internal/run/engine.go:431` — `skip_if_satisfied` runs before the resumable switch, orphaning a paused resumable. `[A]`
+### #6 — `internal/run/engine.go:431` — the compression skip runs before the resumable switch, orphaning a paused resumable. `[A]`
 If compression already reads satisfied while a PAUSED resumable still sits on the index,
 `skipSatisfied` returns true, the op is recorded skipped and `advanceCursor` moves past it — the
 paused resumable is neither RESUMEd nor ABORTed → a later rebuild fails with Msg 10637.
+
+> The manifest-level flag this was originally defined against (`skip_if_satisfied`) has since
+> been removed; the skip is now gated per-operation by `intent: compression`
+> (`specs/OPERATION-INTENT.md`). The orphaning hazard described above is unchanged — it lives in
+> the ordering of `skipSatisfied` relative to the resumable switch, not in what triggers the skip.
 
 ### #7 — `internal/run/engine.go:549` — audit log records the wrong statement. `[C, verified inline]`
 When the boundary op runs `ALTER INDEX … RESUME`, `opRep.SQL = step.SQL` still logs the full
@@ -134,8 +140,12 @@ inconsistent with the "a crash preserves the watermark" design. Fix: clear only 
 - **#10 — `executor.go:188`** — a drain Cancel can't un-pause a resumable once `supervise` returned
   Stop; that manifest is finalized interrupted despite the operator cancelling. Documented tradeoff,
   but surprising. `[B]`
-- **#11 — `report/history.go:22`** — `RunRecord.Skipped` (documented as *skip_if_satisfied*) also
-  counts resume-cursor "already done" skips, polluting the metric each resume cycle. `[altitude]`
+- **#11 — `report/history.go:22`** — `RunRecord.Skipped` (originally documented as
+  *skip_if_satisfied*, now the intent-compression skip) also counts resume-cursor "already done"
+  skips, polluting the metric each resume cycle. `[altitude]` The field's population change (the
+  flag is gone; the count now reflects `intent: compression` skips) is described in
+  `specs/OPERATION-INTENT.md` §6; this open item about resume-cursor pollution is unaffected and
+  remains open.
 - **#12 — `report/history.go:~90`** — additive migration detected via
   `strings.Contains(err, "duplicate column")`; a driver reword/localization breaks it and history
   fails to open on every later start. Prefer `PRAGMA user_version`. `[D, efficiency]`
@@ -155,8 +165,10 @@ inconsistent with the "a crash preserves the watermark" design. Fix: clear only 
   directly. `blockingResumable` runs a `PausedResumable` DMV round-trip per index op on the hot path.
 - **Altitude:** two parallel stop seams (`Capabilities.Stop` in `supervise` vs driver `stop` fields
   polled between chunks, checked at 4 copy-pasted sites); `Stop` is a live predicate smuggled into
-  the otherwise-static `Capabilities`; `skip_if_satisfied` is a generic flag backed by one hardcoded
-  `RebuildIndex`+compression case (consider `Operation.Satisfied(ctx, readers) (bool, reason)`).
+  the otherwise-static `Capabilities`; `skip_if_satisfied` (since removed; the skip is now gated
+  by the per-operation `intent` field, `specs/OPERATION-INTENT.md`) was a generic flag backed by
+  one hardcoded `RebuildIndex`+compression case (consider
+  `Operation.Satisfied(ctx, readers) (bool, reason)`).
 
 ---
 
