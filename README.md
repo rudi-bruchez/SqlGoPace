@@ -6,11 +6,18 @@ refactoring — heavy `ALTER COLUMN`, `ALTER INDEX`, `CREATE INDEX`, table rebui
 constraint and column changes — and it bridges the gap between raw T-SQL scripts and
 production safety.
 
-Instead of running a script and hoping for the best, SqlGoPace **generates** the
-T-SQL itself from a declarative manifest, **picks the right options** for the target
-server's version and edition, **watches** the operation's impact on locking and the
-transaction log while it runs, and **reacts** to trouble with the least destructive
+Instead of running a script and hoping for the best, SqlGoPace generates the
+T-SQL itself from a declarative manifest, picks the right options for the target
+server's version and edition, watches the operation's impact on locking and the
+transaction log while it runs, and reacts to trouble with the least destructive
 mechanism available — preferring pause/resume over kill/rollback.
+
+It runs either unattended or interactively. Left to itself — from cron, the Windows Task
+Scheduler, or a SQL Agent job — it drains a queue of manifests silently and traces every
+decision to a `.log` sidecar next to each one, so an overnight maintenance window needs no
+operator. Started with `--tui`, it opens an incident console instead: live progress of the
+running DDL, the sessions it is blocking or blocked by, and single-key actions to kill a
+blocker, ignore it, or pause the operation without leaving the terminal.
 
 ---
 
@@ -18,28 +25,28 @@ mechanism available — preferring pause/resume over kill/rollback.
 
 Demanding DDL is risky in production:
 
-- it **blocks** other sessions or **gets blocked** (`LCK_M_SCH_S`, `LCK_M_SCH_M`,
+- it blocks other sessions or gets blocked (`LCK_M_SCH_S`, `LCK_M_SCH_M`,
   `LCK_M_IX` waits);
-- it can **fill the transaction log**;
+- it can fill the transaction log;
 - a `KILL` triggers a `ROLLBACK` that may be long and expensive;
 - the correct option set (`ONLINE`, `RESUMABLE`, `WAIT_AT_LOW_PRIORITY`, `MAXDOP`, …)
-  depends on **both the version and the edition** of the target server.
+  depends on both the version and the edition of the target server.
 
 SqlGoPace automates the decision and the monitoring, and always favours the safest
 available mechanism.
 
 ## How it works
 
-Each task is a **YAML manifest** describing one or more DDL operations. SqlGoPace does
-**not** accept arbitrary `.sql` files — parsing and rewriting unknown T-SQL is fragile
+Each task is a YAML manifest describing one or more DDL operations. SqlGoPace does
+not accept arbitrary `.sql` files — parsing and rewriting unknown T-SQL is fragile
 and unsafe. Because it knows each operation's exact shape, it builds the `WITH (...)`
 clause without duplication, runs a precise preflight on the targeted object, and
 handles idempotency and resume.
 
-At runtime the orchestrator uses **two connections**:
+At runtime the orchestrator uses two connections:
 
-- an **execution** connection (dedicated, pinned) that runs the DDL;
-- a **monitoring** connection that polls locking, blocking, transaction-log pressure,
+- an execution connection (dedicated, pinned) that runs the DDL;
+- a monitoring connection that polls locking, blocking, transaction-log pressure,
   and operation progress.
 
 A manifest flows through a set of directories as it is processed:
@@ -49,26 +56,55 @@ A manifest flows through a set of directories as it is processed:
                               ↘   04.failed/  (failure, with a .log)
 ```
 
-By default a manifest is fail-fast: the first failed operation sends the whole manifest
-to `04.failed/`. Setting `on_failure: continue` (see the manifest example below) instead
-**quarantines** each failed operation and runs the rest; the run ends as **`PARTIAL`** and
-a re-runnable **recovery manifest** `<name>.recovery.yaml` — holding only the failed
-operations — is written into `04.failed/`. Move it back into `01.to_run/` to retry just
-those. Use this for independent batches (e.g. compressing many indexes) where a few
-objects may be locked while the rest should still proceed.
+### What a re-run repeats
 
-If the process crashes mid-operation, the next run reconciles anything left in
-`02.processing/` — adopting a still-running operation, resuming a paused resumable
-index build, or requeuing the work.
+A manifest's operations are individually addressable on a re-run, but *how* depends on how
+the previous run ended. There are three paths, and they behave differently:
+
+| Previous run ended by | Left where | A re-run repeats |
+|-----------------------|------------|------------------|
+| An operation failed, `on_failure: stop` (default) | `04.failed/` | Everything, from operation 1 |
+| Operations failed, `on_failure: continue` | `04.failed/` + `<name>.recovery.yaml` | Only the failed operations |
+| Crash, `Ctrl+C` drain, or window close | stays in `02.processing/` | Resumes at the first unfinished operation |
+
+**Fail-fast (default).** The first failed operation sends the whole manifest to `04.failed/`
+untouched — no recovery manifest, and the resume cursor is discarded. Re-running it replays
+the operations that already succeeded. For a long batch this is the expensive path; reach for
+`on_failure: continue`, or for `skip_if_satisfied` (below) to make the replay cheap.
+
+**`on_failure: continue`.** Each failed operation is quarantined and the rest still run. The
+run ends as `PARTIAL`, and a re-runnable recovery manifest `<name>.recovery.yaml` — holding
+only the failed operations — is written into `04.failed/`. Move it back into `01.to_run/` to
+retry just those. This is the mode for independent batches (e.g. compressing many indexes)
+where a few objects may be locked while the rest should still proceed.
+
+**Crash, drain, or window close.** The manifest stays in `02.processing/` with a resume
+cursor in a `<name>.state.json` sidecar, and the next run continues where it stopped rather
+than replaying. A crash also reconciles what was in flight — adopting a still-running
+operation, resuming a paused resumable index build, or requeuing the work. No recovery
+manifest is written here, deliberately: the manifest itself is resumed, so a recovery
+manifest would run the same operations a second time.
+
+The cursor is a watermark, not a set: it marks how many *leading* operations are done. In
+`on_failure: continue` mode it therefore freezes at the first quarantined operation, so a
+resumed run retries that operation — and re-runs the successful ones after it. Those retries
+are what make the quarantine safe without a recovery manifest, but on a long batch they cost
+real work: pair a windowed `continue` manifest with `skip_if_satisfied: true` so the
+already-done operations after the gap collapse to a catalog read.
+
+An interrupted run writes its report to `<name>.log` next to the manifest in
+`02.processing/`, so a campaign that only ever drains or runs out of window is still
+reviewable; it is superseded by the final report in `03.done/` or `04.failed/` when the
+manifest finishes.
 
 ### Reaction hierarchy
 
 When the running DDL causes pressure, SqlGoPace escalates from gentlest to harshest:
 
-1. **`WAIT_AT_LOW_PRIORITY`** — yield to existing sessions where supported.
-2. **`RESUMABLE` pause/resume** — pause an index operation and resume it later instead
+1. `WAIT_AT_LOW_PRIORITY` — yield to existing sessions where supported.
+2. `RESUMABLE` pause/resume — pause an index operation and resume it later instead
    of rolling back.
-3. **`KILL`** — last resort, only after a grace period, with bounded retries.
+3. `KILL` — last resort, only after a grace period, with bounded retries.
 
 The exact set of options that are even *eligible* is driven by
 `ddl_compatibility.yaml`, keyed by SQL Server major version and edition tier.
@@ -86,7 +122,7 @@ make build
 ### Versioning
 
 The version lives in [`internal/version/VERSION`](internal/version/VERSION) and is embedded
-into the binary at build time. **Edit that file before building to bump the version** — no
+into the binary at build time. Edit that file before building to bump the version — no
 build flags needed — then rebuild. `sqlgopace --version` prints it, and every run writes a
 `-- sqlgopace <version>` banner at the top of its `.log`, so each run record states which
 build produced it.
@@ -107,7 +143,7 @@ See [`docs/build.md`](docs/build.md) for the full build, versioning, and cross-c
 ## Configuration
 
 Two files drive a run: `config.yaml` (policy, directories, connection, monitoring) and
-a `.env` holding secrets. **Secrets are never stored in plaintext in `config.yaml`** —
+a `.env` holding secrets. Secrets are never stored in plaintext in `config.yaml` —
 the connection string references environment variables with `${VAR}`, injected from
 `.env` (which is gitignored). See `.env.example`.
 
@@ -125,7 +161,7 @@ Key `config.yaml` sections:
 | `shrink`           | Tuning for the `shrink` driver (chunk sizes, batch target, no-progress/self-wait/log-reuse timeouts). Optional — every field defaults. |
 | `matrix_file`      | Path to the DDL compatibility matrix (resolved relative to the config). |
 
-The `shrink:` block is **entirely optional** — omit it and every field takes the default
+The `shrink:` block is entirely optional — omit it and every field takes the default
 below. The values are global only (they depend on the instance's storage and SLA, not on a
 manifest) and are starting points and bounds that the driver's dynamic calibration varies; an
 operator usually only touches them for atypical storage.
@@ -147,8 +183,8 @@ shrink:
 
 ## Manifest format
 
-A manifest is one logical task: an ordered list of operations executed **sequentially**.
-Options left empty are **injected automatically** based on the detected version, edition,
+A manifest is one logical task: an ordered list of operations executed sequentially.
+Options left empty are injected automatically based on the detected version, edition,
 and the compatibility matrix; per-operation `options:` blocks override them.
 
 ```yaml
@@ -193,7 +229,7 @@ operations:
 ### `window` (optional)
 
 Restrict a manifest's operations to a recurring window, evaluated against the SQL
-Server's **local** clock (`SYSDATETIME()`):
+Server's local clock (`SYSDATETIME()`):
 
 ```yaml
 window:
@@ -203,11 +239,11 @@ window:
 ```
 
 - `end < start` is an overnight window that crosses midnight (e.g. `22:00`–`05:00`).
-  `days` selects the day the window **opens**.
-- Outside the window, the manifest is **deferred** (left in `01.to_run`, not run) —
+  `days` selects the day the window opens.
+- Outside the window, the manifest is deferred (left in `01.to_run`, not run) —
   schedule the run (cron / Task Scheduler) to launch during the window.
-- If the window closes while the manifest is running, the **current operation
-  finishes**, then the run stops and the manifest stays in `02.processing` with its
+- If the window closes while the manifest is running, the current operation
+  finishes, then the run stops and the manifest stays in `02.processing` with its
   resume cursor, continuing in the next window.
 - `start == end` is rejected. Offline `--dry-run` cannot evaluate the window (no
   connection) and annotates it instead.
@@ -235,10 +271,10 @@ operation from ever finishing: it runs, yields to the nuisance, restarts, yields
 again.
 
 `ignore_blocked_sessions:` (top-level, applies to every operation in the manifest)
-lets you name sessions that are allowed to **stay blocked**, so the operation holds
+lets you name sessions that are allowed to stay blocked, so the operation holds
 its lock through them and keeps going. It is the *targeted* form of the blanket
-per-operation `options.ignore_blocking: true`. **Transaction-log protection is always
-honored** — only the *blocking* reaction is suppressed, and only for matching sessions.
+per-operation `options.ignore_blocking: true`. Transaction-log protection is always
+honored — only the *blocking* reaction is suppressed, and only for matching sessions.
 
 ```yaml
 ignore_blocked_sessions:
@@ -260,8 +296,8 @@ records it (`hold: holding the lock through ignored session SPID …`), so the
 suppression is never silent.
 
 As a backstop against a too-broad rule, set `options.max_block_minutes: N` on an
-operation: after `N` minutes of continuous blocking it yields **even if the blocker is
-ignored** (`ignore_blocked_sessions` or `ignore_blocking`). Transaction-log protection
+operation: after `N` minutes of continuous blocking it yields even if the blocker is
+ignored (`ignore_blocked_sessions` or `ignore_blocking`). Transaction-log protection
 is unaffected.
 
 **Discovering who blocked you.** When the engine reacts to blocking, it writes an
@@ -273,20 +309,20 @@ so you never accidentally ignore real work.
 
 **Adding a rule mid-run.** SqlGoPace re-reads the running manifest's `ignore_blocked_sessions`
 on every blocking poll. If an operation stalls on a blocker you decide is safe, edit the manifest
-in `02.processing/` to add the rule and the operation **continues without a restart** — the new
+in `02.processing/` to add the rule and the operation continues without a restart — the new
 exclusion takes effect before the next abort. It is also folded into the recovery manifest, so a
 later resumed run remembers it. In the interactive console (`--tui`), select a blocked session and
-press **`i`**, then pick the criterion (`s` session_id / `a` app_name / `l` login_name / `h`
+press `i`, then pick the criterion (`s` session_id / `a` app_name / `l` login_name / `h`
 host_name) — the rule is written into the running manifest for you and hot-reloaded.
 
 ### Shrinking files: `operation: shrink`
 
-`shrink` reclaims space from a database's **data** or **log** files with `DBCC SHRINKFILE`,
+`shrink` reclaims space from a database's data or log files with `DBCC SHRINKFILE`,
 driven file by file. Unlike the other operations it is not one statement: the driver reads the
 file's space at run time, runs a free `TRUNCATEONLY` pass first, then moves pages in
-**calibrated chunks**, adjusting the chunk size from the I/O and log waits each chunk produced.
+calibrated chunks, adjusting the chunk size from the I/O and log waits each chunk produced.
 Because every internal batch commits, a shrink can be stopped at any time with no rollback and
-is **re-entrant** — re-running toward the same target resumes where it left off.
+is re-entrant — re-running toward the same target resumes where it left off.
 
 ```yaml
 # Reclaim space from all data files, leaving ~10% free above what's used:
@@ -308,13 +344,13 @@ is **re-entrant** — re-running toward the same target resumes where it left of
   (chunked page-move for data; truncation for log).
 - **`files`** (default `all`): a logical file name (`sys.database_files.name`), or `all` to
   shrink every file of the type, one at a time (never two of a filegroup in parallel).
-- **`targetfreespace`**: the free space wanted in the final file, as a **percent of used
-  space** (`N%` ⇒ final ≈ `used × (1 + N/100)`) or an absolute `N MB` (final ≈ `used + N`).
+- **`targetfreespace`**: the free space wanted in the final file, as a percent of used
+  space (`N%` ⇒ final ≈ `used × (1 + N/100)`) or an absolute `N MB` (final ≈ `used + N`).
   Always clamped to the floor a file can actually reach (its used space, or the active VLFs
   for a log).
 - **`emptyfile`**: reserved for a future release; `true` is rejected in this version.
 - **`options.wait_at_low_priority`**: auto by default. On SQL Server 2022+ it is injected for
-  **data** shrinks so the schema-modify lock waits at low priority instead of blocking queries.
+  data shrinks so the schema-modify lock waits at low priority instead of blocking queries.
   It does not apply to log files. `DBCC SHRINKFILE` takes no `MAXDOP`.
 
 Behaviour worth knowing:
@@ -323,10 +359,10 @@ Behaviour worth knowing:
   of the file, it is reclaimed instantly with no page movement (and no fragmentation).
 - **No-op** when there is nothing to reclaim (no free space, or the target is not below the
   current size): reported as a successful "nothing to reclaim".
-- **Log files**: in **SIMPLE** recovery a `CHECKPOINT` is issued, then the log is shrunk. In
-  **FULL/BULK_LOGGED**, if the log cannot yet be truncated (e.g. awaiting a log backup),
-  SqlGoPace **waits** — bounded by `log_reuse_wait_timeout_minutes` — for the environment's
-  scheduled backup to free the log, then shrinks; it **never issues `BACKUP LOG` itself** and
+- **Log files**: in `SIMPLE` recovery a `CHECKPOINT` is issued, then the log is shrunk. In
+  `FULL`/`BULK_LOGGED`, if the log cannot yet be truncated (e.g. awaiting a log backup),
+  SqlGoPace waits — bounded by `log_reuse_wait_timeout_minutes` — for the environment's
+  scheduled backup to free the log, then shrinks; it never issues `BACKUP LOG` itself and
   abandons cleanly (work preserved) if the wait times out.
 - **Fragmentation**: a data-file shrink fragments indexes by design; rebuild/reorganize
   afterwards if needed. (Automatic before/after fragmentation reporting is a future feature.)
@@ -371,8 +407,8 @@ sqlgopace --dry-run --assume-version 16 --assume-edition enterprise \
 
 ### Maintenance: `abort-resumable`
 
-A paused resumable index operation keeps consuming data space and **blocks a concurrent rebuild of
-the same index** (SQL Server error 10637) until it is finished or aborted. The `abort-resumable`
+A paused resumable index operation keeps consuming data space and blocks a concurrent rebuild of
+the same index (SQL Server error 10637) until it is finished or aborted. The `abort-resumable`
 subcommand inventories the connected database's resumable operations and cancels them with
 `ALTER INDEX … ABORT`:
 
@@ -390,8 +426,8 @@ sqlgopace abort-resumable --config config.yaml --include-running
 By default only `PAUSED` operations are aborted. The exit code is non-zero if any abort fails.
 
 During a run, a paused resumable on an index a manifest wants to rebuild is handled automatically:
-if it is **this manifest's own** interrupted operation, the run **resumes** it (`ALTER INDEX … RESUME`,
-reusing the server-side progress) instead of restarting. A **stale or foreign** paused resumable that
+if it is this manifest's own interrupted operation, the run resumes it (`ALTER INDEX … RESUME`,
+reusing the server-side progress) instead of restarting. A stale or foreign paused resumable that
 would block a fresh rebuild fails the operation with a message pointing here — unless the manifest opts
 in with `abort_blocking_resumable: true`, which lets the engine clear it with `ALTER INDEX … ABORT`
 before rebuilding. The flag is off by default because aborting discards the paused operation's
@@ -409,7 +445,7 @@ operations:
 ### Maintenance: `plan`
 
 The `plan` subcommand turns SqlGoPace into a maintenance planner: it inspects the connected database
-and **generates** the maintenance work itself — fragmentation-driven `REORGANIZE`/`REBUILD`, data
+and generates the maintenance work itself — fragmentation-driven `REORGANIZE`/`REBUILD`, data
 compression (`ROW`/`PAGE`, chosen on measured gain and write-intensity), heap rebuilds (forwarded
 records), `UPDATE STATISTICS`, and `DBCC CHECKDB` — instead of you hand-writing the manifests. The
 rules live in `maintenance_profile.yaml` (thresholds, per-object overrides). See
@@ -417,7 +453,7 @@ rules live in `maintenance_profile.yaml` (thresholds, per-object overrides). See
 
 It runs cheap-first: one metadata sweep selects candidates, and the expensive reads
 (`sp_estimate_data_compression_savings`, sampled `dm_db_index_physical_stats`) run only over the
-survivors. The output is **reviewable manifests** written into the queue — nothing is executed until
+survivors. The output is reviewable manifests written into the queue — nothing is executed until
 you run them through the normal engine.
 
 **Scope: the connected database.** Index, compression, heap, and statistics maintenance analyse and act
@@ -425,9 +461,9 @@ on the single database the connection string points to (the analysis DMVs and ge
 database-scoped). Only `DBCC CHECKDB` can span several databases, via `checkdb.databases` in the
 profile. Point the connection string at the database you want to maintain.
 
-A server-wide **multi-database mode** maintains several databases in one go. `plan --all-databases` (or
+A server-wide multi-database mode maintains several databases in one go. `plan --all-databases` (or
 `--databases a,b,c`) materialises a per-database block of manifests, scoped by a `scope:` selector in
-the profile; the run then processes the queue **one connection per database**, sequentially. `--auto`
+the profile; the run then processes the queue one connection per database, sequentially. `--auto`
 accepts the same flags for an unattended server-wide run. Ineligible databases (AG secondary,
 read-only, offline, no access) are skipped with a logged reason.
 
@@ -482,7 +518,7 @@ major version and edition tier (with `requires` dependencies, e.g. `resumable` r
 `online`). It encodes the real SQL Server rules — for example `ONLINE` index builds from
 2005 (Enterprise), `RESUMABLE` rebuild from 2017 and create from 2019,
 `WAIT_AT_LOW_PRIORITY` on index ops from 2014/2022, `ONLINE ALTER COLUMN` from 2016, and
-that `WAIT_AT_LOW_PRIORITY` is **not** supported with online `ALTER COLUMN` on any
+that `WAIT_AT_LOW_PRIORITY` is not supported with online `ALTER COLUMN` on any
 version. Azure SQL Database / Managed Instance are treated as an evergreen pseudo-version.
 
 ## Testing
