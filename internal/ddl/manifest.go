@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -259,7 +260,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
 	}
-	if err := value.Decode(&raw); err != nil {
+	if err := strictDecode(value, &raw); err != nil {
 		return err
 	}
 
@@ -270,13 +271,32 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.AbortBlockingResumable = raw.AbortBlockingResumable
 	m.Window = raw.Window
-	m.Operations = make([]Operation, 0, len(raw.Operations))
-	for i := range raw.Operations {
-		op, err := decodeOperation(&raw.Operations[i])
+	// The operation nodes come from the original document rather than from raw: strictDecode
+	// round-trips through a buffer, so nodes decoded out of raw carry that buffer's line
+	// numbers instead of the file's — and an unknown-field error would then point the
+	// operator at the wrong line.
+	opNodes := operationNodes(value)
+	m.Operations = make([]Operation, 0, len(opNodes))
+	for i, node := range opNodes {
+		op, err := decodeOperation(node)
 		if err != nil {
 			return fmt.Errorf("operation %d: %w", i, err)
 		}
 		m.Operations = append(m.Operations, op)
+	}
+	return nil
+}
+
+// operationNodes returns the manifest's operation nodes straight from the parsed document,
+// preserving their source positions.
+func operationNodes(node *yaml.Node) []*yaml.Node {
+	if node.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == "operations" {
+			return node.Content[i+1].Content
+		}
 	}
 	return nil
 }
@@ -355,7 +375,7 @@ func decodeOperation(node *yaml.Node) (Operation, error) {
 // which is carried by the discriminator rather than a YAML field.
 func decodeBatchDML(node *yaml.Node, verb string) (Operation, error) {
 	var op BatchDML
-	if err := node.Decode(&op); err != nil {
+	if err := decodeOperationNode(node, &op); err != nil {
 		return nil, err
 	}
 	op.Verb = verb
@@ -365,10 +385,111 @@ func decodeBatchDML(node *yaml.Node, verb string) (Operation, error) {
 // decodeInto decodes a YAML node into the concrete operation type T.
 func decodeInto[T Operation](node *yaml.Node) (Operation, error) {
 	var op T
-	if err := node.Decode(&op); err != nil {
+	if err := decodeOperationNode(node, &op); err != nil {
 		return nil, err
 	}
 	return op, nil
+}
+
+// decodeOperationNode strictly decodes an operation node, minus the "operation"
+// discriminator — which every operation node carries but no operation type declares as a
+// field, so a strict decode would reject it.
+func decodeOperationNode(node *yaml.Node, out any) error {
+	return strictDecode(withoutKey(node, "operation"), out)
+}
+
+// withoutKey returns a shallow copy of a mapping node with one key/value pair removed. The
+// original is left untouched: decodeOperation reads the discriminator from it first.
+func withoutKey(node *yaml.Node, key string) *yaml.Node {
+	if node.Kind != yaml.MappingNode {
+		return node
+	}
+	out := *node
+	out.Content = make([]*yaml.Node, 0, len(node.Content))
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		if node.Content[i].Value == key {
+			continue
+		}
+		out.Content = append(out.Content, node.Content[i], node.Content[i+1])
+	}
+	return &out
+}
+
+// strictDecode decodes node into out, rejecting any YAML key that maps to no field.
+//
+// config.yaml, maintenance_profile.yaml and ddl_compatibility.yaml all decode with
+// KnownFields(true); manifests did not, so a misspelled key was silently dropped — a
+// `data_compresion: PAGE` typo produced an uncompressed rebuild reported as success. Simply
+// setting KnownFields on the manifest decoder does not fix it: yaml.v3 does not carry the
+// flag into a type's UnmarshalYAML, and both Manifest and the operation types decode
+// through one. Round-tripping the node through a decoder that has the flag set restores the
+// check for the whole tree, nested structs included.
+func strictDecode(node *yaml.Node, out any) error {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	if err := enc.Encode(node); err != nil {
+		return err
+	}
+	if err := enc.Close(); err != nil {
+		return err
+	}
+	dec := yaml.NewDecoder(&buf)
+	dec.KnownFields(true)
+	if err := dec.Decode(out); err != nil {
+		return unknownFieldError(node, err)
+	}
+	return nil
+}
+
+// unknownFieldRE matches yaml.v3's KnownFields complaint. Its message ends in the Go type
+// being decoded into — for a manifest that is an anonymous struct dump, meaningless to an
+// operator — and its line number counts from the re-encoded buffer strictDecode built, not
+// from the file the operator has open.
+var unknownFieldRE = regexp.MustCompile(`^line \d+: field (\S+) not found in type `)
+
+// unknownFieldError rewrites yaml.v3's unknown-field errors to name the offending key and
+// its real line in the source node, so the message points at the typo instead of at Go.
+func unknownFieldError(node *yaml.Node, err error) error {
+	var te *yaml.TypeError
+	if !errors.As(err, &te) {
+		return err
+	}
+	msgs := make([]string, 0, len(te.Errors))
+	for _, e := range te.Errors {
+		m := unknownFieldRE.FindStringSubmatch(e)
+		if m == nil {
+			msgs = append(msgs, e)
+			continue
+		}
+		if line := findKeyLine(node, m[1]); line > 0 {
+			msgs = append(msgs, fmt.Sprintf("line %d: unknown field %q", line, m[1]))
+			continue
+		}
+		msgs = append(msgs, fmt.Sprintf("unknown field %q", m[1]))
+	}
+	return fmt.Errorf("%s: %w", strings.Join(msgs, "; "), ErrInvalidManifest)
+}
+
+// findKeyLine returns the source line of the first mapping key named key, so an unknown
+// field can be reported against the file the operator wrote rather than the buffer we
+// decoded. Returns 0 when the key is not found.
+func findKeyLine(node *yaml.Node, key string) int {
+	if node == nil {
+		return 0
+	}
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == key {
+				return node.Content[i].Line
+			}
+		}
+	}
+	for _, c := range node.Content {
+		if line := findKeyLine(c, key); line > 0 {
+			return line
+		}
+	}
+	return 0
 }
 
 // requireFields returns an ErrInvalidManifest error naming any blank fields.
