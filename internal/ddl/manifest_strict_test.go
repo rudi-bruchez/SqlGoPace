@@ -103,6 +103,124 @@ operations:
 	}
 }
 
+// An unknown key must be reported at ITS line, not at a valid key that happens to share its
+// name. A first-match-by-name search reported `table: T1` for a typo nested under options:,
+// and the manifest's own `description:` for a typo inside window:.
+func TestParseManifestReportsTheShadowedKeysOwnLine(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		wantLine int
+	}{
+		{
+			name: "unknown key under options shadowed by a valid outer table:",
+			manifest: `
+description: t
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T1
+    index: IX1
+    options:
+      table: x
+`,
+			wantLine: 9,
+		},
+		{
+			name: "unknown key under window shadowed by a valid outer description:",
+			manifest: `
+description: t
+window:
+  start: "01:00"
+  end: "05:00"
+  description: oops
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T1
+    index: IX1
+`,
+			wantLine: 6,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ddl.ParseManifest(strings.NewReader(tt.manifest))
+			if err == nil {
+				t.Fatal("ParseManifest() error = nil, want an unknown-field error")
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("line %d", tt.wantLine)) {
+				t.Errorf("error points somewhere other than the typo's line %d:\n%v", tt.wantLine, err)
+			}
+		})
+	}
+}
+
+// yaml.v3's own errors must keep pointing at the operator's file. Decoding a re-encoded copy
+// of the node numbered these from that copy instead: a type mismatch on line 9 reported 5.
+func TestParseManifestTypeErrorKeepsSourceLine(t *testing.T) {
+	const m = `
+description: t
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T1
+    index: IX1
+    options:
+      maxdop: "abc"
+`
+	_, err := ddl.ParseManifest(strings.NewReader(m))
+	if err == nil {
+		t.Fatal("ParseManifest() error = nil, want a type error")
+	}
+	if !strings.Contains(err.Error(), "line 9") {
+		t.Errorf("type error does not point at source line 9:\n%v", err)
+	}
+}
+
+// Anchors, aliases and merge keys resolve against the whole document, so they do not survive
+// re-encoding one operation's subtree — the alias loses sight of its anchor.
+func TestParseManifestSupportsAnchorsAcrossOperations(t *testing.T) {
+	const m = `
+description: anchors
+operations:
+  - operation: rebuild_index
+    <<: &base
+      schema: dbo
+      table: T1
+    index: IX1
+  - operation: rebuild_index
+    <<: *base
+    index: IX2
+`
+	man, err := ddl.ParseManifest(strings.NewReader(m))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v, want nil (the alias must resolve)", err)
+	}
+	second, ok := man.Operations[1].(ddl.RebuildIndex)
+	if !ok {
+		t.Fatalf("operation 1 type = %T, want ddl.RebuildIndex", man.Operations[1])
+	}
+	if second.Schema != "dbo" || second.Table != "T1" || second.Index != "IX2" {
+		t.Errorf("merged operation = %+v, want schema dbo, table T1, index IX2", second)
+	}
+}
+
+// A bare scalar in the operations list must not surface yaml.v3's message naming the
+// anonymous discriminator struct.
+func TestParseManifestRejectsNonMappingOperation(t *testing.T) {
+	_, err := ddl.ParseManifest(strings.NewReader("description: t\noperations:\n  - foo\n"))
+	if err == nil {
+		t.Fatal("ParseManifest() error = nil, want an error")
+	}
+	if !strings.Contains(err.Error(), "must be a mapping") {
+		t.Errorf("error does not explain the shape problem: %v", err)
+	}
+	if strings.Contains(err.Error(), "yaml:\\\"") {
+		t.Errorf("error leaks the Go type: %v", err)
+	}
+}
+
 // The discriminator is present on every operation node but is not a field of any operation
 // type, so a strict decode must not trip over it.
 func TestParseManifestAcceptsValidManifests(t *testing.T) {

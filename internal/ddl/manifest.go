@@ -1,11 +1,11 @@
 package ddl
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -260,7 +260,10 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
 	}
-	if err := strictDecode(value, &raw); err != nil {
+	if err := checkKnownFields(value, reflect.TypeOf(raw)); err != nil {
+		return err
+	}
+	if err := value.Decode(&raw); err != nil {
 		return err
 	}
 
@@ -271,32 +274,13 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.SkipIfSatisfied = raw.SkipIfSatisfied
 	m.AbortBlockingResumable = raw.AbortBlockingResumable
 	m.Window = raw.Window
-	// The operation nodes come from the original document rather than from raw: strictDecode
-	// round-trips through a buffer, so nodes decoded out of raw carry that buffer's line
-	// numbers instead of the file's — and an unknown-field error would then point the
-	// operator at the wrong line.
-	opNodes := operationNodes(value)
-	m.Operations = make([]Operation, 0, len(opNodes))
-	for i, node := range opNodes {
-		op, err := decodeOperation(node)
+	m.Operations = make([]Operation, 0, len(raw.Operations))
+	for i := range raw.Operations {
+		op, err := decodeOperation(&raw.Operations[i])
 		if err != nil {
 			return fmt.Errorf("operation %d: %w", i, err)
 		}
 		m.Operations = append(m.Operations, op)
-	}
-	return nil
-}
-
-// operationNodes returns the manifest's operation nodes straight from the parsed document,
-// preserving their source positions.
-func operationNodes(node *yaml.Node) []*yaml.Node {
-	if node.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 0; i+1 < len(node.Content); i += 2 {
-		if node.Content[i].Value == "operations" {
-			return node.Content[i+1].Content
-		}
 	}
 	return nil
 }
@@ -326,6 +310,14 @@ func LoadManifestFile(path string) (*Manifest, error) {
 
 // decodeOperation reads the discriminator and decodes into the matching type.
 func decodeOperation(node *yaml.Node) (Operation, error) {
+	if node.Kind == yaml.AliasNode {
+		node = node.Alias
+	}
+	// Checked before decoding: a non-mapping (a bare scalar in the list) would otherwise
+	// fail inside yaml.v3 with a message naming the anonymous discriminator struct.
+	if node.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("line %d: operation must be a mapping: %w", node.Line, ErrInvalidManifest)
+	}
 	var disc struct {
 		Operation string `yaml:"operation"`
 	}
@@ -391,15 +383,19 @@ func decodeInto[T Operation](node *yaml.Node) (Operation, error) {
 	return op, nil
 }
 
-// decodeOperationNode strictly decodes an operation node, minus the "operation"
-// discriminator — which every operation node carries but no operation type declares as a
-// field, so a strict decode would reject it.
+// decodeOperationNode decodes an operation node, rejecting keys that map to no field of the
+// concrete type. The "operation" discriminator is exempt: every operation node carries it,
+// no operation type declares it.
 func decodeOperationNode(node *yaml.Node, out any) error {
-	return strictDecode(withoutKey(node, "operation"), out)
+	if err := checkKnownFields(withoutKey(node, "operation"), reflect.TypeOf(out).Elem()); err != nil {
+		return err
+	}
+	return node.Decode(out)
 }
 
 // withoutKey returns a shallow copy of a mapping node with one key/value pair removed. The
-// original is left untouched: decodeOperation reads the discriminator from it first.
+// children are shared, so every node keeps its source position; the original is left
+// untouched because decodeOperation reads the discriminator from it first.
 func withoutKey(node *yaml.Node, key string) *yaml.Node {
 	if node.Kind != yaml.MappingNode {
 		return node
@@ -415,81 +411,112 @@ func withoutKey(node *yaml.Node, key string) *yaml.Node {
 	return &out
 }
 
-// strictDecode decodes node into out, rejecting any YAML key that maps to no field.
+var (
+	yamlNodeType        = reflect.TypeOf(yaml.Node{})
+	yamlUnmarshalerType = reflect.TypeOf((*yaml.Unmarshaler)(nil)).Elem()
+)
+
+// checkKnownFields reports the first YAML key in node that maps to no field of t, naming the
+// key and its line.
 //
 // config.yaml, maintenance_profile.yaml and ddl_compatibility.yaml all decode with
 // KnownFields(true); manifests did not, so a misspelled key was silently dropped — a
-// `data_compresion: PAGE` typo produced an uncompressed rebuild reported as success. Simply
-// setting KnownFields on the manifest decoder does not fix it: yaml.v3 does not carry the
-// flag into a type's UnmarshalYAML, and both Manifest and the operation types decode
-// through one. Round-tripping the node through a decoder that has the flag set restores the
-// check for the whole tree, nested structs included.
-func strictDecode(node *yaml.Node, out any) error {
-	var buf bytes.Buffer
-	enc := yaml.NewEncoder(&buf)
-	if err := enc.Encode(node); err != nil {
-		return err
+// `data_compresion: PAGE` typo produced an uncompressed rebuild reported as success. Setting
+// KnownFields on the manifest decoder does not fix that: yaml.v3 does not carry the flag into
+// a type's UnmarshalYAML, and both Manifest and every operation type decode through one.
+//
+// So the check walks the parsed document instead. Decoding still runs against the original
+// node, which keeps yaml.v3's own errors pointing at the operator's line numbers and leaves
+// anchors, aliases and merge keys resolvable — none of which survive re-encoding a subtree.
+func checkKnownFields(node *yaml.Node, t reflect.Type) error {
+	if node == nil || t == nil {
+		return nil
 	}
-	if err := enc.Close(); err != nil {
-		return err
+	if node.Kind == yaml.AliasNode {
+		return checkKnownFields(node.Alias, t)
 	}
-	dec := yaml.NewDecoder(&buf)
-	dec.KnownFields(true)
-	if err := dec.Decode(out); err != nil {
-		return unknownFieldError(node, err)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	// A type that decodes itself owns its shape, and a yaml.Node holds an arbitrary document.
+	if t == yamlNodeType || reflect.PointerTo(t).Implements(yamlUnmarshalerType) {
+		return nil
+	}
+	switch {
+	case t.Kind() == reflect.Slice && node.Kind == yaml.SequenceNode:
+		for _, el := range node.Content {
+			if err := checkKnownFields(el, t.Elem()); err != nil {
+				return err
+			}
+		}
+	case t.Kind() == reflect.Struct && node.Kind == yaml.MappingNode:
+		fields := yamlFields(t)
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key, val := node.Content[i], node.Content[i+1]
+			// A merge key contributes the merged mapping's keys to this same struct.
+			if key.Value == "<<" {
+				if err := checkMerged(val, t); err != nil {
+					return err
+				}
+				continue
+			}
+			f, ok := fields[key.Value]
+			if !ok {
+				return fmt.Errorf("line %d: unknown field %q: %w", key.Line, key.Value, ErrInvalidManifest)
+			}
+			if err := checkKnownFields(val, f.Type); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }
 
-// unknownFieldRE matches yaml.v3's KnownFields complaint. Its message ends in the Go type
-// being decoded into — for a manifest that is an anonymous struct dump, meaningless to an
-// operator — and its line number counts from the re-encoded buffer strictDecode built, not
-// from the file the operator has open.
-var unknownFieldRE = regexp.MustCompile(`^line \d+: field (\S+) not found in type `)
-
-// unknownFieldError rewrites yaml.v3's unknown-field errors to name the offending key and
-// its real line in the source node, so the message points at the typo instead of at Go.
-func unknownFieldError(node *yaml.Node, err error) error {
-	var te *yaml.TypeError
-	if !errors.As(err, &te) {
-		return err
-	}
-	msgs := make([]string, 0, len(te.Errors))
-	for _, e := range te.Errors {
-		m := unknownFieldRE.FindStringSubmatch(e)
-		if m == nil {
-			msgs = append(msgs, e)
-			continue
-		}
-		if line := findKeyLine(node, m[1]); line > 0 {
-			msgs = append(msgs, fmt.Sprintf("line %d: unknown field %q", line, m[1]))
-			continue
-		}
-		msgs = append(msgs, fmt.Sprintf("unknown field %q", m[1]))
-	}
-	return fmt.Errorf("%s: %w", strings.Join(msgs, "; "), ErrInvalidManifest)
-}
-
-// findKeyLine returns the source line of the first mapping key named key, so an unknown
-// field can be reported against the file the operator wrote rather than the buffer we
-// decoded. Returns 0 when the key is not found.
-func findKeyLine(node *yaml.Node, key string) int {
-	if node == nil {
-		return 0
-	}
-	if node.Kind == yaml.MappingNode {
-		for i := 0; i+1 < len(node.Content); i += 2 {
-			if node.Content[i].Value == key {
-				return node.Content[i].Line
+// checkMerged checks a merge key's value — one mapping, or a sequence of them — against t.
+func checkMerged(val *yaml.Node, t reflect.Type) error {
+	if val.Kind == yaml.SequenceNode {
+		for _, el := range val.Content {
+			if err := checkKnownFields(el, t); err != nil {
+				return err
 			}
 		}
+		return nil
 	}
-	for _, c := range node.Content {
-		if line := findKeyLine(c, key); line > 0 {
-			return line
+	return checkKnownFields(val, t)
+}
+
+// yamlFields maps a struct's YAML keys to their fields, following yaml.v3's rules: an
+// untagged field is keyed by its lowercased name, `yaml:"-"` is not a key at all, and an
+// inline struct contributes its own fields to the parent.
+func yamlFields(t reflect.Type) map[string]reflect.StructField {
+	out := make(map[string]reflect.StructField, t.NumField())
+	for i := range t.NumField() {
+		f := t.Field(i)
+		if f.PkgPath != "" { // unexported
+			continue
 		}
+		name, opts, _ := strings.Cut(f.Tag.Get("yaml"), ",")
+		if name == "-" {
+			continue
+		}
+		if strings.Contains(opts, "inline") {
+			ft := f.Type
+			for ft.Kind() == reflect.Pointer {
+				ft = ft.Elem()
+			}
+			if ft.Kind() == reflect.Struct {
+				for k, v := range yamlFields(ft) {
+					out[k] = v
+				}
+			}
+			continue
+		}
+		if name == "" {
+			name = strings.ToLower(f.Name)
+		}
+		out[name] = f
 	}
-	return 0
+	return out
 }
 
 // requireFields returns an ErrInvalidManifest error naming any blank fields.
