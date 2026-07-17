@@ -1,90 +1,90 @@
-# BATCH-DML — `UPDATE` / `DELETE` découpés en lots
+# BATCH-DML — batched `UPDATE` / `DELETE`
 
-> Source de vérité du comportement visé pour les opérations DML par lots.
-> **It1 + It2 + It3 (TUI live) implémentés.** It1 : `batch_update`/`batch_delete`, stratégie
-> `predicate`, `set:`/`where:` déclaratifs + échappatoire `set_raw:`/`where_raw:`, calibrage adaptatif,
-> réutilisation réaction/monitoring, preflight (permission + avis RCSI), RCSI/SI dans `ServerInfo`. It2 :
-> stratégie `key_range` (clé entière simple) avec **curseur persistant** (sidecar `.op<i>.wm` dans
-> `02.processing/`) pour reprise après crash, inférence de clé via `ClusteringKeyColumns`. It3 :
-> **progression live** — un *step-sink* moteur (`WithStepSink`, cf. `specs/progress-tui.md`) alimente
-> stdout (`[i/N] cmd cible — started/… in Xs`) et le TUI (compteur op i/N, chrono live), plus une ligne
-> batch live (lignes faites/estimées, %, taille de lot, lignes/s ; `BatchDMLProgress` complété par
-> `RowsPerSec`). It3 restant / It4 (calibrage RCSI fin plus poussé, surfaçage DMV d'escalade,
-> exactement-une-fois, clés composites/non entières) : cf. §7.
+> Source of truth for the intended behavior of batched DML operations.
+> **It1 + It2 + It3 (live TUI) implemented.** It1: `batch_update`/`batch_delete`, `predicate`
+> strategy, declarative `set:`/`where:` plus the `set_raw:`/`where_raw:` escape hatch, adaptive
+> calibration, reaction/monitoring reuse, preflight (permission + RCSI advisory), RCSI/SI in `ServerInfo`. It2:
+> `key_range` strategy (single integer key) with a **persistent cursor** (`.op<i>.wm` sidecar in
+> `02.processing/`) for crash resume, key inference via `ClusteringKeyColumns`. It3:
+> **live progress** — an engine *step sink* (`WithStepSink`, see `specs/progress-tui.md`) feeds
+> stdout (`[i/N] cmd target — started/… in Xs`) and the TUI (op counter i/N, live timer), plus a live
+> batch line (rows done/estimated, %, batch size, rows/s; `BatchDMLProgress` extended with
+> `RowsPerSec`). Remaining It3 / It4 (deeper RCSI-aware calibration, escalation DMV surfacing,
+> exactly-once, composite/non-integer keys): see §7.
 
-## 1. Objectif et contexte
+## 1. Goal and context
 
-SqlGoPace n'exécute aujourd'hui que du **DDL** (rebuild/reorganize d'index, compression, shrink,
-checkdb, statistiques). Un besoin DBA récurrent sur ces mêmes bases multi-To en 24/7 est une
-**instruction DML massive en un seul coup** — « mettre une colonne à une valeur sur toute une
-table », ou « supprimer tout (ou un large sous-ensemble) d'une table » — qui sur une base de
-production chargée est dangereuse pour les raisons que SqlGoPace gère déjà côté DDL, **plus deux
-spécifiques au DML** :
+Today SqlGoPace only executes **DDL** (index rebuild/reorganize, compression, shrink,
+checkdb, statistics). A recurring DBA need on those same multi-TB 24/7 databases is a
+**massive one-shot DML statement** — "set a column to a value across a whole table", or
+"delete everything (or a large subset) from a table" — which on a busy production
+database is dangerous for the reasons SqlGoPace already handles on the DDL side, **plus two
+specific to DML**:
 
-- **Escalade de verrous.** Un gros `UPDATE`/`DELETE` prend des verrous **X (exclusifs) de données**
-  ligne/page ; dès qu'une seule instruction détient ~5000 verrous sur un objet, SQL Server
-  **escalade en un verrou X de table**, gelant tout accès concurrent à la table entière.
-- **Explosion du journal.** Une instruction = une transaction ; le journal ne peut pas être tronqué
-  tant qu'elle n'est pas validée, donc un DML de plusieurs heures fait croître le journal sans borne.
+- **Lock escalation.** A large `UPDATE`/`DELETE` takes row/page **X (exclusive) data locks**;
+  as soon as a single statement holds ~5000 locks on an object, SQL Server
+  **escalates to a table-level X lock**, freezing all concurrent access to the entire table.
+- **Log explosion.** One statement = one transaction; the log cannot be truncated
+  until it commits, so a multi-hour DML grows the log without bound.
 
-La parade est le motif classique : **découper l'instruction en une boucle** de petits lots validés
-individuellement, chacun maintenu sous le seuil d'escalade, en échantillonnant le serveur entre les
-lots et en réagissant à la pression — ce qui est **architecturalement identique au driver de
-shrink** existant.
+The remedy is the classic pattern: **split the statement into a loop** of small batches committed
+individually, each kept under the escalation threshold, sampling the server between
+batches and reacting to pressure — which is **architecturally identical to the existing
+shrink driver**.
 
-C'est aussi là que la question **RCSI finit par servir** : contrairement au DDL (verrous de schéma,
-où le RCSI est orthogonal — cf. la discussion sur `CheckServer`), un lot DML entre en conflit sur des
-**verrous de données**, et le RCSI change directement à quel point l'escalade est perturbante. Cette
-spec **expose donc et utilise** l'état RCSI/SI de la base.
+This is also where the **RCSI question finally matters**: unlike DDL (schema locks,
+where RCSI is orthogonal — see the `CheckServer` discussion), a DML batch conflicts on
+**data locks**, and RCSI directly changes how disruptive escalation is. This
+spec therefore **surfaces and uses** the database's RCSI/SI state.
 
-## 2. Pourquoi le driver de shrink est le patron (carte de réutilisation)
+## 2. Why the shrink driver is the template (reuse map)
 
-Un shrink est déjà « une boucle de `DBCC SHRINKFILE` par chunks, pas une instruction DDL unique »
-avec un **deuxième driver parallèle** (`ShrinkRunner`) qui ne passe pas par `MonitoredRunner`. Un DML
-par lots a la même forme et réutilise les mêmes coutures :
+A shrink is already "a chunked `DBCC SHRINKFILE` loop, not a single DDL statement"
+with a **second, parallel driver** (`ShrinkRunner`) that does not go through `MonitoredRunner`. A batched
+DML has the same shape and reuses the same seams:
 
-| Couture | Shrink | Batch DML |
+| Seam | Shrink | Batch DML |
 |---------|--------|-----------|
-| Struct opération | `ddl.Shrink` (`internal/ddl/manifest.go`) | nouvelle `ddl.BatchDML` |
-| SQL généré au run | `ShrinkChunkSQL` bâti par chunk dans la boucle | `BatchDMLChunkSQL` bâti par lot |
-| Driver | `ShrinkRunner` + iface `ShrinkDriver`, `WithShrinkRunner` | `BatchDMLRunner` + `BatchDMLDriver`, `WithBatchDMLRunner` |
-| Iface de lecture | `ShrinkReader` (`internal/run/shrink.go`) | nouvelle `BatchDMLReader` |
-| Maths de pas (pures) | `shrink_calc.go` `InitialStepMB`/`AdjustStepMB`/clamp | nouveau `batch_calc.go` `InitialBatchRows`/`AdjustBatchRows`/clamp |
-| Dispatch moteur | `processOne` type-assert `ddl.Shrink` → `e.shrink.Run(...)` | type-assert `ddl.BatchDML` → `e.batchDML.Run(...)` |
-| Réaction/monitoring | `pumpSamples` + `supervise` + `ReactionSink` + `Capabilities` + `IgnoreSource` | **réutilisés tels quels** |
-| Sûreté d'annulation | `CancelSafe: true` (valide par chunk) | `CancelSafe: true` (valide par lot) |
+| Operation struct | `ddl.Shrink` (`internal/ddl/manifest.go`) | new `ddl.BatchDML` |
+| SQL generated at run time | `ShrinkChunkSQL` built per chunk in the loop | `BatchDMLChunkSQL` built per batch |
+| Driver | `ShrinkRunner` + `ShrinkDriver` iface, `WithShrinkRunner` | `BatchDMLRunner` + `BatchDMLDriver`, `WithBatchDMLRunner` |
+| Read iface | `ShrinkReader` (`internal/run/shrink.go`) | new `BatchDMLReader` |
+| Step math (pure) | `shrink_calc.go` `InitialStepMB`/`AdjustStepMB`/clamp | new `batch_calc.go` `InitialBatchRows`/`AdjustBatchRows`/clamp |
+| Engine dispatch | `processOne` type-asserts `ddl.Shrink` → `e.shrink.Run(...)` | type-assert `ddl.BatchDML` → `e.batchDML.Run(...)` |
+| Reaction/monitoring | `pumpSamples` + `supervise` + `ReactionSink` + `Capabilities` + `IgnoreSource` | **reused as-is** |
+| Cancel safety | `CancelSafe: true` (commits per chunk) | `CancelSafe: true` (commits per batch) |
 | Config | `ShrinkConfig` → `ShrinkTuning` | `BatchDMLConfig` → `BatchDMLTuning` |
 
-Le DML par lots est **meilleur que le shrink sur un point** : il a un **point de reprise** naturel
-(les lignes supprimées le restent / le curseur avance), donc il peut être rendu **réellement
-reprenable après crash**, ce que le shrink n'est pas.
+Batched DML is **better than shrink in one respect**: it has a natural **resume point**
+(deleted rows stay deleted / the cursor advances), so it can be made **genuinely
+crash-resumable**, which shrink is not.
 
 ---
 
-## 3. Forme du manifeste
+## 3. Manifest shape
 
-Deux discriminants (`batch_update`, `batch_delete`) se décodent en une seule struct `BatchDML` — à
-l'image de `Shrink` qui porte `type: data|log` et dont `CommandType()` renvoie
+Two discriminants (`batch_update`, `batch_delete`) decode into a single `BatchDML` struct — mirroring
+`Shrink`, which carries `type: data|log` and whose `CommandType()` returns
 `shrink_data`/`shrink_log`.
 
 ```yaml
 operations:
-  # UPDATE idempotent d'une table entière vers une valeur littérale — le cas phare.
+  # Idempotent UPDATE of an entire table to a literal value — the flagship case.
   - operation: batch_update
     schema: dbo
     table: Orders
-    set:                                 # colonne -> littéral scalaire (string/number/bool/null)
+    set:                                 # column -> scalar literal (string/number/bool/null)
       Status: 'Archived'
-    where:                               # optionnel ; liste de conditions simples, ET-liées
+    where:                               # optional; list of simple conditions, AND-ed
       - { column: Status, op: '=', value: 'Pending' }
     batch:
-      strategy: predicate                # predicate (défaut) | key_range
-      key: OrderID                       # requis pour key_range seulement ; défaut = clé cluster
-      initial_rows: 5000                 # optionnel ; auto-calibré sinon
+      strategy: predicate                # predicate (default) | key_range
+      key: OrderID                       # required for key_range only; defaults to the clustering key
+      initial_rows: 5000                 # optional; auto-calibrated otherwise
     options:
-      maxdop: 1                          # seule option « WITH » applicable au DML
+      maxdop: 1                          # the only "WITH" option applicable to DML
 
-  # DELETE découpé d'un sous-ensemble (ou, avec confirmation, de toute la table).
+  # Batched DELETE of a subset (or, with confirmation, of the whole table).
   - operation: batch_delete
     schema: dbo
     table: AuditLog
@@ -92,249 +92,249 @@ operations:
       - { column: CreatedAt, op: '<', value: '2024-01-01' }
     batch: { initial_rows: 10000 }
 
-  # Échappatoire SQL brute, sous garde (manifestes signés DBA ; injectés verbatim).
+  # Raw SQL escape hatch, guarded (DBA-signed manifests; injected verbatim).
   - operation: batch_update
     schema: dbo
     table: Invoice
-    set_raw: "Status = 'Closed', ClosedAt = SYSUTCDATETIME()"   # exclusif avec set:
-    where_raw: "Status = 'Open' AND DueDate < '2024-01-01'"     # exclusif avec where:
+    set_raw: "Status = 'Closed', ClosedAt = SYSUTCDATETIME()"   # mutually exclusive with set:
+    where_raw: "Status = 'Open' AND DueDate < '2024-01-01'"     # mutually exclusive with where:
 ```
 
-### Règles de champ (`Validate()`, fail-fast au chargement — comme la validation des ops existantes)
+### Field rules (`Validate()`, fail-fast at load — like the existing op validation)
 
-- Exactement un de (`set:` | `set_raw:`) pour `batch_update` ; **aucun des deux** pour `batch_delete`.
-- Au plus un de (`where:` | `where_raw:`).
-- Les valeurs de `set:` sont des **littéraux scalaires uniquement** (pas de référence de colonne) →
-  **idempotence** garantie.
-- `op` ∈ une petite liste blanche : `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`.
-- `set_raw` / `where_raw` sont des chaînes non vides injectées **verbatim** dans l'instruction
-  générée. C'est une exception explicite et documentée au principe « jamais de SQL brut », justifiée
-  par le fait que les manifestes sont écrits par des DBA (même périmètre de confiance qu'un script
-  `.sql`), et elle a des conséquences (cf. §4).
-- **Garde « table entière »** : un `batch_delete` (ou `batch_update`) **sans** `where`/`where_raw`
-  exige un `confirm_full_table: true` explicite, sinon le preflight **échoue**. (Évite la purge
-  accidentelle ; aligné sur le verrouillage des intentions destructrices ailleurs.) Le message
-  rappelle que **`TRUNCATE TABLE`** est l'outil adapté pour un vidage total inconditionnel quand les
-  FK/triggers/accès le permettent — le DELETE découpé sert quand TRUNCATE n'est pas viable.
+- Exactly one of (`set:` | `set_raw:`) for `batch_update`; **neither** for `batch_delete`.
+- At most one of (`where:` | `where_raw:`).
+- `set:` values are **scalar literals only** (no column reference) →
+  **idempotence** guaranteed.
+- `op` ∈ a small allow-list: `=`, `<>`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`, `IN`.
+- `set_raw` / `where_raw` are non-empty strings injected **verbatim** into the generated
+  statement. This is an explicit, documented exception to the "never raw SQL" principle, justified
+  by the fact that manifests are written by DBAs (same trust boundary as a `.sql`
+  script), and it has consequences (see §4).
+- **"Whole table" guard**: a `batch_delete` (or `batch_update`) **without** `where`/`where_raw`
+  requires an explicit `confirm_full_table: true`, otherwise preflight **fails**. (Avoids the
+  accidental purge; aligned with how destructive intent is gated elsewhere.) The message
+  reminds that **`TRUNCATE TABLE`** is the right tool for an unconditional full wipe when
+  FKs/triggers/access allow it — batched DELETE is for when TRUNCATE is not viable.
 
 ---
 
-## 4. Idempotence & reprise après crash (modèle de sûreté central)
+## 4. Idempotence & crash resume (the core safety model)
 
-Un lot est **validé individuellement**, donc un crash/kill ne perd au plus que le lot en cours. Que
-ce lot soit **re-jouable** sans risque à la reprise dépend de l'idempotence :
+A batch is **committed individually**, so a crash/kill loses at most the in-flight batch. Whether
+that batch is safely **replayable** on resume depends on idempotence:
 
-| Cas | Idempotent ? | Stratégie de reprise |
+| Case | Idempotent? | Resume strategy |
 |-----|--------------|----------------------|
-| `batch_delete` (tout prédicat) | **Oui** (une ligne supprimée le reste) | boucle predicate, sans point de reprise |
-| `batch_update` avec `set:` littéral | **Oui** (`col = 'X'` identique au re-jeu) | predicate (`WHERE col <> 'X'`) **ou** key_range + curseur |
-| `batch_update` avec `set_raw` référençant la ligne (`Counter = Counter + 1`) | **Non** | **pas re-jouable sans risque** |
+| `batch_delete` (any predicate) | **Yes** (a deleted row stays deleted) | predicate loop, no resume point |
+| `batch_update` with literal `set:` | **Yes** (`col = 'X'` identical on replay) | predicate (`WHERE col <> 'X'`) **or** key_range + cursor |
+| `batch_update` with `set_raw` referencing the row (`Counter = Counter + 1`) | **No** | **not safely replayable** |
 
-Règles :
+Rules:
 
-- **Stratégie predicate (défaut).** `… TOP(@n) … WHERE <prédicat>` en boucle jusqu'à
-  `@@ROWCOUNT = 0`. Pour DELETE et UPDATE littéral, le prédicat est **auto-limitant** (les lignes
-  qu'il vient de changer ne matchent plus), donc une reprise continue simplement — **aucun point de
-  reprise à gérer, sûr par construction.** Coût : chaque lot ré-évalue le prédicat, la colonne du
-  prédicat doit donc être indexée pour les grosses tables.
-- **Stratégie key_range (opt-in).** Parcourt une `key` unique/ordonnable par plages ascendantes
-  (`WHERE key > @curseur ORDER BY key`), en persistant `MAX(key)` traité comme point de reprise.
-  Prévisible sur multi-To et sans re-scan, **mais** le curseur vit dans le sidecar de processing (un
-  fichier), pas dans la même transaction que le SQL → la reprise est **au-moins-une-fois** sur le lot
-  frontière. Donc key_range n'est offert **que pour un SET idempotent** (`set:` littéral), où
-  ré-appliquer le lot frontière est sans effet.
-- **`set_raw` non idempotent** est autorisé mais **marqué non reprenable** : le preflight émet un
-  `WARN`, l'op tourne sans point de reprise, et un crash en cours laisse la table partiellement mise à
-  jour pour **réconciliation manuelle** (consignée dans le `.log`). Le MVP ne tente **pas** l'exactement-
-  une-fois pour ce cas (il faudrait une table de contrôle côté base mise à jour dans la transaction du
-  lot — reporté en itération ultérieure si demandé).
+- **Predicate strategy (default).** `… TOP(@n) … WHERE <predicate>` looping until
+  `@@ROWCOUNT = 0`. For DELETE and literal UPDATE, the predicate is **self-limiting** (the rows
+  it just changed no longer match), so a resume simply continues — **no resume
+  point to manage, safe by construction.** Cost: every batch re-evaluates the predicate, so the
+  predicate column must be indexed for large tables.
+- **key_range strategy (opt-in).** Walks a unique/orderable `key` in ascending ranges
+  (`WHERE key > @cursor ORDER BY key`), persisting the processed `MAX(key)` as a resume point.
+  Predictable at multi-TB scale and re-scan free, **but** the cursor lives in the processing sidecar (a
+  file), not in the same transaction as the SQL → resume is **at-least-once** on the
+  boundary batch. So key_range is only offered **for an idempotent SET** (literal `set:`), where
+  re-applying the boundary batch is a no-op.
+- **Non-idempotent `set_raw`** is allowed but **marked non-resumable**: preflight emits a
+  `WARN`, the op runs without a resume point, and a crash mid-run leaves the table partially
+  updated for **manual reconciliation** (recorded in the `.log`). The MVP does **not** attempt exactly-
+  once for this case (it would need a database-side control table updated within the batch's
+  transaction — deferred to a later iteration if asked for).
 
-Stratégie par défaut selon le verbe : `batch_delete` → `predicate` ; `batch_update` → `predicate`
-(basculer en `key_range` quand la table est énorme et le prédicat n'est pas indexé sélectivement).
-
----
-
-## 5. Intégration RCSI / isolation snapshot (le fil conducteur)
-
-Un lot DML détient des **verrous X de données** ; le RCSI/SI change qui en pâtit :
-
-- **RCSI OFF (READ COMMITTED prend des verrous S) :** l'escalade en **verrou X de table bloque tous
-  les lecteurs** → l'application gèle sur cette table. Maintenir chaque lot **sous le seuil d'escalade
-  (~5000 verrous)** et honorer la réaction « bon citoyen » au blocage est **critique**.
-- **RCSI / SI ON (lecteurs en versions de lignes) :** les lecteurs ne sont **pas bloqués** par les
-  verrous X ligne/page du lot, donc l'escalade est bien moins perturbante pour les *lectures* (elle
-  bloque toujours les *écrivains*). Le coût dominant se déplace vers le **version store de tempdb** :
-  chaque ligne modifiée/supprimée génère une version conservée jusqu'au commit du lot → de petits
-  lots + commit-par-lot bornent la croissance du version store/tempdb.
-
-Concrètement, cette spec ajoute la conscience du RCSI/SI à trois endroits :
-
-1. **`mssql.ServerInfo`** gagne `RCSIEnabled bool` et `SnapshotIsolation bool`, lus dans
-   `DetectServer` depuis `sys.databases` (`is_read_committed_snapshot_on`,
-   `snapshot_isolation_state_desc`). `CheckServer` les affiche sur la ligne de faits serveur, à côté
-   des `adr=`/`recovery=` existants.
-2. **Avis de preflight** (`WARN`, non bloquant) pour une op `batch_*` : si **RCSI OFF**, avertir que
-   l'escalade bloquera les lecteurs et recommander un `initial_rows` prudent (< seuil d'escalade) ;
-   si **RCSI/SI ON**, signaler la croissance du version store tempdb et de surveiller tempdb.
-3. **Calibrage par défaut du lot** indexé sur le RCSI : RCSI **off** → lot initial auto plafonné sous
-   le seuil d'escalade (p. ex. ≤ 4000 lignes) ; RCSI **on** → le plafond peut se détendre (le journal
-   et le version store, pas le blocage des lecteurs, deviennent les signaux gouvernants). Défaut
-   seulement — un `initial_rows` explicite l'emporte toujours.
-
-L'escalade est sinon gérée **réactivement**, comme tout le reste : le calibreur adaptatif réduit le
-lot dès que de la pression `LCK_M_*` / blocage apparaît entre lots (pas besoin de pré-lire les DMV
-d'escalade). On n'émet **pas** `ALTER TABLE … SET (LOCK_ESCALATION = DISABLE)` automatiquement — cela
-modifie la table et relève de l'opérateur ; calibrer sous le seuil est le levier non intrusif.
-
-La pression **version store / tempdb** sous RCSI est traitée par le garde-fou transversal
-`TEMPDB-GUARD.md` (preflight no-start + alerte runtime ; arrêt seulement si tempdb est plein **et**
-que c'est notre session le contributeur matériel). Le version store n'étant pas attribuable par
-session à bon marché, ce cas reste en **alerte seule** côté DML.
+Default strategy per verb: `batch_delete` → `predicate`; `batch_update` → `predicate`
+(switch to `key_range` when the table is huge and the predicate is not selectively indexed).
 
 ---
 
-## 6. Conception du driver — `internal/run/batch_dml.go` (calque de `shrink.go`)
+## 5. RCSI / snapshot isolation integration (the through line)
 
-- **`BatchDMLReader`** (interface étroite, satisfaite par `*mssql.Conn`) :
-  - `ClusteringKeyColumns(ctx, schema, table) ([]mssql.KeyColumn, error)` — **nouvelle** lecture des
-    colonnes de la clé cluster/PK en ordre de clé (étendre `internal/mssql/indexes.go` ; via
-    `sys.index_columns`). Nécessaire pour `key_range` et pour défaut de `batch.key`.
-  - `EstimateRows(ctx, schema, table) (int64, error)` — réutiliser `ObjectInventory`
-    (`analysis.go`) pour une estimation du nombre de lignes (progression %, calibrage initial).
-  - `SessionWaits(ctx, spid) ([]mssql.SessionWait, error)` — réutilisé, pour les deltas de calibrage.
-  - (lectures log-reuse + plancher de journal actif réutilisées du jeu de lectures du shrink.)
+A DML batch holds **data X locks**; RCSI/SI changes who suffers:
+
+- **RCSI OFF (READ COMMITTED takes S locks):** escalation to a **table X lock blocks all
+  readers** → the application freezes on that table. Keeping each batch **under the escalation
+  threshold (~5000 locks)** and honoring the "good citizen" reaction to blocking is **critical**.
+- **RCSI / SI ON (readers use row versions):** readers are **not blocked** by the batch's
+  row/page X locks, so escalation is far less disruptive to *reads* (it still
+  blocks *writers*). The dominant cost shifts to the **tempdb version store**:
+  every modified/deleted row generates a version retained until the batch commits → small
+  batches + commit-per-batch bound version store/tempdb growth.
+
+Concretely, this spec adds RCSI/SI awareness in three places:
+
+1. **`mssql.ServerInfo`** gains `RCSIEnabled bool` and `SnapshotIsolation bool`, read in
+   `DetectServer` from `sys.databases` (`is_read_committed_snapshot_on`,
+   `snapshot_isolation_state_desc`). `CheckServer` shows them on the server facts line, next to
+   the existing `adr=`/`recovery=`.
+2. **Preflight advisory** (`WARN`, non-blocking) for a `batch_*` op: if **RCSI OFF**, warn that
+   escalation will block readers and recommend a conservative `initial_rows` (< escalation threshold);
+   if **RCSI/SI ON**, flag tempdb version store growth and to watch tempdb.
+3. **Default batch calibration** keyed on RCSI: RCSI **off** → the initial auto batch is capped under
+   the escalation threshold (e.g. ≤ 4000 rows); RCSI **on** → the cap can relax (the log
+   and version store, not reader blocking, become the governing signals). Default
+   only — an explicit `initial_rows` always wins.
+
+Escalation is otherwise handled **reactively**, like everything else: the adaptive calibrator shrinks the
+batch as soon as `LCK_M_*` pressure / blocking appears between batches (no need to pre-read the
+escalation DMVs). We do **not** emit `ALTER TABLE … SET (LOCK_ESCALATION = DISABLE)` automatically — that
+alters the table and is the operator's call; calibrating under the threshold is the non-intrusive lever.
+
+**Version store / tempdb** pressure under RCSI is handled by the cross-cutting
+`TEMPDB-GUARD.md` guardrail (preflight no-start + runtime alert; stop only if tempdb is full **and**
+our session is the material contributor). Since the version store is not cheaply attributable per
+session, this case stays **alert-only** on the DML side.
+
+---
+
+## 6. Driver design — `internal/run/batch_dml.go` (modeled on `shrink.go`)
+
+- **`BatchDMLReader`** (narrow interface, satisfied by `*mssql.Conn`):
+  - `ClusteringKeyColumns(ctx, schema, table) ([]mssql.KeyColumn, error)` — **new** read of the
+    clustering key/PK columns in key order (extend `internal/mssql/indexes.go`; via
+    `sys.index_columns`). Needed for `key_range` and for the `batch.key` default.
+  - `EstimateRows(ctx, schema, table) (int64, error)` — reuse `ObjectInventory`
+    (`analysis.go`) for a row-count estimate (progress %, initial calibration).
+  - `SessionWaits(ctx, spid) ([]mssql.SessionWait, error)` — reused, for calibration deltas.
+  - (log-reuse reads + active log floor reused from the shrink read set.)
 - **`BatchDMLRunner`** struct + `NewBatchDMLRunner(exec, reader, sampler, clk, cfg, opts...)`,
-  `WithBatchDMLProgress(...)` — même patron de construction que `ShrinkRunner`.
+  `WithBatchDMLProgress(...)` — same construction pattern as `ShrinkRunner`.
 - **`Run(ctx, op ddl.BatchDML, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink)
-  ([]BatchDMLResult, error)`** — même famille de signature que `ShrinkDriver.Run`. La boucle :
-  1. estimer les lignes, choisir la taille de lot initiale (`InitialBatchRows`, plafonnée RCSI).
-  2. boucler : bâtir le SQL du lot (`BatchDMLChunkSQL`), échantillonner les waits avant, exécuter le
-     lot sous `supervise` (goroutines exécution + échantillonnage, cancel-safe), échantillonner après,
-     lire `@@ROWCOUNT`.
-  3. s'arrêter quand `@@ROWCOUNT == 0` (predicate) ou que le curseur dépasse la fin (key_range).
-  4. entre les lots : `awaitRelief` sur pression blocage/journal (réutilisé), avancer/clamper via
-     `AdjustBatchRows`, persister le curseur pour key_range, honorer le backoff no-progress +
+  ([]BatchDMLResult, error)`** — same signature family as `ShrinkDriver.Run`. The loop:
+  1. estimate rows, pick the initial batch size (`InitialBatchRows`, RCSI-capped).
+  2. loop: build the batch SQL (`BatchDMLChunkSQL`), sample waits before, execute the
+     batch under `supervise` (execution + sampling goroutines, cancel-safe), sample after,
+     read `@@ROWCOUNT`.
+  3. stop when `@@ROWCOUNT == 0` (predicate) or the cursor passes the end (key_range).
+  4. between batches: `awaitRelief` on blocking/log pressure (reused), advance/clamp via
+     `AdjustBatchRows`, persist the cursor for key_range, honor the no-progress backoff +
      `SelfWaitTimeout`.
-- **`batch_calc.go`** (pur, testé sans base) : `InitialBatchRows(estRows, rcsi, t)`,
-  `AdjustBatchRows(size, elapsed, WaitDeltas, t)` (réduit sur WRITELOG/PAGEIOLATCH/`LCK_*`/blocage ;
-  agrandit quand calme et sous la durée de lot cible), `clampBatchRows(min,max)`.
+- **`batch_calc.go`** (pure, tested without a database): `InitialBatchRows(estRows, rcsi, t)`,
+  `AdjustBatchRows(size, elapsed, WaitDeltas, t)` (shrinks on WRITELOG/PAGEIOLATCH/`LCK_*`/blocking;
+  grows when quiet and under the target batch duration), `clampBatchRows(min,max)`.
 
-### Jeu de réactions DML (via `reaction.go` existant)
+### DML reaction set (via the existing `reaction.go`)
 
-Les options propres au DDL (`ONLINE`/`RESUMABLE`/`WAIT_AT_LOW_PRIORITY`) **ne s'appliquent pas** — un
-lot DML n'est pas resumable au sens SQL. Réactions utiles entre/pendant les lots :
+The DDL-specific options (`ONLINE`/`RESUMABLE`/`WAIT_AT_LOW_PRIORITY`) **do not apply** — a
+DML batch is not resumable in the SQL sense. Useful reactions between/during batches:
 
-- **continuer** / **réduire le lot** (calibreur adaptatif) / **attendre le répit** (`awaitRelief`) /
-  **arrêt propre + point de reprise** (le travail fait est validé ; reprise ultérieure).
-- Un **kill** en cours de lot ne rollback que le petit lot courant → bon marché.
-  `Capabilities.CancelSafe = true` ; `Resumable = false` ; `Ignore`/`MaxBlock` réutilisés (donc
-  `ignore_blocked_sessions` et le plafond par op `max_block_minutes` marchent aussi pour le DML,
-  gratuitement).
+- **continue** / **shrink the batch** (adaptive calibrator) / **wait for relief** (`awaitRelief`) /
+  **clean stop + resume point** (work done is committed; resume later).
+- A **kill** mid-batch only rolls back the small current batch → cheap.
+  `Capabilities.CancelSafe = true`; `Resumable = false`; `Ignore`/`MaxBlock` reused (so
+  `ignore_blocked_sessions` and the per-op `max_block_minutes` cap work for DML too,
+  for free).
 
 ---
 
-## 7. Câblage du pipeline (ce que touche chaque couche)
+## 7. Pipeline wiring (what each layer touches)
 
-- **`internal/ddl/manifest.go`** — ajouter la struct `BatchDML` (+ `Set map[string]any`, `SetRaw`,
-  `Where []Condition`, `WhereRaw`, `Batch BatchSpec`, `ConfirmFullTable bool`, `Verb` interne) ;
-  implémenter `CommandType()` (`batch_update`/`batch_delete`), `Target()` (`schema.table`, `Name`
-  vide), `Validate()` ; ajouter `case "batch_update"` / `case "batch_delete"` à `decodeOperation`
-  (positionne `Verb`).
-- **`internal/ddl/resolve.go`** — ajouter `case BatchDML: return o.Options` à `overridesOf` ; comme
-  `Shrink`, l'exempter de la résolution d'options façon index (seul `maxdop` est pertinent).
-- **`internal/ddl/generate.go`** — `generateBatchDML` (instruction indicative pour le plan/rapport) +
-  le runtime `BatchDMLChunkSQL(op, batchSize, watermark, res)` ; réutiliser `quoteIdent`/`qualified`/
-  `nLiteral` ; rendre le `set:`/`where:` déclaratif en T-SQL (littéraux quotés, prédicat depuis la
-  liste blanche d'`op`) ou insérer `set_raw`/`where_raw` verbatim.
-- **`internal/ddl/plan.go` / `expand.go`** — génériques, **pass-through** (pas de changement ;
-  `expand` forwarde déjà les ops non-`RebuildIndex`, mais **ajouter un test de non-régression** que
-  `BatchDML` survit à l'expansion — la classe de bug déjà rencontrée avec `OnFailure`).
-- **`internal/ddl/matrix.go` / `ddl_compatibility.yaml`** — ajouter `batch_update`/`batch_delete`
-  avec `maxdop` seul (pas d'online/resumable/walp).
-- **`internal/mssql`** — étendre `ServerInfo`/`DetectServer` (RCSI/SI) ; ajouter `ClusteringKeyColumns`
-  (`indexes.go`) ; ajouter une sonde de permission `UPDATE`/`DELETE` sur la table (cf. preflight).
-- **`internal/preflight/preflight.go`** — `CheckBatchDML` : table existe (réutilisé), colonnes de
-  `set` existent + types compatibles (réutiliser `ColumnExists`, ajouter un contrôle de type),
-  `batch.key` existe & unique pour `key_range`, **permission UPDATE/DELETE** sur la table, garde
-  table-entière, **WARN** sur référence FK / trigger DELETE, et l'avis RCSI. (La logique de skip
-  base-/fichier-scoped est inchangée ; les ops `batch_*` sont schema.table-scoped donc empruntent le
-  chemin d'existence normal.)
-- **`internal/run/engine.go`** — interface `BatchDMLDriver` + `WithBatchDMLRunner` ; branche dans
-  `processOne` `if b, ok := step.Operation.(ddl.BatchDML); ok && e.batchDML != nil { … }` ; mapper
-  `[]BatchDMLResult` → un nouveau `report.BatchDMLReport` (lignes affectées, lots, taille finale de
-  lot, raison d'arrêt, curseur) ; persister/restaurer le curseur dans `finalizePartial`/recovery pour
+- **`internal/ddl/manifest.go`** — add the `BatchDML` struct (+ `Set map[string]any`, `SetRaw`,
+  `Where []Condition`, `WhereRaw`, `Batch BatchSpec`, `ConfirmFullTable bool`, internal `Verb`);
+  implement `CommandType()` (`batch_update`/`batch_delete`), `Target()` (`schema.table`, empty
+  `Name`), `Validate()`; add `case "batch_update"` / `case "batch_delete"` to `decodeOperation`
+  (sets `Verb`).
+- **`internal/ddl/resolve.go`** — add `case BatchDML: return o.Options` to `overridesOf`; like
+  `Shrink`, exempt it from index-style option resolution (only `maxdop` is relevant).
+- **`internal/ddl/generate.go`** — `generateBatchDML` (indicative statement for the plan/report) +
+  the runtime `BatchDMLChunkSQL(op, batchSize, watermark, res)`; reuse `quoteIdent`/`qualified`/
+  `nLiteral`; render the declarative `set:`/`where:` into T-SQL (quoted literals, predicate from the
+  `op` allow-list) or insert `set_raw`/`where_raw` verbatim.
+- **`internal/ddl/plan.go` / `expand.go`** — generic, **pass-through** (no change;
+  `expand` already forwards non-`RebuildIndex` ops, but **add a regression test** that
+  `BatchDML` survives expansion — the bug class already hit with `OnFailure`).
+- **`internal/ddl/matrix.go` / `ddl_compatibility.yaml`** — add `batch_update`/`batch_delete`
+  with `maxdop` only (no online/resumable/walp).
+- **`internal/mssql`** — extend `ServerInfo`/`DetectServer` (RCSI/SI); add `ClusteringKeyColumns`
+  (`indexes.go`); add an `UPDATE`/`DELETE` permission probe on the table (see preflight).
+- **`internal/preflight/preflight.go`** — `CheckBatchDML`: table exists (reused), `set` columns
+  exist + types compatible (reuse `ColumnExists`, add a type check),
+  `batch.key` exists & is unique for `key_range`, **UPDATE/DELETE permission** on the table, whole-table
+  guard, **WARN** on FK reference / DELETE trigger, and the RCSI advisory. (The database-/file-scoped
+  skip logic is unchanged; `batch_*` ops are schema.table-scoped so they take the normal
+  existence path.)
+- **`internal/run/engine.go`** — `BatchDMLDriver` interface + `WithBatchDMLRunner`; branch in
+  `processOne` `if b, ok := step.Operation.(ddl.BatchDML); ok && e.batchDML != nil { … }`; map
+  `[]BatchDMLResult` → a new `report.BatchDMLReport` (rows affected, batches, final batch
+  size, stop reason, cursor); persist/restore the cursor in `finalizePartial`/recovery for
   `key_range`.
-- **`internal/config/config.go`** — `BatchDMLConfig` → `BatchDMLTuning` (rows initial/min/max, durée
-  de lot cible, backoff no-progress, self-wait timeout, log-reuse-wait timeout — même forme que
+- **`internal/config/config.go`** — `BatchDMLConfig` → `BatchDMLTuning` (initial/min/max rows, target
+  batch duration, no-progress backoff, self-wait timeout, log-reuse-wait timeout — same shape as
   `ShrinkConfig`).
-- **`cmd/sqlgopace/main.go`** — câbler `WithBatchDMLRunner(NewBatchDMLRunner(...))` dans
-  `buildEngine` ; `--explain`/plan affiche la stratégie, la clé, l'estimation de lignes, la note
-  idempotence/reprise, et l'avis RCSI.
+- **`cmd/sqlgopace/main.go`** — wire `WithBatchDMLRunner(NewBatchDMLRunner(...))` into
+  `buildEngine`; `--explain`/plan shows the strategy, the key, the row estimate, the
+  idempotence/resume note, and the RCSI advisory.
 
 ---
 
-## 8. Inconvénients / limites (délibérés, documentés)
+## 8. Drawbacks / limits (deliberate, documented)
 
-1. **`set_raw` non idempotent n'est pas exactement-une-fois** au crash (frontière au-moins-une-fois)
-   — marqué non reprenable ; réconciliation manuelle. L'exactement-une-fois (table de contrôle côté
-   base) est reporté.
-2. **DELETE en cascade / triggers DELETE** peuvent faire qu'un lot touche bien plus que `@n` lignes
-   (FK `ON DELETE CASCADE`, effets de bord de trigger) → le preflight avertit ; le calibreur réagit
-   tout de même, mais l'opérateur doit tenir compte du fan-out de cascade en fixant `initial_rows`.
-3. **`set_raw`/`where_raw` injectés verbatim** — aucune analyse/validation. Modèle manifeste-de-
-   confiance uniquement (écrit par DBA), jamais d'entrée utilisateur final.
-4. **La stratégie predicate peut re-scanner** à chaque lot si la colonne du prédicat n'est pas
-   indexée → lent sur grosses tables ; choisir `key_range` là.
-5. **Lignes modifiées en concurrence par l'appli** : predicate ré-inclut naturellement toute ligne
-   qui matche encore ; key_range traite chaque clé une fois (une ligne ré-introduite derrière le
-   curseur avec l'ancienne valeur est manquée) — acceptable pour « converger une colonne vers une
-   valeur » ; documenté.
-6. **Pas de substitution `TRUNCATE`** — le DELETE découpé est volontairement journalisé ligne à
-   ligne ; pour un vidage inconditionnel autorisé, l'opérateur doit utiliser `TRUNCATE` (le preflight
-   le signale).
+1. **Non-idempotent `set_raw` is not exactly-once** on crash (at-least-once boundary)
+   — marked non-resumable; manual reconciliation. Exactly-once (database-side control table)
+   is deferred.
+2. **Cascading DELETEs / DELETE triggers** can make a batch touch far more than `@n` rows
+   (`ON DELETE CASCADE` FKs, trigger side effects) → preflight warns; the calibrator reacts
+   anyway, but the operator must account for cascade fan-out when setting `initial_rows`.
+3. **`set_raw`/`where_raw` injected verbatim** — no parsing/validation. Trusted-manifest
+   model only (written by DBAs), never end-user input.
+4. **The predicate strategy may re-scan** on every batch if the predicate column is not
+   indexed → slow on large tables; choose `key_range` there.
+5. **Rows modified concurrently by the application**: predicate naturally re-includes any row
+   that still matches; key_range processes each key once (a row re-introduced behind the
+   cursor with the old value is missed) — acceptable for "converge a column to a
+   value"; documented.
+6. **No `TRUNCATE` substitution** — batched DELETE is deliberately logged row by
+   row; for an authorized unconditional wipe, the operator should use `TRUNCATE` (preflight
+   says so).
 
 ---
 
-## 9. Phasage
+## 9. Phasing
 
-- **It1 (MVP).** `batch_update` + `batch_delete` ; `set:` littéral/`where:` simple déclaratifs **et**
-  l'échappatoire `set_raw:`/`where_raw:` sous garde ; stratégie **predicate** seule (sûre par
-  construction pour DELETE + UPDATE littéral ; `set_raw` tourne non-reprenable avec un WARN) ;
-  calibrage adaptatif (`batch_calc.go`) ; réutilisation réaction/monitoring ; attente log-reuse ;
-  preflight (existence, permission, garde table-entière, avis RCSI) ; `ServerInfo` RCSI/SI + ligne
-  `CheckServer`. Rapport + `--explain`.
-- **It2.** Stratégie `key_range` avec **curseur** persistant pour reprise après crash (updates
-  idempotents) ; `ClusteringKeyColumns` ; inférence de clé par défaut ; câblage recovery ; support des
-  clés composites.
-- **It3.** Calibrage par défaut conscient du RCSI ; intégration TUI live (lignes/s, taille de lot
-  courante, curseur/progression %, raison d'arrêt) ; surfaçage optionnel des DMV d'escalade.
-- **It4 (raffinements).** Exactement-une-fois pour updates non idempotents via table de contrôle
-  côté base ; calibrage conscient des cascades/triggers ; un dry-run CLI estimant lots/journal par
-  lot.
+- **It1 (MVP).** `batch_update` + `batch_delete`; declarative literal `set:`/simple `where:` **and**
+  the guarded `set_raw:`/`where_raw:` escape hatch; **predicate** strategy only (safe by
+  construction for DELETE + literal UPDATE; `set_raw` runs non-resumable with a WARN);
+  adaptive calibration (`batch_calc.go`); reaction/monitoring reuse; log-reuse wait;
+  preflight (existence, permission, whole-table guard, RCSI advisory); `ServerInfo` RCSI/SI +
+  `CheckServer` line. Report + `--explain`.
+- **It2.** `key_range` strategy with a persistent **cursor** for crash resume (idempotent
+  updates); `ClusteringKeyColumns`; default key inference; recovery wiring; composite key
+  support.
+- **It3.** RCSI-aware default calibration; live TUI integration (rows/s, current batch
+  size, cursor/progress %, stop reason); optional escalation DMV surfacing.
+- **It4 (refinements).** Exactly-once for non-idempotent updates via a database-side control
+  table; cascade/trigger-aware calibration; a CLI dry-run estimating batches/log per
+  batch.
 
-## 10. Tests (sans base ; `-race`)
+## 10. Tests (no database; `-race`)
 
-- **ddl :** parse/validate `batch_update`/`batch_delete` (exclusivité set vs set_raw ; delete refuse
-  set ; liste blanche where ; raw vide refusé ; table-entière exige confirm) ; `generate` round-trip
-  des deux stratégies et de l'insertion brute ; non-régression pass-through d'`expand` ; matrice ne
-  garde que `maxdop`.
-- **run (pur) :** `InitialBatchRows`/`AdjustBatchRows`/clamp en table-driven (plafond RCSI ; réduit
-  sur WRITELOG/`LCK_*`/blocage ; agrandit au calme) ; boucle du driver sur un faux `BatchDMLReader` +
-  faux `Sampler` — boucle predicate s'arrête à `@@ROWCOUNT=0`, key_range avance le curseur, un arrêt
-  sous pression est propre et le travail fait est validé, backoff no-progress + self-wait timeout.
-- **preflight :** colonne/permission manquante échoue ; table-entière sans confirm échoue ; RCSI-off
-  émet l'avis ; FK/trigger en WARN.
-- **mssql :** `ClusteringKeyColumns` et les requêtes de détection RCSI/SI derrière le tag
-  `integration`.
+- **ddl:** parse/validate `batch_update`/`batch_delete` (set vs set_raw exclusivity; delete rejects
+  set; where allow-list; empty raw rejected; whole-table requires confirm); `generate` round-trip
+  of both strategies and of raw insertion; `expand` pass-through regression; matrix keeps
+  only `maxdop`.
+- **run (pure):** `InitialBatchRows`/`AdjustBatchRows`/clamp table-driven (RCSI cap; shrinks
+  on WRITELOG/`LCK_*`/blocking; grows when quiet); driver loop over a fake `BatchDMLReader` +
+  fake `Sampler` — the predicate loop stops at `@@ROWCOUNT=0`, key_range advances the cursor, a stop
+  under pressure is clean and work done is committed, no-progress backoff + self-wait timeout.
+- **preflight:** missing column/permission fails; whole-table without confirm fails; RCSI-off
+  emits the advisory; FK/trigger WARN.
+- **mssql:** `ClusteringKeyColumns` and the RCSI/SI detection queries behind the
+  `integration` tag.
 
-## 11. Vérification (bout-en-bout, base jetable)
+## 11. Verification (end-to-end, throwaway database)
 
-1. `make test` au vert.
-2. Écrire à la main un `batch_delete` sur une table semée de plusieurs millions de lignes ;
-   `--explain` montre la stratégie, l'estimation de lots, et (sur une base non-RCSI) l'avis
-   d'escalade de verrous.
-3. L'exécuter ; depuis une 2ᵉ session, confirmer que les lectures sont/ne sont pas bloquées selon
-   l'état RCSI, que le journal reste borné entre lots, et qu'un `KILL` en cours laisse un partiel
-   propre (run predicate reprend par re-lancement sans double effet ; DELETE continue simplement).
-4. Refaire un `batch_update` littéral avec `strategy: key_range` ; interrompre ; confirmer que le
-   manifeste de recovery porte le curseur et que le run repris continue en milieu de table.
+1. `make test` green.
+2. Hand-write a `batch_delete` against a table seeded with several million rows;
+   `--explain` shows the strategy, the batch estimate, and (on a non-RCSI database) the lock
+   escalation advisory.
+3. Run it; from a 2nd session, confirm that reads are/are not blocked depending on the
+   RCSI state, that the log stays bounded between batches, and that a `KILL` mid-run leaves a clean
+   partial (a predicate run resumes by re-launching with no double effect; DELETE simply continues).
+4. Redo a literal `batch_update` with `strategy: key_range`; interrupt it; confirm that the
+   recovery manifest carries the cursor and that the resumed run continues mid-table.

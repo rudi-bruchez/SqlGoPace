@@ -1,121 +1,119 @@
-# WAIT-OBSERVABILITY — suivi des attentes de notre opération (TUI live + log)
+# WAIT-OBSERVABILITY — tracking our operation's waits (live TUI + log)
 
-> **DRAFT** — source de vérité du comportement visé pour l'observabilité des attentes provoquées par
-> l'opération en cours, via `sys.dm_exec_session_wait_stats`. Rien de neuf n'est codé ; **une grande
-> partie existe déjà** (cf. §3) — ce document cadre surtout le **panneau TUI live**.
+> **DRAFT** — source of truth for the intended behavior of observability over the waits caused by
+> the running operation, via `sys.dm_exec_session_wait_stats`. Nothing new is coded yet; **a large
+> part already exists** (see §3) — this document mainly frames the **live TUI panel**.
 
-## 1. Objectif et contexte
+## 1. Goal and context
 
-Une opération exigeante (rebuild, compression, shrink, DML par lots) **attend** : sur des verrous, des
-I/O de données, le flush du journal, le parallélisme, la mémoire, tempdb… Exposer **ce qui ralentit
-notre session**, en temps réel dans le TUI et en synthèse dans le `.log`, aide l'opérateur à
-**comprendre** un run et à décider *à la main* (prolonger l'attente, pause, kill).
+A demanding operation (rebuild, compression, shrink, batched DML) **waits**: on locks, data I/O, log
+flush, parallelism, memory, tempdb… Exposing **what is slowing our session down**, live in the TUI
+and as a summary in the `.log`, helps the operator **understand** a run and decide *by hand* (extend
+the wait, pause, kill).
 
-Décision de cadrage (cf. §2) : c'est de l'**observabilité**, **pas** un nouveau signal de réaction.
+Scoping decision (see §2): this is **observability**, **not** a new reaction signal.
 
-## 2. Posture : information, pas alerte ni réaction automatique
+## 2. Stance: information, not alerting or automatic reaction
 
-Les attentes sont **diagnostiques** (le « pourquoi »), pas **prescriptives** (le « quoi faire ») :
+Waits are **diagnostic** (the "why"), not **prescriptive** (the "what to do"):
 
-- Les signaux qui méritent vraiment une réaction — **blocage** et **pression journal** — ont déjà des
-  lectures **dédiées et précises** (sampler de blocage sur `BlockingSPID`, sampler d'espace log).
-  Réagir à partir des wait stats **agrégées** serait moins précis et **redondant**.
-- Le seul usage légitime « wait → action », le **throttle adaptatif** (WRITELOG / PAGEIOLATCH_EX →
-  réduire le pas du shrink, le lot du DML), **existe déjà** per-driver (`shrink_calc.go` ;
-  `batch_calc.go` dans `BATCH-DML.md`). On **ne le généralise pas** en moteur d'alerte.
-- Donc : le panneau d'attentes **alimente la décision humaine** dans le TUI ; il ne déclenche **rien**
-  de lui-même.
+- The signals that genuinely warrant a reaction — **blocking** and **log pressure** — already have
+  **dedicated, precise** reads (blocking sampler on `BlockingSPID`, log-space sampler). Reacting off
+  **aggregated** wait stats would be less precise and **redundant**.
+- The one legitimate "wait → action" use, the **adaptive throttle** (WRITELOG / PAGEIOLATCH_EX →
+  shrink the step size, shrink the DML batch), **already exists** per driver (`shrink_calc.go`;
+  `batch_calc.go` in `BATCH-DML.md`). We **do not generalize it** into an alerting engine.
+- So: the wait panel **feeds the human decision** in the TUI; it triggers **nothing** on its own.
 
-> Si une attente devait un jour piloter une réaction, ce serait via une **lecture dédiée** de ce
-> signal précis, pas via ce panneau agrégé.
+> If a wait were ever to drive a reaction, it would be through a **dedicated read** of that precise
+> signal, not through this aggregated panel.
 
-## 3. Ce qui existe déjà vs ce qui manque
+## 3. What already exists vs what is missing
 
-**Déjà en place (à réutiliser tel quel) :**
+**Already in place (reuse as is):**
 
-- `internal/mssql/waits.go` : `SessionWaits(ctx, spid)` lit `sys.dm_exec_session_wait_stats` (2016+ ;
-  best-effort, « pas de données » sur serveur plus ancien).
-- `CategorizeWaits` : jeu **curé et ordonné** de catégories utiles (Locking, Data I/O, Transaction
-  log, Parallelism, Memory, CPU & scheduling, Page latch (tempdb), Sort & spill, AG, Backup), le bruit
-  étant écarté ; tri par temps décroissant + total.
-- `DiffWaits(before, after)` : delta par type d'attente (le DMV est cumulatif pour la session).
-- `engine.go` `snapshotWaits`/`operationWaits` : capture avant/après et **écrit déjà le résumé
-  d'attentes par opération dans le `.log`** (`report.WaitLine`).
+- `internal/mssql/waits.go`: `SessionWaits(ctx, spid)` reads `sys.dm_exec_session_wait_stats` (2016+;
+  best-effort, "no data" on an older server).
+- `CategorizeWaits`: a **curated, ordered** set of useful categories (Locking, Data I/O, Transaction
+  log, Parallelism, Memory, CPU & scheduling, Page latch (tempdb), Sort & spill, AG, Backup), with
+  the noise filtered out; sorted by descending time + total.
+- `DiffWaits(before, after)`: delta per wait type (the DMV is cumulative for the session).
+- `engine.go` `snapshotWaits`/`operationWaits`: before/after capture, and **already writes the
+  per-operation wait summary to the `.log`** (`report.WaitLine`).
 
-**Ce qui manque (l'objet de cette spec) :**
+**What is missing (the subject of this spec):**
 
-- Un **panneau TUI live** : les catégories d'attentes de **notre SPID d'exécution**, en **delta
-  glissant depuis le début de l'op**, rafraîchies sur la cadence d'échantillonnage — au lieu du seul
-  avant/après de fin d'op.
-- (Optionnel) un **surlignage *advisory*** d'une poignée d'attentes « notables » (info, jamais stop).
+- A **live TUI panel**: the wait categories of **our executing SPID**, as a **rolling delta since the
+  start of the op**, refreshed on the sampling cadence — instead of only the end-of-op before/after.
+- (Optional) an ***advisory* highlight** of a handful of "notable" waits (info, never a stop).
 
-## 4. La fonctionnalité
+## 4. The feature
 
-### 4.1 Panneau TUI live
+### 4.1 Live TUI panel
 
-- À l'entrée d'une opération, capturer le snapshot d'attentes (réutilise `snapshotWaits`) comme
-  **base**. À chaque tick d'échantillonnage, relire `SessionWaits(spid)`, faire `DiffWaits(base,
-  now)` puis `CategorizeWaits(delta)`, et **pousser** le résultat au TUI.
-- Le TUI affiche les **top catégories** (nom, temps d'attente cumulé depuis le début de l'op, nb de
-  tâches), triées décroissant — exactement ce que `CategorizeWaits` renvoie déjà. Mise à jour en place.
-- C'est une **information de contexte** à côté des panneaux existants (progression, sessions
-  bloquées) ; elle aide l'opérateur à choisir une action TUI (`extend` / `pause` / `kill`).
+- On entering an operation, capture the wait snapshot (reuses `snapshotWaits`) as the **baseline**. On
+  each sampling tick, re-read `SessionWaits(spid)`, compute `DiffWaits(base, now)` then
+  `CategorizeWaits(delta)`, and **push** the result to the TUI.
+- The TUI shows the **top categories** (name, wait time accumulated since the start of the op, task
+  count), sorted descending — exactly what `CategorizeWaits` already returns. Updated in place.
+- It is **context information** alongside the existing panels (progress, blocked sessions); it helps
+  the operator choose a TUI action (`extend` / `pause` / `kill`).
 
-### 4.2 Synthèse log (déjà présente, à confirmer)
+### 4.2 Log summary (already present, to confirm)
 
-- Le `.log` continue de porter le **résumé d'attentes par opération** (catégories + total) via
-  `operationWaits`. Aucun changement requis ; au plus, s'assurer que le **max** observé en cours (pic)
-  est conservé si jugé utile.
+- The `.log` keeps carrying the **per-operation wait summary** (categories + total) via
+  `operationWaits`. No change required; at most, make sure the **max** observed during the run (peak)
+  is kept if deemed useful.
 
-### 4.3 (Optionnel, It2) surlignage advisory
+### 4.3 (Optional, It2) advisory highlight
 
-Un petit ensemble curé d'attentes mérite un **highlight** visuel (couleur/pastille « ⚠ info »), sans
-jamais déclencher d'action :
+A small curated set of waits deserves a visual **highlight** (color / "⚠ info" badge), without ever
+triggering an action:
 
-- `RESOURCE_SEMAPHORE` / `RESOURCE_SEMAPHORE_QUERY_COMPILE` — famine de grant mémoire ;
-- `THREADPOOL` — famine de workers (problème **instance**, pas seulement nous) ;
-- `PAGELATCH_*` (catégorie « Page latch (tempdb) ») — contention d'allocation tempdb → **lien avec
+- `RESOURCE_SEMAPHORE` / `RESOURCE_SEMAPHORE_QUERY_COMPILE` — memory grant starvation;
+- `THREADPOOL` — worker starvation (an **instance** problem, not just ours);
+- `PAGELATCH_*` (the "Page latch (tempdb)" category) — tempdb allocation contention → **ties in with
   `TEMPDB-GUARD.md`**.
 
-Ce sont des repères **pour l'humain**, pas des alertes qui agissent.
+These are markers **for the human**, not alerts that act.
 
-## 5. Intégration / câblage
+## 5. Integration / wiring
 
-- **Aucune nouvelle lecture DMV** : tout passe par `SessionWaits`/`DiffWaits`/`CategorizeWaits`
-  existants. On ne touche pas `internal/mssql`.
-- **Flux moteur → TUI** : pousser le delta catégorisé via le **même canal** que les autres mises à
-  jour TUI. Converge avec le **step-sink** introduit par `progress-tui.md` (`specs/TODO.md`) — à
-  concevoir ensemble pour ne pas multiplier les canaux. En l'absence de TUI (`--tui` off), le panneau
-  est simplement inactif ; le `.log` suffit.
-- **Cadence** : réutiliser la cadence d'échantillonnage du run (le panneau n'a pas besoin d'être plus
-  fréquent que les autres samples). Best-effort : un échec de lecture laisse le dernier état affiché.
+- **No new DMV read**: everything goes through the existing `SessionWaits`/`DiffWaits`/
+  `CategorizeWaits`. We do not touch `internal/mssql`.
+- **Engine → TUI flow**: push the categorized delta over the **same channel** as the other TUI
+  updates. Converges with the **step sink** introduced by `progress-tui.md` (`specs/TODO.md`) — to be
+  designed together so we don't multiply channels. With no TUI (`--tui` off), the panel is simply
+  inactive; the `.log` is enough.
+- **Cadence**: reuse the run's sampling cadence (the panel does not need to be more frequent than the
+  other samples). Best-effort: a failed read leaves the last state displayed.
 
-## 6. Plancher de version
+## 6. Version floor
 
-`sys.dm_exec_session_wait_stats` existe à partir de **SQL Server 2016**. Sur un serveur plus ancien,
-`SessionWaits` renvoie « pas de données » (déjà géré) → le panneau reste **vide/masqué**, sans erreur.
-Comportement identique au `.log` aujourd'hui.
+`sys.dm_exec_session_wait_stats` exists from **SQL Server 2016** onward. On an older server,
+`SessionWaits` returns "no data" (already handled) → the panel stays **empty/hidden**, with no error.
+Same behavior as the `.log` today.
 
-## 7. Phasage
+## 7. Phasing
 
-- **It1.** Panneau TUI live (delta glissant catégorisé de notre SPID) ; confirmation du résumé log.
-  Aucune réaction.
-- **It2 (option).** Surlignage advisory des attentes notables ; éventuel pic conservé au `.log`.
+- **It1.** Live TUI panel (categorized rolling delta for our SPID); confirmation of the log summary.
+  No reaction.
+- **It2 (option).** Advisory highlight of notable waits; possible peak kept in the `.log`.
 
-## 8. Tests (sans base ; `-race`)
+## 8. Tests (no database; `-race`)
 
-- **run (pur) :** à partir de deux snapshots simulés, le delta glissant catégorisé poussé au TUI est
-  correct (réutilise `DiffWaits`/`CategorizeWaits`, déjà testés — ici on teste le **streaming** et le
-  choix de base = début d'op).
-- **tui :** le modèle affiche les top catégories et se met à jour sur message ; vide quand pas de
-  données (serveur < 2016).
-- **Pas de test de réaction** : par conception, ce panneau n'en déclenche aucune.
+- **run (pure):** from two simulated snapshots, the categorized rolling delta pushed to the TUI is
+  correct (reuses `DiffWaits`/`CategorizeWaits`, already tested — here we test the **streaming** and
+  the choice of baseline = start of op).
+- **tui:** the model shows the top categories and updates on message; empty when there is no data
+  (server < 2016).
+- **No reaction test**: by design, this panel triggers none.
 
-## 9. Limites (délibérées)
+## 9. Limits (deliberate)
 
-1. **Diagnostic, pas prescriptif** : n'attendez pas du panneau qu'il « décide » — il informe l'humain.
-2. **Périmètre = notre SPID d'exécution** : ce sont *nos* attentes, pas une vue serveur globale (ce
-   n'est pas un remplacement d'un outil de monitoring d'instance).
-3. **Cumulatif → delta** : le DMV est cumulatif ; tout l'intérêt est dans le **delta depuis le début
-   de l'op** (sinon on mélange l'historique de la connexion).
-4. **2016+** : invisible sur serveur plus ancien (best-effort), comme le résumé log actuel.
+1. **Diagnostic, not prescriptive**: don't expect the panel to "decide" — it informs the human.
+2. **Scope = our executing SPID**: these are *our* waits, not a global server view (it is not a
+   replacement for an instance monitoring tool).
+3. **Cumulative → delta**: the DMV is cumulative; the whole point is the **delta since the start of
+   the op** (otherwise we mix in the connection's history).
+4. **2016+**: invisible on an older server (best-effort), like the current log summary.

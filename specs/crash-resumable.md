@@ -1,276 +1,272 @@
-# Spec métier — Reprise après interruption (« crash-resumable »)
+# Functional spec — Recovery after interruption ("crash-resumable")
 
-> **Statut : §9 (skip par métadonnées) IMPLÉMENTÉ ; le reste reste DRAFT.** Le flag manifeste
-> `skip_if_satisfied` (défaut off) fait qu'au run-time un `rebuild_index` dont **toutes les
-> partitions** portent déjà la `data_compression` cible est **skippé** (outcome `skipped`, une
-> ligne de log `— skipped in 0s (already PAGE)` / `.log` `skipped: already PAGE`, compteur history
-> `runs.skipped`). Lecture étroite `mssql.IndexCompression(schema,table,index)` par partition ;
-> comparaison pure `compressionSatisfied` (partition-aware) ; gardé côté moteur par
-> `WithCompressionReader`. Rend le re-jeu d'un manifeste de compression interrompu **bon marché**
-> (les ops déjà faites ne sont pas refaites) — cf. §9. **Le curseur d'opération `State.ResumeFromOp`
-> (§3.4/§6) est désormais écrit progressivement, donc crash-safe** : `advanceCursor` le fait avancer
-> à `i+1` **après chaque opération complétée** (succès ou skip) et le persiste (`WriteState` rendu
-> **atomique** temp+rename, pour qu'un crash en cours d'écriture ne laisse jamais un sidecar tronqué).
-> Il gèle sur un trou laissé par `on_failure: continue` (le curseur n'avance que si `*cursor == i`),
-> pour que le re-run rejoue l'op échouée et les idempotentes suivantes plutôt que de sauter un effet
-> jamais produit. La recovery le conserve au requeue (déjà en place), et le re-run saute les ops
-> `i < curseur`. Un *crash* (≠ drain) renseigne donc maintenant le curseur : la reprise repart de
-> l'op suivante, sans dépendre du skip métadonnée (§9), qui reste complémentaire (préfixe compression
-> bon marché). L'**arrêt propre sur Ctrl+C (§3.1) est fait** (`graceful-stop.md` : 1× drain / 2× hard).
-> **Le vrai `ALTER INDEX … RESUME` (§4.2) est IMPLÉMENTÉ** : au re-run d'un manifeste **repris**
-> (un sidecar existait au claim → flag `resumed` retourné par `writeSidecar`), si l'**op à la frontière
-> du curseur** (`i == resumeFrom`) porte un resumable **PAUSED** côté serveur (`PausedResumable`), le
-> moteur émet `ALTER INDEX … RESUME` (`resumeStatement` → `ddl.ResumableControlSQL(op,"RESUME")`) au
-> lieu du REBUILD — que SQL Server rejetterait tant qu'un resumable est en pause — en réutilisant tout
-> le `MonitoredRunner` (qui sait déjà la boucle pause/reprise). Garde-fou anti-« resumable étranger » :
-> jamais de RESUME sur un manifeste **frais** ni sur une op **jamais démarrée** (options potentiellement
-> différentes). La recovery **conserve le sidecar** au requeue quand `action == Resume` (resumable en
-> pause) ou curseur > 0, pour que le re-run se reconnaisse comme repris. Dégradation propre (S2 :
-> Standard/heap, pas de resumable) : l'op redémarre, mais le curseur évite de refaire les précédentes.
-> **L'orchestration `abort-resumable` (§3.6) est IMPLÉMENTÉE, en opt-in** : un resumable en pause
-> *étranger/périmé* qui bloquerait un REBUILD à neuf (Msg 10637) est, quand le manifeste porte
-> `abort_blocking_resumable: true`, purgé par `ALTER INDEX … ABORT` (`clearOrRejectBlockingResumable`
-> → `ResumableAborter.ExecDDL`) avant le rebuild ; **sans** le flag, l'op échoue tôt avec un message
-> actionnable (« run `sqlgopace abort-resumable` or set abort_blocking_resumable: true »). Opt-in par
-> défaut car ABORT **détruit la progression serveur** — choix délibéré sur une base partagée/prod. La
-> détection est précise à l'index (`blockingResumable` = `PausedResumable` sur la cible), au moment de
-> l'exécution (symétrique du RESUME), pas un balayage dans le `Recoverer` (qui n'a pas l'index en vol et
-> détruirait un resumable qu'un manifeste en file reprendrait). Le rejet pré-run est un **échec** franc
-> (exclu de la reclassification « interrupted », sinon boucle infinie). Rien de bloquant ne reste ouvert
-> sur cette spec.
+> **Status: §9 (metadata-based skip) IMPLEMENTED; the rest remains DRAFT.** The manifest flag
+> `skip_if_satisfied` (default off) makes a `rebuild_index` whose **every partition** already
+> carries the target `data_compression` **skipped** at run time (outcome `skipped`, one log
+> line `— skipped in 0s (already PAGE)` / `.log` `skipped: already PAGE`, history counter
+> `runs.skipped`). Narrow read `mssql.IndexCompression(schema,table,index)` per partition;
+> pure comparison `compressionSatisfied` (partition-aware); gated on the engine side by
+> `WithCompressionReader`. Makes re-running an interrupted compression manifest **cheap**
+> (ops already done are not redone) — see §9. **The operation cursor `State.ResumeFromOp`
+> (§3.4/§6) is now written incrementally, so it is crash-safe**: `advanceCursor` moves it
+> to `i+1` **after each completed operation** (success or skip) and persists it (`WriteState`
+> made **atomic** via temp+rename, so a crash mid-write never leaves a truncated sidecar).
+> It freezes on a gap left by `on_failure: continue` (the cursor only advances if `*cursor == i`),
+> so the re-run replays the failed op and the idempotent ones that follow rather than skipping an
+> effect that was never produced. Recovery preserves it on requeue (already in place), and the
+> re-run skips ops `i < cursor`. A *crash* (≠ drain) therefore now populates the cursor: recovery
+> restarts from the next op, without depending on the metadata skip (§9), which remains
+> complementary (cheap compression prefix). The **graceful stop on Ctrl+C (§3.1) is done**
+> (`graceful-stop.md`: 1× drain / 2× hard).
+> **The true `ALTER INDEX … RESUME` (§4.2) is IMPLEMENTED**: on the re-run of a **resumed**
+> manifest (a sidecar existed at claim time → `resumed` flag returned by `writeSidecar`), if the
+> **op at the cursor boundary** (`i == resumeFrom`) carries a **PAUSED** resumable on the server
+> (`PausedResumable`), the engine emits `ALTER INDEX … RESUME` (`resumeStatement` →
+> `ddl.ResumableControlSQL(op,"RESUME")`) instead of the REBUILD — which SQL Server would reject
+> as long as a resumable is paused — reusing the whole `MonitoredRunner` (which already knows the
+> pause/resume loop). Guardrail against a "foreign resumable": never RESUME on a **fresh** manifest
+> nor on an op that **never started** (options may differ). Recovery **preserves the sidecar** on
+> requeue when `action == Resume` (paused resumable) or cursor > 0, so the re-run recognizes itself
+> as resumed. Graceful degradation (S2: Standard/heap, no resumable): the op restarts, but the
+> cursor avoids redoing the previous ones.
+> **The `abort-resumable` orchestration (§3.6) is IMPLEMENTED, opt-in**: a *foreign/stale* paused
+> resumable that would block a fresh REBUILD (Msg 10637) is, when the manifest carries
+> `abort_blocking_resumable: true`, purged by `ALTER INDEX … ABORT` (`clearOrRejectBlockingResumable`
+> → `ResumableAborter.ExecDDL`) before the rebuild; **without** the flag, the op fails early with an
+> actionable message ("run `sqlgopace abort-resumable` or set abort_blocking_resumable: true").
+> Opt-in by default because ABORT **destroys server-side progress** — a deliberate choice on a
+> shared/production database. Detection is precise to the index (`blockingResumable` = `PausedResumable`
+> on the target), at execution time (symmetric with RESUME), not a sweep in the `Recoverer` (which
+> does not have the in-flight index and would destroy a resumable that a queued manifest would resume).
+> The pre-run rejection is a clean **failure** (excluded from the "interrupted" reclassification,
+> otherwise an infinite loop). Nothing blocking remains open on this spec.
 >
-> Créé le 2026-06-17, à la suite d'un essai de compression de masse (manifeste
-> `01.to_run/030_compress_exampledb_indexes.yaml`, 74 index EXAMPLEDB).
+> Created on 2026-06-17, following a mass compression attempt (manifest
+> `01.to_run/030_compress_exampledb_indexes.yaml`, 74 EXAMPLEDB indexes).
 
-## 1. Objectif métier
+## 1. Functional goal
 
-Quand une opération longue (typiquement un **rebuild d'index avec compression** sur une
-très grosse table) est **interrompue** — `Ctrl+C`, arrêt/kill du process SqlGoPace, crash
-de la machine, coupure réseau — l'utilisateur veut que, au run suivant, l'outil
-**reprenne là où il s'était arrêté** plutôt que de tout refaire depuis le début.
+When a long-running operation (typically an **index rebuild with compression** on a very
+large table) is **interrupted** — `Ctrl+C`, stop/kill of the SqlGoPace process, machine
+crash, network outage — the user wants the tool to **pick up where it left off** on the next
+run rather than redoing everything from scratch.
 
-Le coût d'un redémarrage à zéro sur ce type d'opération est élevé (heures de rebuild,
-pression sur le journal de transactions, fenêtre de maintenance). C'est précisément le
-scénario que la compression de masse rend fréquent.
+The cost of a restart from zero on this kind of operation is high (hours of rebuild,
+transaction-log pressure, maintenance window). This is exactly the scenario that mass
+compression makes frequent.
 
-## 2. Contexte : compression = REBUILD
+## 2. Context: compression = REBUILD
 
-Changer la compression d'un index existant **est** un `ALTER INDEX … REBUILD WITH
-(DATA_COMPRESSION = …)`. Il n'existe pas d'opération SQL Server « compresser » distincte ;
-un REORGANIZE ne peut pas changer la compression (`internal/ddl/manifest.go:401` :
-« cannot change data compression — that requires a REBUILD »).
+Changing the compression of an existing index **is** an `ALTER INDEX … REBUILD WITH
+(DATA_COMPRESSION = …)`. There is no separate SQL Server "compress" operation; a REORGANIZE
+cannot change compression (`internal/ddl/manifest.go:401`:
+"cannot change data compression — that requires a REBUILD").
 
-Conséquence : tout ce qui suit sur la reprise des rebuilds s'applique directement aux
-opérations de compression. Une opération de compression interrompue est un rebuild
-interrompu.
+Consequence: everything below about resuming rebuilds applies directly to compression
+operations. An interrupted compression operation is an interrupted rebuild.
 
-## 3. État actuel observé (constats techniques)
+## 3. Current observed state (technical findings)
 
-### 3.1 Aucune gestion de signal
+### 3.1 No signal handling
 
-Il n'y a **aucun handler de signal** dans le code (`signal.Notify` / `os.Interrupt` :
-0 occurrence). Un `Ctrl+C` (SIGINT) tue donc le process **immédiatement** : la connexion
-tombe, SQL Server avorte l'instruction en cours. Il n'y a pas d'arrêt « propre » qui
-mettrait l'opération en pause de manière contrôlée avant de quitter.
+There is **no signal handler** in the code (`signal.Notify` / `os.Interrupt`: 0 occurrences).
+A `Ctrl+C` (SIGINT) therefore kills the process **immediately**: the connection drops and
+SQL Server aborts the running statement. There is no "graceful" stop that would pause the
+operation in a controlled way before exiting.
 
-### 3.2 Reprise *en cours de process* : vraie reprise (déjà implémentée)
+### 3.2 Resume *within the process*: a true resume (already implemented)
 
-La boucle de monitoring sait faire une **vraie** pause/reprise SQL, mais uniquement
-**tant que le process vit** et **en réaction à la pression** (journal / verrous), pas sur
-interruption utilisateur :
+The monitoring loop knows how to do a **true** SQL pause/resume, but only **while the process
+is alive** and **in reaction to pressure** (log / locks), not on user interruption:
 
-- `MonitoredRunner.runStatement` abandonne l'instruction par annulation de contexte (une
-  *attention* qui **met en pause** un resumable côté serveur tout en gardant la connexion
-  épinglée vivante), KILL en repli si l'instruction ne s'arrête pas à temps
+- `MonitoredRunner.runStatement` abandons the statement by cancelling the context (an
+  *attention* that **pauses** a resumable on the server while keeping the pinned connection
+  alive), with KILL as a fallback if the statement does not stop in time
   (`internal/run/monitored_runner.go:132-159`).
-- `runLoop` attend l'accalmie puis ré-émet l'instruction de reprise
-  (`internal/run/monitored_runner.go:105-130`), qui est un vrai `ALTER INDEX … RESUME`
+- `runLoop` waits for relief, then re-issues the resume statement
+  (`internal/run/monitored_runner.go:105-130`), which is a true `ALTER INDEX … RESUME`
   (`internal/run/monitored_runner.go:89`, `ddl.ResumableControlSQL(op, "RESUME")`).
 
-C'est le mécanisme « WAIT_AT_LOW_PRIORITY → RESUMABLE pause/resume → KILL » de la doc
-produit. **Il ne couvre pas l'interruption externe** (Ctrl+C / kill / crash).
+This is the "WAIT_AT_LOW_PRIORITY → RESUMABLE pause/resume → KILL" mechanism from the product
+docs. **It does not cover external interruption** (Ctrl+C / kill / crash).
 
-### 3.3 Reprise *après crash* : actuellement un redémarrage, pas une reprise
+### 3.3 Resume *after a crash*: currently a restart, not a resume
 
-Après une interruption, le manifeste reste dans `02.processing/`. Au run suivant, le
-`Recoverer` le réconcilie :
+After an interruption, the manifest stays in `02.processing/`. On the next run, the
+`Recoverer` reconciles it:
 
-- Les actions de récupération sont `Adopt` / `Resume` / `Restart`
-  (`internal/run/recovery.go:16-61`). `DecideRecovery` choisit `Adopt` si un orphelin est
-  encore vivant, sinon `Resume` si un resumable est connu, sinon `Restart`.
-- **MAIS** dans `Recover()`, les branches `Resume` **et** `Restart` font exactement la même
-  chose : `requeue` → « *re-enqueued for an idempotent re-run* »
+- The recovery actions are `Adopt` / `Resume` / `Restart`
+  (`internal/run/recovery.go:16-61`). `DecideRecovery` picks `Adopt` if an orphan is still
+  alive, otherwise `Resume` if a resumable is known, otherwise `Restart`.
+- **BUT** in `Recover()`, the `Resume` **and** `Restart` branches do exactly the same thing:
+  `requeue` → "*re-enqueued for an idempotent re-run*"
   (`internal/run/recovery.go:174-184`).
-- Le commentaire de l'action `Resume` est explicite : « *continues a resumable operation;
-  re-enqueued for an idempotent re-run in this version (**true RESUME is a refinement**)* »
+- The comment on the `Resume` action is explicit: "*continues a resumable operation;
+  re-enqueued for an idempotent re-run in this version (**true RESUME is a refinement**)*"
   (`internal/run/recovery.go:22-24`).
 
-Autrement dit : **la vraie reprise après crash n'est pas implémentée.** Le message
-utilisateur le confirme : « *interrupted manifest(s) left in processing; the next run will
-resume them* » (`cmd/sqlgopace/main.go:283`) — mais « resume » signifie ici « re-jouer le
-manifeste », pas « reprendre l'index au point d'arrêt ».
+In other words: **true resume after a crash is not implemented.** The user-facing message
+confirms it: "*interrupted manifest(s) left in processing; the next run will resume them*"
+(`cmd/sqlgopace/main.go:283`) — but "resume" here means "replay the manifest", not "pick the
+index back up where it stopped".
 
-### 3.4 Pas de point de reprise par-opération
+### 3.4 No per-operation resume point
 
-L'état persistant (`State`, `internal/run/state.go:12-20`) ne stocke **pas** de curseur
-d'opération : il garde `manifest`, `database`, `spid`, `login_time`, `marker`, `command`,
-`started_at`. Il n'y a aucune trace de « j'en étais à l'opération N sur 74 ».
+The persistent state (`State`, `internal/run/state.go:12-20`) does **not** store an operation
+cursor: it keeps `manifest`, `database`, `spid`, `login_time`, `marker`, `command`,
+`started_at`. There is no trace of "I was at operation N of 74".
 
-Conséquence pour un manifeste multi-opérations (ex. nos 74 index) : au re-jeu, **tout le
-manifeste repart de l'opération 1**. Les index déjà compressés sont **re-rebuildés**
-(idempotent — résultat correct — mais travail refait).
+Consequence for a multi-operation manifest (e.g. our 74 indexes): on replay, **the whole
+manifest restarts at operation 1**. Indexes already compressed are **rebuilt again**
+(idempotent — correct result — but wasted work).
 
-### 3.5 Conditions d'éligibilité RESUMABLE
+### 3.5 RESUMABLE eligibility conditions
 
-`RESUMABLE` n'est injectable que sous conditions (`ddl_compatibility.yaml:27/34/51`) :
+`RESUMABLE` can only be injected under conditions (`ddl_compatibility.yaml:27/34/51`):
 
-- SQL Server **2017+** (major 14) pour `rebuild_index` ;
-- éditions **Enterprise / Azure** uniquement ;
-- **exige `ONLINE`** (`requires: [online]`).
+- SQL Server **2017+** (major 14) for `rebuild_index`;
+- **Enterprise / Azure** editions only;
+- **requires `ONLINE`** (`requires: [online]`).
 
-Donc : pas de resumable sur **Standard**, ni sur un **rebuild de heap** (note
-`ddl_compatibility.yaml:70` : pas de RESUMABLE ni WAIT_AT_LOW_PRIORITY pour un heap). Une
-vraie reprise après crash ne sera **possible que là où RESUMABLE était actif**. Ailleurs,
-seul un redémarrage de l'opération est envisageable.
+So: no resumable on **Standard**, nor on a **heap rebuild** (note
+`ddl_compatibility.yaml:70`: no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap). A true
+resume after a crash will only be **possible where RESUMABLE was active**. Elsewhere, only
+restarting the operation is conceivable.
 
-### 3.6 Risque de blocage par un resumable en pause
+### 3.6 Risk of being blocked by a paused resumable
 
-Quand la session est tuée alors qu'un rebuild `RESUMABLE = ON` tournait, SQL Server laisse
-l'opération **en pause** (progression conservée côté serveur). Relancer un **nouveau**
-`REBUILD` sur cet index peut alors être **rejeté** par SQL Server tant que le resumable en
-pause n'est pas repris ou abandonné. L'outil expose déjà une sous-commande
-**`abort-resumable`** (`cmd/sqlgopace/abort.go`) pour purger un resumable en pause, mais le
-flux de recovery ne l'orchestre pas automatiquement aujourd'hui.
+When the session is killed while a `RESUMABLE = ON` rebuild was running, SQL Server leaves the
+operation **paused** (progress kept on the server). Launching a **new** `REBUILD` on that index
+may then be **rejected** by SQL Server as long as the paused resumable is not resumed or
+aborted. The tool already exposes an **`abort-resumable`** subcommand
+(`cmd/sqlgopace/abort.go`) to purge a paused resumable, but the recovery flow does not
+orchestrate it automatically today.
 
-## 4. Le besoin (ce qu'on veut acter)
+## 4. The requirement (what we want to settle)
 
-1. **Reprise réelle après interruption externe** (Ctrl+C / kill / crash / coupure), pas
-   seulement après détection de pression en cours de run.
-2. Quand l'opération interrompue était un rebuild **RESUMABLE en pause**, la reprise doit
-   émettre un `ALTER INDEX … RESUME` (réutiliser la progression conservée) au lieu d'un
-   REBUILD complet.
-3. Pour un **manifeste multi-opérations**, ne pas refaire les opérations déjà terminées :
-   reprendre à la première opération non terminée.
-4. **Dégradation propre** quand la reprise n'est pas possible (Standard, heap, resumable
-   non injecté) : redémarrer l'opération, en le signalant clairement à l'utilisateur.
-5. Gérer le **resumable en pause bloquant** (résoudre / abandonner avant de relancer) sans
-   intervention manuelle systématique.
+1. **Real resume after an external interruption** (Ctrl+C / kill / crash / outage), not only
+   after pressure detection during a run.
+2. When the interrupted operation was a **paused RESUMABLE** rebuild, the resume must emit an
+   `ALTER INDEX … RESUME` (reusing the retained progress) instead of a full REBUILD.
+3. For a **multi-operation manifest**, do not redo operations already completed: restart at the
+   first unfinished operation.
+4. **Graceful degradation** when resuming is not possible (Standard, heap, resumable not
+   injected): restart the operation, telling the user clearly.
+5. Handle the **blocking paused resumable** (resolve / abort before relaunching) without
+   systematic manual intervention.
 
-## 5. Scénarios métier (à valider au brainstorming)
+## 5. Functional scenarios (to validate at brainstorming)
 
-- **S1 — Kill pendant l'index 31/74 (Enterprise, resumable actif).** Attendu : au run
-  suivant, les index 1–30 ne sont pas retouchés, l'index 31 **reprend** via RESUME, puis
-  32–74 s'enchaînent.
-- **S2 — Kill pendant l'index 31/74 (Standard, pas de resumable).** Attendu : l'index 31
-  redémarre de zéro (inévitable), mais 1–30 ne sont pas refaits ; message explicite « pas
-  de reprise possible, redémarrage de l'opération ».
-- **S3 — Crash machine complet.** Attendu : même comportement que S1/S2 au redémarrage de
-  l'outil (état reconstruit depuis `02.processing/` + l'état serveur).
-- **S4 — Resumable laissé en pause puis run relancé.** Attendu : pas d'échec « resumable
-  operation already in progress » ; l'outil reprend ou abandonne proprement.
+- **S1 — Kill during index 31/74 (Enterprise, resumable active).** Expected: on the next run,
+  indexes 1–30 are untouched, index 31 **resumes** via RESUME, then 32–74 follow.
+- **S2 — Kill during index 31/74 (Standard, no resumable).** Expected: index 31 restarts from
+  zero (unavoidable), but 1–30 are not redone; explicit message "no resume possible, restarting
+  the operation".
+- **S3 — Full machine crash.** Expected: same behavior as S1/S2 when the tool restarts (state
+  reconstructed from `02.processing/` + the server state).
+- **S4 — Resumable left paused, then run relaunched.** Expected: no "resumable operation already
+  in progress" failure; the tool resumes or aborts cleanly.
 
-## 6. Questions ouvertes pour le brainstorming
+## 6. Open questions for the brainstorming
 
-- **Granularité de l'état** : faut-il un curseur d'opération dans `State` (op N/M + statut),
-  ou s'appuyer uniquement sur l'idempotence + l'état serveur (resumable existant) ?
-- **Détection « déjà fait »** : comment savoir qu'un index est déjà à la compression cible
-  sans le rebuild ? (lecture `data_compression_desc` avant chaque op — déjà fait côté
-  planner ; à porter côté run ?) Cela rendrait le re-jeu *cheap* même sans curseur.
-- **Vraie reprise vs re-jeu idempotent** : implémenter `Resume` = vrai `ALTER INDEX RESUME`
-  (réutilise la progression serveur) vs simplement « skip ce qui est fait ». Les deux sont
-  utiles et combinables.
-- **Arrêt propre sur Ctrl+C** : installer un handler de signal qui met en pause le
-  resumable et écrit un état « pausé proprement » avant de quitter — réutiliser la
-  mécanique `runLoop`/`ResumableControlSQL` existante ?
-- **Orchestration `abort-resumable`** : la recovery doit-elle reprendre, ou abandonner
-  automatiquement, un resumable en pause incompatible avec le re-jeu ?
-- **Périmètre v1** : se limiter au cas `rebuild_index` RESUMABLE (le plus fréquent et le
-  seul qui conserve une progression serveur), shrink et autres ops traités séparément
-  (le shrink est déjà chunké, voir `specs/SHRINK.md`).
-- **Découpage des manifestes** : alternative pragmatique sans nouveau code — recommander/
-  générer des manifestes plus petits pour borner le coût d'un re-jeu. Palliatif, pas une
-  vraie reprise.
+- **State granularity**: do we need an operation cursor in `State` (op N/M + status), or should
+  we rely solely on idempotence + the server state (existing resumable)?
+- **"Already done" detection**: how do we know an index is already at the target compression
+  without the rebuild? (reading `data_compression_desc` before each op — already done on the
+  planner side; port it to the run side?) That would make replay *cheap* even without a cursor.
+- **True resume vs idempotent replay**: implement `Resume` = a true `ALTER INDEX RESUME`
+  (reuses server-side progress) vs simply "skip what is done". Both are useful and can be
+  combined.
+- **Graceful stop on Ctrl+C**: install a signal handler that pauses the resumable and writes a
+  "cleanly paused" state before exiting — reuse the existing `runLoop`/`ResumableControlSQL`
+  machinery?
+- **`abort-resumable` orchestration**: should recovery automatically resume, or abort, a paused
+  resumable that is incompatible with the replay?
+- **v1 scope**: limit to the `rebuild_index` RESUMABLE case (the most frequent and the only one
+  that retains server-side progress), with shrink and other ops handled separately (shrink is
+  already chunked, see `specs/SHRINK.md`).
+- **Splitting manifests**: a pragmatic alternative with no new code — recommend/generate smaller
+  manifests to bound the cost of a replay. A palliative, not a real resume.
 
-## 7. Hors périmètre (pour mémoire)
+## 7. Out of scope (for the record)
 
-- La pause/reprise **en réaction à la pression** est déjà en place (§3.2) et n'est pas
-  l'objet de cette feature.
-- Le **shrink** suit un driver chunké distinct (`ShrinkRunner`) qui reprend naturellement
-  entre chunks ; son besoin de reprise est différent et déjà partiellement couvert.
+- Pause/resume **in reaction to pressure** is already in place (§3.2) and is not the subject of
+  this feature.
+- **Shrink** follows a distinct chunked driver (`ShrinkRunner`) that resumes naturally between
+  chunks; its resume requirement is different and already partially covered.
 
-## 8. Références code (au 2026-06-17)
+## 8. Code references (as of 2026-06-17)
 
-| Sujet | Emplacement |
+| Topic | Location |
 |---|---|
-| Compression ⇒ REBUILD obligatoire | `internal/ddl/manifest.go:401` |
-| Matrice RESUMABLE (2017+/Enterprise/Azure/online) | `ddl_compatibility.yaml:27,34,51` |
-| Pas de RESUMABLE pour heap | `ddl_compatibility.yaml:70` |
-| Vraie pause/reprise en cours de run | `internal/run/monitored_runner.go:89,105-159` |
-| Génération SQL PAUSE/RESUME/ABORT | `internal/ddl/control.go` (`ResumableControlSQL`) |
-| Actions de recovery + commentaire « true RESUME is a refinement » | `internal/run/recovery.go:16-61` |
+| Compression ⇒ REBUILD mandatory | `internal/ddl/manifest.go:401` |
+| RESUMABLE matrix (2017+/Enterprise/Azure/online) | `ddl_compatibility.yaml:27,34,51` |
+| No RESUMABLE for a heap | `ddl_compatibility.yaml:70` |
+| True pause/resume during a run | `internal/run/monitored_runner.go:89,105-159` |
+| PAUSE/RESUME/ABORT SQL generation | `internal/ddl/control.go` (`ResumableControlSQL`) |
+| Recovery actions + "true RESUME is a refinement" comment | `internal/run/recovery.go:16-61` |
 | `Resume` == `Restart` == requeue | `internal/run/recovery.go:174-184` |
-| État persistant sans curseur d'opération | `internal/run/state.go:12-20` |
-| Message « next run will resume » (= re-jeu) | `cmd/sqlgopace/main.go:283` |
-| Sous-commande de purge d'un resumable en pause | `cmd/sqlgopace/abort.go` (`abort-resumable`) |
-| Absence de handler de signal | aucun `signal.Notify` dans le dépôt |
-| Lecture compression côté planner (déjà-fait) | `internal/maint/decide.go` (`decideCompression`) + `data_compression_desc` |
-| Check d'existence per-op au preflight (modèle à suivre) | `internal/mssql/existence.go`, `internal/preflight/preflight.go` |
+| Persistent state without an operation cursor | `internal/run/state.go:12-20` |
+| "next run will resume" message (= replay) | `cmd/sqlgopace/main.go:283` |
+| Subcommand to purge a paused resumable | `cmd/sqlgopace/abort.go` (`abort-resumable`) |
+| Absence of a signal handler | no `signal.Notify` in the repository |
+| Compression read on the planner side (already-done) | `internal/maint/decide.go` (`decideCompression`) + `data_compression_desc` |
+| Per-op existence check at preflight (model to follow) | `internal/mssql/existence.go`, `internal/preflight/preflight.go` |
 
-## 9. Piste de conception : skip par métadonnées (proposé le 2026-06-17)
+## 9. Design direction: metadata-based skip (proposed on 2026-06-17)
 
-> Issu d'un essai réel : compresser 74 index en PAGE sur `EXAMPLEDB` (Standard, donc rebuilds
-> **offline et atomiques**). Idée : rendre chaque op **idempotente à coût quasi nul** au re-jeu.
+> Came out of a real attempt: compressing 74 indexes to PAGE on `EXAMPLEDB` (Standard, so
+> **offline and atomic** rebuilds). Idea: make each op **idempotent at near-zero cost** on replay.
 
-### 9.1 Principe
+### 9.1 Principle
 
-Avant d'exécuter chaque `rebuild_index` portant un `data_compression`, **lire la métadonnée
-de compression de l'objet** et **ne rebuild que si elle diffère de la cible**. Exemple : cible
-PAGE → on rebuild uniquement si la compression courante ≠ PAGE.
+Before executing each `rebuild_index` carrying a `data_compression`, **read the object's
+compression metadata** and **rebuild only if it differs from the target**. Example: target
+PAGE → rebuild only if the current compression ≠ PAGE.
 
-Cela couvre la **moitié « skip ce qui est fait »** du besoin (§4.3, §6) **sans** avoir besoin du
-vrai `ALTER INDEX … RESUME`. Un manifeste de 74 ops tué à l'op 31 : au re-run, 1–30 sont
-**skippés** (simple lecture), 31 refait, 32–74 enchaînent.
+This covers the **"skip what is done" half** of the requirement (§4.3, §6) **without** needing
+the true `ALTER INDEX … RESUME`. A 74-op manifest killed at op 31: on the re-run, 1–30 are
+**skipped** (a simple read), 31 is redone, 32–74 follow.
 
-### 9.2 Pourquoi c'est propre sur Standard (et en général)
+### 9.2 Why it is clean on Standard (and in general)
 
-Un rebuild offline est **atomique** : une interruption fait un **rollback complet**, donc
-l'index revient à sa compression d'avant. Au re-jeu il y a donc **deux états seulement** par
-index — *déjà à la cible* (skip) ou *pas à la cible* (refait) — **jamais de demi-état**. Sur
-Enterprise online/resumable, l'index interrompu est laissé *en pause* (≠ cible) : il sera donc
-refait par ce mécanisme, sauf à combiner avec un vrai RESUME (§6).
+An offline rebuild is **atomic**: an interruption causes a **full rollback**, so the index
+reverts to its previous compression. On replay there are therefore **only two states** per
+index — *already at the target* (skip) or *not at the target* (redone) — **never a half-state**.
+On Enterprise online/resumable, the interrupted index is left *paused* (≠ target): it will
+therefore be redone by this mechanism, unless combined with a true RESUME (§6).
 
-### 9.3 Granularité partition
+### 9.3 Partition granularity
 
-`sys.partitions` porte **une ligne par partition** (`data_compression`/`data_compression_desc`,
-2 = PAGE). Donc :
+`sys.partitions` carries **one row per partition** (`data_compression`/`data_compression_desc`,
+2 = PAGE). So:
 
-- op sur l'index entier (`PARTITION = ALL`) → skip **uniquement si *toutes* les partitions**
-  sont déjà à la cible ;
-- op ciblant `PARTITION = n` → ne tester que cette partition.
+- an op on the whole index (`PARTITION = ALL`) → skip **only if *all* partitions** are already
+  at the target;
+- an op targeting `PARTITION = n` → test only that partition.
 
-### 9.4 Décisions à trancher
+### 9.4 Decisions to settle
 
-1. **Compression ≠ défrag.** Un `rebuild_index` peut aussi viser un défrag ; skipper « déjà
-   compressé » zapperait ce défrag. → rendre le skip **opt-in** (flag manifeste/CLI, p. ex.
-   `skip_if_satisfied: true`), **défaut off**, pour préserver le contrat « fais ce que je dis »
-   du run direct. Pour un manifeste *de compression* pure (cas d'usage), on l'active.
-2. **Où.** Au **moment d'exécuter chaque op** (au run-time, comme le shrink génère son SQL),
-   pas au preflight global : on lit l'état le plus frais, ce qui gère naturellement la
-   progression d'un run précédent interrompu.
-3. **Réutilisation.** Le planner fait **déjà** cette comparaison (`decideCompression` lit
-   `data_compression_desc` et n'émet rien si déjà à la cible). Porter cette logique sur le
-   chemin run via un read `mssql` étroit, p. ex. `IndexCompression(schema, table, index) →
-   desc par partition`. Pas de logique neuve.
-4. **Reporting.** Logguer chaque skip (`[k] rebuild_index dbo.X.IX — already PAGE, skipped`)
-   et distinguer `skipped` / `done` dans le `.log` et l'history, pour qu'un re-run montre
-   clairement ce qui a été réutilisé.
-5. **Portée.** Étendre l'idée aux autres ops à cible métadonnée (p. ex. `add_column` déjà
-   présente, `alter_column` déjà au bon type) ? À discuter ; commencer par la compression.
+1. **Compression ≠ defrag.** A `rebuild_index` may also aim at a defrag; skipping "already
+   compressed" would drop that defrag. → make the skip **opt-in** (manifest/CLI flag, e.g.
+   `skip_if_satisfied: true`), **default off**, to preserve the "do what I say" contract of a
+   direct run. For a pure *compression* manifest (the use case), we enable it.
+2. **Where.** At the **moment each op executes** (at run time, the way shrink generates its SQL),
+   not at global preflight: we read the freshest state, which naturally handles the progress of a
+   previous interrupted run.
+3. **Reuse.** The planner **already** does this comparison (`decideCompression` reads
+   `data_compression_desc` and emits nothing if already at the target). Port that logic onto the
+   run path via a narrow `mssql` read, e.g. `IndexCompression(schema, table, index) →
+   desc per partition`. No new logic.
+4. **Reporting.** Log each skip (`[k] rebuild_index dbo.X.IX — already PAGE, skipped`) and
+   distinguish `skipped` / `done` in the `.log` and the history, so a re-run clearly shows what
+   was reused.
+5. **Scope.** Extend the idea to other ops with a metadata target (e.g. `add_column` already
+   present, `alter_column` already at the right type)? To be discussed; start with compression.
 
-### 9.5 Rapport au reste de la spec
+### 9.5 Relation to the rest of the spec
 
-- Mécanisme **complémentaire**, pas un substitut, au vrai RESUME (§6) : il rend le re-jeu
-  *bon marché* mais ne reprend pas un index interrompu *en cours* de rebuild.
-- Beaucoup plus simple qu'un curseur d'opération dans `State` (§6) : l'« état » est lu
-  directement côté serveur, source de vérité, donc **aucune persistance de progression** à
-  maintenir.
+- A **complementary** mechanism, not a substitute, to the true RESUME (§6): it makes replay
+  *cheap* but does not resume an index interrupted *in the middle* of a rebuild.
+- Much simpler than an operation cursor in `State` (§6): the "state" is read directly from the
+  server, the source of truth, so **no progress persistence** to maintain.

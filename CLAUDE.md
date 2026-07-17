@@ -46,7 +46,11 @@ mandatory for monitoring).
   the simplest thing that works over cleverness or premature abstraction. Don't add layers,
   interfaces, generics, or options the current need doesn't justify.
 - **English only** — all code, comments, identifiers, file names, and committed docs are in
-  English (the spec docs under `specs/` and `formation/` are the exception).
+  English, **including the design docs under `specs/`**. The training material under
+  `formation/` is the only exception (it is delivered in French). Two raw AI research dumps
+  kept as historical source material — `specs/gemini-shrink.md` and `specs/SQL Server Shrink -
+  Document de référence technique - Perplexity.md` — remain in French deliberately; they are
+  inputs to a decision already made, not specs.
 - **Manifest-driven, never raw SQL.** Adding a DDL capability means adding an `operation` type
   end-to-end (parse → resolve → generate → plan), not parsing user SQL.
 - **No query timeout.** Operation duration is governed by the monitoring loop and the reaction

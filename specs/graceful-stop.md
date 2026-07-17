@@ -1,166 +1,166 @@
-# Spec métier — Arrêt en douceur (drain) après l'instruction en cours
+# Feature spec — Graceful stop (drain) after the current statement
 
-> **Statut : v1 implémenté, avec pause d'un resumable en cours.** Le moteur expose `WithDrainSignal(<-chan
-> struct{})` ; une fois le canal **fermé** (signal latché), il s'arrête **avant l'op suivante**
-> (`finalizeDrained` : manifeste laissé en `02.processing/`, compté `Interrupted`) et n'entame plus les
-> manifestes restants. **Nouveau (§3.2) : une opération resumable EN COURS est mise en pause immédiatement**
-> au lieu d'attendre sa fin — le signal drain est passé au `MonitoredRunner` via `Capabilities.Stop` ;
-> `supervise` renvoie une action **`Stop`** pour un op resumable quand le canal se ferme ; `runLoop`
-> traduit `Stop` en sentinel **`ErrStopped`** (geste de pause existant = annulation du contexte d'exécution
-> = *attention* qui met le resumable en pause, puis on **ne reprend pas**) ; le moteur classe `ErrStopped`
-> en interruption propre (`finalizeInterrupted`, manifeste+sidecar laissés), et le prochain run **RESUME**
-> (cf. `crash-resumable.md` §4.2). Un op **non-resumable** ignore le stop (il finit ; le drain stoppe au
-> prochain bord d'op). Shrink/batch : hors périmètre (drivers distincts). Déclencheurs : **Ctrl+C 1× =
-> drain / 2× = hard stop** (handler `os/signal` dans `cmd/sqlgopace/main.go`, `sync.Once` pour fermer le
-> canal une fois, 2ᵉ signal → `cancelRun()`), et l'action TUI **`d`** (`ActionDrain` → statut `DRAINING`).
-> Reprise : le **curseur d'opération** `State.ResumeFromOp` (§3.3.1) est écrit par `finalizeDrained`
-> (= nb d'ops faites) ; la recovery **conserve** le sidecar au requeue quand le curseur > 0
-> (`requeue(..., keepCursor)` + `queue.InToRun` pour tolérer un manifeste déjà re-enfilé) ; au re-run
-> `writeSidecar` **préserve** le curseur et le retourne, et la boucle **saute** les ops `i < curseur`
-> (outcome `skipped`, raison « already done in a previous run ») — via le helper partagé
-> `recordSkipped` (mutualisé avec `skip_if_satisfied`). Le curseur est désormais **aussi écrit
-> progressivement par opération** (`advanceCursor`, `crash-resumable.md` §6), pas seulement au drain :
-> un *crash* renseigne donc le curseur comme un drain, et `WriteState` est rendu **atomique**
-> (temp+rename) puisque le sidecar est réécrit après chaque op. Le **skip métadonnée** (`crash-resumable.md`
-> §9) reste complémentaire (rend le préfixe compression bon marché). **Le stop par chunk (§3.2) est
-> implémenté aussi pour shrink et batch-DML** : ces drivers chunkés reçoivent le signal via
-> `WithShrinkStop`/`WithBatchDMLStop` (câblés dans `buildEngine`) et vérifient `stopRequested(r.stop)`
-> **entre deux chunks/batches** (chacun est committé) ; ils finissent le chunk courant puis renvoient
-> `ErrStopped` avec résultats partiels — le moteur finalise en interrupted (laissé en processing), et le
-> prochain run reprend (shrink idempotent par espace libre ; predicate auto-limitant ; key_range depuis
-> le watermark, que le moteur **ne purge pas** sur `ErrStopped`). **L'annulation d'un drain (§6) est
-> implémentée** : le signal latché (canal fermé) est remplacé par un `DrainFlag` (atomic bool,
-> `Request`/`Cancel`/`Draining`) ; tous les points de stop deviennent un prédicat **`func() bool`**
-> (`Capabilities.Stop`, `engine.drain`, champs `stop` des drivers) vérifié **aux bords** (op, chunk) et
-> sur le **tick de sampling** de `supervise` — donc un `Cancel` avant le prochain check retire la
-> demande. La touche TUI **`d` bascule** (drain ⇄ cancel, via `dispatchActions` sur le flag partagé) ;
-> Ctrl+C reste **one-way** (2× = hard stop), l'annulation étant une fonctionnalité TUI. Compromis : la
-> pause mid-statement d'un resumable est désormais **poll-delayed** (au lieu d'un réveil immédiat) pour
-> être annulable. Créé le 2026-06-17, suite au besoin d'arrêter un run **sans avorter l'opération en
-> cours**. Cette spec est désormais **entièrement implémentée**.
+> **Status: v1 implemented, including pausing an in-flight resumable.** The engine exposes `WithDrainSignal(<-chan
+> struct{})`; once the channel is **closed** (latched signal), it stops **before the next op**
+> (`finalizeDrained`: manifest left in `02.processing/`, counted as `Interrupted`) and does not start any of the
+> remaining manifests. **New (§3.2): an IN-FLIGHT resumable operation is paused immediately**
+> instead of waiting for it to finish — the drain signal is passed to the `MonitoredRunner` via `Capabilities.Stop`;
+> `supervise` returns a **`Stop`** action for a resumable op when the channel closes; `runLoop`
+> translates `Stop` into the **`ErrStopped`** sentinel (the existing pause gesture = canceling the execution
+> context — *note*: that cancellation is what pauses the resumable — after which we **do not resume**); the engine classifies `ErrStopped`
+> as a clean interruption (`finalizeInterrupted`, manifest+sidecar left in place), and the next run **RESUMEs**
+> (see `crash-resumable.md` §4.2). A **non-resumable** op ignores the stop (it finishes; the drain stops at
+> the next op boundary). Shrink/batch: out of scope (separate drivers). Triggers: **Ctrl+C 1× =
+> drain / 2× = hard stop** (`os/signal` handler in `cmd/sqlgopace/main.go`, `sync.Once` to close the
+> channel once, 2nd signal → `cancelRun()`), and the TUI action **`d`** (`ActionDrain` → status `DRAINING`).
+> Resume: the **operation cursor** `State.ResumeFromOp` (§3.3.1) is written by `finalizeDrained`
+> (= number of ops completed); recovery **keeps** the sidecar when requeuing if the cursor is > 0
+> (`requeue(..., keepCursor)` + `queue.InToRun` to tolerate a manifest that has already been requeued); on the re-run
+> `writeSidecar` **preserves** the cursor and returns it, and the loop **skips** ops `i < cursor`
+> (outcome `skipped`, reason "already done in a previous run") — via the shared helper
+> `recordSkipped` (shared with `skip_if_satisfied`). The cursor is now **also written
+> incrementally per operation** (`advanceCursor`, `crash-resumable.md` §6), not only on drain:
+> a *crash* therefore populates the cursor just like a drain, and `WriteState` is made **atomic**
+> (temp+rename) since the sidecar is rewritten after every op. The **metadata skip** (`crash-resumable.md`
+> §9) remains complementary (it makes the compression prefix cheap). **Per-chunk stop (§3.2) is
+> implemented for shrink and batch-DML too**: these chunked drivers receive the signal via
+> `WithShrinkStop`/`WithBatchDMLStop` (wired in `buildEngine`) and check `stopRequested(r.stop)`
+> **between chunks/batches** (each one is committed); they finish the current chunk then return
+> `ErrStopped` with partial results — the engine finalizes as interrupted (left in processing), and the
+> next run picks up where it left off (shrink is idempotent by free space; the predicate is self-limiting; key_range comes from
+> the watermark, which the engine **does not purge** on `ErrStopped`). **Cancelling a drain (§6) is
+> implemented**: the latched signal (closed channel) is replaced by a `DrainFlag` (atomic bool,
+> `Request`/`Cancel`/`Draining`); every stop point becomes a **`func() bool`** predicate
+> (`Capabilities.Stop`, `engine.drain`, the drivers' `stop` fields) checked **at boundaries** (op, chunk) and
+> on `supervise`'s **sampling tick** — so a `Cancel` before the next check withdraws the
+> request. The TUI **`d`** key **toggles** (drain ⇄ cancel, via `dispatchActions` on the shared flag);
+> Ctrl+C stays **one-way** (2× = hard stop), cancellation being a TUI feature. Trade-off: the
+> mid-statement pause of a resumable is now **poll-delayed** (instead of waking immediately) so that it
+> can be cancelled. Created on 2026-06-17, out of the need to stop a run **without aborting the operation in
+> progress**. This spec is now **fully implemented**.
 
-## 1. Objectif
+## 1. Goal
 
-Offrir une commande (TUI, et idéalement Ctrl+C) qui **arrête le traitement à la fin de
-l'instruction/opération en cours**, au lieu de l'interrompre brutalement :
+Provide a command (TUI, and ideally Ctrl+C) that **stops processing at the end of the
+current statement/operation**, rather than interrupting it abruptly:
 
-- l'**opération en cours va jusqu'au bout** (pas de rollback, pas de travail perdu) ;
-- le moteur **ne démarre pas l'opération suivante** ;
-- il **enregistre le point de reprise** pour que le prochain run **continue à l'op suivante**,
-  pas depuis le début.
+- the **current operation runs to completion** (no rollback, no work lost);
+- the engine **does not start the next operation**;
+- it **records the resume point** so that the next run **continues at the next op**,
+  not from the beginning.
 
-C'est le chaînon manquant entre les deux leviers actuels : `pause` (suspend *au milieu* d'une
-instruction resumable) et `kill` (avorte l'instruction, rollback). Le **drain** se place *entre*
-deux opérations.
+This is the missing link between the two existing levers: `pause` (suspends *in the middle* of a
+resumable statement) and `kill` (aborts the statement, rollback). The **drain** sits *between*
+two operations.
 
-## 2. État actuel observé
+## 2. Current state observed
 
-- **Boucle d'exécution** : `for i, step := range planned` (`internal/run/engine.go:286`) ; le moteur
-  connaît `i`, `len(planned)` et démarre chaque op sans point d'arrêt négociable entre elles.
-- **Leviers TUI existants** : `kill DDL`, `kill blocker`, `pause`, `extend`
-  (`internal/tui/model.go` ~95-113 ; aide en bas d'écran `model.go:244-245`). **Pas de drain.**
-- **Pas de handler de signal** : Ctrl+C tue le process net (cf. `crash-resumable.md §3.1`).
-- **Pas de curseur d'opération** dans l'état persistant (`internal/run/state.go:12-20`).
-- **Recovery = re-jeu depuis le début** : un manifeste laissé dans `02.processing/` est ré-enfilé
-  et relancé op 1 (`internal/run/recovery.go:174-184`).
-- **Compteur déjà présent** : `Summary.Interrupted` + message « interrupted manifest(s) left in
-  processing; the next run will resume them » (`cmd/sqlgopace/main.go:283`) — un manifeste drainé
-  s'y range naturellement.
+- **Execution loop**: `for i, step := range planned` (`internal/run/engine.go:286`); the engine
+  knows `i` and `len(planned)` and starts each op with no negotiable stop point in between.
+- **Existing TUI levers**: `kill DDL`, `kill blocker`, `pause`, `extend`
+  (`internal/tui/model.go` ~95-113; on-screen help at `model.go:244-245`). **No drain.**
+- **No signal handler**: Ctrl+C kills the process outright (see `crash-resumable.md §3.1`).
+- **No operation cursor** in the persistent state (`internal/run/state.go:12-20`).
+- **Recovery = replay from the beginning**: a manifest left in `02.processing/` is requeued
+  and restarted at op 1 (`internal/run/recovery.go:174-184`).
+- **Counter already present**: `Summary.Interrupted` + the message "interrupted manifest(s) left in
+  processing; the next run will resume them" (`cmd/sqlgopace/main.go:283`) — a drained manifest
+  fits there naturally.
 
-Donc aujourd'hui : arrêter = avorter l'op en cours (rollback offline) **et** tout refaire au run
-suivant. Le drain supprime ces deux pertes.
+So today: stopping means aborting the current op (offline rollback) **and** redoing everything on the next
+run. The drain removes both losses.
 
-## 3. Conception proposée
+## 3. Proposed design
 
-### 3.1 Déclencheurs
+### 3.1 Triggers
 
-- **Action TUI `drain`** : une nouvelle touche (p. ex. `d`) qui pose un flag « stop after current
-  op ». Le moteur le vérifie **en tête de boucle**, avant de démarrer l'op suivante
-  (`engine.go:286`). Affichage : statut `DRAINING — s'arrêtera après l'op 31/74`.
-- **Ctrl+C = drain (recommandé)** : installer enfin un handler de signal (cf. `crash-resumable.md
-  §3.1`) avec la sémantique **1× = drain** (arrêt propre après l'op en cours), **2× = hard stop**
-  (annulation immédiate, comportement actuel). UX standard et sûre par défaut.
+- **TUI `drain` action**: a new key (e.g. `d`) that sets a "stop after current
+  op" flag. The engine checks it **at the top of the loop**, before starting the next op
+  (`engine.go:286`). Display: status `DRAINING — will stop after op 31/74`.
+- **Ctrl+C = drain (recommended)**: finally install a signal handler (see `crash-resumable.md
+  §3.1`) with the semantics **1× = drain** (clean stop after the current op), **2× = hard stop**
+  (immediate cancellation, the current behavior). Standard UX, and safe by default.
 
-### 3.2 Granularité
+### 3.2 Granularity
 
-- Cas normal (`rebuild_index`, etc.) : on s'arrête **après l'opération courante** (un step).
-- **Shrink** : un step = une boucle multi-chunks ; le driver échantillonne déjà entre chunks
-  (`ShrinkRunner`). Le drain s'y traduit par « s'arrêter **après le chunk courant** » — le re-jeu
-  repart de l'espace libre courant (déjà idempotent).
+- Normal case (`rebuild_index`, etc.): we stop **after the current operation** (one step).
+- **Shrink**: one step = a multi-chunk loop; the driver already samples between chunks
+  (`ShrinkRunner`). The drain translates there to "stop **after the current chunk**" — the replay
+  restarts from the current free space (already idempotent).
 
-### 3.3 Où enregistrer le point de reprise
+### 3.3 Where to record the resume point
 
-Deux options ; **ne pas muter le manifeste** (entrée déclarative de l'utilisateur ; réécrire le
-YAML est risqué et lossy) :
+Two options; **do not mutate the manifest** (it is the user's declarative input; rewriting the
+YAML is risky and lossy):
 
-1. **Étendre le sidecar `State`** (recommandé) — il existe déjà, vit à côté du manifeste dans
-   `02.processing/`, et est **déjà lu par la recovery**. Ajouter un **curseur** :
-   `ResumeFromOp int` (prochaine op à exécuter) + `CompletedOps int` + `Reason` (« drain demandé à
-   l'op 31/74 le … »). C'est exactement le « curseur d'opération » évoqué en `crash-resumable.md
-   §6`, ici avec un déclencheur **intentionnel** (pas un crash).
-2. **Fichier de contrôle de vol dédié** (alternative que tu proposais) : un
-   `<manifeste>.flight.json` à côté. Plus explicite/lisible isolément, mais **duplique** le rôle du
-   sidecar `State` et ajoute un fichier à gérer dans le cycle de file. À retenir seulement si on
-   veut un format de reprise indépendant de `State`.
+1. **Extend the `State` sidecar** (recommended) — it already exists, lives next to the manifest in
+   `02.processing/`, and is **already read by recovery**. Add a **cursor**:
+   `ResumeFromOp int` (next op to execute) + `CompletedOps int` + `Reason` ("drain requested at
+   op 31/74 on ..."). This is exactly the "operation cursor" mentioned in `crash-resumable.md
+   §6`, here with an **intentional** trigger (not a crash).
+2. **A dedicated flight-control file** (the alternative you suggested): a
+   `<manifest>.flight.json` alongside. More explicit/readable on its own, but it **duplicates** the role of the
+   `State` sidecar and adds a file to manage in the queue lifecycle. Worth keeping only if we
+   want a resume format independent of `State`.
 
-→ Recommandation : **réutiliser `State`** (moins de surface, déjà câblé recovery), sauf besoin
-explicite d'un artefact séparé.
+→ Recommendation: **reuse `State`** (less surface, already wired into recovery), unless there is an
+explicit need for a separate artifact.
 
-### 3.4 Reprise
+### 3.4 Resume
 
-La recovery (`recovery.go`) honore le curseur : si `ResumeFromOp` est posé, **continuer à cette
-op** au lieu de re-jouer depuis le début. Se combine avec le **skip par métadonnée**
-(`crash-resumable.md §9`) : même si le curseur manquait, les ops déjà faites seraient sautées.
+Recovery (`recovery.go`) honors the cursor: if `ResumeFromOp` is set, **continue at that
+op** instead of replaying from the beginning. It combines with the **metadata skip**
+(`crash-resumable.md §9`): even if the cursor were missing, the ops already done would be skipped.
 
-### 3.5 Nouvel état terminal
+### 3.5 New terminal state
 
-Un manifeste drainé **reste dans `02.processing/`** (ni `done`, ni `failed`) et compte comme
-**`Interrupted`** (réutilise le compteur existant, `main.go:283`), avec un message clair :
-« drainé à l'op 31/74 — reprise au prochain run ».
+A drained manifest **stays in `02.processing/`** (neither `done` nor `failed`) and counts as
+**`Interrupted`** (reusing the existing counter, `main.go:283`), with a clear message:
+"drained at op 31/74 — will resume on the next run".
 
-## 4. Différence avec les leviers existants
+## 4. Difference from the existing levers
 
-| Levier | Sur l'instruction en cours | Reprise | Travail perdu |
+| Lever | Effect on the current statement | Resume | Work lost |
 |---|---|---|---|
-| `pause` (existant) | suspend *au milieu* (resumable) | même run, via `RESUME` | aucun (online/resumable) |
-| `kill DDL` (existant) | **avorte** (rollback offline) | run suivant, **depuis le début** | l'op en cours |
-| **`drain` (proposé)** | **laisse finir** | run suivant, **à l'op suivante** | **aucun** |
+| `pause` (existing) | suspends *mid-statement* (resumable) | same run, via `RESUME` | none (online/resumable) |
+| `kill DDL` (existing) | **aborts** (offline rollback) | next run, **from the beginning** | the current op |
+| **`drain` (proposed)** | **lets it finish** | next run, **at the next op** | **none** |
 
-## 5. Liens avec les autres itérations
+## 5. Links with the other iterations
 
-- **`progress-tui.md`** : le drain a besoin de `i`/`N` (déjà exposés par le *step-sink* proposé) pour
-  afficher « s'arrêtera après l'op i/N » et écrire le curseur.
-- **`crash-resumable.md`** : le drain **matérialise** le « curseur d'opération » (§6) avec un
-  déclencheur volontaire, et profite du **skip métadonnée** (§9) à la reprise. Concevoir les deux
-  ensemble (même champ `ResumeFromOp` dans `State`).
-- **`remote-tui.md`** : `drain` devient une `Action` diffusable — un client distant peut demander un
-  arrêt propre (avec les mêmes garde-fous de sécurité que `kill`).
+- **`progress-tui.md`**: the drain needs `i`/`N` (already exposed by the proposed *step sink*) to
+  display "will stop after op i/N" and to write the cursor.
+- **`crash-resumable.md`**: the drain **materializes** the "operation cursor" (§6) with a
+  deliberate trigger, and benefits from the **metadata skip** (§9) on resume. Design the two
+  together (same `ResumeFromOp` field in `State`).
+- **`remote-tui.md`**: `drain` becomes a broadcastable `Action` — a remote client can request a
+  clean stop (with the same safety guards as `kill`).
 
-## 6. Questions ouvertes
+## 6. Open questions
 
-- **Sémantique Ctrl+C** : 1× drain / 2× hard — ou réserver le drain au TUI et garder Ctrl+C = hard ?
-- **Annuler un drain** : permettre de revenir en arrière (« finalement, continue ») avant que l'op
-  courante se termine ?
-- **`State` vs fichier dédié** (§3.3) : trancher selon qu'on veut un artefact de reprise autonome.
-- **Drain pendant un shrink** : s'arrêter après le chunk courant suffit-il, ou faut-il un sous-curseur
-  de chunk persistant ?
-- **Multi-base** (§17) : un drain arrête-t-il le manifeste courant seulement, ou toute la file ?
+- **Ctrl+C semantics**: 1× drain / 2× hard — or reserve the drain for the TUI and keep Ctrl+C = hard?
+- **Cancelling a drain**: allow backing out ("actually, keep going") before the current op
+  finishes?
+- **`State` vs a dedicated file** (§3.3): decide based on whether we want a standalone resume artifact.
+- **Drain during a shrink**: is stopping after the current chunk enough, or do we need a persistent
+  chunk sub-cursor?
+- **Multi-database** (§17): does a drain stop only the current manifest, or the whole queue?
 
-## 7. Estimation d'effort
+## 7. Effort estimate
 
-**Petit-moyen.** Le moteur a déjà la boucle, l'index `i`, et un point naturel de vérification entre
-ops ; `State` et la recovery existent. À écrire : l'action/flag `drain`, le handler de signal
-(optionnel mais souhaitable), l'extension de `State` (curseur) + sa prise en compte par la recovery,
-et l'affichage. Le plus gros est partagé avec `crash-resumable.md` (le curseur).
+**Small-to-medium.** The engine already has the loop, the index `i`, and a natural check point between
+ops; `State` and recovery exist. To write: the `drain` action/flag, the signal handler
+(optional but desirable), the `State` extension (cursor) + making recovery honor it,
+and the display. The bulk is shared with `crash-resumable.md` (the cursor).
 
-## 8. Références code (au 2026-06-17)
+## 8. Code references (as of 2026-06-17)
 
-| Sujet | Emplacement |
+| Topic | Location |
 |---|---|
-| Boucle d'ops (point de vérification du flag drain) | `internal/run/engine.go:286` |
-| Actions/touches TUI (où ajouter `drain`) | `internal/tui/model.go` ~95-113 ; `model.go:244-245` |
-| État persistant à étendre (curseur de reprise) | `internal/run/state.go:12-20` |
-| Recovery à rendre « curseur-aware » | `internal/run/recovery.go:174-184` |
-| Compteur `Interrupted` réutilisable | `cmd/sqlgopace/main.go:283` |
-| Absence de handler de signal (à ajouter pour Ctrl+C) | `specs/crash-resumable.md §3.1` |
-| Curseur d'opération (idée sœur) + skip métadonnée | `specs/crash-resumable.md §6, §9` |
+| Op loop (drain flag check point) | `internal/run/engine.go:286` |
+| TUI actions/keys (where to add `drain`) | `internal/tui/model.go` ~95-113; `model.go:244-245` |
+| Persistent state to extend (resume cursor) | `internal/run/state.go:12-20` |
+| Recovery to make "cursor-aware" | `internal/run/recovery.go:174-184` |
+| Reusable `Interrupted` counter | `cmd/sqlgopace/main.go:283` |
+| No signal handler (to be added for Ctrl+C) | `specs/crash-resumable.md §3.1` |
+| Operation cursor (sibling idea) + metadata skip | `specs/crash-resumable.md §6, §9` |

@@ -1,160 +1,160 @@
-# Spec métier — TUI distant (mode serveur / client)
+# Functional spec — remote TUI (server / client mode)
 
-> **Statut : DRAFT — itération à concevoir/implémenter.** Acte le besoin et le design pressenti.
-> Créé le 2026-06-17, suite à l'essai `030_compress_exampledb_indexes.yaml` (run lancé en
-> arrière-plan, non-TUI) où l'on a voulu suivre l'état en direct **depuis une autre session**.
+> **Status: DRAFT — iteration to design/implement.** Records the need and the intended design.
+> Created on 2026-06-17, following the `030_compress_exampledb_indexes.yaml` trial (run launched in
+> the background, non-TUI) where we wanted to follow the state live **from another session**.
 
-## 1. Objectif
+## 1. Goal
 
-Permettre de **suivre l'état live d'un run et d'agir dessus depuis un autre processus** :
+Allow **following a run's live state and acting on it from another process**:
 
-- l'instance qui exécute le run ouvre un **serveur sur un port** et diffuse son état
-  (progression, sessions bloquées, waits, statut) ;
-- une **autre exécution de l'outil en mode client** se connecte à ce port et **affiche le
-  TUI** (incident console) + l'état, et peut envoyer des **actions** (kill DDL, kill un
-  bloqueur, pause/extend).
+- the instance executing the run opens a **server on a port** and broadcasts its state
+  (progress, blocked sessions, waits, status);
+- **another execution of the tool in client mode** connects to that port and **displays the
+  TUI** (incident console) + the state, and can send **actions** (kill DDL, kill a
+  blocker, pause/extend).
 
-Cas d'usage : un run de maintenance long tourne sur un jump-host / en arrière-plan ; un DBA
-veut ouvrir le TUI depuis sa machine sans relancer ni interrompre le run.
+Use case: a long maintenance run is executing on a jump host / in the background; a DBA
+wants to open the TUI from their machine without relaunching or interrupting the run.
 
-## 2. Pourquoi c'est tractable : le découplage existe déjà
+## 2. Why this is tractable: the decoupling already exists
 
-Le TUI ne communique avec le moteur **que par messages**, c'est déjà le protocole :
+The TUI communicates with the engine **only through messages** — that is already the protocol:
 
-- **État (serveur → TUI)** : `ProgressMsg`, `BlockersMsg`, `WaitsMsg`, `StatusMsg`, `LogMsg`
+- **State (server → TUI)**: `ProgressMsg`, `BlockersMsg`, `WaitsMsg`, `StatusMsg`, `LogMsg`
   (`internal/tui/model.go:66-84`).
-- **Actions (TUI → serveur)** : un `chan Action` (`internal/tui/model.go:123,129`), routé par
+- **Actions (TUI → server)**: a `chan Action` (`internal/tui/model.go:123,129`), routed by
   `dispatchActions` (`cmd/sqlgopace/main.go:438,514-515`).
 
-Aujourd'hui `runWithTUI` (`cmd/sqlgopace/main.go:431-456`) câble tout ça **in-process** :
+Today `runWithTUI` (`cmd/sqlgopace/main.go:431-456`) wires all of that **in-process**:
 
 ```
-feedConsole (poll DB) ──Msg──▶ tui.Program ──Action──▶ dispatchActions (→ serveur SQL)
+feedConsole (poll DB) ──Msg──▶ tui.Program ──Action──▶ dispatchActions (→ SQL server)
    main.go:459-488                  (Bubble Tea)              main.go:514
 ```
 
-Le mode serveur/client **ne change pas le TUI** : il remplace ce câblage in-process par un
-**transport réseau**. Le modèle Bubble Tea (rendu, touches) est réutilisé **tel quel** côté
-client. C'est ce qui rend l'effort moyen et non énorme.
+Server/client mode **does not change the TUI**: it replaces that in-process wiring with a
+**network transport**. The Bubble Tea model (rendering, keys) is reused **as is** on the
+client side. That is what keeps the effort moderate rather than huge.
 
-## 3. Conception proposée
+## 3. Proposed design
 
-### 3.1 Vue d'ensemble
+### 3.1 Overview
 
 ```
-            instance SERVEUR (exécute le run)                     instance CLIENT
+            SERVER instance (executes the run)                     CLIENT instance
   ┌───────────────────────────────────────────┐        ┌──────────────────────────┐
-  feedConsole/engine ──Msg──▶  HUB de diffusion │  SSE   │  reader ──Msg──▶ tui.Model │
-  (état déjà produit)         │  (dernier snapshot,      │        │  (Bubble Tea, inchangé) │
-  dispatchActions ◀──Action── │   fan-out N clients) │◀──POST── writer ◀──Action── tui │
-  (→ serveur SQL)             └───────────── :port ──┘        └──────────────────────────┘
+  feedConsole/engine ──Msg──▶  broadcast HUB   │  SSE   │  reader ──Msg──▶ tui.Model │
+  (state already produced)    │  (last snapshot,        │        │  (Bubble Tea, unchanged) │
+  dispatchActions ◀──Action── │   fan-out to N clients) │◀──POST── writer ◀──Action── tui │
+  (→ SQL server)              └───────────── :port ──┘        └──────────────────────────┘
 ```
 
-- **Serveur** : l'instance qui exécute possède déjà la connexion SQL, le SPID et produit déjà
-  les `Msg` (via `feedConsole` / le futur step-sink de `progress-tui.md`). On ajoute un **hub**
-  qui (a) garde le **dernier snapshot** de chaque type de message, (b) **fan-out** vers les
-  clients connectés, (c) reçoit les `Action` des clients et les pousse dans le `chan Action`
-  existant.
-- **Client** : un nouveau mode (`--connect host:port`) qui ouvre le **même TUI**, mais alimente
-  son `tui.Program` depuis le **flux réseau** au lieu de `feedConsole`, et renvoie les `Action`
-  vers `POST /action` au lieu de `dispatchActions` local.
+- **Server**: the executing instance already owns the SQL connection and the SPID, and already
+  produces the `Msg` values (via `feedConsole` / the future step-sink from `progress-tui.md`). We add a **hub**
+  that (a) keeps the **last snapshot** of each message type, (b) **fans out** to the
+  connected clients, (c) receives the clients' `Action`s and pushes them into the existing
+  `chan Action`.
+- **Client**: a new mode (`--connect host:port`) that opens the **same TUI**, but feeds
+  its `tui.Program` from the **network stream** instead of `feedConsole`, and sends `Action`s
+  to `POST /action` instead of the local `dispatchActions`.
 
-### 3.2 Transport recommandé : HTTP SSE + POST
+### 3.2 Recommended transport: HTTP SSE + POST
 
-- **État** : `GET /state` en **Server-Sent Events** (flux de `Msg` encodés JSON). Avantages :
-  simple, debuggable (`curl`), traverse les proxys, et **ouvre gratuitement la voie d'un futur
-  dashboard web** (même flux).
-- **Actions** : `POST /action` (corps JSON = une `Action`).
-- **Snapshot au join** : à la connexion SSE, le hub renvoie d'abord le **dernier snapshot** de
-  chaque message (sinon un client tardif ne voit que les deltas et a un écran vide).
-- Alternatives écartées pour la v1 : WebSocket (bidirectionnel mais plus lourd) ; TCP + JSON
-  lignes (le plus simple mais pas debuggable au navigateur/curl). À garder en tête si SSE coince.
+- **State**: `GET /state` as **Server-Sent Events** (a stream of JSON-encoded `Msg`). Upsides:
+  simple, debuggable (`curl`), traverses proxies, and **opens the way to a future web
+  dashboard for free** (same stream).
+- **Actions**: `POST /action` (JSON body = one `Action`).
+- **Snapshot on join**: on SSE connection, the hub first sends back the **last snapshot** of
+  each message (otherwise a late client only sees deltas and gets an empty screen).
+- Alternatives rejected for v1: WebSocket (bidirectional but heavier); TCP + JSON
+  lines (the simplest but not debuggable from a browser/curl). Worth keeping in mind if SSE gets in the way.
 
-### 3.3 Sérialisation
+### 3.3 Serialization
 
-Les `Msg`/`Action` sont des structs simples → JSON direct. Définir un petit type enveloppe
-`{ "type": "progress|blockers|waits|status|log", "data": {…} }` côté serveur ; côté client,
-décoder vers le `tea.Msg` correspondant. Les types vivent dans `internal/tui` (ou un nouveau
-`internal/tui/wire`) pour rester l'unique source du protocole.
+`Msg`/`Action` are plain structs → direct JSON. Define a small envelope type
+`{ "type": "progress|blockers|waits|status|log", "data": {…} }` on the server side; on the client side,
+decode into the matching `tea.Msg`. The types live in `internal/tui` (or a new
+`internal/tui/wire`) so they remain the single source of the protocol.
 
 ### 3.4 Modes & flags
 
-- `sqlgopace -config config.yaml --serve :7070` : exécute le run **et** sert l'état (TUI local
-  optionnel en plus, ou pas de TUI local).
-- `sqlgopace --connect host:7070` : **n'exécute aucun DDL** ; ouvre seulement le TUI alimenté par
-  le flux distant. Ne nécessite ni `config.yaml` ni connexion SQL côté client.
+- `sqlgopace -config config.yaml --serve :7070`: executes the run **and** serves the state (local TUI
+  optional on top, or no local TUI).
+- `sqlgopace --connect host:7070`: **executes no DDL**; only opens the TUI fed by
+  the remote stream. Requires neither `config.yaml` nor a SQL connection on the client side.
 
-## 4. Sécurité — le vrai coût de la feature
+## 4. Security — the real cost of the feature
 
-Un port qui accepte des actions, c'est un port qui peut **`KILL` une DDL ou une session SQL** à
-distance. Décisions structurantes :
+A port that accepts actions is a port that can **`KILL` a DDL or a SQL session** remotely.
+Structuring decisions:
 
-1. **Bind `127.0.0.1` par défaut.** Exposition réseau (`--serve 0.0.0.0:…`) = opt-in explicite,
-   avec avertissement.
-2. **Clients lecture seule par défaut.** L'état est diffusé à tous ; les **actions** sont une
-   capability séparée, refusée sauf si le client présente un **jeton** (`--token` / en-tête
-   `Authorization`).
-3. **TLS** dès qu'on dépasse localhost (sinon jeton et état en clair sur le réseau).
-4. **Pas d'exécution côté client** : le mode `--connect` ne touche jamais une base ; il ne fait
-   qu'afficher et relayer des actions au serveur, qui reste le seul à parler à SQL Server.
+1. **Bind `127.0.0.1` by default.** Network exposure (`--serve 0.0.0.0:…`) = explicit opt-in,
+   with a warning.
+2. **Read-only clients by default.** State is broadcast to everyone; **actions** are a
+   separate capability, refused unless the client presents a **token** (`--token` / `Authorization`
+   header).
+3. **TLS** as soon as we go beyond localhost (otherwise token and state travel in clear over the network).
+4. **No execution on the client side**: `--connect` mode never touches a database; it only
+   displays and relays actions to the server, which remains the only one talking to SQL Server.
 
-C'est ici que part l'essentiel de l'effort, **pas** dans le rendu.
+This is where most of the effort goes, **not** into the rendering.
 
-## 5. Limites inhérentes (à assumer)
+## 5. Inherent limits (to accept)
 
-- **Serveur éphémère.** Le run est *one-shot* (le moteur traite la file puis sort) : le serveur
-  ne vit que **le temps de l'opération**. Il faut donc **lancer avec `--serve` dès le départ** —
-  on ne peut pas « brancher » un serveur sur un run déjà lancé en mode nu (même limite que le TUI
-  actuel, cf. `specs/progress-tui.md §5`). Cette feature **résout** ce manque, à condition de
-  démarrer en mode serveur.
-- **Reconnexion client.** Un client peut se (re)connecter à tout moment ; il reçoit le snapshot
-  courant. Si le serveur s'arrête (fin du run), le client doit l'afficher proprement et quitter.
-- **Un seul producteur.** Le serveur est l'instance qui exécute ; les clients sont passifs
-  (affichage + actions relayées). Pas de multi-serveur.
+- **Ephemeral server.** The run is *one-shot* (the engine processes the queue then exits): the server
+  only lives **for the duration of the operation**. So it has to be **launched with `--serve` from the start** —
+  you cannot "attach" a server to a run already launched in bare mode (the same limit as the current
+  TUI, cf. `specs/progress-tui.md §5`). This feature **solves** that gap, provided you
+  start in server mode.
+- **Client reconnection.** A client can (re)connect at any time; it receives the current
+  snapshot. If the server stops (end of run), the client must show that cleanly and exit.
+- **A single producer.** The server is the executing instance; clients are passive
+  (display + relayed actions). No multi-server.
 
-## 6. Liens avec les autres itérations
+## 6. Links with the other iterations
 
-- **`progress-tui.md`** : le *step-sink* « opération i/N » + chrono passe **dans le même hub**,
-  donc les clients distants voient aussi la progression manifeste. Concevoir les deux ensemble :
-  le hub est le point de convergence des messages (poll serveur + step events).
-- **`crash-resumable.md`** : sans rapport direct, mais un client distant rend le suivi d'un long
-  run de maintenance (et ses éventuels skips métadonnée) bien plus pratique.
+- **`progress-tui.md`**: the "operation i/N" *step-sink* + timer goes **through the same hub**,
+  so remote clients also see the manifest progress. Design the two together:
+  the hub is the convergence point for messages (server poll + step events).
+- **`crash-resumable.md`**: not directly related, but a remote client makes following a long
+  maintenance run (and its possible metadata skips) far more practical.
 
-## 7. Estimation d'effort
+## 7. Effort estimate
 
-**Moyen** (quelques jours), dominé par le **transport + le modèle de sécurité**, pas par le TUI :
+**Moderate** (a few days), dominated by the **transport + the security model**, not by the TUI:
 
-| Lot | Taille |
+| Lot | Size |
 |---|---|
-| Hub de diffusion (snapshot + fan-out) côté serveur | petit |
-| Transport SSE (`GET /state`) + `POST /action` | petit-moyen |
-| Mode client `--connect` (réutilise `tui.Model`, reader/writer réseau) | petit |
-| Sérialisation `Msg`/`Action` + type enveloppe | petit |
-| Sécurité : bind localhost, lecture seule, jeton, (TLS) | **moyen — le gros** |
-| Flags/config, tests, doc | moyen |
+| Broadcast hub (snapshot + fan-out) on the server side | small |
+| SSE transport (`GET /state`) + `POST /action` | small-moderate |
+| Client mode `--connect` (reuses `tui.Model`, network reader/writer) | small |
+| `Msg`/`Action` serialization + envelope type | small |
+| Security: localhost bind, read-only, token, (TLS) | **moderate — the bulk** |
+| Flags/config, tests, docs | moderate |
 
-Le modèle Bubble Tea et le protocole de messages **existent déjà** : c'est l'économie principale.
+The Bubble Tea model and the message protocol **already exist**: that is the main saving.
 
-## 8. Questions ouvertes
+## 8. Open questions
 
-- **SSE vs WebSocket** pour la v1 ? (SSE + POST recommandé ; WS si on veut un seul canal bidi.)
-- **Périmètre des actions à distance** : autorise-t-on `KILL` à distance, ou seulement
-  pause/extend, le KILL restant réservé au TUI local ? (sécurité)
-- **Découverte** : port fixe via flag, ou écrit dans un sidecar (`02.processing/…`) pour qu'un
-  `--connect` local le retrouve sans le saisir ?
-- **Plusieurs runs en parallèle** (multi-base, §17) : un port par run, ou un hub multiplexant
-  plusieurs runs sous un même port ?
-- **Réutilisation web** : fige-t-on le format SSE pour pouvoir brancher un dashboard web plus
-  tard sans le casser ?
+- **SSE vs WebSocket** for v1? (SSE + POST recommended; WS if we want a single bidi channel.)
+- **Scope of remote actions**: do we allow `KILL` remotely, or only
+  pause/extend, with KILL reserved for the local TUI? (security)
+- **Discovery**: fixed port via flag, or written into a sidecar (`02.processing/…`) so a local
+  `--connect` can find it without typing it in?
+- **Several runs in parallel** (multi-database, §17): one port per run, or a hub multiplexing
+  several runs under a single port?
+- **Web reuse**: do we freeze the SSE format so a web dashboard can be plugged in later
+  without breaking it?
 
-## 9. Références code (au 2026-06-17)
+## 9. Code references (as of 2026-06-17)
 
-| Sujet | Emplacement |
+| Topic | Location |
 |---|---|
-| Types de messages d'état (protocole) | `internal/tui/model.go:66-84` |
-| Canal d'actions TUI → serveur | `internal/tui/model.go:123,129` ; `internal/tui/program.go:25` |
-| Câblage TUI in-process (à remplacer par le réseau) | `cmd/sqlgopace/main.go:431-456` |
-| Production d'état par poll serveur | `feedConsole` (`cmd/sqlgopace/main.go:459-488`) |
-| Routage des actions vers SQL Server | `dispatchActions` (`cmd/sqlgopace/main.go:514-515`) |
-| Limite « pas d'attache à un run déjà lancé » | `specs/progress-tui.md §5` |
-| Step-sink à faire converger dans le hub | `specs/progress-tui.md §3.0` |
+| State message types (protocol) | `internal/tui/model.go:66-84` |
+| Action channel TUI → server | `internal/tui/model.go:123,129` ; `internal/tui/program.go:25` |
+| In-process TUI wiring (to be replaced by the network) | `cmd/sqlgopace/main.go:431-456` |
+| State production by server poll | `feedConsole` (`cmd/sqlgopace/main.go:459-488`) |
+| Action routing to SQL Server | `dispatchActions` (`cmd/sqlgopace/main.go:514-515`) |
+| Limit "no attaching to an already-running run" | `specs/progress-tui.md §5` |
+| Step-sink to converge into the hub | `specs/progress-tui.md §3.0` |

@@ -1,75 +1,75 @@
-# SHRINK — réduction de fichiers (données & journal)
+# SHRINK — file shrinking (data & log)
 
-> Source de vérité du comportement visé pour la fonctionnalité de shrink de SqlGoPace.
-> Les docs d'analyse brutes restent dans `SQL Server Shrink - Document de référence
-> technique - Perplexity.md` et `gemini-shrink.md` ; ce document fixe le design arrêté.
+> Source of truth for the intended behavior of SqlGoPace's shrink feature.
+> The raw analysis documents remain in `SQL Server Shrink - Document de référence
+> technique - Perplexity.md` and `gemini-shrink.md` — both still in French, kept as
+> historical source material; this document fixes the settled design.
 
-## 1. Objectif et périmètre
+## 1. Goal and scope
 
-Ajouter une opération `shrink` qui réduit la taille physique des fichiers d'une base
-SQL Server, exécutée et surveillée par le moteur existant (queue `01.to_run` →
-`02.processing` → `03.done`/`04.failed`, monitoring de blocage et de journal, hiérarchie
-de réaction la moins destructive).
+Add a `shrink` operation that reduces the physical size of a SQL Server database's files,
+executed and monitored by the existing engine (queue `01.to_run` → `02.processing` →
+`03.done`/`04.failed`, blocking and log monitoring, least-destructive reaction hierarchy).
 
-Le shrink n'est **pas** une opération de maintenance récurrente. L'outil l'exécute quand
-on le lui demande explicitement (purge massive, suppression de tables, réduction de
-périmètre) et fait le maximum pour qu'elle reste **non bloquante, mesurée, reprenable**.
+Shrink is **not** a recurring maintenance operation. The tool runs it when explicitly asked
+to (mass purge, table drops, scope reduction) and does everything it can to keep it
+**non-blocking, measured, resumable**.
 
-### Périmètre v1 (cette spec)
+### v1 scope (this spec)
 
-- Opération `operation: shrink` (`type: data` | `type: log`) exécutable depuis `01.to_run`.
-- **Estimation en preflight** : espace récupérable, détection des no-op, bascule
-  automatique sur `TRUNCATEONLY` quand l'espace libre est en fin de fichier.
-- Shrink de données **par chunks** avec stepsize calibré et ajusté dynamiquement.
-- Shrink de journal **en troncature** (pas de chunking), avec détection du modèle de
-  récupération et refus propre quand la troncature est impossible.
-- `files: all` étendu en une opération par fichier, séquentiellement.
-- Monitoring + réactions intégrés (pause entre chunks, self-wait, no-progress, blocage,
-  journal au-dessus du seuil).
+- `operation: shrink` (`type: data` | `type: log`), runnable from `01.to_run`.
+- **Preflight estimation**: reclaimable space, no-op detection, automatic fallback to
+  `TRUNCATEONLY` when the free space sits at the end of the file.
+- **Chunked** data shrink with a calibrated, dynamically adjusted stepsize.
+- Log shrink **by truncation** (no chunking), with recovery-model detection and a clean
+  refusal when truncation is impossible.
+- `files: all` expanded into one operation per file, run sequentially.
+- Integrated monitoring + reactions (pause between chunks, self-wait, no-progress, blocking,
+  log above threshold).
 
-### Hors périmètre v1 (→ Phase 2, §12)
+### Out of v1 scope (→ Phase 2, §12)
 
-- Rapport de fragmentation avant/après et génération automatique de manifests de
-  défragmentation (enchaînement maintenance post-shrink ; design arrêté §12.1).
-- Mode `EMPTYFILE` + `ALTER DATABASE … REMOVE FILE`.
-- Détection des fichiers shrinkables côté sous-commande `plan` (planner).
-- Pré-allocation/redimensionnement du journal en un bloc après shrink (contrôle des VLF).
+- Before/after fragmentation report and automatic generation of defragmentation manifests
+  (post-shrink maintenance chaining; design settled in §12.1).
+- `EMPTYFILE` mode + `ALTER DATABASE … REMOVE FILE`.
+- Detection of shrinkable files on the `plan` subcommand side (planner).
+- Pre-allocating/resizing the log in one block after a shrink (VLF control).
 
-## 2. Modèle d'opération (YAML)
+## 2. Operation model (YAML)
 
 ```yaml
 - operation: shrink
   type: data            # "data" | "log"
-  files: all            # "all" (tous les fichiers du type) | nom logique d'un fichier
-  emptyfile: false      # réservé Phase 2 ; doit être false (ou absent) en v1
-  targetfreespace: 10%  # espace libre VISÉ dans le fichier final : "10%" ou "100MB"
+  files: all            # "all" (every file of that type) | logical name of one file
+  emptyfile: false      # reserved for Phase 2; must be false (or absent) in v1
+  targetfreespace: 10%  # TARGET free space in the final file: "10%" or "100MB"
   options:
-    wait_at_low_priority: true   # 2022+ uniquement (gaté par le matrix) ; auto si absent
+    wait_at_low_priority: true   # 2022+ only (gated by the matrix); auto when absent
 ```
 
-Champs :
+Fields:
 
-- **`type`** (obligatoire) : `data` ou `log`. Détermine quels fichiers sont éligibles et
-  quel algorithme s'applique (chunking pour `data`, troncature pour `log`).
-- **`files`** (défaut `all`) : `all` étend en une opération par fichier du type donné
-  (voir §6). Sinon, nom logique d'un fichier (`sys.database_files.name`).
-- **`targetfreespace`** : objectif d'espace libre, exprimé **en % de l'espace utilisé**.
+- **`type`** (required): `data` or `log`. Determines which files are eligible and which
+  algorithm applies (chunking for `data`, truncation for `log`).
+- **`files`** (default `all`): `all` expands into one operation per file of the given
+  `type` (see §6). Otherwise, the logical name of a file (`sys.database_files.name`).
+- **`targetfreespace`**: free-space target, expressed **as a % of used space**.
   `N%` ⇒ `final_mb = ceil(used_mb × (1 + N/100))`. `N MB` ⇒ `final_mb = used_mb + N`.
-  Toujours borné par le plancher `SpaceUsed` (§5.1).
-- **`emptyfile`** : réservé Phase 2. En v1, une valeur `true` est rejetée à la validation.
-- **`options.wait_at_low_priority`** : `*bool` « auto » (comme les autres options).
-  `nil` ⇒ décidé par le matrix (ON si 2022+). `ABORT_AFTER_WAIT` reste `SELF` sauf si
-  `Policy.AllowAbortBlockers` est activé globalement (réutilise le champ existant).
+  Always bounded by the `SpaceUsed` floor (§5.1).
+- **`emptyfile`**: reserved for Phase 2. In v1, a `true` value is rejected at validation.
+- **`options.wait_at_low_priority`**: an "auto" `*bool` (like the other options).
+  `nil` ⇒ decided by the matrix (ON on 2022+). `ABORT_AFTER_WAIT` stays `SELF` unless
+  `Policy.AllowAbortBlockers` is enabled globally (reuses the existing field).
 
-**Pas de `maxdop`** : `DBCC SHRINKFILE` n'accepte pas d'option MAXDOP. Toute clé `maxdop`
-sous un shrink est ignorée (ou rejetée à la validation).
+**No `maxdop`**: `DBCC SHRINKFILE` takes no MAXDOP option. Any `maxdop` key under a shrink
+is ignored (or rejected at validation).
 
-`Validate` : `type` ∈ {data, log} ; `targetfreespace` parsable (`%` ou `MB`) et > 0 ;
-`emptyfile` non `true` en v1.
+`Validate`: `type` ∈ {data, log}; `targetfreespace` parsable (`%` or `MB`) and > 0;
+`emptyfile` not `true` in v1.
 
-## 3. Grammaire T-SQL générée
+## 3. Generated T-SQL grammar
 
-Grammaire officielle ciblée :
+Target official grammar:
 
 ```
 DBCC SHRINKFILE
@@ -87,45 +87,45 @@ DBCC SHRINKFILE
 ]
 ```
 
-Conséquences pour le générateur (générateur **dédié**, pas le `withClause` des index) :
+Consequences for the generator (a **dedicated** generator, not the index `withClause`):
 
-- `target_size` est un **entier en Mo**.
-- `WAIT_AT_LOW_PRIORITY` du shrink **n'a pas de `MAX_DURATION`** (timeout fixe ~1 min) et
-  **n'est pas** imbriqué dans `ONLINE = ON`. Il n'existe pas d'`ONLINE` pour DBCC.
-- `TRUNCATEONLY`, `NOTRUNCATE` et `EMPTYFILE` sont mutuellement exclusifs avec un chunk de
-  déplacement ; avec `TRUNCATEONLY`, `target_size` est ignoré par le moteur.
-- On ajoute `NO_INFOMSGS` pour réduire le bruit.
+- `target_size` is an **integer in MB**.
+- Shrink's `WAIT_AT_LOW_PRIORITY` **has no `MAX_DURATION`** (fixed ~1 min timeout) and is
+  **not** nested inside `ONLINE = ON`. There is no `ONLINE` for DBCC.
+- `TRUNCATEONLY`, `NOTRUNCATE` and `EMPTYFILE` are mutually exclusive with a move chunk;
+  with `TRUNCATEONLY`, `target_size` is ignored by the engine.
+- We add `NO_INFOMSGS` to cut down on noise.
 
-Statements types générés :
+Typical generated statements:
 
 ```sql
--- chunk de déplacement (un par itération) ; WAIT_AT_LOW_PRIORITY seulement si résolu ON
+-- move chunk (one per iteration); WAIT_AT_LOW_PRIORITY only if resolved ON
 DBCC SHRINKFILE (N'MyDb_Data', 8192) WITH WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF), NO_INFOMSGS;
 
--- truncate-only (phase A, §7) ; pas de déplacement, pas de fragmentation
+-- truncate-only (phase A, §7); no page movement, no fragmentation
 DBCC SHRINKFILE (N'MyDb_Data', TRUNCATEONLY) WITH NO_INFOMSGS;
 
--- journal
+-- log
 DBCC SHRINKFILE (N'MyDb_Log', 512) WITH NO_INFOMSGS;
 ```
 
-## 4. Détection de version / édition (matrix)
+## 4. Version / edition detection (matrix)
 
-Entrées matrix dédiées, clées par command type `shrink_data` / `shrink_log` × version × tier :
+Dedicated matrix entries, keyed by command type `shrink_data` / `shrink_log` × version × tier:
 
-- `wait_at_low_priority` : éligible **SQL Server 2022 (16.x) et +** uniquement, pour
-  `shrink_data`. (Non pertinent pour `shrink_log` : pas de déplacement de pages, donc pas
-  de verrou Sch-M sur IAM à attendre.)
+- `wait_at_low_priority`: eligible on **SQL Server 2022 (16.x) and later** only, for
+  `shrink_data`. (Not relevant for `shrink_log`: no page movement, hence no Sch-M lock on
+  IAM to wait for.)
 
-`Resolve` produit les `Decision` habituelles pour `--explain`, **sans** appliquer la règle
-« WALP requires ONLINE » (inexistante pour DBCC). `ABORT_AFTER_WAIT = BLOCKERS` n'est émis
-que si `Policy.AllowAbortBlockers` est vrai ; sinon `SELF`.
+`Resolve` produces the usual `Decision`s for `--explain`, **without** applying the
+"WALP requires ONLINE" rule (which doesn't exist for DBCC). `ABORT_AFTER_WAIT = BLOCKERS`
+is emitted only if `Policy.AllowAbortBlockers` is true; otherwise `SELF`.
 
 ## 5. Preflight
 
-### 5.1 Données
+### 5.1 Data
 
-Lire `sys.database_files` + `FILEPROPERTY(name,'SpaceUsed')` (rafraîchir au besoin) :
+Read `sys.database_files` + `FILEPROPERTY(name,'SpaceUsed')` (refresh as needed):
 
 ```sql
 SELECT name, type_desc, file_id,
@@ -136,96 +136,94 @@ FROM sys.database_files
 WHERE type_desc = 'ROWS';
 ```
 
-- **Plancher** : le fichier ne peut pas descendre sous `used_mb`. `final_mb` calculé depuis
-  `targetfreespace` (§2) est clampé à `max(final_mb, ceil(used_mb))`.
-- **No-op** : si `free_mb ≈ 0` ou `final_mb ≥ size_mb`, l'opération est inutile → skip
-  explicite (succès « rien à faire », consigné dans le rapport).
-- **Bascule TRUNCATEONLY** : on tente toujours d'abord une phase truncate-only (§7), gratuite
-  et instantanée, avant tout déplacement.
+- **Floor**: a file cannot go below `used_mb`. The `final_mb` computed from
+  `targetfreespace` (§2) is clamped to `max(final_mb, ceil(used_mb))`.
+- **No-op**: if `free_mb ≈ 0` or `final_mb ≥ size_mb`, the operation is pointless → explicit
+  skip (a "nothing to do" success, recorded in the report).
+- **TRUNCATEONLY fallback**: we always try a truncate-only phase first (§7) — free and
+  instantaneous — before moving anything.
 
-### 5.2 Journal
+### 5.2 Log
 
 ```sql
 SELECT recovery_model_desc, log_reuse_wait_desc
 FROM sys.databases WHERE name = DB_NAME();
 ```
 
-Plancher récupérable = dernier VLF actif (`sys.dm_db_log_info`, `vlf_active = 1`) : on ne
-peut pas tronquer au-delà.
+Reclaimable floor = the last active VLF (`sys.dm_db_log_info`, `vlf_active = 1`): we cannot
+truncate past it.
 
-Décision selon le modèle de récupération (**responsabilité limitée, décision arrêtée**) :
+Decision by recovery model (**limited responsibility, settled decision**):
 
-- **SIMPLE** : un `CHECKPOINT` (inoffensif) est autorisé pour libérer les VLF, puis shrink.
-- **FULL / BULK_LOGGED** :
-  - `log_reuse_wait_desc = NOTHING` ⇒ le log est déjà tronqué (sauvegarde récente) → shrink.
-  - sinon (`LOG_BACKUP`, `ACTIVE_TRANSACTION`, …) ⇒ **attente bornée**, **pas** de refus
-    immédiat. SqlGoPace **n'émet jamais** de `BACKUP LOG` (il ne touche pas la chaîne de
-    sauvegarde), mais il **laisse passer** la sauvegarde de log planifiée de l'environnement :
-    boucle d'attente (réutilise le pattern `awaitRelief`/`waitForRelief`) qui relit
-    `log_reuse_wait_desc` et le plancher VLF sur la cadence de poll du log, en émettant un
-    événement `pause` avec la raison à chaque cycle.
-    - dès que `reuse_wait` repasse à `NOTHING` (sauvegarde passée, VLF de fin devenus
-      inactifs) → shrink.
-    - au-delà de `log_reuse_wait_timeout` → **abandon propre** avec la dernière raison observée.
-  - Note : `LOG_BACKUP` / `ACTIVE_TRANSACTION` sont transitoires (résolus par le job de
-    sauvegarde ou la fin d'une transaction). Des raisons structurelles (`REPLICATION`,
-    `AVAILABILITY_REPLICA`, `DATABASE_MIRRORING`) peuvent ne jamais se résoudre : la même
-    attente bornée s'applique, la raison rapportée à chaque cycle permet à l'opérateur
-    d'interrompre, et le timeout garantit qu'on ne pend pas indéfiniment.
+- **SIMPLE**: a `CHECKPOINT` (harmless) is allowed to free the VLFs, then shrink.
+- **FULL / BULK_LOGGED**:
+  - `log_reuse_wait_desc = NOTHING` ⇒ the log is already truncated (recent backup) → shrink.
+  - otherwise (`LOG_BACKUP`, `ACTIVE_TRANSACTION`, …) ⇒ **bounded wait**, **not** an
+    immediate refusal. SqlGoPace **never issues** a `BACKUP LOG` (it doesn't touch the backup
+    chain), but it **lets the environment's scheduled log backup happen**: a wait loop
+    (reusing the `awaitRelief`/`waitForRelief` pattern) re-reads `log_reuse_wait_desc` and the
+    VLF floor on the log poll cadence, emitting a `pause` event with the reason on each cycle.
+    - as soon as `reuse_wait` returns to `NOTHING` (backup done, trailing VLFs now inactive)
+      → shrink.
+    - past `log_reuse_wait_timeout` → **clean abandon** with the last observed reason.
+  - Note: `LOG_BACKUP` / `ACTIVE_TRANSACTION` are transient (resolved by the backup job or by
+    a transaction finishing). Structural reasons (`REPLICATION`, `AVAILABILITY_REPLICA`,
+    `DATABASE_MIRRORING`) may never resolve: the same bounded wait applies, the reason
+    reported on each cycle lets the operator interrupt, and the timeout guarantees we never
+    hang indefinitely.
 
 ### 5.3 Permissions
 
-`DBCC SHRINKFILE` exige `db_owner` (dans la base ciblée) ou `sysadmin` — `db_ddladmin`
-ne suffit pas. Le preflight le **vérifie de façon proactive** (sonde
-`IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1`) et émet un `Check`
-`permissions` : un login sans le droit échoue **avant tout DBCC**, avec un message
-actionnable rédigé par l'outil, au lieu d'une erreur d'exécution opaque. Le même contrôle
-couvre `check_db` (DBCC CHECKDB requiert les mêmes droits). La sonde ne tourne qu'une fois
-par manifest, et seulement si une opération à droits élevés est présente.
+`DBCC SHRINKFILE` requires `db_owner` (in the target database) or `sysadmin` —
+`db_ddladmin` is not enough. Preflight **checks this proactively** (probe
+`IS_ROLEMEMBER('db_owner') = 1 OR IS_SRVROLEMEMBER('sysadmin') = 1`) and emits a
+`permissions` `Check`: a login without the right fails **before any DBCC**, with an
+actionable message written by the tool, instead of an opaque runtime error. The same check
+covers `check_db` (DBCC CHECKDB requires the same rights). The probe runs only once per
+manifest, and only if a high-privilege operation is present.
 
-## 6. Expansion `files: all`
+## 6. `files: all` expansion
 
-Comme `index: ALL` (voir `expand.go`) : résolu contre `sys.database_files` (filtré par
-`type` : `ROWS` pour data, `LOG` pour log) en **une opération shrink par fichier**, exécutées
-**séquentiellement**. Ne jamais shrinker deux fichiers du même filegroup en parallèle
-(contention sur les tables système) — garanti gratuitement par l'exécution séquentielle du
-moteur.
+Like `index: ALL` (see `expand.go`): resolved against `sys.database_files` (filtered by
+`type`: `ROWS` for data, `LOG` for log) into **one shrink operation per file**, executed
+**sequentially**. Never shrink two files of the same filegroup in parallel (contention on
+the system tables) — guaranteed for free by the engine's sequential execution.
 
-## 7. Driver de chunking (shrink de données)
+## 7. Chunking driver (data shrink)
 
-**Driver dédié** dans `internal/run` (à côté de `MonitoredRunner`, pas une généralisation),
-réutilisant `Executor` (`SPID`/`ExecDDL`/`Kill`), `ServerSampler`, `supervise`/`Pressure`,
-et le pattern de waits en **delta** (`snapshotWaits`/`operationWaits`).
+A **dedicated driver** in `internal/run` (alongside `MonitoredRunner`, not a generalization
+of it), reusing `Executor` (`SPID`/`ExecDDL`/`Kill`), `ServerSampler`, `supervise`/`Pressure`,
+and the **delta** waits pattern (`snapshotWaits`/`operationWaits`).
 
-### 7.1 Algorithme
+### 7.1 Algorithm
 
 ```
-finalTarget := preflight.FinalTargetMB           // §5.1, clampé au plancher
+finalTarget := preflight.FinalTargetMB           // §5.1, clamped to the floor
 startSize   := preflight.SizeMB
 
-// Phase A — truncate-only (gratuit, sans fragmentation)
+// Phase A — truncate-only (free, no fragmentation)
 exec: DBCC SHRINKFILE(file, TRUNCATEONLY)
-relire size ; si size <= finalTarget → terminé
+re-read size; if size <= finalTarget → done
 
-// Phase B — chunks de déplacement
-step := initialStep(startSize - finalTarget)      // heuristique §7.2
+// Phase B — move chunks
+step := initialStep(startSize - finalTarget)      // heuristic §7.2
 current := size
 noProgress := 0
 for current > finalTarget {
     next := max(current - step, finalTarget)
     t0 := clk.Now()
-    action := runChunk(file, next, walp)          // §8 : Continue | pause | abort
-    if action == abort { return reprenable }      // travail conservé
+    action := runChunk(file, next, walp)          // §8: Continue | pause | abort
+    if action == abort { return resumable }       // work is preserved
     elapsed := clk.Since(t0)
 
     newSize := readFileSizeMB(file)
     dWaits  := deltaWaits()                        // WRITELOG, PAGEIOLATCH_EX
     dLog    := deltaLogSpace()
 
-    if newSize >= current {                        // aucun gain (cf. §8.3)
+    if newSize >= current {                        // no gain (cf. §8.3)
         noProgress++
-        if noProgress >= maxNoProgress { return reprenable } // ou attente + retry
-        attendre backoff ; continue
+        if noProgress >= maxNoProgress { return resumable } // or wait + retry
+        wait backoff; continue
     }
     noProgress = 0
     step = adjustStep(step, elapsed, dWaits, dLog) // §7.2
@@ -234,210 +232,212 @@ for current > finalTarget {
 }
 ```
 
-### 7.2 Calibration du stepsize
+### 7.2 Stepsize calibration
 
-Step initial par volume à récupérer (Perplexity §9.2), borne basse de chaque tranche comme
-défaut prudent (l'ajustement dynamique fera monter si l'I/O suit) :
+Initial step by volume to reclaim (Perplexity §9.2), taking the low end of each band as a
+prudent default (dynamic adjustment will raise it if the I/O keeps up):
 
-| Volume à récupérer | step initial (défaut) |
+| Volume to reclaim | initial step (default) |
 |--------------------|-----------------------|
-| < 5 Go             | 100 Mo                |
-| 5–50 Go            | 250 Mo                |
-| > 50 Go            | 500 Mo                |
+| < 5 GB             | 100 MB                |
+| 5–50 GB            | 250 MB                |
+| > 50 GB            | 500 MB                |
 
-Ajustement entre chunks, sur les **deltas** (jamais les valeurs cumulées de
-`sys.dm_os_wait_stats`) :
+Adjustment between chunks, on **deltas** (never the cumulative values of
+`sys.dm_os_wait_stats`):
 
-- **Réduire** (`step/2`, borné par `minStep`) si : `WRITELOG` avg > 10 ms, ou
-  `PAGEIOLATCH_EX` avg > 20 ms, ou blocage d'autres sessions > 30 s.
-- **Augmenter** (`step*2`, borné par `maxStep`) si : latences I/O < 5 ms, pas de wait
-  significatif, `log_space_since_backup` faible, et `elapsed < targetBatchDuration`.
+- **Reduce** (`step/2`, bounded by `minStep`) if: `WRITELOG` avg > 10 ms, or
+  `PAGEIOLATCH_EX` avg > 20 ms, or blocking of other sessions > 30 s.
+- **Increase** (`step*2`, bounded by `maxStep`) if: I/O latencies < 5 ms, no significant
+  wait, low `log_space_since_backup`, and `elapsed < targetBatchDuration`.
 
-### 7.3 Défauts proposés (bloc `shrink:` de `config.yaml`)
+### 7.3 Proposed defaults (`shrink:` block in `config.yaml`)
 
 ```yaml
 shrink:
-  initial_step_small_mb:  100   # volume à récupérer < 5 Go
-  initial_step_medium_mb: 250   # 5–50 Go
-  initial_step_large_mb:  500   # > 50 Go
-  min_step_mb:             50    # en deçà, l'overhead par boucle domine le gain
-  max_step_mb:           1024    # plafond pour ne pas saturer l'I/O d'un coup
-  target_batch_seconds:     5    # un chunk « idéal » dure quelques s → réactions vives
-  max_no_progress:          3    # chunks sans gain consécutifs avant arrêt propre
-  no_progress_backoff_seconds:      30   # attente avant retry, doublée à chaque no-progress
-  no_progress_backoff_max_seconds: 300   # plafond du backoff (5 min)
-  self_wait_timeout_minutes: 5   # attente max sur Sch-M / snapshot avant arrêt propre (§8.2)
-  log_reuse_wait_timeout_minutes: 30  # attente max qu'un BACKUP LOG planifié libère le log (§5.2)
+  initial_step_small_mb:  100   # volume to reclaim < 5 GB
+  initial_step_medium_mb: 250   # 5–50 GB
+  initial_step_large_mb:  500   # > 50 GB
+  min_step_mb:             50    # below this, per-loop overhead dominates the gain
+  max_step_mb:           1024    # cap so we don't saturate the I/O in one go
+  target_batch_seconds:     5    # an "ideal" chunk lasts a few s → snappy reactions
+  max_no_progress:          3    # consecutive chunks without gain before a clean stop
+  no_progress_backoff_seconds:      30   # wait before retry, doubled on each no-progress
+  no_progress_backoff_max_seconds: 300   # backoff cap (5 min)
+  self_wait_timeout_minutes: 5   # max wait on Sch-M / snapshot before a clean stop (§8.2)
+  log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free the log (§5.2)
 ```
 
-`log_reuse_wait_timeout_minutes` par défaut à 30 min : marge pour un ou deux cycles d'une
-cadence de sauvegarde de log courante (~15 min). L'attente est gratuite (le shrink n'a pas
-démarré) et émet un `pause` par cycle, donc interruptible.
+`log_reuse_wait_timeout_minutes` defaults to 30 min: room for one or two cycles of a common
+log backup cadence (~15 min). The wait is free (the shrink hasn't started) and emits a
+`pause` per cycle, so it is interruptible.
 
-**Configurabilité** : bloc **global**, **tous les champs optionnels** (absent ⇒ défaut
-appliqué, comme `MonitoringConfig`) — un `config.yaml` sans bloc `shrink:` fonctionne. Niveau
-**global uniquement, jamais par-manifest** : ces valeurs dépendent du stockage et du SLA de
-l'instance, pas de l'opération ; le manifest ne porte que ses `options:` métier. Elles sont
-des **points de départ et des bornes** que l'ajustement dynamique (§7.2) fait varier ;
-l'esprit reste « auto-calibré », un opérateur n'y touche que pour un stockage atypique.
+**Configurability**: a **global** block, **all fields optional** (absent ⇒ default applied,
+like `MonitoringConfig`) — a `config.yaml` with no `shrink:` block works. **Global only,
+never per-manifest**: these values depend on the instance's storage and SLA, not on the
+operation; a manifest carries only its business `options:`. They are **starting points and
+bounds** that the dynamic adjustment (§7.2) moves around; the spirit stays "self-calibrating",
+and an operator only touches them for atypical storage.
 
-Seuils de tranches (`< 5 Go`, `5–50 Go`) en constantes documentées (non exposés). Les
-durées de réaction transverses (`blocking_timeout_minutes`, `log_drain_timeout_minutes`,
-`kill_grace_seconds`) restent celles de `MonitoringConfig`, réutilisées par le driver.
+Band thresholds (`< 5 GB`, `5–50 GB`) are documented constants (not exposed). The
+cross-cutting reaction durations (`blocking_timeout_minutes`, `log_drain_timeout_minutes`,
+`kill_grace_seconds`) stay those of `MonitoringConfig`, reused by the driver.
 
-## 8. Réactions et pression
+## 8. Reactions and pressure
 
-Le shrink est l'opération la **plus** sûre à interrompre : chaque batch interne (~32 pages)
-est une transaction propre ; arrêter le shrink **conserve le travail déjà fait** et il est
-ré-entrant (relancer vers la même cible reprend). La réaction la moins destructive n'est
-donc même pas un cancel.
+Shrink is the **safest** operation to interrupt: each internal batch (~32 pages) is a clean
+transaction; stopping the shrink **preserves the work already done** and it is re-entrant
+(re-running toward the same target picks up where it left off). So the least destructive
+reaction isn't even a cancel.
 
-### 8.1 Pause « gratuite » entre chunks
+### 8.1 "Free" pause between chunks
 
-Sous pression (blocage d'autres sessions au-delà du timeout, ou journal au-dessus du seuil),
-le driver **ne lance pas le chunk suivant** et attend la détente (réutilise la logique de
-`awaitRelief`/`waitForRelief` et le `logDrainTimeout`). Aucun rollback : le travail des
-chunks précédents est déjà commité. C'est plus doux que le pause/resume d'un rebuild.
+Under pressure (blocking of other sessions past the timeout, or log above the threshold),
+the driver **doesn't launch the next chunk** and waits for relief (reusing the
+`awaitRelief`/`waitForRelief` logic and `logDrainTimeout`). No rollback: the work of the
+previous chunks is already committed. This is gentler than a rebuild's pause/resume.
 
-Événements `ReactionSink` réutilisés : `pause` (attente), `resume` (« pressure cleared »),
-`abort` (arrêt propre, travail conservé). Un chunk en cours qui doit être stoppé passe par
-le même chemin que `runStatement` : annulation douce via le `context` de la connexion
-d'exécution, puis **`KILL` en fallback émis depuis le pool de monitoring** (voir §8.5).
+Reused `ReactionSink` events: `pause` (waiting), `resume` ("pressure cleared"), `abort`
+(clean stop, work preserved). A running chunk that has to be stopped goes down the same path
+as `runStatement`: soft cancellation via the execution connection's `context`, then a
+**`KILL` fallback issued from the monitoring pool** (see §8.5).
 
-### 8.2 Self-wait (nouvelle dimension de pression)
+### 8.2 Self-wait (a new pressure dimension)
 
-Le shrink peut être **bloqué par** d'autres sessions (transactions snapshot RCSI/SI →
-messages 5202/5203 ; attente `LCK_M_SCH_M`). Le modèle actuel ne couvre que
-`Pressure.BlockingOthers`. Ajouter la détection « on attend » via les waits de **notre**
-session (`sys.dm_exec_requests` / `SessionWaits` sur notre SPID) :
+A shrink can be **blocked by** other sessions (RCSI/SI snapshot transactions → messages
+5202/5203; `LCK_M_SCH_M` wait). The current model only covers `Pressure.BlockingOthers`. Add
+"we are waiting" detection via **our own** session's waits (`sys.dm_exec_requests` /
+`SessionWaits` on our SPID):
 
-- `LCK_M_SCH_M` (ou `LCK_M_SCH_M_LOW_PRIORITY`) prolongé, ou blocage par snapshot :
-  privilégier **l'attente** (le shrink reprendra), puis **arrêt propre** si l'attente
-  dépasse un seuil (le travail est conservé).
+- prolonged `LCK_M_SCH_M` (or `LCK_M_SCH_M_LOW_PRIORITY`), or blocking by a snapshot:
+  prefer **waiting** (the shrink will resume), then a **clean stop** if the wait exceeds a
+  threshold (the work is preserved).
 
-### 8.3 No-progress / timeout WALP 49516 silencieux
+### 8.3 No-progress / silent WALP 49516 timeout
 
-En `WAIT_AT_LOW_PRIORITY`, si le verrou Sch-M n'est pas obtenu en ~1 min, le shrink
-**se termine sans erreur visible et sans avoir rien fait** (erreur 49516 seulement dans le
-log SQL Server). On ne peut donc pas se fier au code retour. Détection par **comparaison de
-taille** : si `newSize >= current` après un chunk (49516, ou données en fin de fichier qui
-ne peuvent pas être déplacées), incrémenter un compteur no-progress → backoff + retry, puis
-arrêt propre au-delà de `maxNoProgress`.
+Under `WAIT_AT_LOW_PRIORITY`, if the Sch-M lock isn't acquired within ~1 min, the shrink
+**finishes with no visible error and without having done anything** (error 49516 appears only
+in the SQL Server log). So the return code can't be trusted. Detection by **size comparison**:
+if `newSize >= current` after a chunk (49516, or data at the end of the file that can't be
+moved), increment a no-progress counter → backoff + retry, then a clean stop past
+`maxNoProgress`.
 
-### 8.4 Journal pendant un shrink de données
+### 8.4 Log during a data shrink
 
-Un shrink de données **génère lui-même du log** (chaque page déplacée est loguée). Le
-sampler `Log` existant (seuil `LogOverCap`) s'applique tel quel : au-dessus du seuil, pause
-entre chunks et réduction du stepsize au chunk suivant.
+A data shrink **generates log itself** (every moved page is logged). The existing `Log`
+sampler (`LogOverCap` threshold) applies as-is: above the threshold, pause between chunks and
+reduce the stepsize for the next chunk.
 
-### 8.5 KILL de sa propre session — détail d'implémentation critique
+### 8.5 KILL of one's own session — critical implementation detail
 
-On ne peut pas `KILL` sa propre session depuis la connexion qui exécute le DDL. `Conn` garde
-**deux** connexions : `exec` (épinglée, `@@SPID` stable) et `pool` (monitoring). `Conn.Kill`
-émet `KILL <spid>` **sur le pool**, jamais sur `exec`. Le driver shrink **doit** passer par
-l'interface `Executor` (`ExecDDL` sur `exec`, `Kill` via le pool) pour hériter de cette
-garantie ; ne pas ouvrir de chemin d'exécution parallèle qui contournerait ce partage.
+You cannot `KILL` your own session from the connection executing the DDL. `Conn` keeps
+**two** connections: `exec` (pinned, stable `@@SPID`) and `pool` (monitoring). `Conn.Kill`
+issues `KILL <spid>` **on the pool**, never on `exec`. The shrink driver **must** go through
+the `Executor` interface (`ExecDDL` on `exec`, `Kill` via the pool) to inherit that
+guarantee; do not open a parallel execution path that would bypass this split.
 
-## 9. Progression, reporting, TUI
+## 9. Progress, reporting, TUI
 
-- **Progression déterministe** (avantage du chunking, contrairement au `percent_complete`
-  fluctuant de `dm_exec_requests`) : `(startSize - currentSize) / (startSize - finalTarget)`.
-  À alimenter dans le `Model` du TUI à la place de `operationPercent` pour le shrink.
-- **Log par chunk** : cible visée, taille obtenue, durée, stepsize, deltas de waits / log.
-- **Rapport `.log` + history** : `initial_size`, `final_size`, espace gagné, durée totale,
-  nombre de chunks, réactions, et la version `--version` ayant produit le run (comme le reste).
+- **Deterministic progress** (an advantage of chunking, unlike the fluctuating
+  `percent_complete` of `dm_exec_requests`): `(startSize - currentSize) / (startSize - finalTarget)`.
+  To be fed into the TUI's `Model` in place of `operationPercent` for shrink.
+- **Per-chunk log**: target aimed for, size obtained, duration, stepsize, waits/log deltas.
+- **`.log` report + history**: `initial_size`, `final_size`, space reclaimed, total duration,
+  chunk count, reactions, and the `--version` that produced the run (as everywhere else).
 
-## 10. Recovery / ré-entrance
+## 10. Recovery / re-entrancy
 
-Un shrink interrompu (crash moteur, perte de connexion) est trivialement reprenable :
-relancer `DBCC SHRINKFILE` vers la même cible reprend là où on en était (le travail commité
-persiste). Le `Recoverer` database-aware existant s'applique : un orphelin dont la base est
-injoignable (ex. devenue secondaire AG) est laissé pour un run ultérieur. Aucune sous-commande
-`abort-shrink` n'est nécessaire (l'opération est déjà sûre à arrêter).
+An interrupted shrink (engine crash, connection loss) is trivially resumable: re-running
+`DBCC SHRINKFILE` toward the same target picks up where it stopped (committed work
+persists). The existing database-aware `Recoverer` applies: an orphan whose database is
+unreachable (e.g. now an AG secondary) is left for a later run. No `abort-shrink` subcommand
+is needed (the operation is already safe to stop).
 
-## 11. Erreurs et messages à connaître
+## 11. Errors and messages to know
 
-| Code / signal | Type | Signification | Action SqlGoPace |
+| Code / signal | Type | Meaning | SqlGoPace action |
 |---------------|------|---------------|------------------|
-| 5202 / 5203 | Informatif (log SQL) | Shrink bloqué par une transaction snapshot | Self-wait (§8.2) : attendre, puis arrêt propre |
-| 49516 | Erreur Level 16 (log SQL) | Timeout WALP, Sch-M non obtenu | No-progress (§8.3) : backoff + retry |
-| 9002 | Erreur | Transaction log full | Pause + réduire le stepsize (§8.4) |
-| Pas de réduction | Normal | Espace libre absent ou pas en fin de fichier | TRUNCATEONLY déjà tenté ; no-progress → arrêt propre |
-| Log non shrinkable | Normal | VLF actifs en fin, ou `log_reuse_wait ≠ NOTHING` | Attente bornée que le log se libère (§5.2), jamais de BACKUP LOG ; abandon propre au timeout |
-| Droits insuffisants | Erreur (DBCC) | Login non `db_owner`/`sysadmin` sur la base | **Capté en preflight** (§5.3) : `Check` `permissions` en échec, message actionnable, avant tout DBCC |
+| 5202 / 5203 | Informational (SQL log) | Shrink blocked by a snapshot transaction | Self-wait (§8.2): wait, then clean stop |
+| 49516 | Level 16 error (SQL log) | WALP timeout, Sch-M not acquired | No-progress (§8.3): backoff + retry |
+| 9002 | Error | Transaction log full | Pause + reduce the stepsize (§8.4) |
+| No reduction | Normal | No free space, or not at the end of the file | TRUNCATEONLY already tried; no-progress → clean stop |
+| Log not shrinkable | Normal | Active VLFs at the end, or `log_reuse_wait ≠ NOTHING` | Bounded wait for the log to free up (§5.2), never a BACKUP LOG; clean abandon at timeout |
+| Insufficient rights | Error (DBCC) | Login not `db_owner`/`sysadmin` on the database | **Caught in preflight** (§5.3): failing `permissions` `Check`, actionable message, before any DBCC |
 
-## 12. Phase 2 (hors v1)
+## 12. Phase 2 (out of v1)
 
-- **Fragmentation avant/après & enchaînement maintenance** : `sys.dm_db_index_physical_stats` ;
-  comparer et **générer des manifests `rebuild_index`/`reorganize_index` dans `01.to_run`**
-  (réutilisation du pipeline et du planner) ; automatisation **post-shrink**. Design arrêté en §12.1.
-- **`EMPTYFILE`** : migration du contenu vers les autres fichiers du filegroup, puis
+- **Before/after fragmentation & maintenance chaining**: `sys.dm_db_index_physical_stats`;
+  compare and **generate `rebuild_index`/`reorganize_index` manifests in `01.to_run`**
+  (reusing the pipeline and the planner); **post-shrink** automation. Design settled in §12.1.
+- **`EMPTYFILE`**: migrate the content to the filegroup's other files, then
   `ALTER DATABASE … REMOVE FILE`.
-- **Détection côté `plan`** : repérage des fichiers shrinkables comme la maintenance.
-- **Pré-allocation du journal** après shrink (un seul `ALTER DATABASE … MODIFY FILE`) pour
-  contrôler le nombre de VLF.
+- **Detection on the `plan` side**: spotting shrinkable files, like maintenance does.
+- **Log pre-allocation** after a shrink (a single `ALTER DATABASE … MODIFY FILE`) to control
+  the VLF count.
 
-### 12.1 Enchaînement maintenance post-shrink (design arrêté pour Phase 2)
+### 12.1 Post-shrink maintenance chaining (design settled for Phase 2)
 
-**Besoin.** Un shrink de **données** fragmente les index par construction (les pages sont
-déplacées vers l'avant du fichier, ce qui désordonne l'ordre physique des index). Il est donc
-naturel de vouloir le **faire suivre d'une défragmentation**. La question posée : « ajouter une
-option dans l'opération `shrink` pour enchaîner automatiquement un `plan --auto` ? ».
+**The need.** A **data** shrink fragments indexes by construction (pages are moved toward the
+front of the file, which scrambles the indexes' physical order). It is therefore natural to
+want to **follow it with a defragmentation**. The question raised: "add an option to the
+`shrink` operation to automatically chain a `plan --auto`?".
 
-**Décision de couche — ce n'est PAS un champ de l'opération `shrink`.** Trois raisons arrêtent
-ce choix :
+**Layering decision — this is NOT a field of the `shrink` operation.** Three reasons settle
+this choice:
 
-1. **Une `operation` est une unité DDL déclarative et mono-objet** (parse → resolve → generate
-   → plan). L'enchaînement « fais X puis génère/exécute Y » est de l'**orchestration**, qui vit
-   dans `cmd/sqlgopace` et le moteur, pas dans la définition d'une opération. Mettre un
-   `maintain_after: true` dans le YAML du shrink mélangerait les deux niveaux.
-2. **Pas de couplage `run → maint`.** Aujourd'hui `internal/run` n'importe pas `internal/maint`
-   (séparation pure-core / planner). Faire appeler le planificateur depuis `processOne`
-   introduirait ce couplage dans le chemin chaud du moteur. À éviter.
-3. **Le seam existe déjà.** `--auto` (`runAuto`, `cmd/sqlgopace/plan.go`) *est* le mécanisme
-   « analyser la base connectée → générer des manifests de maintenance dans `to_run` → laisser
-   le moteur les traiter comme n'importe quel manifest ». On le **réutilise**, on ne le duplique
-   pas.
+1. **An `operation` is a declarative, single-object DDL unit** (parse → resolve → generate
+   → plan). Chaining "do X then generate/execute Y" is **orchestration**, which lives in
+   `cmd/sqlgopace` and the engine, not in an operation's definition. Putting a
+   `maintain_after: true` in the shrink's YAML would mix the two levels.
+2. **No `run → maint` coupling.** Today `internal/run` does not import `internal/maint`
+   (pure-core / planner separation). Calling the planner from `processOne` would introduce
+   that coupling into the engine's hot path. To be avoided.
+3. **The seam already exists.** `--auto` (`runAuto`, `cmd/sqlgopace/plan.go`) *is* the
+   "analyze the connected database → generate maintenance manifests in `to_run` → let the
+   engine process them like any other manifest" mechanism. We **reuse** it, we don't
+   duplicate it.
 
-**Piège SQL Server décisif — le `REBUILD` re-grossit le fichier.** Un `ALTER INDEX … REBUILD`
-a besoin d'un espace de travail ≈ la taille du plus gros index/partition reconstruit ; sur un
-fichier qu'on vient de shrinker, il **re-fait croître le fichier de données** et peut donc
-**annuler une partie de l'espace récupéré**. `REORGANIZE` est in-place (pas de re-croissance
-notable). Conséquence directe sur le design : l'enchaînement post-shrink **biaise `REORGANIZE`
-par défaut**, et `REBUILD` n'est émis que sur **opt-in explicite** de l'opérateur, accompagné de
-l'avertissement « le rebuild re-grossit le fichier ». C'est précisément le genre d'arbitrage qui
-doit **rester relu par un humain** plutôt que caché derrière un booléen d'opération.
+**Decisive SQL Server pitfall — `REBUILD` grows the file back.** An `ALTER INDEX … REBUILD`
+needs working space ≈ the size of the largest index/partition being rebuilt; on a file we
+have just shrunk, it **grows the data file back** and can therefore **undo part of the
+reclaimed space**. `REORGANIZE` is in-place (no notable re-growth). Direct consequence for the
+design: post-shrink chaining **biases toward `REORGANIZE` by default**, and `REBUILD` is
+emitted only on the operator's **explicit opt-in**, accompanied by the warning "a rebuild
+grows the file back". This is exactly the kind of trade-off that must **stay reviewed by a
+human** rather than hidden behind an operation boolean.
 
-**Forme retenue.** Une orchestration au niveau **run**, pas opération, et un **manifest relu,
-pas une exécution silencieuse** :
+**Chosen shape.** Orchestration at the **run** level, not the operation level, and a
+**reviewed manifest, not a silent execution**:
 
-- Un flag de run, p. ex. `--maintain-after-shrink` (nom à confirmer à l'implémentation).
-- **Périmètre** : ne s'applique qu'après un shrink **`data`** réussi (un shrink `log` ne
-  fragmente pas les index → rien à enchaîner). Restreint aux **bases effectivement shrinkées**
-  dans le run.
-- **Mesure post-shrink** : la fragmentation est lue **après** la fin du shrink (état réel
-  post-déplacement de pages), via le planner existant (`internal/maint` + `dm_db_index_physical_stats`).
-- **Génération** : le planner produit un manifest de défrag déposé dans `to_run/` (réutilisation
-  de `runAuto`/`writeManifests`), **biaisé `REORGANIZE`** (voir piège ci-dessus).
-- **Relu par défaut** : le manifest généré **attend en file** pour relecture. Il ne **s'exécute**
-  que si le run est déjà en `--auto` (cohérent avec la sémantique « `--auto` = non supervisé »).
-  Sans `--auto`, on a déposé un manifest reviewable, rien de plus.
-- **`REBUILD`** : seulement si un opt-in explicite est fourni (p. ex. `--post-shrink-allow-rebuild`,
-  ou un profil de maintenance dédié `reorganize-only` levé volontairement). Sinon, `REORGANIZE`
-  uniquement.
+- A run flag, e.g. `--maintain-after-shrink` (name to be confirmed at implementation).
+- **Scope**: applies only after a successful **`data`** shrink (a `log` shrink doesn't
+  fragment indexes → nothing to chain). Restricted to the **databases actually shrunk** in
+  the run.
+- **Post-shrink measurement**: fragmentation is read **after** the shrink finishes (the real
+  post-page-movement state), via the existing planner (`internal/maint` +
+  `dm_db_index_physical_stats`).
+- **Generation**: the planner produces a defrag manifest dropped into `to_run/` (reusing
+  `runAuto`/`writeManifests`), **biased toward `REORGANIZE`** (see the pitfall above).
+- **Reviewed by default**: the generated manifest **waits in the queue** for review. It only
+  **executes** if the run is already in `--auto` (consistent with the "`--auto` = unsupervised"
+  semantics). Without `--auto`, we've dropped a reviewable manifest, nothing more.
+- **`REBUILD`**: only if an explicit opt-in is given (e.g. `--post-shrink-allow-rebuild`, or a
+  dedicated `reorganize-only` maintenance profile deliberately lifted). Otherwise,
+  `REORGANIZE` only.
 
-**Ce que ça réutilise (rien de neuf côté exécution).** Le planner (`internal/maint`), le pipeline
-`ddl`/`render`, `writeManifests`, et le moteur + monitoring + réactions existants. Aucun nouveau
-chemin d'exécution ni nouvelle dépendance dans le cœur pur : l'ajout est circonscrit à la couche
-`cmd/sqlgopace` (le flag, l'appel au planner après le shrink, l'écriture du manifest).
+**What this reuses (nothing new on the execution side).** The planner (`internal/maint`), the
+`ddl`/`render` pipeline, `writeManifests`, and the existing engine + monitoring + reactions.
+No new execution path and no new dependency in the pure core: the addition is confined to the
+`cmd/sqlgopace` layer (the flag, the call to the planner after the shrink, writing the
+manifest).
 
-**Alternative écartée.** Un champ `maintain_after` sur l'opération `shrink` : rejeté pour les
-raisons de couche (1–3) et parce qu'il rendrait l'auto-rebuild trop facile à déclencher sans
-relecture, en contradiction avec le piège du re-grossissement.
+**Rejected alternative.** A `maintain_after` field on the `shrink` operation: rejected for the
+layering reasons (1–3) and because it would make auto-rebuild too easy to trigger without
+review, contradicting the re-growth pitfall.
 
-## 13. Requêtes de référence
+## 13. Reference queries
 
-### Espace libre des fichiers de données
+### Free space in data files
 ```sql
 SELECT name, type_desc,
        size/128.0                                              AS size_mb,
@@ -446,7 +446,7 @@ SELECT name, type_desc,
 FROM sys.database_files;
 ```
 
-### Portion active du journal (plancher récupérable)
+### Active portion of the log (reclaimable floor)
 ```sql
 SELECT file_id, vlf_begin_offset, vlf_size_mb, vlf_sequence_number, vlf_active, vlf_status
 FROM sys.dm_db_log_info(DB_ID())
@@ -458,13 +458,13 @@ SELECT total_log_size_in_bytes/1048576.0 AS total_log_mb,
 FROM sys.dm_db_log_space_usage;
 ```
 
-### Raison de non-troncature du journal
+### Reason the log can't be truncated
 ```sql
 SELECT name, recovery_model_desc, log_reuse_wait_desc
 FROM sys.databases WHERE name = DB_NAME();
 ```
 
-### Progression native (diagnostic ; on préfère la progression par chunks, §9)
+### Native progress (diagnostic; we prefer per-chunk progress, §9)
 ```sql
 SELECT session_id, command, percent_complete,
        estimated_completion_time/1000/60 AS est_min_left,
@@ -473,7 +473,7 @@ FROM sys.dm_exec_requests
 WHERE command IN ('DbccFilesCompact', 'DbccSpaceReclaim');
 ```
 
-### Waits critiques (à lire en delta)
+### Critical waits (to be read as deltas)
 ```sql
 SELECT wait_type, wait_time_ms, waiting_tasks_count
 FROM sys.dm_os_wait_stats
@@ -481,14 +481,13 @@ WHERE wait_type IN ('PAGEIOLATCH_EX','PAGEIOLATCH_SH','WRITELOG',
                     'LCK_M_SCH_M','LCK_M_SCH_M_LOW_PRIORITY');
 ```
 
-## 14. Points encore ouverts
+## 14. Still-open points
 
-- Aucun point bloquant. Conventions arrêtées : `targetfreespace` en % de l'espace **utilisé**
-  (`final = ceil(used × (1 + N/100))`, §2) ; défauts du driver figés (§7.3). Ces défauts
-  restent à valider empiriquement lors des tests e2e (calibration I/O réelle).
-- **Enchaînement maintenance post-shrink** : design tranché (§12.1) — orchestration au niveau
-  run (flag `--maintain-after-shrink`) réutilisant `--auto`, manifest relu déposé dans `to_run`,
-  biais `REORGANIZE` (le `REBUILD` re-grossit le fichier), **pas** un champ d'opération. Reste à
-  confirmer à l'implémentation : nom exact du flag et forme de l'opt-in `REBUILD`.
-</content>
-</invoke>
+- No blocking point. Settled conventions: `targetfreespace` as a % of **used** space
+  (`final = ceil(used × (1 + N/100))`, §2); driver defaults frozen (§7.3). Those defaults
+  still need empirical validation during the e2e tests (real I/O calibration).
+- **Post-shrink maintenance chaining**: design settled (§12.1) — orchestration at the run
+  level (`--maintain-after-shrink` flag) reusing `--auto`, a reviewed manifest dropped into
+  `to_run`, biased toward `REORGANIZE` (`REBUILD` grows the file back), **not** an operation
+  field. Still to confirm at implementation: the exact flag name and the shape of the
+  `REBUILD` opt-in.

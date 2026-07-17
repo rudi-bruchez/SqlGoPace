@@ -1,157 +1,157 @@
-# Spec métier — Progression d'un manifeste (compteur, chrono, bloqués)
+# Functional spec — Progress of a manifest (counter, timer, blocked sessions)
 
-> **Statut : items 1, 2 et 3 implémentés.** Le *step-sink* moteur (`run.WithStepSink` /
-> `run.StepEvent`, émis en haut/bas de la boucle d'ops) alimente **stdout** (`-- [i/N] cmd cible —
-> started` / `— <outcome> in Xs`, items 1+2) et le **TUI** (compteur op i/N + chrono live via un tick
-> 1 s ; item 2) — livré avec BATCH-DML It3. **Item 3** : sur chaque réaction (pause/cancel/abort) le
-> compte de sessions bloquées est intégré à la narration (`… ; blocking N session(s)`, stdout +
-> `.log`), le **pic par op** est enregistré dans le `.log` (`peak blocked: N session(s)`) et le pic
-> manifeste dans l'history (colonne `runs.peak_blocked`, via migration `ALTER TABLE`). Reste (DRAFT) :
-> la persistance i/N dans `State` (§3.1, pour un affichage de reprise — à arbitrer avec le skip
-> métadonnée de `crash-resumable.md`). Créé le 2026-06-17, suite à l'essai de compression
-> `030_compress_exampledb_indexes.yaml` (74 rebuilds offline sur `EXAMPLEDB`), où l'on a constaté
-> l'absence de progression lisible.
+> **Status: items 1, 2 and 3 implemented.** The engine *step sink* (`run.WithStepSink` /
+> `run.StepEvent`, emitted at the top/bottom of the op loop) feeds **stdout** (`-- [i/N] cmd target —
+> started` / `— <outcome> in Xs`, items 1+2) and the **TUI** (op counter i/N + live timer via a 1 s
+> tick; item 2) — shipped with BATCH-DML It3. **Item 3**: on every reaction (pause/cancel/abort) the
+> blocked-session count is folded into the narration (`… ; blocking N session(s)`, stdout +
+> `.log`), the **per-op peak** is recorded in the `.log` (`peak blocked: N session(s)`) and the
+> manifest peak in the history (column `runs.peak_blocked`, via an `ALTER TABLE` migration). Remaining
+> (DRAFT): persisting i/N in `State` (§3.1, for a resume display — to be weighed against the metadata
+> skip in `crash-resumable.md`). Created on 2026-06-17, following the compression run
+> `030_compress_exampledb_indexes.yaml` (74 offline rebuilds on `EXAMPLEDB`), where we found there was
+> no readable progress.
 
-## 1. Objectif
+## 1. Goal
 
-Donner à l'opérateur une **progression lisible** pendant qu'un manifeste s'exécute, en mode
-stdout (run en arrière-plan) **et** dans le TUI :
+Give the operator **readable progress** while a manifest runs, both in stdout mode (background run)
+**and** in the TUI:
 
-1. **Compteur niveau manifeste « opération i / N ».**
-2. **Chronomètre de l'opération en cours** (quelle op, depuis combien de temps).
-3. **Nombre de sessions bloquées** par l'opération (déjà présent dans le TUI — à confirmer/étendre).
+1. **Manifest-level counter "operation i / N".**
+2. **Timer for the current operation** (which op, and for how long).
+3. **Number of sessions blocked** by the operation (already present in the TUI — to confirm/extend).
 
-Motivation : sur du **Standard**, les rebuilds sont **offline** et SQL Server **ne renseigne pas**
-`percent_complete` (cf. §3.2) ; la seule jauge actuelle du TUI reste donc à 0 %. Une progression
-*au niveau manifeste* (i/N + chrono) est indépendante de ce que le serveur veut bien rapporter.
+Motivation: on **Standard**, rebuilds are **offline** and SQL Server **does not populate**
+`percent_complete` (see §3.2); the TUI's only current gauge therefore stays at 0%. Progress *at the
+manifest level* (i/N + timer) does not depend on what the server chooses to report.
 
-## 2. État actuel observé
+## 2. Current state observed
 
-### 2.1 Le moteur a déjà l'information, il ne l'expose pas
+### 2.1 The engine already has the information, it just doesn't expose it
 
-La boucle d'exécution connaît tout ce qu'il faut (`internal/run/engine.go:286-287`) :
+The execution loop knows everything needed (`internal/run/engine.go:286-287`):
 
 ```go
-for i, step := range planned {        // i = index 0-based ; len(planned) = N (après expansion/plan)
-    opStart := e.clk.Now()            // début de l'op : le chrono est déjà calculé
+for i, step := range planned {        // i = 0-based index; len(planned) = N (after expansion/plan)
+    opStart := e.clk.Now()            // start of the op: the timer is already computed
     ...
 }
 ```
 
-`opTarget(step.Operation)` donne déjà le libellé de la cible (utilisé en `engine.go:299`). Mais le
-moteur ne narre **aucune** ligne « début d'op i/N » : il n'écrit que les événements manifeste
-(`skip`/`complete`/`fail`/`done`) et les événements de réaction (`engine.go:299`). D'où un log de run
-quasi muet entre le départ et la fin (constaté : seules les 2 lignes d'en-tête).
+`opTarget(step.Operation)` already yields the target label (used at `engine.go:299`). But the engine
+narrates **no** "op i/N started" line: it only writes the manifest events
+(`skip`/`complete`/`fail`/`done`) and the reaction events (`engine.go:299`). Hence a run log that is
+nearly silent between start and finish (observed: only the 2 header lines).
 
-### 2.2 Le TUI est découplé du moteur (poll serveur uniquement)
+### 2.2 The TUI is decoupled from the engine (server polling only)
 
-`runWithTUI` (`cmd/sqlgopace/main.go:431-456`) lance en parallèle :
+`runWithTUI` (`cmd/sqlgopace/main.go:431-456`) starts in parallel:
 
-- `engine.ProcessAll` dans une goroutine, qui écrit dans **`io.Discard`** en mode TUI ;
-- `feedConsole` (`main.go:459-488`) qui **interroge le serveur** et envoie au TUI : `BlockersMsg`,
-  `ProgressMsg` (le `percent_complete` du SPID), `WaitsMsg`.
+- `engine.ProcessAll` in a goroutine, which writes to **`io.Discard`** in TUI mode;
+- `feedConsole` (`main.go:459-488`), which **polls the server** and sends the TUI: `BlockersMsg`,
+  `ProgressMsg` (the SPID's `percent_complete`), `WaitsMsg`.
 
-Il n'existe **aucun canal moteur → TUI**. Le label `operation:` du modèle reste donc `(running)`
-(`tui.New("(running)", …)`), jamais mis à jour par op — même si `StatusMsg.Operation` existe déjà
-côté modèle (`internal/tui/model.go:78-81, 151-154, 215-216`).
+There is **no engine → TUI channel**. The model's `operation:` label therefore stays at `(running)`
+(`tui.New("(running)", …)`), never updated per op — even though `StatusMsg.Operation` already exists
+on the model side (`internal/tui/model.go:78-81, 151-154, 215-216`).
 
-### 2.3 `percent_complete` inexploitable en offline
+### 2.3 `percent_complete` is unusable offline
 
-`ProgressMsg.Percent` vient de `sys.dm_exec_requests.percent_complete` (`main.go:480-501`,
-`internal/mssql/dmv.go:53-80`). Ce champ n'est renseigné que pour REORGANIZE, online/resumable, DBCC,
-BACKUP/RESTORE, rollback… **pas** pour un `ALTER INDEX REBUILD` **offline**. Sur Standard il reste à 0.
+`ProgressMsg.Percent` comes from `sys.dm_exec_requests.percent_complete` (`main.go:480-501`,
+`internal/mssql/dmv.go:53-80`). That field is only populated for REORGANIZE, online/resumable, DBCC,
+BACKUP/RESTORE, rollback… **not** for an offline `ALTER INDEX REBUILD`. On Standard it stays at 0.
 
-### 2.4 Item 3 déjà là (TUI)
+### 2.4 Item 3 is already there (TUI)
 
-Le TUI affiche déjà `blocked sessions (%d)` + la liste (SPID/login/host/wait/requête) :
-`internal/tui/model.go:222`, alimenté par `feedConsole` qui filtre les sessions dont
-`BlockingSPID == ddlSPID` (`main.go:468-478`). **Rien à créer côté TUI** pour l'item 3 ; seul le
-report stdout/non-TUI ne l'a pas.
+The TUI already shows `blocked sessions (%d)` + the list (SPID/login/host/wait/query):
+`internal/tui/model.go:222`, fed by `feedConsole`, which filters the sessions whose
+`BlockingSPID == ddlSPID` (`main.go:468-478`). **Nothing to build on the TUI side** for item 3; only
+the stdout/non-TUI report lacks it.
 
-## 3. Conception proposée
+## 3. Proposed design
 
-### 3.0 Pièce maîtresse : un *sink d'étape* moteur → consommateurs
+### 3.0 Centerpiece: an engine *step sink* → consumers
 
-Ajouter au moteur un canal d'événements d'étape, indépendant de la narration texte, pour que **stdout
-et TUI** soient alimentés par la même source :
+Add a step-event channel to the engine, independent of the text narration, so that **stdout and TUI**
+are fed from the same source:
 
 ```go
 type StepEvent struct {
-    Index, Total int           // i+1 sur N (1-based pour l'affichage)
+    Index, Total int           // i+1 of N (1-based for display)
     Command      string        // "rebuild_index", "shrink", …
     Target       string        // opTarget(step.Operation)
-    StartedAt    time.Time     // = opStart (chrono)
+    StartedAt    time.Time     // = opStart (timer)
     Phase        StepPhase     // Started | Finished
-    Duration     time.Duration // rempli sur Finished
-    Outcome      string        // "done" | "failed" | "skipped" (cf. crash-resumable §9)
+    Duration     time.Duration // filled in on Finished
+    Outcome      string        // "done" | "failed" | "skipped" (see crash-resumable §9)
 }
 ```
 
-Câblage via une `EngineOption` (`WithStepSink(func(StepEvent))`, à côté de `WithProgress`/`WithOutput`,
-`engine.go:147-156`). Émission en haut et en bas de la boucle `engine.go:286`.
+Wired through an `EngineOption` (`WithStepSink(func(StepEvent))`, alongside `WithProgress`/`WithOutput`,
+`engine.go:147-156`). Emitted at the top and the bottom of the loop at `engine.go:286`.
 
-- **Mode non-TUI** (cas réel : run en arrière-plan) : le sink formate vers `e.out` —
-  `\[12/74] rebuild_index dbo.ORDERS.PK_ORDERS — started 23:45:01` puis
-  `\[12/74] … done in 3m20s`. **C'est le gain de progression le plus important**, vu que l'usage
-  courant est non-TUI.
-- **Mode TUI** : `runWithTUI` mappe `StepEvent` → `tui.StatusMsg` (label + compteur + `StartedAt`).
+- **Non-TUI mode** (the real-world case: background run): the sink formats to `e.out` —
+  `\[12/74] rebuild_index dbo.ORDERS.PK_ORDERS — started 23:45:01` then
+  `\[12/74] … done in 3m20s`. **This is the biggest progress win**, since the common usage is
+  non-TUI.
+- **TUI mode**: `runWithTUI` maps `StepEvent` → `tui.StatusMsg` (label + counter + `StartedAt`).
 
-### 3.1 Item 1 — compteur « opération i / N »
+### 3.1 Item 1 — "operation i / N" counter
 
-- Données : `i+1` et `len(planned)` déjà disponibles (§2.1).
-- TUI : étendre `StatusMsg` (ou `tui.New`) avec `StepIndex`/`StepTotal` ; rendu en tête de `View`
-  (`model.go:215`) : `operation 12/74: rebuild_index dbo.ORDERS.PK_ORDERS [RUNNING]`.
-- stdout : voir 3.0.
-- (Option) persister `i/N` dans `State` (`internal/run/state.go`) pour qu'un re-run affiche d'emblée
-  « reprise à l'op k/N » — à arbitrer avec le mécanisme de skip métadonnée (crash-resumable §9), qui
-  rend le curseur d'état moins nécessaire.
+- Data: `i+1` and `len(planned)` already available (§2.1).
+- TUI: extend `StatusMsg` (or `tui.New`) with `StepIndex`/`StepTotal`; rendered at the top of `View`
+  (`model.go:215`): `operation 12/74: rebuild_index dbo.ORDERS.PK_ORDERS [RUNNING]`.
+- stdout: see 3.0.
+- (Option) persist `i/N` in `State` (`internal/run/state.go`) so that a re-run immediately shows
+  "resuming at op k/N" — to be weighed against the metadata skip mechanism (crash-resumable §9),
+  which makes the state cursor less necessary.
 
-### 3.2 Item 2 — chronomètre de l'opération en cours
+### 3.2 Item 2 — timer for the current operation
 
-- Donnée : `opStart` existe déjà (§2.1) ; le pousser via `StartedAt`.
-- TUI : stocker `opStartedAt` dans le modèle ; afficher `elapsed = now − opStartedAt`. Nécessite un
-  rafraîchissement périodique → ajouter un **`tea.Tick` à 1 s** (le modèle/`program.go` n'en a pas
-  aujourd'hui) qui ne fait que re-render. Rendu : `progress: op 12/74 — elapsed 03:20` (et garder le
-  `percent`/ETA serveur quand il est disponible, p. ex. online/resumable/rollback).
-- stdout/.log : la **durée par op** sur la ligne `Finished` (3.0) et dans le `.log`/history.
+- Data: `opStart` already exists (§2.1); push it through `StartedAt`.
+- TUI: store `opStartedAt` in the model; display `elapsed = now − opStartedAt`. This requires a
+  periodic refresh → add a **1 s `tea.Tick`** (the model/`program.go` has none today) that only
+  re-renders. Rendering: `progress: op 12/74 — elapsed 03:20` (and keep the server `percent`/ETA
+  when it is available, e.g. online/resumable/rollback).
+- stdout/.log: the **per-op duration** on the `Finished` line (3.0) and in the `.log`/history.
 
-### 3.3 Item 3 — sessions bloquées
+### 3.3 Item 3 — blocked sessions
 
-- **Déjà affiché dans le TUI** (§2.4). Delta proposé :
-  - surfacer le **compte** en non-TUI : l'inclure quand une réaction se déclenche, ou en ligne d'op
-    (`… blocked: 2`) lors d'un poll ;
-  - enregistrer le **pic de sessions bloquées** par op dans le `.log`/history (utile post-mortem :
-    « cette compression a bloqué jusqu'à 5 sessions pendant 4 min »).
+- **Already shown in the TUI** (§2.4). Proposed delta:
+  - surface the **count** in non-TUI: include it when a reaction fires, or on the op line
+    (`… blocked: 2`) on a poll;
+  - record the **peak blocked-session count** per op in the `.log`/history (useful post-mortem:
+    "this compression blocked up to 5 sessions for 4 min").
 
-## 4. Périmètre & limites
+## 4. Scope & limits
 
-- L'item 2 (chrono live) est surtout une feature **TUI** (tick 1 s). En stdout, on se limite à la
-  **durée par op** à la complétion (un chrono qui défile n'a pas de sens dans un log).
-- Indépendant de `percent_complete` : i/N + chrono fonctionnent même quand le serveur ne rapporte
-  rien (offline), ce qui est précisément le cas Standard.
-- Ne dépend pas de la feature crash-resumable, mais s'y combine bien : le sink peut émettre
-  `Outcome = "skipped"` quand le skip métadonnée (crash-resumable §9) saute une op déjà à la cible.
+- Item 2 (live timer) is mainly a **TUI** feature (1 s tick). In stdout, we limit ourselves to the
+  **per-op duration** at completion (a ticking timer makes no sense in a log).
+- Independent of `percent_complete`: i/N + timer work even when the server reports nothing
+  (offline), which is precisely the Standard case.
+- Does not depend on the crash-resumable feature, but combines well with it: the sink can emit
+  `Outcome = "skipped"` when the metadata skip (crash-resumable §9) skips an op already at target.
 
-## 5. Questions ouvertes
+## 5. Open questions
 
-- **Forme du sink** : un seul `WithStepSink` (Started/Finished) vs deux callbacks ? Réutiliser le
-  patron des `WithX` existants (`engine.go:147-156`).
-- **Attacher le TUI à un run déjà lancé ?** Aujourd'hui impossible (le TUI est intra-process). Hors
-  périmètre, mais à noter : un run non-TUI en arrière-plan ne peut pas recevoir le TUI a posteriori.
-- **Granularité shrink** : un `shrink` est multi-chunk (un seul `step`). Faut-il un sous-compteur
-  « chunk j/k » en plus de l'op i/N ? Le driver shrink connaît déjà sa progression (`main.go:322`).
-- **Persistance i/N dans `State`** : utile pour l'affichage de reprise, ou redondant avec le skip
-  métadonnée ? (cf. crash-resumable §6, §9.5).
+- **Shape of the sink**: a single `WithStepSink` (Started/Finished) vs two callbacks? Reuse the
+  pattern of the existing `WithX` options (`engine.go:147-156`).
+- **Attach the TUI to an already-running run?** Impossible today (the TUI is in-process). Out of
+  scope, but worth noting: a non-TUI background run cannot get the TUI after the fact.
+- **Shrink granularity**: a `shrink` is multi-chunk (a single `step`). Do we want a "chunk j/k"
+  sub-counter on top of the op i/N? The shrink driver already knows its progress (`main.go:322`).
+- **Persisting i/N in `State`**: useful for the resume display, or redundant with the metadata skip?
+  (see crash-resumable §6, §9.5).
 
-## 6. Références code (au 2026-06-17)
+## 6. Code references (as of 2026-06-17)
 
-| Sujet | Emplacement |
+| Topic | Location |
 |---|---|
-| Boucle d'ops avec `i`, `len(planned)`, `opStart` | `internal/run/engine.go:286-287` |
-| Libellé cible d'une op | `opTarget(step.Operation)` (`engine.go:299`) |
-| Options moteur (`WithOutput`/`WithProgress`) | `internal/run/engine.go:147-156` |
-| TUI : label op + `StatusMsg` | `internal/tui/model.go:78-81, 151-154, 215-216` |
-| TUI découplé (moteur→`io.Discard`, poll serveur) | `cmd/sqlgopace/main.go:431-488` |
-| `percent_complete` (0 en offline) | `cmd/sqlgopace/main.go:480-501`, `internal/mssql/dmv.go:53-80` |
-| Sessions bloquées déjà affichées (item 3) | `internal/tui/model.go:222`, `cmd/sqlgopace/main.go:468-478` |
-| Skip métadonnée (combinable, `Outcome=skipped`) | `specs/crash-resumable.md` §9 |
+| Op loop with `i`, `len(planned)`, `opStart` | `internal/run/engine.go:286-287` |
+| Target label of an op | `opTarget(step.Operation)` (`engine.go:299`) |
+| Engine options (`WithOutput`/`WithProgress`) | `internal/run/engine.go:147-156` |
+| TUI: op label + `StatusMsg` | `internal/tui/model.go:78-81, 151-154, 215-216` |
+| TUI decoupled (engine→`io.Discard`, server poll) | `cmd/sqlgopace/main.go:431-488` |
+| `percent_complete` (0 when offline) | `cmd/sqlgopace/main.go:480-501`, `internal/mssql/dmv.go:53-80` |
+| Blocked sessions already displayed (item 3) | `internal/tui/model.go:222`, `cmd/sqlgopace/main.go:468-478` |
+| Metadata skip (combinable, `Outcome=skipped`) | `specs/crash-resumable.md` §9 |

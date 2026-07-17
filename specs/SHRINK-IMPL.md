@@ -1,271 +1,270 @@
-# SHRINK — plan d'implémentation
+# SHRINK — implementation plan
 
-> Compagnon de `SHRINK.md` (design v1). Développement **linéaire, mono-développeur**, pensé
-> pour économiser les tokens : étapes autonomes, ordonnées cœur-pur d'abord, chacune
-> vérifiable par `make test && make vet` **sans base** ; l'intégration/e2e (DB réelle) n'arrive
-> qu'aux étapes 5 et 8.
+> Companion to `SHRINK.md` (design v1). **Linear, single-developer** development, designed
+> to save tokens: self-contained steps, ordered pure-core first, each one verifiable with
+> `make test && make vet` **without a database**; integration/e2e (real DB) only shows up
+> at steps 5 and 8.
 >
-> Convention de travail : une étape = un commit (ou une petite PR). Ne pas démarrer l'étape
-> N+1 tant que l'étape N ne passe pas `make test && make vet && make lint`.
+> Working convention: one step = one commit (or a small PR). Do not start step N+1 until
+> step N passes `make test && make vet && make lint`.
 
-## Principe d'architecture (rappel)
+## Architecture principle (recap)
 
-Le shrink **ne se plie pas** au modèle « une opération = un statement ». Il est piloté par un
-**driver dédié** (`internal/run/shrink.go`) qui lit des DMV au runtime, construit le SQL par
-chunk via des helpers de `ddl`, et mène sa propre boucle. L'engine **route** les opérations
-`Shrink` vers ce driver au lieu de `MonitoredRunner`.
+Shrink **does not fit** the "one operation = one statement" model. It is driven by a
+**dedicated driver** (`internal/run/shrink.go`) that reads DMVs at run time, builds the SQL
+per chunk via `ddl` helpers, and runs its own loop. The engine **routes** `Shrink` operations
+to that driver instead of `MonitoredRunner`.
 
-Toute la logique décisionnelle (calcul de cible, stepsize initial, ajustement, no-progress)
-est écrite en **fonctions pures** testables sans DB, sur le modèle de `runLoop`/`supervise`/
-`DecideReaction` (cœur pur + I/O injectées).
-
----
-
-## Étape 0 — Matrix + command types (fondation, minuscule)
-
-**But** : déclarer l'éligibilité des options shrink par version/édition.
-
-- `internal/ddl/ddl_compatibility.yaml` : ajouter les command types `shrink_data` et
-  `shrink_log`. Sous `shrink_data`, `wait_at_low_priority` éligible **SQL Server 2022 (16.x)+**
-  seulement. Rien d'éligible sous `shrink_log` (pas de WALP).
-- Vérifier que `matrix.go` charge ces entrées sans changement de code (juste data).
-
-**Tests** : un cas dans `matrix_test.go` : `Applicable(16, tier, "shrink_data", "wait_at_low_priority")`
-vrai en 2022, faux en 2019.
-
-**Checkpoint** : `make test`.
+All decision logic (target computation, initial step size, adjustment, no-progress) is
+written as **pure functions**, testable without a DB, following the `runLoop`/`supervise`/
+`DecideReaction` model (pure core + injected I/O).
 
 ---
 
-## Étape 1 — Type d'opération `shrink` dans `ddl` (parse / validate / target)
+## Step 0 — Matrix + command types (foundation, tiny)
 
-**But** : parser et valider le YAML de l'opération.
+**Goal**: declare shrink option eligibility by version/edition.
 
-- `internal/ddl/manifest.go` :
-  - `case "shrink": return decodeInto[Shrink](node)` dans `decodeOperation`.
-  - Struct `Shrink` :
+- `internal/ddl/ddl_compatibility.yaml`: add the `shrink_data` and `shrink_log` command
+  types. Under `shrink_data`, `wait_at_low_priority` is eligible on **SQL Server 2022 (16.x)+**
+  only. Nothing is eligible under `shrink_log` (no WALP).
+- Check that `matrix.go` loads these entries with no code change (data only).
+
+**Tests**: one case in `matrix_test.go`: `Applicable(16, tier, "shrink_data", "wait_at_low_priority")`
+true on 2022, false on 2019.
+
+**Checkpoint**: `make test`.
+
+---
+
+## Step 1 — `shrink` operation type in `ddl` (parse / validate / target)
+
+**Goal**: parse and validate the operation's YAML.
+
+- `internal/ddl/manifest.go`:
+  - `case "shrink": return decodeInto[Shrink](node)` in `decodeOperation`.
+  - `Shrink` struct:
     ```go
     type Shrink struct {
         Type            string          // "data" | "log"
-        Files           string          // "all" | nom logique ; défaut "all"
-        EmptyFile       bool            // réservé Phase 2 ; doit être false en v1
-        TargetFreeSpace string          // brut "10%" | "100MB" ; parsé par TargetSpec
-        Options         OptionOverrides // seul WaitAtLowPriority est pertinent
+        Files           string          // "all" | logical name; defaults to "all"
+        EmptyFile       bool            // reserved for Phase 2; must be false in v1
+        TargetFreeSpace string          // raw "10%" | "100MB"; parsed by TargetSpec
+        Options         OptionOverrides // only WaitAtLowPriority is relevant
     }
     ```
-  - `CommandType()` : `"shrink_data"` ou `"shrink_log"` selon `Type` (sert le matrix).
-  - `Target()` : cible un fichier/une base, **pas** `schema.table` (cf. mémoire
-    *check_db target shape* — ne pas détourner `ObjectRef.table`). Renvoyer
-    `ObjectRef{Name: o.Files}` (ou un champ dédié si plus clair).
-  - `Validate()` : `Type ∈ {data, log}` ; `EmptyFile == false` (sinon erreur « réservé
-    Phase 2 ») ; `TargetFreeSpace` parsable et > 0.
-- Nouveau `internal/ddl/shrink.go` (fonctions pures, sans DB) :
+  - `CommandType()`: `"shrink_data"` or `"shrink_log"` depending on `Type` (feeds the matrix).
+  - `Target()`: targets a file/a database, **not** `schema.table` (cf. the
+    *check_db target shape* memory — don't abuse `ObjectRef.table`). Return
+    `ObjectRef{Name: o.Files}` (or a dedicated field if clearer).
+  - `Validate()`: `Type ∈ {data, log}`; `EmptyFile == false` (otherwise error "reserved for
+    Phase 2"); `TargetFreeSpace` parsable and > 0.
+- New `internal/ddl/shrink.go` (pure functions, no DB):
   - `type TargetSpec struct { Percent *int; AbsoluteMB *int }`
-  - `ParseTargetFreeSpace(s string) (TargetSpec, error)` : `"10%"` → Percent ; `"100MB"`/`"100 MB"`
-    → AbsoluteMB ; rejette le vide / négatif / unité inconnue.
-  - `FinalTargetMB(usedMB int, spec TargetSpec) int` : `Percent` ⇒
-    `ceil(used × (1 + N/100))` ; `AbsoluteMB` ⇒ `used + N`. (Le clamp au plancher `used`
-    se fait ici aussi : jamais < usedMB.)
+  - `ParseTargetFreeSpace(s string) (TargetSpec, error)`: `"10%"` → Percent; `"100MB"`/`"100 MB"`
+    → AbsoluteMB; rejects empty / negative / unknown unit.
+  - `FinalTargetMB(usedMB int, spec TargetSpec) int`: `Percent` ⇒
+    `ceil(used × (1 + N/100))`; `AbsoluteMB` ⇒ `used + N`. (The clamp to the `used` floor
+    happens here too: never < usedMB.)
 
-**Tests** (`manifest_test.go`, `shrink_test.go`) : décodage YAML data/log ; rejets
-(`type` invalide, `emptyfile: true`, targetfreespace illisible) ; table de cas pour
-`ParseTargetFreeSpace` et `FinalTargetMB` (arrondis, clamp).
+**Tests** (`manifest_test.go`, `shrink_test.go`): YAML decoding for data/log; rejections
+(invalid `type`, `emptyfile: true`, unreadable targetfreespace); case tables for
+`ParseTargetFreeSpace` and `FinalTargetMB` (rounding, clamp).
 
-**Checkpoint** : `make test`.
+**Checkpoint**: `make test`.
 
 ---
 
-## Étape 2 — Résolution d'options + génération SQL par chunk
+## Step 2 — Option resolution + per-chunk SQL generation
 
-**But** : décider WALP (sans forcer ONLINE) et produire les statements `DBCC SHRINKFILE`.
+**Goal**: decide WALP (without forcing ONLINE) and produce the `DBCC SHRINKFILE` statements.
 
-- `internal/ddl/resolve.go` :
-  - Branche dédiée pour les command types shrink : ne résoudre **que** `wait_at_low_priority`
-    (via le matrix) ; **ne pas** toucher online/resumable/sort_in_tempdb ni appliquer la
-    règle « WALP requires ONLINE ». `ABORT_AFTER_WAIT = BLOCKERS` seulement si
-    `Policy.AllowAbortBlockers`, sinon `SELF`. Pas de `MAX_DURATION` (champ ignoré pour shrink).
-  - `overridesOf` : ajouter le `case Shrink: return o.Options`.
-- `internal/ddl/generate.go` (générateur **dédié**, pas `withClause`) :
+- `internal/ddl/resolve.go`:
+  - Dedicated branch for the shrink command types: resolve **only** `wait_at_low_priority`
+    (via the matrix); **do not** touch online/resumable/sort_in_tempdb, and do not apply the
+    "WALP requires ONLINE" rule. `ABORT_AFTER_WAIT = BLOCKERS` only if
+    `Policy.AllowAbortBlockers`, otherwise `SELF`. No `MAX_DURATION` (field ignored for shrink).
+  - `overridesOf`: add the `case Shrink: return o.Options`.
+- `internal/ddl/generate.go` (**dedicated** generator, not `withClause`):
   - `ShrinkChunkSQL(file string, targetMB int, res ResolvedOptions) string` →
     `DBCC SHRINKFILE (N'file', targetMB) WITH WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF), NO_INFOMSGS;`
-    (clause WALP seulement si `res.WaitAtLowPriority`, sinon juste `WITH NO_INFOMSGS`).
+    (WALP clause only if `res.WaitAtLowPriority`, otherwise just `WITH NO_INFOMSGS`).
   - `ShrinkTruncateOnlySQL(file string) string` →
     `DBCC SHRINKFILE (N'file', TRUNCATEONLY) WITH NO_INFOMSGS;`
-  - `Generate()` pour un `Shrink` : renvoyer une chaîne **représentative** (ex. le SQL du
-    premier chunk ou un commentaire), car le SQL réel est multi-statement et construit au
-    runtime par le driver. Documenter que `PlannedOperation.SQL` d'un shrink est indicatif.
+  - `Generate()` for a `Shrink`: return a **representative** string (e.g. the SQL of the
+    first chunk, or a comment), since the real SQL is multi-statement and built at run time
+    by the driver. Document that a shrink's `PlannedOperation.SQL` is indicative only.
 
-**Tests** (`resolve_test.go`, `generate_test.go`) : WALP résolu ON/OFF selon matrix et
-override ; aucun `ONLINE`/`RESUMABLE` jamais injecté pour shrink ; quoting du nom de fichier
-(`N'...'`, doublage des `'`) ; forme exacte des deux helpers.
+**Tests** (`resolve_test.go`, `generate_test.go`): WALP resolved ON/OFF according to matrix
+and override; no `ONLINE`/`RESUMABLE` ever injected for shrink; file name quoting
+(`N'...'`, doubling of `'`); exact shape of both helpers.
 
-**Checkpoint** : `make test`.
+**Checkpoint**: `make test`.
 
 ---
 
-## Étape 3 — Cœur pur du chunking (stepsize, ajustement, décisions)
+## Step 3 — Pure core of the chunking (step size, adjustment, decisions)
 
-**But** : toute la logique de calibration en fonctions pures testables.
+**Goal**: all the calibration logic as testable pure functions.
 
-- `internal/ddl/shrink.go` ou `internal/run/shrink_calc.go` (au choix ; garder pur) :
-  - `InitialStepMB(reclaimMB int, cfg ShrinkConfig) int` : tranches < 5 Go / 5–50 Go / > 50 Go.
-  - `AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, cfg ShrinkConfig) int` :
-    `/2` si `WRITELOG>10ms` ou `PAGEIOLATCH_EX>20ms` ou blocage>30s ; `*2` si I/O<5ms,
-    pas de wait, `elapsed<targetBatch` ; borné `[min,max]`.
-  - `NextTargetMB(current, step, final int) int` : `max(current-step, final)`.
-  - Type `WaitDeltas` (WRITELOG, PAGEIOLATCH_EX avg ms, blockingSeconds) consommé par
+- `internal/ddl/shrink.go` or `internal/run/shrink_calc.go` (either; keep it pure):
+  - `InitialStepMB(reclaimMB int, cfg ShrinkConfig) int`: bands < 5 GB / 5–50 GB / > 50 GB.
+  - `AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, cfg ShrinkConfig) int`:
+    `/2` if `WRITELOG>10ms` or `PAGEIOLATCH_EX>20ms` or blocking>30s; `*2` if I/O<5ms,
+    no wait, `elapsed<targetBatch`; bounded to `[min,max]`.
+  - `NextTargetMB(current, step, final int) int`: `max(current-step, final)`.
+  - `WaitDeltas` type (WRITELOG, PAGEIOLATCH_EX avg ms, blockingSeconds) consumed by
     `AdjustStepMB`.
 
-**Tests** : tables de cas pour chaque fonction (réduction, augmentation, bornes, dernier
-chunk qui colle à `final`).
+**Tests**: case tables for each function (reduction, increase, bounds, last chunk landing
+exactly on `final`).
 
-**Checkpoint** : `make test`.
-
----
-
-## Étape 4 — Configuration `shrink:` (defaults)
-
-**But** : exposer les défauts du §7.3 de `SHRINK.md`, tous optionnels.
-
-- `internal/config/config.go` : struct `ShrinkConfig` (champs `initial_step_small_mb`, …,
-  `self_wait_timeout_minutes`, `log_reuse_wait_timeout_minutes`) + accesseurs `time.Duration`
-  comme `MonitoringConfig`. Application des défauts quand un champ est zéro (bloc absent ⇒
-  tous défauts).
-- Brancher `ShrinkConfig` dans la structure `Config` racine.
-
-**Tests** (`config_test.go`) : bloc absent ⇒ défauts ; override partiel ⇒ seuls les champs
-fournis changent ; valeurs négatives rejetées ou clampées.
-
-**Checkpoint** : `make test`.
+**Checkpoint**: `make test`.
 
 ---
 
-## Étape 5 — Lectures DMV dans `internal/mssql` (adapter, DB réelle)
+## Step 4 — `shrink:` configuration (defaults)
 
-**But** : les lectures runtime dont le driver a besoin. Code derrière interfaces, tests
-`integration`-tagués (skippés sans `SQLGOPACE_TEST_DSN`).
+**Goal**: expose the defaults from §7.3 of `SHRINK.md`, all optional.
 
-- `internal/mssql` (nouveau `shrink.go` ou compléter `databases.go`/`recovery.go`) :
-  - `FileSpace(ctx, fileType) ([]FileSpace, error)` : `name, type_desc, size_mb, used_mb,
-    free_mb` depuis `sys.database_files` + `FILEPROPERTY`. (`fileType` = ROWS|LOG.)
-  - `FileSizeMB(ctx, file string) (int, error)` : taille courante (pour la boucle / progression).
-  - `LogReuse(ctx) (recoveryModel, reuseWaitDesc string, error)` depuis `sys.databases`.
-  - `ActiveLogFloorMB(ctx) (int, error)` : somme des VLF actifs (`sys.dm_db_log_info`,
-    `vlf_active=1`) → plancher de troncature du log.
-  - Réutiliser `SessionWaits(ctx, spid)` existant pour la détection self-wait (étape 6).
-- Déclarer les interfaces étroites côté `run` (comme `sampleProbe`) pour ces lectures, afin
-  de fournir des fakes en test unitaire.
+- `internal/config/config.go`: `ShrinkConfig` struct (fields `initial_step_small_mb`, …,
+  `self_wait_timeout_minutes`, `log_reuse_wait_timeout_minutes`) + `time.Duration` accessors
+  like `MonitoringConfig`. Defaults applied when a field is zero (block absent ⇒ all
+  defaults).
+- Wire `ShrinkConfig` into the root `Config` structure.
 
-**Tests** : `*_integration_test.go` (tag `integration`) contre la base e2e. Pas de test
-unitaire pur ici (c'est l'adapter SQL).
+**Tests** (`config_test.go`): block absent ⇒ defaults; partial override ⇒ only the supplied
+fields change; negative values rejected or clamped.
 
-**Checkpoint** : `make test` (les tests integration sont skippés) puis, si DB dispo,
+**Checkpoint**: `make test`.
+
+---
+
+## Step 5 — DMV reads in `internal/mssql` (adapter, real DB)
+
+**Goal**: the run-time reads the driver needs. Code behind interfaces, tests
+`integration`-tagged (skipped without `SQLGOPACE_TEST_DSN`).
+
+- `internal/mssql` (new `shrink.go`, or extend `databases.go`/`recovery.go`):
+  - `FileSpace(ctx, fileType) ([]FileSpace, error)`: `name, type_desc, size_mb, used_mb,
+    free_mb` from `sys.database_files` + `FILEPROPERTY`. (`fileType` = ROWS|LOG.)
+  - `FileSizeMB(ctx, file string) (int, error)`: current size (for the loop / progress).
+  - `LogReuse(ctx) (recoveryModel, reuseWaitDesc string, error)` from `sys.databases`.
+  - `ActiveLogFloorMB(ctx) (int, error)`: sum of active VLFs (`sys.dm_db_log_info`,
+    `vlf_active=1`) → log truncation floor.
+  - Reuse the existing `SessionWaits(ctx, spid)` for self-wait detection (step 6).
+- Declare the narrow interfaces on the `run` side (like `sampleProbe`) for these reads, so
+  fakes can be supplied in unit tests.
+
+**Tests**: `*_integration_test.go` (`integration` tag) against the e2e database. No pure unit
+test here (this is the SQL adapter).
+
+**Checkpoint**: `make test` (integration tests are skipped), then, if a DB is available,
 `make integration`.
 
 ---
 
-## Étape 6 — Driver de shrink (`internal/run/shrink.go`)
+## Step 6 — Shrink driver (`internal/run/shrink.go`)
 
-**But** : orchestrer estimation → truncate-only → boucle de chunks, avec réactions.
+**Goal**: orchestrate estimation → truncate-only → chunk loop, with reactions.
 
-- `ShrinkRunner` (ou `ShrinkDriver`) construit avec des I/O injectées :
-  exécution (`Executor` : `ExecDDL`/`SPID`/`Kill` — **hérite du KILL via le pool**, §8.5 du
-  design), lectures (`FileSpace`/`FileSizeMB`/`SessionWaits`), sampler (`ServerSampler`),
-  horloge (`Clock`), `ShrinkConfig`, `ReactionSink`.
-- `Run(ctx, op ddl.Shrink, res ddl.ResolvedOptions, caps Capabilities, sink ReactionSink) error` :
-  1. **Estimation/gating** (réutilise les lectures) :
-     - data : calc `final` via `FinalTargetMB` ; no-op si `free≈0`/`final≥size` → succès « rien à faire ».
-     - log : `LogReuse` → SIMPLE = `CHECKPOINT` autorisé puis shrink ; FULL/BULK_LOGGED avec
-       `reuseWait≠NOTHING` → **attente bornée** (`log_reuse_wait_timeout`) qu'une sauvegarde
-       de log planifiée libère le log : relire `reuseWait`+plancher VLF sur la cadence de poll,
-       émettre un `pause` par cycle avec la raison, shrink dès `reuseWait=NOTHING`, abandon
-       propre au timeout. **Jamais** de BACKUP LOG émis. Plancher = `ActiveLogFloorMB`.
-  2. **Phase A — TRUNCATEONLY** : `ExecDDL(ShrinkTruncateOnlySQL)` ; relire taille ; si ≤ final → fin.
-  3. **Phase B — boucle de chunks** (data) : `InitialStepMB` → boucle
-     `NextTargetMB`/`ShrinkChunkSQL`, mesure `elapsed`+deltas, `AdjustStepMB`, relit la taille.
-     - **Pause gratuite** sous pression : ne pas lancer le chunk suivant, attendre la détente
-       (réutiliser `awaitRelief`/`waitForRelief`, `logDrainTimeout`).
-     - **Self-wait** : `SessionWaits` montre `LCK_M_SCH_M`/snapshot prolongé → attendre jusqu'à
-       `self_wait_timeout` puis arrêt propre.
-     - **No-progress** : taille inchangée après un chunk (49516, données en fin) → backoff
-       croissant + retry, arrêt propre au-delà de `max_no_progress`.
-     - Un chunk à stopper passe par annulation de `context` (attention) puis `Kill` via le pool.
-  4. Émettre `ReactionEvent` (`pause`/`resume`/`abort`) via `sink` et la **progression
-     déterministe** `(start-current)/(start-final)`.
-  - Le log est shrinké (Phase A/troncature) sans chunking : un (ou deux) `DBCC SHRINKFILE`.
-- Garder la boucle structurée façon `runLoop` : la mécanique de décision en fonctions pures
-  (étape 3) + I/O injectées, pour un test unitaire déterministe avec fakes (pas de DB).
+- `ShrinkRunner` (or `ShrinkDriver`) built with injected I/O:
+  execution (`Executor`: `ExecDDL`/`SPID`/`Kill` — **inherits KILL through the pool**, §8.5 of
+  the design), reads (`FileSpace`/`FileSizeMB`/`SessionWaits`), sampler (`ServerSampler`),
+  clock (`Clock`), `ShrinkConfig`, `ReactionSink`.
+- `Run(ctx, op ddl.Shrink, res ddl.ResolvedOptions, caps Capabilities, sink ReactionSink) error`:
+  1. **Estimation/gating** (reuses the reads):
+     - data: compute `final` via `FinalTargetMB`; no-op if `free≈0`/`final≥size` → success, "nothing to do".
+     - log: `LogReuse` → SIMPLE = `CHECKPOINT` allowed, then shrink; FULL/BULK_LOGGED with
+       `reuseWait≠NOTHING` → **bounded wait** (`log_reuse_wait_timeout`) for a scheduled log
+       backup to free the log: re-read `reuseWait`+VLF floor on the poll cadence, emit one
+       `pause` per cycle with the reason, shrink as soon as `reuseWait=NOTHING`, clean give-up
+       at timeout. **Never** issue a BACKUP LOG. Floor = `ActiveLogFloorMB`.
+  2. **Phase A — TRUNCATEONLY**: `ExecDDL(ShrinkTruncateOnlySQL)`; re-read size; if ≤ final → done.
+  3. **Phase B — chunk loop** (data): `InitialStepMB` → loop over
+     `NextTargetMB`/`ShrinkChunkSQL`, measure `elapsed`+deltas, `AdjustStepMB`, re-read the size.
+     - **Free pause** under pressure: don't launch the next chunk, wait for relief
+       (reuse `awaitRelief`/`waitForRelief`, `logDrainTimeout`).
+     - **Self-wait**: `SessionWaits` shows a prolonged `LCK_M_SCH_M`/snapshot → wait up to
+       `self_wait_timeout`, then stop cleanly.
+     - **No-progress**: size unchanged after a chunk (49516, data at the end of the file) →
+       increasing backoff + retry, clean stop beyond `max_no_progress`.
+     - A chunk that must be stopped goes through `context` cancellation (attention), then `Kill`
+       via the pool.
+  4. Emit `ReactionEvent` (`pause`/`resume`/`abort`) via `sink`, plus the **deterministic
+     progress** `(start-current)/(start-final)`.
+  - The log is shrunk (Phase A/truncation) without chunking: one (or two) `DBCC SHRINKFILE`.
+- Keep the loop structured like `runLoop`: decision mechanics in pure functions (step 3) +
+  injected I/O, for a deterministic unit test with fakes (no DB).
 
-**Tests** (`shrink_test.go`, sans DB) : no-op ; bascule truncate-only suffisante ; boucle qui
-converge vers `final` ; ajustement du step sous pression simulée ; no-progress → arrêt après
-`max_no_progress` ; log FULL `reuseWait=LOG_BACKUP` → attente puis shrink quand ça repasse à
-`NOTHING`, et abandon propre si le timeout expire ; succès log SIMPLE après CHECKPOINT.
+**Tests** (`shrink_test.go`, no DB): no-op; truncate-only alone is enough; loop converging
+to `final`; step adjustment under simulated pressure; no-progress → stop after
+`max_no_progress`; log FULL `reuseWait=LOG_BACKUP` → wait, then shrink when it flips back to
+`NOTHING`, and clean give-up if the timeout expires; log SIMPLE success after CHECKPOINT.
 
-**Checkpoint** : `make test && make vet`.
-
----
-
-## Étape 7 — Câblage engine + TUI
-
-**But** : router les opérations shrink et reporter.
-
-- `internal/run/engine.go` (`processOne`) : si `step.Operation` est un `ddl.Shrink`, appeler
-  le `ShrinkRunner` au lieu de `r.runner.Run`. Construire `caps` (shrink = cancel-safe,
-  reprenable). Alimenter `OperationReport` (initial/final size, espace gagné, nb de chunks,
-  réactions, waits, durée). `notify` sur `pause`/`abort` comme l'existant.
-- Progression : pour un shrink, alimenter le `Model` TUI avec la progression par chunks
-  (et non `operationPercent`). Étendre le feed (`feedConsole`/messages TUI) si nécessaire,
-  ou exposer la progression du driver via un canal/`sink`.
-- Recovery (`Recoverer`) : vérifier qu'un shrink interrompu est simplement requeue/relançable
-  (aucune logique resumable spécifique ; relancer vers la même cible reprend).
-
-**Tests** : `engine_test.go` — un manifest shrink est routé vers le driver (fake driver),
-le rapport contient les champs attendus ; cas data + log.
-
-**Checkpoint** : `make test && make vet && make lint`.
+**Checkpoint**: `make test && make vet`.
 
 ---
 
-## Étape 8 — e2e + documentation
+## Step 7 — Engine + TUI wiring
 
-**But** : valider contre une vraie instance et documenter la surface utilisateur.
+**Goal**: route shrink operations and report on them.
 
-- e2e (`make e2e`, SQL Server 2022) : créer une base jetable, gonfler un fichier (insert +
-  delete massif pour créer de l'espace libre), lancer un manifest shrink data, vérifier la
-  réduction et le rapport ; cas log SIMPLE (CHECKPOINT + shrink) et FULL refusé.
-- `README.md` (référence canonique) : documenter `operation: shrink` (champs, exemples data
-  et log), le bloc `shrink:` de `config.yaml`, et le comportement (TRUNCATEONLY auto, refus
-  log FULL, progression par chunks).
-- `docs/e2e.md` : noter les permissions/contexte requis si différents (le shrink exige des
-  droits sur la base ; `VIEW SERVER STATE` déjà requis pour le monitoring).
-- Calibrer empiriquement les défauts (§14 du design) et ajuster si besoin.
+- `internal/run/engine.go` (`processOne`): if `step.Operation` is a `ddl.Shrink`, call the
+  `ShrinkRunner` instead of `r.runner.Run`. Build `caps` (shrink = cancel-safe, resumable).
+  Populate `OperationReport` (initial/final size, space reclaimed, chunk count, reactions,
+  waits, duration). `notify` on `pause`/`abort` like the existing path.
+- Progress: for a shrink, feed the TUI `Model` with per-chunk progress (not
+  `operationPercent`). Extend the feed (`feedConsole`/TUI messages) if needed, or expose the
+  driver's progress via a channel/`sink`.
+- Recovery (`Recoverer`): check that an interrupted shrink is simply requeued/re-runnable
+  (no resumable-specific logic; re-running toward the same target picks up where it left off).
 
-**Checkpoint** : `make e2e` vert ; relire le diff complet.
+**Tests**: `engine_test.go` — a shrink manifest is routed to the driver (fake driver), the
+report contains the expected fields; data + log cases.
+
+**Checkpoint**: `make test && make vet && make lint`.
 
 ---
 
-## Récap dépendances / ordre
+## Step 8 — e2e + documentation
+
+**Goal**: validate against a real instance and document the user-facing surface.
+
+- e2e (`make e2e`, SQL Server 2022): create a throwaway database, inflate a file (insert +
+  massive delete to create free space), run a shrink data manifest, check the reduction and
+  the report; SIMPLE log case (CHECKPOINT + shrink) and FULL refused.
+- `README.md` (canonical reference): document `operation: shrink` (fields, data and log
+  examples), the `shrink:` block of `config.yaml`, and the behavior (automatic TRUNCATEONLY,
+  FULL log refusal, per-chunk progress).
+- `docs/e2e.md`: note the required permissions/context if different (shrink requires rights on
+  the database; `VIEW SERVER STATE` already required for monitoring).
+- Calibrate the defaults empirically (§14 of the design) and adjust if needed.
+
+**Checkpoint**: `make e2e` green; re-read the full diff.
+
+---
+
+## Dependency / ordering recap
 
 ```
-0 matrix ─▶ 1 type ─▶ 2 resolve+generate ─▶ 3 cœur pur chunking ─▶ 6 driver ─▶ 7 engine ─▶ 8 e2e+doc
+0 matrix ─▶ 1 type ─▶ 2 resolve+generate ─▶ 3 pure chunking core ─▶ 6 driver ─▶ 7 engine ─▶ 8 e2e+doc
                                           ╲                        ╱
                                 4 config ──┴── 5 mssql (DB) ──────┘
 ```
 
-- Étapes 0–4 : 100 % cœur pur, testables sans DB — l'essentiel de la logique y est figé.
-- Étape 5 : seul adapter SQL ; tests `integration`-tagués.
-- Étapes 6–7 : assemblage, tests unitaires avec fakes (pas de DB).
-- Étape 8 : DB réelle + doc utilisateur.
+- Steps 0–4: 100% pure core, testable without a DB — the bulk of the logic is frozen there.
+- Step 5: the only SQL adapter; `integration`-tagged tests.
+- Steps 6–7: assembly, unit tests with fakes (no DB).
+- Step 8: real DB + user documentation.
 
-## Points de vigilance (déjà tranchés dans `SHRINK.md`, à ne pas réinventer)
+## Watch points (already settled in `SHRINK.md`, don't reinvent)
 
-- **KILL de sa propre session** : toujours via `Executor.Kill` (pool), jamais sur la
-  connexion d'exécution (design §8.5).
-- **Log FULL** : refus propre, **jamais** de `BACKUP LOG` automatique (design §5.2).
-- **Pas de MAXDOP** sur `DBCC SHRINKFILE` ; **pas de `MAX_DURATION`** sur le WALP du shrink.
-- **`targetfreespace`** = % de l'espace **utilisé** (`final = ceil(used × (1 + N/100))`).
-- **`files: all`** étendu séquentiellement (jamais deux fichiers d'un filegroup en parallèle).
-- Cœur décisionnel en **fonctions pures** (pattern `runLoop`/`supervise`) pour rester
-  testable sans DB.
-```
-</content>
+- **KILL of one's own session**: always via `Executor.Kill` (pool), never on the executing
+  connection (design §8.5).
+- **FULL log**: clean refusal, **never** an automatic `BACKUP LOG` (design §5.2).
+- **No MAXDOP** on `DBCC SHRINKFILE`; **no `MAX_DURATION`** on the shrink's WALP.
+- **`targetfreespace`** = % of the **used** space (`final = ceil(used × (1 + N/100))`).
+- **`files: all`** expanded sequentially (never two files of a filegroup in parallel).
+- Decision core as **pure functions** (the `runLoop`/`supervise` pattern) to stay testable
+  without a DB.
