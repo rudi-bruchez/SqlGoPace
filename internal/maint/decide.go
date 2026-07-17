@@ -241,13 +241,15 @@ func decideIndex(m IndexMeasurement, p *Profile) Decision {
 		dataCompression = comp.target.DataCompression()
 	}
 	reason := fmt.Sprintf("fragmentation %.0f%%", frag)
+	intent := ddl.IntentFragmentation
 	if !fragRebuild { // rebuild is purely compression-motivated
 		reason = "compression change"
+		intent = ddl.IntentCompression
 	}
 	reason += "; " + comp.reason
 	op := ddl.RebuildIndex{
 		Schema: m.Schema, Table: m.Table, Index: m.Index,
-		Partition: m.Partition, DataCompression: dataCompression,
+		Partition: m.Partition, DataCompression: dataCompression, Intent: intent,
 	}
 	return Decision{Category: "index", Target: target, Kind: "rebuild_index", Reason: reason, Op: op}
 }

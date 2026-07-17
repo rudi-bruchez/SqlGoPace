@@ -437,7 +437,7 @@ func TestGoldenPath(t *testing.T) {
 	pl := maint.Decide(in, p)
 
 	wantIndex := []ddl.Operation{
-		ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE"},
+		ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE", Intent: ddl.IntentFragmentation},
 		ddl.ReorganizeIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_ORDERS_CUST", LOBCompaction: true},
 		ddl.ReorganizeIndex{Schema: "dbo", Table: "AUDIT_2024", Index: "PK_AUDIT_2024", LOBCompaction: true},
 		ddl.ReorganizeIndex{Schema: "dbo", Table: "LEDGER", Index: "PK_LEDGER", LOBCompaction: true},
