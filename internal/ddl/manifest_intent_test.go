@@ -67,6 +67,9 @@ func TestManifestRejectsUnknownIntent(t *testing.T) {
 	if err == nil {
 		t.Fatal("ParseManifest() error = nil, want an invalid manifest-intent error")
 	}
+	if !errors.Is(err, ddl.ErrInvalidManifest) {
+		t.Errorf("error is not ErrInvalidManifest: %v", err)
+	}
 	if !strings.Contains(err.Error(), "banana") {
 		t.Errorf("error does not name the offending value: %v", err)
 	}
