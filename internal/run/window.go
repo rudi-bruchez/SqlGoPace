@@ -57,8 +57,8 @@ func windowStopReason(err error, closedAt string) string {
 // finalizeWindowClosed records a graceful stop because the manifest's execution window
 // closed (or its clock could not be read). Like a drain, the manifest stays in processing
 // with its resume cursor so the next run inside the window continues.
-func (e *Engine) finalizeWindowClosed(ctx context.Context, name string, rep *report.RunReport, start time.Time, reason string) runOutcome {
-	return e.finalizeGracefulStop(ctx, name, rep, start,
+func (e *Engine) finalizeWindowClosed(ctx context.Context, name string, rep *report.RunReport, start time.Time, reason string, quarantined []ddl.Operation) runOutcome {
+	return e.finalizeGracefulStop(ctx, name, rep, start, quarantined,
 		reason+" — resumes in the next window",
 		fmt.Sprintf("-- %s: %s — left in processing, resumes next window", name, reason))
 }

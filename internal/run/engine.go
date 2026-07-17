@@ -409,7 +409,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// preflight — nothing to do until the window reopens. A clock error is treated
 	// conservatively as closed.
 	if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-		return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, "before this run's operations"))
+		return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, "before this run's operations"), nil)
 	}
 
 	pfReport, err := e.pf.Check(ctx, manifest)
@@ -453,7 +453,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// Graceful stop: the operation in flight has finished (we are at the top of the
 		// loop); stop before starting the next one and leave the manifest for recovery.
 		if e.draining() {
-			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned))
+			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned), failedOps)
 		}
 		opStart := e.clk.Now()
 		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
@@ -471,7 +471,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			continue
 		}
 		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-			return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", cursor, len(planned))))
+			return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", cursor, len(planned))), failedOps)
 		}
 		// skip_if_satisfied: a rebuild whose target compression already holds is a no-op —
 		// unless this operation left its own paused resumable, which must be resumed/finished
@@ -690,6 +690,7 @@ func (e *Engine) ignoreSource(name string, rules []ddl.IgnoredSession) (IgnoreSo
 // notifies, and persists history.
 func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunReport, start time.Time, success bool) runOutcome {
 	e.removeSidecar(name)
+	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 
@@ -738,6 +739,7 @@ func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, 
 // it, and reports/records the run like a failure so the exit code reflects it.
 func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
 	e.removeSidecar(name)
+	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "PARTIAL"
@@ -840,8 +842,8 @@ func (e *Engine) draining() bool { return stopRequested(e.drain) }
 // manifest stays in processing (not done/failed) so the next run resumes it. The resume
 // cursor is already durable — advanceCursor persisted it after each completed operation —
 // so this only finalizes the report; it does not re-write the cursor.
-func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int) runOutcome {
-	return e.finalizeGracefulStop(ctx, name, rep, start,
+func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.RunReport, start time.Time, done, total int, quarantined []ddl.Operation) runOutcome {
+	return e.finalizeGracefulStop(ctx, name, rep, start, quarantined,
 		fmt.Sprintf("drained after operation %d/%d — resumes on the next run", done, total),
 		fmt.Sprintf("-- drained after operation %d/%d on %s — left in processing, resumes next run", done, total, name))
 }
@@ -849,11 +851,23 @@ func (e *Engine) finalizeDrained(ctx context.Context, name string, rep *report.R
 // finalizeGracefulStop records a graceful stop — a drain or a closed execution window —
 // leaving the manifest in processing with its resume cursor so the next run continues it.
 // errMsg goes to the report; logMsg is narrated to stdout.
-func (e *Engine) finalizeGracefulStop(ctx context.Context, name string, rep *report.RunReport, start time.Time, errMsg, logMsg string) runOutcome {
-	rep.Error = errMsg
+func (e *Engine) finalizeGracefulStop(ctx context.Context, name string, rep *report.RunReport, start time.Time, quarantined []ddl.Operation, errMsg, logMsg string) runOutcome {
+	rep.Error = errMsg + quarantinedNote(quarantined)
 	e.recordInterrupted(ctx, name, rep, start)
 	fmt.Fprintln(e.out, logMsg)
 	return outcomeInterrupted
+}
+
+// quarantinedNote reports operations continue-on-failure quarantined before a graceful
+// stop. They get no recovery manifest, deliberately: the manifest stays in processing and
+// its cursor is frozen at the first gap, so the next run retries them where they are — a
+// recovery manifest would run them a second time. Naming them in the report is what keeps
+// the quarantine visible until then.
+func quarantinedNote(quarantined []ddl.Operation) string {
+	if len(quarantined) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; %d operation(s) quarantined by continue-on-failure, retried on the next run", len(quarantined))
 }
 
 // finalizeInterrupted records a recoverable interruption: the manifest and its
@@ -866,12 +880,20 @@ func (e *Engine) finalizeInterrupted(ctx context.Context, name string, rep *repo
 }
 
 // recordInterrupted writes the shared bookkeeping for an interruption (report timestamps,
-// INTERRUPTED outcome, notify, and history) without moving the manifest — it is left in
-// processing. The caller sets rep.Error and prints its own log line.
+// INTERRUPTED outcome, report, notify, and history) without moving the manifest — it is
+// left in processing. The caller sets rep.Error and prints its own log line.
 func (e *Engine) recordInterrupted(ctx context.Context, name string, rep *report.RunReport, start time.Time) {
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"
+	// The report goes next to the manifest in processing, where the manifest itself stays.
+	// A run that only ever drains or runs out of window (the normal shape of a windowed
+	// campaign) otherwise leaves no .log at all, and anything continue-on-failure
+	// quarantined before the stop would exist only in the optional history. finalize
+	// supersedes this with the terminal report once the manifest leaves processing.
+	if err := report.WriteFile(filepath.Join(e.dirs.Processing, name+".log"), *rep); err != nil {
+		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
+	}
 	e.notify(ctx, "interrupted", name, rep.Error)
 	e.record(ctx, *rep)
 }
@@ -1190,6 +1212,15 @@ func (e *Engine) removeSidecar(name string) {
 
 func (e *Engine) sidecarPath(name string) string {
 	return filepath.Join(e.dirs.Processing, name+stateSuffix)
+}
+
+// removeInterimLog drops the in-processing report left by an earlier interrupted run of
+// this manifest, now that it has reached a terminal outcome and its final report is
+// written next to it in done/failed. Absent (never interrupted) is the common case.
+func (e *Engine) removeInterimLog(name string) {
+	if err := os.Remove(filepath.Join(e.dirs.Processing, name+".log")); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(e.out, "remove interim log %s: %v\n", name, err)
+	}
 }
 
 func checkLines(r preflight.Report) []report.CheckLine {
