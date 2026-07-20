@@ -119,12 +119,22 @@ func WithShrinkStop(stop func() bool) ShrinkOption {
 	return func(r *ShrinkRunner) { r.stop = stop }
 }
 
-// NewShrinkRunner builds a ShrinkRunner. A zero LogPollInterval falls back to the
-// blocking poll interval, mirroring NewMonitoredRunner.
+// defaultShrinkPollInterval floors the poll cadence so time.NewTicker (used by
+// pumpSamples and runTruncateOnly) never gets a non-positive interval and panics.
+// config.Validate rejects a zero blocking_poll in the production path; this defends any
+// other caller (tests, future wiring) that constructs a runner directly.
+const defaultShrinkPollInterval = time.Second
+
+// NewShrinkRunner builds a ShrinkRunner. A zero PollInterval floors to a default; a zero
+// LogPollInterval falls back to the (floored) blocking poll interval, mirroring NewMonitoredRunner.
 func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Clock, cfg ShrinkRunnerConfig, opts ...ShrinkOption) *ShrinkRunner {
+	pollIntv := cfg.PollInterval
+	if pollIntv <= 0 {
+		pollIntv = defaultShrinkPollInterval
+	}
 	logPoll := cfg.LogPollInterval
 	if logPoll <= 0 {
-		logPoll = cfg.PollInterval
+		logPoll = pollIntv
 	}
 	r := &ShrinkRunner{
 		exec:     exec,
@@ -132,7 +142,7 @@ func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Cl
 		sampler:  sampler,
 		clk:      clk,
 		tuning:   cfg.Tuning,
-		pollIntv: cfg.PollInterval,
+		pollIntv: pollIntv,
 		logPoll:  logPoll,
 		blockTO:  cfg.BlockingTimeout,
 		logDrain: cfg.LogDrainTimeout,
@@ -441,16 +451,23 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	}
 
 	sink(ReactionEvent{Kind: "pause", Detail: "shrink chunk stopped under pressure; committed work preserved — " + pressure.Detail()})
+	r.cancelAndAwait(cancelExec, done, sink, "abort did not stop the chunk within the grace period")
+	return true, nil
+}
+
+// cancelAndAwait cancels the running statement and waits for it to stop, falling back to a
+// pool KILL (never the execution connection) if it does not stop within the grace period.
+// done must be the channel carrying the statement's ExecDDL result. Shared by runChunk and
+// runTruncateOnly.
+func (r *ShrinkRunner) cancelAndAwait(cancelExec context.CancelFunc, done <-chan error, sink ReactionSink, killReason string) {
 	cancelExec()
 	select {
 	case <-done:
-		// stopped on its own after the cancel
 	case <-time.After(r.killGr):
-		sink(ReactionEvent{Kind: "kill", Detail: "abort did not stop the chunk within the grace period"})
+		sink(ReactionEvent{Kind: "kill", Detail: killReason})
 		_ = r.exec.Kill(context.Background(), r.exec.SPID())
 		<-done
 	}
-	return true, nil
 }
 
 // runTruncateOnly runs the free TRUNCATEONLY pass while watching for a graceful stop.
@@ -485,15 +502,15 @@ func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, sink Re
 			if !stopRequested(r.stop) {
 				continue
 			}
-			sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q TRUNCATEONLY stopped on graceful stop; freed space preserved", file)})
-			cancelExec()
+			// The statement may have finished between this tick and the stop check; prefer
+			// the real result over reporting a completed TRUNCATEONLY as stopped.
 			select {
-			case <-done:
-			case <-time.After(r.killGr):
-				sink(ReactionEvent{Kind: "kill", Detail: "TRUNCATEONLY did not stop within the grace period"})
-				_ = r.exec.Kill(context.Background(), r.exec.SPID())
-				<-done
+			case err := <-done:
+				return false, err
+			default:
 			}
+			sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q TRUNCATEONLY stopped on graceful stop; freed space preserved", file)})
+			r.cancelAndAwait(cancelExec, done, sink, "TRUNCATEONLY did not stop within the grace period")
 			return true, nil
 		}
 	}
