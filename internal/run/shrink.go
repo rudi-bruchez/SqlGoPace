@@ -31,14 +31,18 @@ var errLogReuseTimeout = errors.New("log reuse wait timed out")
 // ShrinkProgress is the deterministic progress of one file shrink, fed to the TUI
 // in place of the fluctuating percent_complete of dm_exec_requests. StepMB is the
 // (adaptively adjusted) chunk size going into the next chunk, so the operator can see
-// the increment the shrink is moving by; Type is "data" or "log".
+// the increment the shrink is moving by; Type is "data" or "log". Chunks/ChunksRemaining/
+// ETASeconds project the work left from what the completed chunks have achieved.
 type ShrinkProgress struct {
-	File      string
-	Type      string
-	StartMB   int
-	CurrentMB int
-	FinalMB   int
-	StepMB    int
+	File            string
+	Type            string
+	StartMB         int
+	CurrentMB       int
+	FinalMB         int
+	StepMB          int
+	Chunks          int // page-moving chunks completed so far
+	ChunksRemaining int // estimated chunks left (from the average chunk so far)
+	ETASeconds      int // estimated seconds left (from the achieved reduction rate)
 }
 
 // Percent returns the fraction of the planned reduction achieved, in [0,1].
@@ -249,6 +253,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	noProgress := 0
 	backoff := r.tuning.NoProgressBackoff
 	var stallWaited time.Duration
+	shrinkStart := r.clk.Now() // anchors the ETA from the reduction rate achieved so far
 
 	for current > final {
 		// Graceful stop: each chunk commits, so stopping between chunks preserves work;
@@ -264,7 +269,21 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		t0 := r.clk.Now()
 		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink)
 		if err != nil {
-			return result, err
+			// Msg 5240: the file can't be adjusted to this target right now (pages pinned at
+			// the file end, or concurrent allocation). Not a failure — try a smaller move and
+			// treat it as no-progress, so a persistent stall stops cleanly with work preserved.
+			if !mssql.IsFileAllocationError(err) {
+				return result, err
+			}
+			step = clampStep(step/2, r.tuning.MinStepMB, r.tuning.MaxStepMB)
+			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink); werr != nil {
+				return result, werr
+			} else if stop {
+				result.FinalMB = current
+				result.Reason = "shrink could not adjust the file allocation (work preserved)"
+				return result, nil
+			}
+			continue
 		}
 		elapsed := r.clk.Since(t0)
 		after, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
@@ -292,18 +311,13 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			// No gain: WALP timeout (49516) or data pinned at the file end, or we are
 			// blocked by another session (self-wait, §8.2). Wait and retry, stopping
 			// cleanly at whichever bound trips first — count or total wait time.
-			noProgress++
-			if noProgress >= r.tuning.MaxNoProgress || stallWaited >= r.tuning.SelfWaitTimeout {
+			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink); werr != nil {
+				return result, werr
+			} else if stop {
 				result.FinalMB = current
 				result.Reason = "no further progress (work preserved)"
 				return result, nil
 			}
-			sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q made no progress; backing off %s", f.Name, backoff)})
-			if err := r.wait(ctx, backoff); err != nil {
-				return result, err
-			}
-			stallWaited += backoff
-			backoff = nextBackoff(backoff, r.tuning.NoProgressBackoffMax)
 			continue
 		}
 
@@ -315,7 +329,11 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
-		r.emitProgress(f.Name, "data", start, current, final, step)
+		chunksLeft, eta := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
+		r.emitProgress(ShrinkProgress{
+			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
+			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
+		})
 	}
 	return result, nil
 }
@@ -491,10 +509,29 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 
-func (r *ShrinkRunner) emitProgress(file, typ string, start, current, final, stepMB int) {
+func (r *ShrinkRunner) emitProgress(p ShrinkProgress) {
 	if r.progress != nil {
-		r.progress(ShrinkProgress{File: file, Type: typ, StartMB: start, CurrentMB: current, FinalMB: final, StepMB: stepMB})
+		r.progress(p)
 	}
+}
+
+// stall records a no-progress chunk (a real no-gain, or a Msg 5240 that could not adjust
+// the file) and decides whether to give up. It returns stop=true once the no-progress
+// count or the total self-wait budget trips, so the caller ends the shrink cleanly with
+// the reduction so far preserved; otherwise it backs off (doubling each time) and returns
+// stop=false so the caller retries. The pointers are the loop's running counters.
+func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink) (stop bool, err error) {
+	*noProgress++
+	if *noProgress >= r.tuning.MaxNoProgress || *stallWaited >= r.tuning.SelfWaitTimeout {
+		return true, nil
+	}
+	sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q made no progress; backing off %s", file, *backoff)})
+	if werr := r.wait(ctx, *backoff); werr != nil {
+		return false, werr
+	}
+	*stallWaited += *backoff
+	*backoff = nextBackoff(*backoff, r.tuning.NoProgressBackoffMax)
+	return false, nil
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait

@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	mssqldb "github.com/microsoft/go-mssqldb"
+
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
@@ -25,6 +27,7 @@ type fakeServer struct {
 	noProgress    bool // chunk moves never change the size (simulate 49516 / data at end)
 	floorMB       int  // a chunk cannot shrink below this (also the active-log floor)
 	blockTruncate bool // model a long-running TRUNCATEONLY: block until the context is canceled
+	allocError    bool // every page-moving chunk returns Msg 5240 (could not adjust allocation)
 
 	recovery string   // recovery_model_desc for LogReuse
 	reuse    []string // log_reuse_wait_desc returned per LogReuse call (last value repeats)
@@ -57,6 +60,9 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	case strings.Contains(sql, "CHECKPOINT"):
 		// no size change
 	case strings.Contains(sql, "DBCC SHRINKFILE"):
+		if s.allocError {
+			return mssqldb.Error{Number: 5240, Message: "Could not adjust the space allocation for file 'Data'."}
+		}
 		if s.noProgress {
 			return nil
 		}
@@ -309,6 +315,30 @@ func TestShrinkDataNoProgressStops(t *testing.T) {
 	}
 }
 
+func TestShrinkAbsorbsAllocationError(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, allocError: true, // every chunk returns Msg 5240
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final 440
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("Msg 5240 must not fail the run, got err = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason == "" {
+		t.Fatalf("got %+v, want a clean stop with a reason (work preserved)", res)
+	}
+	if !strings.Contains(res[0].Reason, "adjust") {
+		t.Errorf("Reason = %q, want it to mention the allocation could not be adjusted", res[0].Reason)
+	}
+	if res[0].FinalMB != 1000 { // nothing moved, but the file size is honestly reported
+		t.Errorf("FinalMB = %d, want the unchanged 1000", res[0].FinalMB)
+	}
+}
+
 func TestShrinkLogSimpleCheckpoint(t *testing.T) {
 	s := &fakeServer{
 		fileType: mssql.FileTypeLog, name: "Log",
@@ -390,6 +420,22 @@ func TestShrinkLogFullTimesOutCleanly(t *testing.T) {
 		if strings.Contains(stmt, "DBCC SHRINKFILE") || strings.Contains(stmt, "BACKUP LOG") {
 			t.Fatalf("timed-out log shrink should not shrink or back up; got %q", stmt)
 		}
+	}
+}
+
+func TestEstimateShrink(t *testing.T) {
+	// 400 MB reclaimed over 10 chunks in 100s, 600 MB left: avg 40 MB/chunk → 15 chunks,
+	// rate 4 MB/s → 150s.
+	if chunks, eta := estimateShrink(1000, 600, 0, 10, 100*time.Second); chunks != 15 || eta != 150 {
+		t.Errorf("estimateShrink = (%d chunks, %d s), want (15, 150)", chunks, eta)
+	}
+	// No progress yet (nothing reclaimed): no estimate rather than a misleading one.
+	if chunks, eta := estimateShrink(1000, 1000, 0, 0, 0); chunks != 0 || eta != 0 {
+		t.Errorf("estimateShrink with no progress = (%d, %d), want (0, 0)", chunks, eta)
+	}
+	// Nothing left to reclaim: no estimate.
+	if chunks, eta := estimateShrink(1000, 500, 500, 5, 50*time.Second); chunks != 0 || eta != 0 {
+		t.Errorf("estimateShrink at target = (%d, %d), want (0, 0)", chunks, eta)
 	}
 }
 

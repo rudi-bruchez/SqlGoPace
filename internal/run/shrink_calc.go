@@ -1,6 +1,31 @@
 package run
 
-import "time"
+import (
+	"math"
+	"time"
+)
+
+// estimateShrink projects the chunks and time left from the reduction achieved so far.
+// chunksRemaining scales the remaining MB by the average MB per completed chunk;
+// etaSeconds scales the remaining MB by the achieved reduction rate. Both are zero until
+// there is signal (a completed chunk, some elapsed time, and MB still to reclaim), so a
+// just-started or finished shrink reports no estimate rather than a misleading one.
+func estimateShrink(start, current, final, chunksDone int, elapsed time.Duration) (chunksRemaining, etaSeconds int) {
+	doneMB := start - current
+	remainingMB := current - final
+	if doneMB <= 0 || remainingMB <= 0 {
+		return 0, 0
+	}
+	if chunksDone > 0 {
+		chunksRemaining = int(math.Ceil(float64(remainingMB) / (float64(doneMB) / float64(chunksDone))))
+	}
+	if secs := elapsed.Seconds(); secs > 0 {
+		if rate := float64(doneMB) / secs; rate > 0 {
+			etaSeconds = int(math.Ceil(float64(remainingMB) / rate))
+		}
+	}
+	return chunksRemaining, etaSeconds
+}
 
 // ShrinkTuning is the run-side carrier of the DBCC SHRINKFILE driver parameters.
 // It mirrors config.ShrinkConfig but lives here so internal/run stays free of the
