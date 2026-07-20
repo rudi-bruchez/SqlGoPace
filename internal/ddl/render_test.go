@@ -60,6 +60,33 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 	}
 }
 
+// TestMarshalManifestCompactsSequenceElements checks that a mapping inside a sequence
+// (a batch WHERE condition) is compacted too: an IS NULL condition has a nil Value, which
+// must be omitted (no `value: null` noise) while still round-tripping.
+func TestMarshalManifestCompactsSequenceElements(t *testing.T) {
+	in := &ddl.Manifest{
+		Database: "DB",
+		Operations: []ddl.Operation{
+			ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "T",
+				Where: []ddl.Condition{{Column: "archived_at", Op: "is null"}}},
+		},
+	}
+	data, err := ddl.MarshalManifest(in)
+	if err != nil {
+		t.Fatalf("MarshalManifest() error = %v", err)
+	}
+	if strings.Contains(string(data), "value:") {
+		t.Errorf("a nil condition value must be omitted, got:\n%s", data)
+	}
+	got, err := ddl.ParseManifest(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v\n%s", err, data)
+	}
+	if diff := cmp.Diff(in, got); diff != "" {
+		t.Errorf("round-trip mismatch (-want +got):\n%s\n--- marshaled ---\n%s", diff, data)
+	}
+}
+
 // TestMarshalManifestOmitsEmpty checks the output is clean: no null/false/empty noise.
 func TestMarshalManifestOmitsEmpty(t *testing.T) {
 	data, err := ddl.MarshalManifest(&ddl.Manifest{

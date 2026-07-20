@@ -135,6 +135,9 @@ func compact(n *yaml.Node) {
 			if len(val.Content) == 0 {
 				continue // an empty list carries no information and decodes back to nil
 			}
+			for _, elem := range val.Content {
+				compact(elem) // compact each mapping element (e.g. a batch WHERE condition); no-op otherwise
+			}
 		case isEmptyScalar(val):
 			continue
 		}
