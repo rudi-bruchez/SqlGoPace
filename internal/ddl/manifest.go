@@ -597,7 +597,7 @@ type CreateIndex struct {
 	Table           string          `yaml:"table"`
 	Index           string          `yaml:"index"`
 	Columns         []string        `yaml:"columns"`
-	Unique          bool            `yaml:"unique"`
+	Unique          bool            `yaml:"unique,omitempty"`
 	DataCompression string          `yaml:"data_compression"`
 	Options         OptionOverrides `yaml:"options"`
 }
@@ -624,7 +624,7 @@ type AlterColumn struct {
 	Table    string          `yaml:"table"`
 	Column   string          `yaml:"column"`
 	DataType string          `yaml:"type"`
-	Nullable bool            `yaml:"nullable"`
+	Nullable bool            `yaml:"nullable,omitempty"`
 	Options  OptionOverrides `yaml:"options"`
 }
 
@@ -644,7 +644,7 @@ type AddColumn struct {
 	Table    string   `yaml:"table"`
 	Column   string   `yaml:"column"`
 	DataType string   `yaml:"type"`
-	Nullable bool     `yaml:"nullable"`
+	Nullable bool     `yaml:"nullable,omitempty"`
 	Default  *Literal `yaml:"default"`
 }
 
@@ -743,7 +743,7 @@ type ReorganizeIndex struct {
 	Table         string `yaml:"table"`
 	Index         string `yaml:"index"`
 	Partition     *int   `yaml:"partition"`      // nil = whole index
-	LOBCompaction bool   `yaml:"lob_compaction"` // WITH (LOB_COMPACTION = ON)
+	LOBCompaction bool   `yaml:"lob_compaction,omitempty"` // WITH (LOB_COMPACTION = ON)
 }
 
 func (o ReorganizeIndex) CommandType() string { return "reorganize_index" }
@@ -783,9 +783,9 @@ type UpdateStatistics struct {
 	Schema        string `yaml:"schema"`
 	Table         string `yaml:"table"`
 	Statistic     string `yaml:"statistic"`      // optional; empty = all statistics on the table
-	FullScan      bool   `yaml:"full_scan"`      // WITH FULLSCAN
+	FullScan      bool   `yaml:"full_scan,omitempty"`      // WITH FULLSCAN
 	SamplePercent *int   `yaml:"sample_percent"` // WITH SAMPLE n PERCENT (1..100)
-	Resample      bool   `yaml:"resample"`       // WITH RESAMPLE
+	Resample      bool   `yaml:"resample,omitempty"`       // WITH RESAMPLE
 }
 
 func (o UpdateStatistics) CommandType() string { return "update_statistics" }
@@ -823,8 +823,8 @@ func (o UpdateStatistics) Validate() error {
 // switches, and only MAXDOP is resolved from the matrix.
 type CheckDB struct {
 	Database     string          `yaml:"database"`
-	PhysicalOnly bool            `yaml:"physical_only"`
-	DataPurity   bool            `yaml:"data_purity"`
+	PhysicalOnly bool            `yaml:"physical_only,omitempty"`
+	DataPurity   bool            `yaml:"data_purity,omitempty"`
 	Options      OptionOverrides `yaml:"options"` // only MAXDOP applies
 }
 
@@ -842,7 +842,7 @@ func (o CheckDB) Validate() error {
 type Shrink struct {
 	Type            string          `yaml:"type"`            // "data" | "log"
 	Files           string          `yaml:"files"`           // "all" | logical file name; defaults to "all"
-	EmptyFile       bool            `yaml:"emptyfile"`       // reserved for Phase 2; must be false in v1
+	EmptyFile       bool            `yaml:"emptyfile,omitempty"`       // reserved for Phase 2; must be false in v1
 	TargetFreeSpace string          `yaml:"targetfreespace"` // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
 	Options         OptionOverrides `yaml:"options"`         // only WaitAtLowPriority is relevant
 }
@@ -949,7 +949,7 @@ type BatchDML struct {
 	Where            []Condition        `yaml:"where"`     // simple conditions, AND-ed
 	WhereRaw         string             `yaml:"where_raw"` // guarded raw predicate
 	Batch            BatchSpec          `yaml:"batch"`
-	ConfirmFullTable bool               `yaml:"confirm_full_table"`
+	ConfirmFullTable bool               `yaml:"confirm_full_table,omitempty"`
 	Options          OptionOverrides    `yaml:"options"` // only MAXDOP applies to DML
 }
 

@@ -27,6 +27,8 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 		Window: &ddl.Window{Start: "22:00", End: "05:00", Days: []string{"Sat", "Sun"}},
 		Operations: []ddl.Operation{
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "PK_ORDERS", DataCompression: "PAGE", Intent: ddl.IntentFragmentation},
+			// A forced-off *bool override must survive the rewrite: nil=auto, &false=force off.
+			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_OFF", Options: ddl.OptionOverrides{Online: boolPtr(false), Resumable: boolPtr(false)}},
 			ddl.RebuildIndex{Schema: "dbo", Table: "ORDERS", Index: "IX_PART", Partition: intPtr(3), DataCompression: "ROW"},
 			ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX", LOBCompaction: true},
 			ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX2", Partition: intPtr(2)},

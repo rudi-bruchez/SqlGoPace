@@ -144,20 +144,16 @@ func compact(n *yaml.Node) {
 }
 
 // isEmptyScalar reports whether a scalar node carries no information worth writing.
+// A `false` is NOT empty: for the option overrides (`*bool`), nil means "auto" and a
+// stored false means "force off" — dropping false would silently turn a forced-off
+// option back to auto on any rewrite (recovery manifests, AppendIgnoredSession). Plain
+// bool fields keep their output clean via `,omitempty` on the struct tag instead, so no
+// spurious `field: false` is emitted for them.
 func isEmptyScalar(v *yaml.Node) bool {
 	if v.Kind != yaml.ScalarNode {
 		return false
 	}
-	switch {
-	case v.Tag == "!!null":
-		return true
-	case v.Value == "":
-		return true
-	case v.Tag == "!!bool" && v.Value == "false":
-		return true
-	default:
-		return false
-	}
+	return v.Tag == "!!null" || v.Value == ""
 }
 
 func addPair(m *yaml.Node, key string, val *yaml.Node) {
