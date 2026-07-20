@@ -30,7 +30,7 @@ func drain(t *testing.T, actions <-chan tui.Action) (tui.Action, bool) {
 }
 
 func TestModelUpdatesFromMessages(t *testing.T) {
-	m := tui.New("rebuild_index dbo.T.IX", true, nil)
+	m := tui.New("rebuild_index dbo.T.IX", nil)
 	m, _ = send(m, tui.ProgressMsg{Percent: 42, ETASeconds: 120})
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
 		{SPID: 58, Login: "app", Host: "web01", WaitType: "LCK_M_SCH_M", WaitMS: 4500},
@@ -45,7 +45,7 @@ func TestModelUpdatesFromMessages(t *testing.T) {
 }
 
 func TestModelRendersWaits(t *testing.T) {
-	m := tui.New("rebuild_index dbo.T.IX", true, nil)
+	m := tui.New("rebuild_index dbo.T.IX", nil)
 	m, _ = send(m, tui.WaitsMsg{
 		TotalMS: 800,
 		Categories: []tui.WaitCategory{
@@ -63,7 +63,7 @@ func TestModelRendersWaits(t *testing.T) {
 }
 
 func TestModelShowsStepCounter(t *testing.T) {
-	m := tui.New("(running)", false, nil)
+	m := tui.New("(running)", nil)
 	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, Operation: "rebuild_index dbo.T.IX", StepIndex: 12, StepTotal: 74})
 	v := m.View()
 	for _, want := range []string{"12/74", "rebuild_index dbo.T.IX"} {
@@ -74,7 +74,7 @@ func TestModelShowsStepCounter(t *testing.T) {
 }
 
 func TestModelShowsBatchProgress(t *testing.T) {
-	m := tui.New("batch_update dbo.Orders", false, nil)
+	m := tui.New("batch_update dbo.Orders", nil)
 	m, _ = send(m, tui.BatchMsg{
 		Verb: "update", Table: "dbo.Orders",
 		RowsDone: 1_200_000, EstRows: 5_000_000, Percent: 0.24, BatchRows: 4000, RowsPerSec: 8500,
@@ -88,7 +88,7 @@ func TestModelShowsBatchProgress(t *testing.T) {
 }
 
 func TestModelShowsSPID(t *testing.T) {
-	m := tui.New("shrink_data all", false, nil)
+	m := tui.New("shrink_data all", nil)
 	m, _ = send(m, tui.SPIDMsg{SPID: 102})
 	if v := m.View(); !strings.Contains(v, "SPID 102") {
 		t.Errorf("View() should show the monitored SPID:\n%s", v)
@@ -96,7 +96,7 @@ func TestModelShowsSPID(t *testing.T) {
 }
 
 func TestModelHumanizesWaitDurations(t *testing.T) {
-	m := tui.New("op", false, nil)
+	m := tui.New("op", nil)
 	m, _ = send(m, tui.WaitsMsg{
 		TotalMS: 775170, // 12m55s
 		Categories: []tui.WaitCategory{
@@ -117,7 +117,7 @@ func TestModelHumanizesWaitDurations(t *testing.T) {
 }
 
 func TestModelShowsShrinkProgress(t *testing.T) {
-	m := tui.New("shrink DataFile", false, nil)
+	m := tui.New("shrink DataFile", nil)
 	m, _ = send(m, tui.ShrinkMsg{
 		File: "DataFile", Type: "data", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000,
 		StepMB: 512, Percent: 0.32, Chunks: 128, ChunksRemaining: 140, ETASeconds: 2832,
@@ -137,7 +137,7 @@ func TestModelShowsShrinkProgress(t *testing.T) {
 
 func TestHumanizeMBRendersReadableSizes(t *testing.T) {
 	// exercised through the shrink render; assert the boundary units directly here.
-	m := tui.New("op", false, nil)
+	m := tui.New("op", nil)
 	m, _ = send(m, tui.ShrinkMsg{File: "F", Type: "data", CurrentMB: 500, StartMB: 500, FinalMB: 100, StepMB: 50})
 	if v := m.View(); !strings.Contains(v, "500 MB") {
 		t.Errorf("sub-GB should stay in MB:\n%s", v)
@@ -145,7 +145,7 @@ func TestHumanizeMBRendersReadableSizes(t *testing.T) {
 }
 
 func TestModelResetsShrinkOnNewOperation(t *testing.T) {
-	m := tui.New("shrink DataFile", false, nil)
+	m := tui.New("shrink DataFile", nil)
 	m, _ = send(m, tui.ShrinkMsg{File: "DataFile", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, Percent: 0.32})
 	// A new operation starts (StartedAt set): the stale shrink line must disappear.
 	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, Operation: "rebuild_index dbo.T.IX",
@@ -156,7 +156,7 @@ func TestModelResetsShrinkOnNewOperation(t *testing.T) {
 }
 
 func TestModelShowsAlertAndKeepsItSticky(t *testing.T) {
-	m := tui.New("shrink DataFile", false, nil)
+	m := tui.New("shrink DataFile", nil)
 	m, _ = send(m, tui.AlertMsg{
 		Title: "manifest failed: 020_shrink.yaml — preflight failed",
 		Lines: []string{"permissions: shrink/check_db require db_owner (in this database) or sysadmin"},
@@ -174,7 +174,7 @@ func TestModelShowsAlertAndKeepsItSticky(t *testing.T) {
 
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", true, actions)
+	m := tui.New("op", actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58}, {SPID: 61}}})
 	_, _ = send(m, key("x")) // kill selected (first) blocker; model not needed after
 
@@ -189,7 +189,7 @@ func TestModelKillBlockerAction(t *testing.T) {
 
 func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", true, actions)
+	m := tui.New("op", actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 51}, {SPID: 52}, {SPID: 53}}})
 	m, _ = send(m, key("down")) // select SPID 52 (index 1)
 	// A poll drops SPID 51 and reorders: SPID 52 is now at index 0. The cursor must follow
@@ -202,25 +202,18 @@ func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 	}
 }
 
-func TestModelKillDDLAndPause(t *testing.T) {
+func TestModelKillDDL(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", true, actions)
-
-	if _, _ = send(m, key("k")); true {
-		if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionKillDDL {
-			t.Errorf("k = %+v ok=%t, want KillDDL", a, ok)
-		}
-	}
-	if _, _ = send(m, key("p")); true {
-		if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionPause {
-			t.Errorf("p = %+v ok=%t, want Pause", a, ok)
-		}
+	m := tui.New("op", actions)
+	send(m, key("k"))
+	if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionKillDDL {
+		t.Errorf("k = %+v ok=%t, want KillDDL", a, ok)
 	}
 }
 
 func TestModelDrainAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", true, actions)
+	m := tui.New("op", actions)
 	m, _ = send(m, key("d"))
 
 	a, ok := drain(t, actions)
@@ -232,18 +225,9 @@ func TestModelDrainAction(t *testing.T) {
 	}
 }
 
-func TestModelPauseIgnoredWhenNotResumable(t *testing.T) {
-	actions := make(chan tui.Action, 4)
-	m := tui.New("op", false, actions) // not resumable
-	send(m, key("p"))
-	if a, ok := drain(t, actions); ok {
-		t.Errorf("pause emitted %+v on a non-resumable op, want none", a)
-	}
-}
-
 func TestModelQuit(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", true, actions)
+	m := tui.New("op", actions)
 	_, cmd := send(m, key("q"))
 	if cmd == nil {
 		t.Errorf("q should return a quit command")
@@ -255,7 +239,7 @@ func TestModelQuit(t *testing.T) {
 
 func TestModelIgnoreFlowEmitsAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", false, actions)
+	m := tui.New("op", actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
 		{SPID: 53, Program: "ReportingService", Login: "svc", Host: "BATCH01"},
 	}})
@@ -273,7 +257,7 @@ func TestModelIgnoreFlowEmitsAction(t *testing.T) {
 
 func TestModelIgnorePromptCancel(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", false, actions)
+	m := tui.New("op", actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 53, Program: "X"}}})
 	m, _ = send(m, key("i"))
 	m, _ = send(m, tea.KeyMsg{Type: tea.KeyEsc}) // cancel the prompt
@@ -287,7 +271,7 @@ func TestModelIgnorePromptCancel(t *testing.T) {
 }
 
 func TestModelIgnorePromptShowsCriteria(t *testing.T) {
-	m := tui.New("op", false, make(chan tui.Action, 1))
+	m := tui.New("op", make(chan tui.Action, 1))
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 7, Program: "Rep", Login: "svc", Host: "h1"}}})
 	m, _ = send(m, key("i"))
 	v := m.View()
@@ -299,7 +283,7 @@ func TestModelIgnorePromptShowsCriteria(t *testing.T) {
 }
 
 func TestModelLogMsgShownAsNotice(t *testing.T) {
-	m := tui.New("op", false, nil)
+	m := tui.New("op", nil)
 	m, _ = send(m, tui.LogMsg{Line: "ignoring SPID 53 by app_name"})
 	if v := m.View(); !strings.Contains(v, "ignoring SPID 53 by app_name") {
 		t.Errorf("LogMsg should appear in the view:\n%s", v)

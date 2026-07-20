@@ -563,7 +563,7 @@ func isYAMLManifest(name string) bool {
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
 func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
-	program := tui.NewProgram(tui.New("(running)", false, actions))
+	program := tui.NewProgram(tui.New("(running)", actions))
 	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
 
 	feedCtx, stopFeed := context.WithCancel(ctx)

@@ -150,14 +150,8 @@ const (
 	ActionKillBlocker ActionKind = iota
 	// ActionKillDDL kills the running DDL.
 	ActionKillDDL
-	// ActionPause pauses a resumable operation.
-	ActionPause
-	// ActionExtend extends the blocking wait timer.
-	ActionExtend
 	// ActionDrain requests a graceful stop after the current operation.
 	ActionDrain
-	// ActionSnapshot writes the current state to the log.
-	ActionSnapshot
 	// ActionIgnoreBlocker adds an ignore rule for the selected session to the running
 	// manifest (so the DDL holds its lock through it). Criterion/Value/SPID carry the
 	// chosen match.
@@ -190,7 +184,6 @@ const (
 // Model is the incident console state.
 type Model struct {
 	operation       string
-	resumable       bool
 	status          Status
 	stepIndex       int
 	stepTotal       int
@@ -215,10 +208,9 @@ type Model struct {
 	quitting        bool
 }
 
-// New returns a console model for the given operation. actions may be nil (no
-// dispatch); resumable enables the pause action.
-func New(operation string, resumable bool, actions chan<- Action) Model {
-	return Model{operation: operation, resumable: resumable, status: StatusRunning, actions: actions}
+// New returns a console model for the given operation. actions may be nil (no dispatch).
+func New(operation string, actions chan<- Action) Model {
+	return Model{operation: operation, status: StatusRunning, actions: actions}
 }
 
 // Init implements tea.Model; it starts the once-a-second tick that keeps the
@@ -318,12 +310,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "k":
 		m.emit(Action{Kind: ActionKillDDL})
-	case "p":
-		if m.resumable {
-			m.emit(Action{Kind: ActionPause})
-		}
-	case "e":
-		m.emit(Action{Kind: ActionExtend})
 	case "d":
 		// Toggle: request a graceful stop, or cancel a pending one. The host performs the
 		// same toggle on the shared flag and confirms via StatusMsg.
@@ -333,8 +319,6 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.status = StatusDraining
 		}
-	case "s":
-		m.emit(Action{Kind: ActionSnapshot})
 	}
 	return m, nil
 }
@@ -458,7 +442,7 @@ func (m Model) View() string {
 		}
 	}
 
-	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [p] pause  [e] extend  [d] drain/cancel  [s] snapshot  [q] quit"
+	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [d] drain/cancel  [q] quit"
 	if m.mode == modeCriterion && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
 		help = fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
