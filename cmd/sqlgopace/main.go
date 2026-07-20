@@ -312,7 +312,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
 		var sum run.Summary
 		if useTUI {
-			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, cfg.Monitoring.ProgressPoll())
+			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
@@ -379,7 +379,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	shrinkProgress := func(p run.ShrinkProgress) {
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
-		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
+		fmt.Fprintf(engineOut, "-- shrink %s (%s): %d MB (%.0f%%), step %d MB\n", p.File, p.Type, p.CurrentMB, p.Percent()*100, p.StepMB)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
@@ -560,14 +560,14 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, pollInterval time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", false, actions))
 	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
-	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval)
+	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval, blockingTimeout)
 	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, drain, actions)
 
 	// The engine runs under its own cancelable context so that if the console dies first
@@ -598,8 +598,48 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 	return r.summary, r.err
 }
 
-// feedConsole polls the server and sends progress and blocker updates to the TUI.
-func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, interval time.Duration) {
+// blockerGate debounces blocker visibility: a session is surfaced only once it has been
+// continuously blocked by our DDL for at least the blocking timeout — the same threshold
+// the reaction engine acts on — so a fleeting block (e.g. a page-reclaim latch during a
+// shrink) never prompts the operator. firstSeen tracks when each session was first seen
+// blocked; entries are pruned once a session is no longer blocked, so its timer resets.
+type blockerGate struct {
+	firstSeen map[int]time.Time
+}
+
+func newBlockerGate() *blockerGate { return &blockerGate{firstSeen: make(map[int]time.Time)} }
+
+// persistent returns the sessions blocked by ddlSPID that have persisted for at least
+// timeout, updating the first-seen bookkeeping against now.
+func (g *blockerGate) persistent(sessions []mssql.Session, ddlSPID int, now time.Time, timeout time.Duration) []mssql.Session {
+	live := make(map[int]bool)
+	var out []mssql.Session
+	for _, s := range sessions {
+		if !s.BlockedBy(ddlSPID) {
+			continue
+		}
+		live[s.SPID] = true
+		if _, ok := g.firstSeen[s.SPID]; !ok {
+			g.firstSeen[s.SPID] = now
+		}
+		if now.Sub(g.firstSeen[s.SPID]) >= timeout {
+			out = append(out, s)
+		}
+	}
+	for spid := range g.firstSeen {
+		if !live[spid] {
+			delete(g.firstSeen, spid) // no longer blocked: its debounce timer resets
+		}
+	}
+	return out
+}
+
+// feedConsole polls the server and sends progress and blocker updates to the TUI. A
+// blocker is shown only once it has persisted for blockingTimeout (see blockerGate), so
+// transient blocks that clear on their own never reach the console.
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, interval, blockingTimeout time.Duration) {
+	program.Send(tui.SPIDMsg{SPID: ddlSPID}) // show which server session is ours
+	gate := newBlockerGate()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -610,13 +650,11 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 		case <-ticker.C:
 			if sessions, err := conn.ActiveSessions(ctx); err == nil {
 				var blockers []tui.Blocker
-				for _, s := range sessions {
-					if s.BlockingSPID == ddlSPID {
-						blockers = append(blockers, tui.Blocker{
-							SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
-							WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
-						})
-					}
+				for _, s := range gate.persistent(sessions, ddlSPID, time.Now(), blockingTimeout) {
+					blockers = append(blockers, tui.Blocker{
+						SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
+						WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
+					})
 				}
 				program.Send(tui.BlockersMsg{Blockers: blockers})
 			}
@@ -719,8 +757,8 @@ func batchMsg(p run.BatchDMLProgress) tui.BatchMsg {
 // shrinkMsg maps shrink per-chunk progress to a console ShrinkMsg.
 func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
 	return tui.ShrinkMsg{
-		File: p.File, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
-		FinalMB: p.FinalMB, Percent: p.Percent(),
+		File: p.File, Type: p.Type, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
+		FinalMB: p.FinalMB, StepMB: p.StepMB, Percent: p.Percent(),
 	}
 }
 

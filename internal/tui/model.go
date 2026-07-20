@@ -109,11 +109,16 @@ type (
 	// (which is 0 for the chunked DBCC SHRINKFILE loop).
 	ShrinkMsg struct {
 		File      string
+		Type      string // "data" | "log"
 		CurrentMB int
 		StartMB   int
 		FinalMB   int
+		StepMB    int     // current chunk increment
 		Percent   float64 // 0..1
 	}
+	// SPIDMsg carries the session id of the DDL the console is monitoring, so the
+	// operator can see which server session (and which blocks) is ours.
+	SPIDMsg struct{ SPID int }
 	// AlertMsg carries a prominent, sticky failure notice — typically a manifest that
 	// failed preflight (e.g. the login lacks db_owner for a shrink). Unlike LogMsg's
 	// single overwritten notice line, alerts accumulate and are rendered near the top so
@@ -195,6 +200,7 @@ type Model struct {
 	hasBatch        bool
 	shrink          ShrinkMsg
 	hasShrink       bool
+	spid            int
 	alerts          []AlertMsg
 	blockers        []Blocker
 	waits           []WaitCategory
@@ -252,6 +258,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ShrinkMsg:
 		m.hasShrink = true
 		m.shrink = msg
+	case SPIDMsg:
+		m.spid = msg.SPID
 	case AlertMsg:
 		m.alerts = append(m.alerts, msg)
 	case tickMsg:
@@ -364,7 +372,7 @@ var (
 // View implements tea.Model.
 func (m Model) View() string {
 	var b strings.Builder
-	b.WriteString(titleStyle.Render("SqlGoPace — incident console") + "\n\n")
+	b.WriteString(titleStyle.Render("SqlGoPace") + "\n\n")
 	for _, a := range m.alerts {
 		fmt.Fprintf(&b, "%s\n", alertStyle.Render("⚠ "+a.Title))
 		for _, line := range a.Lines {
@@ -377,6 +385,9 @@ func (m Model) View() string {
 		op = fmt.Sprintf("%d/%d %s", m.stepIndex, m.stepTotal, m.operation)
 	}
 	fmt.Fprintf(&b, "operation: %s   [%s]", op, m.status)
+	if m.spid > 0 {
+		fmt.Fprintf(&b, "   SPID %d", m.spid)
+	}
 	if m.elapsed > 0 {
 		fmt.Fprintf(&b, "   elapsed %s", formatElapsed(m.elapsed))
 	}
@@ -387,8 +398,8 @@ func (m Model) View() string {
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
 	}
 	if m.hasShrink {
-		fmt.Fprintf(&b, "shrink %s: %d → %d MB target (from %d MB, %.0f%%)\n",
-			m.shrink.File, m.shrink.CurrentMB, m.shrink.FinalMB, m.shrink.StartMB, m.shrink.Percent*100)
+		fmt.Fprintf(&b, "shrink %s (%s): %d → %d MB target (from %d MB, %.0f%%)   step %d MB\n",
+			m.shrink.File, m.shrink.Type, m.shrink.CurrentMB, m.shrink.FinalMB, m.shrink.StartMB, m.shrink.Percent*100, m.shrink.StepMB)
 	}
 	fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
 	if m.rollbackPercent > 0 {
@@ -412,9 +423,9 @@ func (m Model) View() string {
 	}
 
 	if len(m.waits) > 0 {
-		fmt.Fprintf(&b, "\nwaits slowing the DDL (total %dms):\n", m.waitTotalMS)
+		fmt.Fprintf(&b, "\nwaits slowing the DDL (total %s):\n", humanizeMS(m.waitTotalMS))
 		for _, w := range m.waits {
-			fmt.Fprintf(&b, "  %-20s %8dms  %6d tasks\n", w.Name, w.WaitMS, w.Tasks)
+			fmt.Fprintf(&b, "  %-20s %10s  %10d tasks\n", w.Name, humanizeMS(w.WaitMS), w.Tasks)
 		}
 	}
 
@@ -429,6 +440,23 @@ func (m Model) View() string {
 		b.WriteString("\n" + m.notice)
 	}
 	return b.String()
+}
+
+// humanizeMS renders a millisecond wait total compactly, escalating the unit so large
+// accumulated values stay readable: "775ms", "2.8s", "6m35s", "1h04m".
+func humanizeMS(ms int64) string {
+	switch {
+	case ms < 1000:
+		return fmt.Sprintf("%dms", ms)
+	case ms < 60_000:
+		return fmt.Sprintf("%.1fs", float64(ms)/1000)
+	case ms < 3_600_000:
+		s := ms / 1000
+		return fmt.Sprintf("%dm%02ds", s/60, s%60)
+	default:
+		s := ms / 1000
+		return fmt.Sprintf("%dh%02dm", s/3600, (s%3600)/60)
+	}
 }
 
 // formatElapsed renders a duration as mm:ss, or h:mm:ss past an hour.

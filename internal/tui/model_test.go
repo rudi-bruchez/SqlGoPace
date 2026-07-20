@@ -87,13 +87,42 @@ func TestModelShowsBatchProgress(t *testing.T) {
 	}
 }
 
+func TestModelShowsSPID(t *testing.T) {
+	m := tui.New("shrink_data all", false, nil)
+	m, _ = send(m, tui.SPIDMsg{SPID: 102})
+	if v := m.View(); !strings.Contains(v, "SPID 102") {
+		t.Errorf("View() should show the monitored SPID:\n%s", v)
+	}
+}
+
+func TestModelHumanizesWaitDurations(t *testing.T) {
+	m := tui.New("op", false, nil)
+	m, _ = send(m, tui.WaitsMsg{
+		TotalMS: 775170, // 12m55s
+		Categories: []tui.WaitCategory{
+			{Name: "Data I/O", WaitMS: 395329, Tasks: 496501}, // 6m35s
+			{Name: "Transaction log", WaitMS: 2785, Tasks: 1393}, // 2.8s
+			{Name: "Page latch (tempdb)", WaitMS: 220, Tasks: 26}, // 220ms
+		},
+	})
+	v := m.View()
+	for _, want := range []string{"total 12m55s", "6m35s", "2.8s", "220ms"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() should humanize waits, missing %q:\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "775170ms") || strings.Contains(v, "395329ms") {
+		t.Errorf("raw millisecond values should not appear:\n%s", v)
+	}
+}
+
 func TestModelShowsShrinkProgress(t *testing.T) {
 	m := tui.New("shrink DataFile", false, nil)
 	m, _ = send(m, tui.ShrinkMsg{
-		File: "DataFile", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, Percent: 0.32,
+		File: "DataFile", Type: "data", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, StepMB: 512, Percent: 0.32,
 	})
 	v := m.View()
-	for _, want := range []string{"shrink DataFile", "6000000", "900000 MB target", "32%"} {
+	for _, want := range []string{"shrink DataFile (data)", "6000000", "900000 MB target", "32%", "step 512 MB"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("View() missing %q:\n%s", want, v)
 		}

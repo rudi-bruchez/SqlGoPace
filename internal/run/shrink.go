@@ -29,12 +29,16 @@ var _ ShrinkReader = (*mssql.Conn)(nil)
 var errLogReuseTimeout = errors.New("log reuse wait timed out")
 
 // ShrinkProgress is the deterministic progress of one file shrink, fed to the TUI
-// in place of the fluctuating percent_complete of dm_exec_requests.
+// in place of the fluctuating percent_complete of dm_exec_requests. StepMB is the
+// (adaptively adjusted) chunk size going into the next chunk, so the operator can see
+// the increment the shrink is moving by; Type is "data" or "log".
 type ShrinkProgress struct {
 	File      string
+	Type      string
 	StartMB   int
 	CurrentMB int
 	FinalMB   int
+	StepMB    int
 }
 
 // Percent returns the fraction of the planned reduction achieved, in [0,1].
@@ -311,7 +315,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
-		r.emitProgress(f.Name, start, current, final)
+		r.emitProgress(f.Name, "data", start, current, final, step)
 	}
 	return result, nil
 }
@@ -487,9 +491,9 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 
-func (r *ShrinkRunner) emitProgress(file string, start, current, final int) {
+func (r *ShrinkRunner) emitProgress(file, typ string, start, current, final, stepMB int) {
 	if r.progress != nil {
-		r.progress(ShrinkProgress{File: file, StartMB: start, CurrentMB: current, FinalMB: final})
+		r.progress(ShrinkProgress{File: file, Type: typ, StartMB: start, CurrentMB: current, FinalMB: final, StepMB: stepMB})
 	}
 }
 
