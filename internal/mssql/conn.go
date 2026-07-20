@@ -69,6 +69,13 @@ func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
 		_ = c.Close()
 		return nil, fmt.Errorf("read @@SPID: %w", err)
 	}
+	// Block attribution keys off this SPID everywhere (Session.BlockedBy). A zero here would
+	// make BlockedBy always false — silently disabling every blocking reaction — so refuse to
+	// run rather than monitor blind. @@SPID is never 0 for a live session; this is a guard.
+	if c.spid <= 0 {
+		_ = c.Close()
+		return nil, fmt.Errorf("read @@SPID: got non-positive session id %d", c.spid)
+	}
 	return c, nil
 }
 

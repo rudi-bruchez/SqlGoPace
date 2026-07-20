@@ -202,8 +202,9 @@ WHERE s.is_user_process = 1
 ORDER BY r.cpu_time DESC
 OPTION (RECOMPILE, MAXDOP 1);`
 
-// ActiveSessions returns all active user requests. The orchestrator filters and
-// walks the blocking chain (blocking_session_id) to find head blockers.
+// ActiveSessions returns all active user requests. BlockingSPID is the DIRECT blocker
+// (r.blocking_session_id), not a chain head; consumers attribute a block to our DDL with
+// Session.BlockedBy (a direct comparison), so a transitively-blocked victim is not counted.
 func (c *Conn) ActiveSessions(ctx context.Context) ([]Session, error) {
 	rows, err := c.pool.QueryContext(ctx, activeSessionsSQL)
 	if err != nil {
