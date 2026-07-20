@@ -26,7 +26,7 @@ monitoring:
   log_max_percent: 80               # secondary
   blocking_timeout_minutes: 1       # delay before reacting when our DDL blocks other sessions
   log_drain_timeout_minutes: 30     # give up if the log does not drain
-  max_retry_attempts: 3
+  max_retry_attempts: 1            # Standard: a blocked offline rebuild is quarantined fast (2 attempts, not 4)
   kill_grace_seconds: 30            # delay before an explicit KILL if the Go cancellation does not take effect
   reconnect_timeout_minutes: 2      # wait this long for the server to come back before classifying an interruption
   checkpoint_between_operations: false  # only has an effect under SIMPLE recovery model

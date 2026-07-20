@@ -103,6 +103,17 @@ type (
 		BatchRows  int
 		RowsPerSec float64
 	}
+	// ShrinkMsg carries the running shrink operation's live per-chunk progress. Like
+	// BatchMsg it is distinct from ProgressMsg: a shrink's percent is the deterministic
+	// fraction of the planned reduction (design §9), not the server's percent_complete
+	// (which is 0 for the chunked DBCC SHRINKFILE loop).
+	ShrinkMsg struct {
+		File      string
+		CurrentMB int
+		StartMB   int
+		FinalMB   int
+		Percent   float64 // 0..1
+	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
 )
@@ -174,6 +185,8 @@ type Model struct {
 	rollbackPercent float64
 	batch           BatchMsg
 	hasBatch        bool
+	shrink          ShrinkMsg
+	hasShrink       bool
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -218,14 +231,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.stepIndex, m.stepTotal = msg.StepIndex, msg.StepTotal
 		}
 		if !msg.StartedAt.IsZero() {
-			// A new operation started: reset the timer and drop the previous batch line.
+			// A new operation started: reset the timer and drop the previous batch/shrink line.
 			m.startedAt = msg.StartedAt
 			m.elapsed = 0
 			m.hasBatch = false
+			m.hasShrink = false
 		}
 	case BatchMsg:
 		m.hasBatch = true
 		m.batch = msg
+	case ShrinkMsg:
+		m.hasShrink = true
+		m.shrink = msg
 	case tickMsg:
 		if !m.startedAt.IsZero() {
 			if t := time.Time(msg); !t.Before(m.startedAt) {
@@ -349,6 +366,10 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "batch %s %s: %d/%d rows (%.0f%%)   batch=%d   %.0f rows/s\n",
 			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
+	}
+	if m.hasShrink {
+		fmt.Fprintf(&b, "shrink %s: %d → %d MB target (from %d MB, %.0f%%)\n",
+			m.shrink.File, m.shrink.CurrentMB, m.shrink.FinalMB, m.shrink.StartMB, m.shrink.Percent*100)
 	}
 	fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
 	if m.rollbackPercent > 0 {

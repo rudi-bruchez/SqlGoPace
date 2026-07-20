@@ -3,6 +3,7 @@ package tui_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
@@ -83,6 +84,30 @@ func TestModelShowsBatchProgress(t *testing.T) {
 		if !strings.Contains(v, want) {
 			t.Errorf("View() missing %q:\n%s", want, v)
 		}
+	}
+}
+
+func TestModelShowsShrinkProgress(t *testing.T) {
+	m := tui.New("shrink DataFile", false, nil)
+	m, _ = send(m, tui.ShrinkMsg{
+		File: "DataFile", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, Percent: 0.32,
+	})
+	v := m.View()
+	for _, want := range []string{"shrink DataFile", "6000000", "900000 MB target", "32%"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelResetsShrinkOnNewOperation(t *testing.T) {
+	m := tui.New("shrink DataFile", false, nil)
+	m, _ = send(m, tui.ShrinkMsg{File: "DataFile", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, Percent: 0.32})
+	// A new operation starts (StartedAt set): the stale shrink line must disappear.
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, Operation: "rebuild_index dbo.T.IX",
+		StepIndex: 2, StepTotal: 5, StartedAt: time.Unix(1000, 0)})
+	if v := m.View(); strings.Contains(v, "shrink DataFile") {
+		t.Errorf("shrink line should clear when a new operation starts:\n%s", v)
 	}
 }
 

@@ -53,3 +53,16 @@ func TestBatchMsgMapsProgress(t *testing.T) {
 		t.Errorf("Percent = %v, want ~0.24", got)
 	}
 }
+
+func TestShrinkMsgMapsProgress(t *testing.T) {
+	msg := shrinkMsg(run.ShrinkProgress{
+		File: "DataFile", StartMB: 8_388_608, CurrentMB: 6_000_000, FinalMB: 900_000,
+	})
+	if msg.File != "DataFile" || msg.StartMB != 8_388_608 || msg.CurrentMB != 6_000_000 || msg.FinalMB != 900_000 {
+		t.Errorf("shrinkMsg = %+v, want DataFile 8388608→900000 at 6000000", msg)
+	}
+	// Percent is (start-current)/(start-final) = 2388608 / 7488608 ≈ 0.319.
+	if got := msg.Percent; got < 0.31 || got > 0.33 {
+		t.Errorf("Percent = %v, want ~0.32", got)
+	}
+}

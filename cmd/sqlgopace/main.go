@@ -364,6 +364,22 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		KillGrace:       cfg.Monitoring.KillGrace(),
 		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
 	})
+	// Progress goes to the TUI when the console is running, else to stdout/log. The
+	// step sink follows the same rule (in TUI mode engineOut is io.Discard anyway).
+	shrinkProgress := func(p run.ShrinkProgress) {
+		// Deterministic per-chunk progress (design §9), unlike the fluctuating
+		// dm_exec_requests percent used for other operations.
+		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
+	}
+	batchProgress := func(p run.BatchDMLProgress) {
+		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
+	}
+	stepSink := stepSinkTo(engineOut)
+	if fwd != nil {
+		shrinkProgress = fwd.shrink
+		batchProgress = fwd.batch
+		stepSink = fwd.step
+	}
 	shrinkRunner := run.NewShrinkRunner(conn, conn, sampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:          shrinkTuning(cfg.Shrink),
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
@@ -371,21 +387,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
 		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
-	}, run.WithShrinkProgress(func(p run.ShrinkProgress) {
-		// Deterministic per-chunk progress (design §9), unlike the fluctuating
-		// dm_exec_requests percent used for other operations.
-		fmt.Fprintf(engineOut, "-- shrink %s: %d MB (%.0f%%)\n", p.File, p.CurrentMB, p.Percent()*100)
-	}), run.WithShrinkStop(drain))
-	// Progress goes to the TUI when the console is running, else to stdout/log. The
-	// step sink follows the same rule (in TUI mode engineOut is io.Discard anyway).
-	batchProgress := func(p run.BatchDMLProgress) {
-		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
-	}
-	stepSink := stepSinkTo(engineOut)
-	if fwd != nil {
-		batchProgress = fwd.batch
-		stepSink = fwd.step
-	}
+	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
 		Tuning:          batchTuning(cfg.BatchDML),
 		RCSI:            info.RCSIEnabled,
@@ -551,7 +553,7 @@ func isYAMLManifest(name string) bool {
 func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, pollInterval time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", false, actions))
-	fwd.attach(program) // engine step/batch progress now reaches the console
+	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
@@ -642,8 +644,8 @@ func waitsMsg(waits []mssql.SessionWait) tui.WaitsMsg {
 	return tui.WaitsMsg{Categories: out, TotalMS: total}
 }
 
-// tuiForwarder relays engine-side progress (per-operation step events and batch-DML
-// progress) to the incident console. The console's program is created after the
+// tuiForwarder relays engine-side progress (per-operation step events, batch-DML and
+// shrink progress) to the incident console. The console's program is created after the
 // engine is built, so the forwarder holds a deferred reference, attached once the
 // console starts. attach happens-before the engine goroutine that drives send (the
 // step/batch callbacks fire only inside ProcessAll), so no lock is needed.
@@ -669,6 +671,9 @@ func (f *tuiForwarder) step(ev run.StepEvent) {
 // batch forwards batch-DML progress to the console.
 func (f *tuiForwarder) batch(p run.BatchDMLProgress) { f.send(batchMsg(p)) }
 
+// shrink forwards shrink per-chunk progress to the console.
+func (f *tuiForwarder) shrink(p run.ShrinkProgress) { f.send(shrinkMsg(p)) }
+
 // stepStatusMsg maps a step event to a console status update. Only the started event
 // maps (ok=true): it carries the label, the i/N counter and the timer anchor. The
 // finished event is dropped — the next operation's started event replaces the
@@ -692,6 +697,14 @@ func batchMsg(p run.BatchDMLProgress) tui.BatchMsg {
 		Verb: p.Verb, Table: p.Schema + "." + p.Table,
 		RowsDone: p.RowsDone, EstRows: p.EstRows, Percent: p.Percent(),
 		BatchRows: p.BatchRows, RowsPerSec: p.RowsPerSec,
+	}
+}
+
+// shrinkMsg maps shrink per-chunk progress to a console ShrinkMsg.
+func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
+	return tui.ShrinkMsg{
+		File: p.File, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
+		FinalMB: p.FinalMB, Percent: p.Percent(),
 	}
 }
 
