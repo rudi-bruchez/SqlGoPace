@@ -288,6 +288,18 @@ func (c *Config) applyDefaults() {
 	if c.Monitoring.ReconnectTimeoutMinutes <= 0 {
 		c.Monitoring.ReconnectTimeoutMinutes = 2
 	}
+	// A zero blocking timeout would make the DDL react to (and the console surface) any
+	// blocked session instantly — a dangerous default for an unset field. Floor these
+	// timeouts to the shipped config.yaml values so omitting them is safe.
+	if c.Monitoring.BlockingTimeoutMinutes <= 0 {
+		c.Monitoring.BlockingTimeoutMinutes = 1
+	}
+	if c.Monitoring.LogDrainTimeoutMinutes <= 0 {
+		c.Monitoring.LogDrainTimeoutMinutes = 30
+	}
+	if c.Monitoring.KillGraceSeconds <= 0 {
+		c.Monitoring.KillGraceSeconds = 30
+	}
 	c.Shrink.applyDefaults()
 	c.BatchDML.applyDefaults()
 }

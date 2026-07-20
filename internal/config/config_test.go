@@ -94,6 +94,19 @@ func TestParseDefaultsWaitDuration(t *testing.T) {
 	}
 }
 
+func TestParseDefaultsBlockingTimeout(t *testing.T) {
+	// A zero blocking timeout would make the DDL react to (and the console show) any block
+	// instantly; an unset field must default, not mean react-immediately.
+	yaml := strings.Replace(validYAML, "blocking_timeout_minutes: 5", "blocking_timeout_minutes: 0", 1)
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	if got := cfg.Monitoring.BlockingTimeout(); got != time.Minute {
+		t.Errorf("BlockingTimeout() = %v, want default 1m", got)
+	}
+}
+
 func TestParseInvalid(t *testing.T) {
 	tests := []struct {
 		name   string
