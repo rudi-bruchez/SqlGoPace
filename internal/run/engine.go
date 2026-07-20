@@ -317,6 +317,7 @@ func NewEngine(dirs Dirs, target ddl.Target, matrix *ddl.Matrix, policy ddl.Poli
 
 // ProcessAll runs every manifest currently in the to_run directory, sequentially.
 func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
+	e.failures = nil // fresh accumulation; the Engine may be run more than once
 	if err := e.queue.EnsureDirs(); err != nil {
 		return Summary{}, err
 	}
@@ -809,6 +810,13 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 
 	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
+	}
+	// A PARTIAL is counted as a failed manifest, so surface its reason like finalize does —
+	// otherwise the run summary and the TUI alert would omit it (len(Failures) != Failed).
+	f := ManifestFailure{Manifest: name, Error: rep.Error, Details: failLines(rep.Preflight)}
+	e.failures = append(e.failures, f)
+	if e.alertSink != nil {
+		e.alertSink(f)
 	}
 	e.notify(ctx, "fail", name, rep.Error)
 	e.record(ctx, *rep)
