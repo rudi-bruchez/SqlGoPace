@@ -111,6 +111,23 @@ func TestModelResetsShrinkOnNewOperation(t *testing.T) {
 	}
 }
 
+func TestModelShowsAlertAndKeepsItSticky(t *testing.T) {
+	m := tui.New("shrink DataFile", false, nil)
+	m, _ = send(m, tui.AlertMsg{
+		Title: "manifest failed: 020_shrink.yaml — preflight failed",
+		Lines: []string{"permissions: shrink/check_db require db_owner (in this database) or sysadmin"},
+	})
+	// A later, unrelated update must not clear the alert (it is sticky, unlike LogMsg).
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 9}}})
+
+	v := m.View()
+	for _, want := range []string{"manifest failed: 020_shrink.yaml", "db_owner", "⚠"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() missing alert %q:\n%s", want, v)
+		}
+	}
+}
+
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", true, actions)

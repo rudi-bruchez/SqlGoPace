@@ -231,8 +231,13 @@ func TestProcessAllDatabaseFilter(t *testing.T) {
 
 func TestProcessAllPreflightFailure(t *testing.T) {
 	runner := &fakeOpRunner{}
-	report := preflight.Report{Checks: []preflight.Check{{Name: "server", Severity: preflight.Fail, Detail: "nope"}}}
-	eng, dirs := setupEngine(t, fakePreflighter{report: report}, runner)
+	report := preflight.Report{Checks: []preflight.Check{
+		{Name: "server", Severity: preflight.Pass, Detail: "ok"},
+		{Name: "permissions", Severity: preflight.Fail, Detail: "shrink requires db_owner; the login has neither"},
+	}}
+	var alerts []run.ManifestFailure
+	eng, dirs := setupEngine(t, fakePreflighter{report: report}, runner,
+		run.WithAlertSink(func(f run.ManifestFailure) { alerts = append(alerts, f) }))
 
 	sum, err := eng.ProcessAll(context.Background())
 	if err != nil {
@@ -245,6 +250,20 @@ func TestProcessAllPreflightFailure(t *testing.T) {
 		t.Errorf("runner.calls = %d, want 0 (preflight failed before execution)", runner.calls)
 	}
 	mustExist(t, filepath.Join(dirs.Failed, "010_a.yaml"))
+
+	// The failure reason must be surfaced through the Summary (for the stdout recap) and the
+	// alert sink (for the TUI), carrying the actionable permissions detail — not just "failed".
+	if len(sum.Failures) != 1 {
+		t.Fatalf("Summary.Failures = %+v, want one entry", sum.Failures)
+	}
+	f := sum.Failures[0]
+	if f.Manifest != "010_a.yaml" || len(f.Details) != 1 ||
+		!strings.Contains(f.Details[0], "permissions") || !strings.Contains(f.Details[0], "db_owner") {
+		t.Errorf("Summary.Failures[0] = %+v, want the permissions/db_owner detail", f)
+	}
+	if len(alerts) != 1 || len(alerts[0].Details) != 1 || !strings.Contains(alerts[0].Details[0], "db_owner") {
+		t.Errorf("alert sink got %+v, want one failure carrying the db_owner detail", alerts)
+	}
 }
 
 func TestProcessAllOperationError(t *testing.T) {

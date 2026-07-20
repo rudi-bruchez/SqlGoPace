@@ -117,6 +117,18 @@ type Summary struct {
 	Failed      int
 	Interrupted int // paused and left for recovery (session killed / connection lost)
 	Deferred    int // manifests skipped this run because they were outside their window
+	Failures    []ManifestFailure
+}
+
+// ManifestFailure records why a manifest failed, for the post-run summary and the TUI
+// alert. Details carries the human-readable preflight FAIL line(s) when the failure is a
+// preflight rejection (e.g. a shrink refused because the login lacks db_owner), so the
+// operator sees the actionable reason without opening the .log; it is empty for other
+// failures, whose reason is in Error.
+type ManifestFailure struct {
+	Manifest string
+	Error    string
+	Details  []string
 }
 
 // runOutcome is the result of processing one manifest.
@@ -153,15 +165,17 @@ type Engine struct {
 	resumeCheck      ResumableProbe
 	aborter          ResumableAborter // clears a blocking paused resumable (opt-in)
 	reconnectTimeout time.Duration
-	database         string            // when set, process only manifests for this database
-	liveReload       bool              // re-read ignore_blocked_sessions from the manifest mid-run
-	manifestObserver func(path string) // notified of the in-flight manifest path (TUI editing)
-	holdPoll         time.Duration     // cadence for narrating held-through ignored sessions
-	stepSink         func(StepEvent)   // manifest-level per-operation progress (stdout + TUI)
-	compression      CompressionReader // reads current index compression for the intent: compression skip
-	drain            func() bool       // reports a requested graceful stop (cancellable DrainFlag)
-	serverClock      ServerClock       // reads SQL Server local time for manifest windows
+	database         string                // when set, process only manifests for this database
+	liveReload       bool                  // re-read ignore_blocked_sessions from the manifest mid-run
+	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
+	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
+	stepSink         func(StepEvent)       // manifest-level per-operation progress (stdout + TUI)
+	alertSink        func(ManifestFailure) // notified when a manifest fails, so the TUI can show why
+	compression      CompressionReader     // reads current index compression for the intent: compression skip
+	drain            func() bool           // reports a requested graceful stop (cancellable DrainFlag)
+	serverClock      ServerClock           // reads SQL Server local time for manifest windows
 	out              io.Writer
+	failures         []ManifestFailure // accumulated across the run, surfaced in Summary
 }
 
 // defaultHoldPoll is how often the engine narrates the ignored sessions it is holding
@@ -205,6 +219,11 @@ func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w }
 // another when it finishes, so stdout and the TUI can show manifest-level progress
 // (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
 func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
+
+// WithAlertSink registers a callback fed one ManifestFailure whenever a manifest fails,
+// so the incident console can show the reason (notably a preflight rejection like a
+// missing db_owner for a shrink) prominently instead of leaving it only in the .log.
+func WithAlertSink(f func(ManifestFailure)) EngineOption { return func(e *Engine) { e.alertSink = f } }
 
 // WithCompressionReader lets the engine honor a rebuild's intent: compression by
 // reading an index's current compression and skipping a rebuild already at its target.
@@ -331,7 +350,22 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 			sum.Failed++
 		}
 	}
+	sum.Failures = e.failures
 	return sum, nil
+}
+
+// failLines returns the human-readable detail of each preflight check that failed,
+// prefixed with the check name (e.g. "permissions: shrink/check_db require db_owner …").
+// It is what the TUI alert and the post-run summary show so the operator sees the
+// actionable reason for a preflight rejection without opening the .log.
+func failLines(checks []report.CheckLine) []string {
+	var out []string
+	for _, c := range checks {
+		if c.Severity == "FAIL" {
+			out = append(out, c.Name+": "+c.Detail)
+		}
+	}
+	return out
 }
 
 // ownsManifest reports whether this engine should process the named manifest: it
@@ -711,6 +745,11 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
 	}
 	if !success {
+		f := ManifestFailure{Manifest: name, Error: rep.Error, Details: failLines(rep.Preflight)}
+		e.failures = append(e.failures, f)
+		if e.alertSink != nil {
+			e.alertSink(f)
+		}
 		e.notify(ctx, "fail", name, rep.Error)
 	}
 	e.record(ctx, *rep)

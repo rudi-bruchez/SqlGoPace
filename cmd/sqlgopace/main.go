@@ -307,7 +307,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		if useTUI {
 			current = &currentManifest{}
 			fwd = &tuiForwarder{}
-			extra = append(extra, run.WithManifestObserver(current.set))
+			extra = append(extra, run.WithManifestObserver(current.set), run.WithAlertSink(fwd.alert))
 		}
 		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
 		var sum run.Summary
@@ -328,9 +328,19 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		total.Failed += sum.Failed
 		total.Interrupted += sum.Interrupted
 		total.Deferred += sum.Deferred
+		total.Failures = append(total.Failures, sum.Failures...)
 	}
 
 	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted, %d deferred\n", total.Done, total.Failed, total.Interrupted, total.Deferred)
+	// The TUI closes when the run ends, so echo each failure's reason here — the console's
+	// alert may have flashed by on a fast preflight rejection. This keeps the actionable
+	// detail (e.g. missing db_owner for a shrink) on screen without opening the .log.
+	for _, f := range total.Failures {
+		fmt.Fprintf(stdout, "-- FAILED %s: %s\n", f.Manifest, f.Error)
+		for _, d := range f.Details {
+			fmt.Fprintf(stdout, "     %s\n", d)
+		}
+	}
 	if total.Interrupted > 0 {
 		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", total.Interrupted)
 	}
@@ -673,6 +683,12 @@ func (f *tuiForwarder) batch(p run.BatchDMLProgress) { f.send(batchMsg(p)) }
 
 // shrink forwards shrink per-chunk progress to the console.
 func (f *tuiForwarder) shrink(p run.ShrinkProgress) { f.send(shrinkMsg(p)) }
+
+// alert forwards a manifest failure to the console as a prominent, sticky notice so the
+// operator sees the reason (e.g. a shrink refused for lack of db_owner) on screen.
+func (f *tuiForwarder) alert(mf run.ManifestFailure) {
+	f.send(tui.AlertMsg{Title: "manifest failed: " + mf.Manifest + " — " + mf.Error, Lines: mf.Details})
+}
 
 // stepStatusMsg maps a step event to a console status update. Only the started event
 // maps (ok=true): it carries the label, the i/N counter and the timer anchor. The

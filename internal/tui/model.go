@@ -114,6 +114,14 @@ type (
 		FinalMB   int
 		Percent   float64 // 0..1
 	}
+	// AlertMsg carries a prominent, sticky failure notice — typically a manifest that
+	// failed preflight (e.g. the login lacks db_owner for a shrink). Unlike LogMsg's
+	// single overwritten notice line, alerts accumulate and are rendered near the top so
+	// the operator sees the reason even as other state updates.
+	AlertMsg struct {
+		Title string
+		Lines []string
+	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
 )
@@ -187,6 +195,7 @@ type Model struct {
 	hasBatch        bool
 	shrink          ShrinkMsg
 	hasShrink       bool
+	alerts          []AlertMsg
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -243,6 +252,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ShrinkMsg:
 		m.hasShrink = true
 		m.shrink = msg
+	case AlertMsg:
+		m.alerts = append(m.alerts, msg)
 	case tickMsg:
 		if !m.startedAt.IsZero() {
 			if t := time.Time(msg); !t.Before(m.startedAt) {
@@ -347,12 +358,20 @@ var (
 	titleStyle = lipgloss.NewStyle().Bold(true)
 	selStyle   = lipgloss.NewStyle().Reverse(true)
 	helpStyle  = lipgloss.NewStyle().Faint(true)
+	alertStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")) // bright red
 )
 
 // View implements tea.Model.
 func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(titleStyle.Render("SqlGoPace — incident console") + "\n\n")
+	for _, a := range m.alerts {
+		fmt.Fprintf(&b, "%s\n", alertStyle.Render("⚠ "+a.Title))
+		for _, line := range a.Lines {
+			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+line))
+		}
+		b.WriteString("\n")
+	}
 	op := m.operation
 	if m.stepTotal > 0 {
 		op = fmt.Sprintf("%d/%d %s", m.stepIndex, m.stepTotal, m.operation)
