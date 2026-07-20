@@ -235,6 +235,15 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		return result, nil
 	}
 
+	// Surface the target immediately — before the possibly-long TRUNCATEONLY and the
+	// chunk loop — so the console shows current size, target and step from the start,
+	// not only after the first chunk that happens to gain space (a shrink blocked or
+	// making no progress would otherwise show no shrink line at all).
+	r.emitProgress(ShrinkProgress{
+		File: f.Name, Type: "data", StartMB: f.SizeMB, CurrentMB: f.SizeMB,
+		FinalMB: final, StepMB: InitialStepMB(f.SizeMB-final, r.tuning),
+	})
+
 	// Phase A — TRUNCATEONLY: releases trailing free space with no page movement, no
 	// fragmentation. On a large file this can run for a while, so it is interruptible: a
 	// graceful stop cancels it and the space it already released is preserved (a re-run
@@ -273,6 +282,14 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			result.Reason = "stopped: graceful stop (work preserved)"
 			return result, ErrStopped
 		}
+		// Emit progress every iteration, not only after a chunk gains space, so a shrink
+		// that is blocked or stalling still shows its live current size, chunk count, step
+		// and ETA in the console instead of appearing frozen.
+		chunksLeft, eta := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
+		r.emitProgress(ShrinkProgress{
+			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
+			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
+		})
 		next := NextTargetMB(current, step, final)
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
@@ -339,7 +356,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
-		chunksLeft, eta := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
+		chunksLeft, eta = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
 		r.emitProgress(ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,

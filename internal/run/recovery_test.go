@@ -39,10 +39,11 @@ func TestMatchesOrphan(t *testing.T) {
 		id   mssql.SessionIdentity
 		want bool
 	}{
-		{"match", mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00", ContextInfo: "0x012300"}, true},
+		{"match", mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T12:00:00", ContextInfo: "0x012300"}, true},
 		{"no session", mssql.SessionIdentity{Exists: false}, false},
-		{"reused spid different login", mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T13:00:00", ContextInfo: "0x012300"}, false},
-		{"marker mismatch", mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00", ContextInfo: "0x9999"}, false},
+		{"idle session no request", mssql.SessionIdentity{Exists: true, Active: false, LoginTime: "2026-06-10T12:00:00", ContextInfo: "0x012300"}, false},
+		{"reused spid different login", mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T13:00:00", ContextInfo: "0x012300"}, false},
+		{"marker mismatch", mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T12:00:00", ContextInfo: "0x9999"}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -194,7 +195,7 @@ func TestRecovererRoutesToOrphanDatabase(t *testing.T) {
 	// no session → Restart → requeue. The outcome proves which probe was used.
 	st := State{SPID: 57, Database: "DB2", LoginTime: "2026-06-10T12:00:00"}
 	dirs, _ := setupRecovery(t, st)
-	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
+	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T12:00:00"}}
 	db2 := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}
 
 	var resolvedFor string
@@ -221,7 +222,7 @@ func TestRecovererConnectedDatabaseUsesBaseProbe(t *testing.T) {
 	// never called.
 	st := State{SPID: 57, Database: "CONN", LoginTime: "2026-06-10T12:00:00"}
 	dirs, _ := setupRecovery(t, st)
-	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
+	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T12:00:00"}}
 
 	called := false
 	r := NewRecoverer(dirs, connected, io.Discard, WithRecoveryProbes("CONN",
@@ -269,8 +270,8 @@ func TestRecovererAdoptsLiveOrphan(t *testing.T) {
 	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
 	dirs, name := setupRecovery(t, st)
 
-	// Live session matches -> orphan alive -> adopt -> leave in processing.
-	probe := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, LoginTime: "2026-06-10T12:00:00"}}
+	// Live session matches and is executing a request -> orphan alive -> adopt -> leave in processing.
+	probe := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, Active: true, LoginTime: "2026-06-10T12:00:00"}}
 	r := NewRecoverer(dirs, probe, io.Discard)
 
 	sum, err := r.Recover(context.Background())
@@ -282,5 +283,27 @@ func TestRecovererAdoptsLiveOrphan(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dirs.Processing, name)); err != nil {
 		t.Errorf("adopted manifest should stay in processing: %v", err)
+	}
+}
+
+func TestRecovererIdleOrphanRestarts(t *testing.T) {
+	// Regression: after a crash the session lingers with the recorded signature but runs
+	// nothing (sleeping, no request). It must not be mistaken for a running operation:
+	// with no resumable, the manifest is requeued for a fresh run, not stranded.
+	st := State{SPID: 57, LoginTime: "2026-06-10T12:00:00"}
+	dirs, name := setupRecovery(t, st)
+
+	probe := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: true, Active: false, LoginTime: "2026-06-10T12:00:00"}}
+	r := NewRecoverer(dirs, probe, io.Discard)
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v", err)
+	}
+	if sum.Requeued != 1 || sum.Adopted != 0 {
+		t.Errorf("sum = %+v, want Requeued 1 / Adopted 0 (idle orphan -> restart)", sum)
+	}
+	if _, err := os.Stat(filepath.Join(dirs.ToRun, name)); err != nil {
+		t.Errorf("idle-orphan manifest should be requeued to to_run: %v", err)
 	}
 }

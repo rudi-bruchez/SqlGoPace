@@ -115,6 +115,7 @@ var _ BlockerReader = (*mssql.Conn)(nil)
 type Summary struct {
 	Done        int
 	Failed      int
+	Incomplete  int // a shrink finished but stopped short of target (work preserved, re-runnable)
 	Interrupted int // paused and left for recovery (session killed / connection lost)
 	Deferred    int // manifests skipped this run because they were outside their window
 	Failures    []ManifestFailure
@@ -137,6 +138,7 @@ type runOutcome int
 const (
 	outcomeDone runOutcome = iota
 	outcomeFailed
+	outcomeIncomplete
 	outcomeInterrupted
 )
 
@@ -345,6 +347,8 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 		switch e.processOne(ctx, name) {
 		case outcomeDone:
 			sum.Done++
+		case outcomeIncomplete:
+			sum.Incomplete++
 		case outcomeInterrupted:
 			sum.Interrupted++
 		default:
@@ -691,6 +695,18 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
 			continue
 		}
+		// A shrink can finish without error yet stop short of target (it stalled or timed
+		// out with work preserved). That is not a clean success: record it as a distinct
+		// INCOMPLETE outcome so it is never mistaken for done, and route the manifest to
+		// failed for review. Terminal for the manifest (like a non-continue failure).
+		if _, isShrink := step.Operation.(ddl.Shrink); isShrink && shrinkStoppedShort(shrinkResults) {
+			opRep.Outcome = "incomplete"
+			e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
+			rep.Operations = append(rep.Operations, opRep)
+			rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
+				i, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
+			return e.finalizeIncomplete(ctx, name, rep, start)
+		}
 		opRep.Outcome = "success"
 		e.emitStep(stepEv.finished("success", opDuration(opRep)))
 		rep.Operations = append(rep.Operations, opRep)
@@ -760,6 +776,61 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 		return outcomeDone
 	}
 	return outcomeFailed
+}
+
+// shrinkStoppedShort reports whether a completed shrink (no error) failed to reach
+// target for at least one file — it stalled, hit a no-progress/self-wait bound, or a
+// log-drain/reuse timeout, leaving work preserved. A no-op file (nothing to reclaim,
+// target already satisfied) is not short; a file that reached target has no reason set.
+func shrinkStoppedShort(results []ShrinkResult) bool {
+	for _, r := range results {
+		if !r.NoOp && r.Reason != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// shrinkShortReason returns the reason of the first file that stopped short, for the
+// run report's error line. Empty only if no file stopped short (never called then).
+func shrinkShortReason(results []ShrinkResult) string {
+	for _, r := range results {
+		if !r.NoOp && r.Reason != "" {
+			return fmt.Sprintf("%s: %s", r.File, r.Reason)
+		}
+	}
+	return ""
+}
+
+// finalizeIncomplete records a shrink that finished without reaching target: work is
+// preserved and re-runnable, but the run is NOT a success. The manifest moves to failed
+// (so it is never mistaken for done), the report is labeled INCOMPLETE, and it is counted
+// distinctly in the run summary. It does not join e.failures — that list drives the
+// "FAILED" echo and the failed exit code; an incomplete run is surfaced separately.
+func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *report.RunReport, start time.Time) runOutcome {
+	e.removeSidecar(name)
+	e.removeInterimLog(name)
+	rep.FinishedAt = e.now()
+	rep.DurationMS = e.msSince(start)
+	rep.Outcome = "INCOMPLETE"
+
+	if err := e.queue.Fail(name); err != nil {
+		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
+	}
+	e.relocateCapture(name, e.dirs.Failed)
+
+	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
+		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
+	}
+	// Surface it in the TUI (if still open) without labeling it a hard failure.
+	if e.alertSink != nil {
+		e.alertSink(ManifestFailure{Manifest: name, Error: rep.Error, Details: []string{"shrink stopped short of target; work preserved — re-run to continue"}})
+	}
+	e.notify(ctx, "incomplete", name, rep.Error)
+	e.record(ctx, *rep)
+
+	fmt.Fprintf(e.out, "incomplete: %s — shrink stopped short of target (work preserved); moved to failed/ for review\n", name)
+	return outcomeIncomplete
 }
 
 // finalizeAll routes a manifest whose operation loop completed. With no failed

@@ -135,6 +135,68 @@ func TestProcessAllShrinkLogRouting(t *testing.T) {
 	}
 }
 
+func TestProcessAllShrinkIncompleteStopsShort(t *testing.T) {
+	runner := &fakeOpRunner{}
+	// The shrink finished (no error) but gained nothing and did not reach target: a stall
+	// with work preserved. It must be recorded as INCOMPLETE, not a clean success.
+	driver := &fakeShrinkDriver{
+		results: []run.ShrinkResult{
+			{File: "MyDb_Data", Type: "data", InitialMB: 1000, FinalMB: 1000, TargetMB: 440,
+				Reason: "no further progress (work preserved)"},
+		},
+	}
+	eng, dirs := setupShrinkEngine(t, shrinkDataManifest, runner, driver)
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Incomplete != 1 || sum.Done != 0 || sum.Failed != 0 {
+		t.Errorf("Summary = %+v, want Incomplete:1 (not done/failed)", sum)
+	}
+	// The manifest and its log move to failed/, never done/.
+	if _, err := os.Stat(filepath.Join(dirs.Done, "010_shrink.yaml.log")); !os.IsNotExist(err) {
+		t.Errorf("incomplete shrink must not land in done/ (err=%v)", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dirs.Failed, "010_shrink.yaml.log"))
+	if err != nil {
+		t.Fatalf("read failed log: %v", err)
+	}
+	log := string(b)
+	for _, want := range []string{"INCOMPLETE", "stopped short of target", "no further progress (work preserved)"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("run log missing %q\n--- log ---\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, "SUCCESS") {
+		t.Errorf("incomplete run must not be labeled SUCCESS\n--- log ---\n%s", log)
+	}
+}
+
+func TestProcessAllShrinkNoOpIsSuccess(t *testing.T) {
+	// A no-op file (nothing to reclaim) has a reason but is legitimately complete: the
+	// target was already satisfied, so the run is a success, not incomplete.
+	runner := &fakeOpRunner{}
+	driver := &fakeShrinkDriver{
+		results: []run.ShrinkResult{
+			{File: "MyDb_Data", Type: "data", InitialMB: 440, FinalMB: 440, TargetMB: 440,
+				NoOp: true, Reason: "nothing to reclaim"},
+		},
+	}
+	eng, dirs := setupShrinkEngine(t, shrinkDataManifest, runner, driver)
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Done != 1 || sum.Incomplete != 0 {
+		t.Errorf("Summary = %+v, want Done:1 (a no-op is complete)", sum)
+	}
+	if _, err := os.Stat(filepath.Join(dirs.Done, "010_shrink.yaml.log")); err != nil {
+		t.Errorf("no-op shrink should land in done/: %v", err)
+	}
+}
+
 func readDoneLog(t *testing.T, dirs run.Dirs, name string) string {
 	t.Helper()
 	b, err := os.ReadFile(filepath.Join(dirs.Done, name))

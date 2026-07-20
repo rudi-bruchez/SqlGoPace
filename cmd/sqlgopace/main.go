@@ -149,7 +149,8 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 // the foreground while the engine runs in the background. With auto.enabled, it
 // first analyses the database and writes the generated maintenance manifests into
 // the queue, then processes the queue — one unattended command, no review pause.
-func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix, useTUI bool, auto autoConfig) error {
+func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix,
+	useTUI bool, auto autoConfig) error {
 	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
 	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
 	if err != nil {
@@ -326,12 +327,14 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		}
 		total.Done += sum.Done
 		total.Failed += sum.Failed
+		total.Incomplete += sum.Incomplete
 		total.Interrupted += sum.Interrupted
 		total.Deferred += sum.Deferred
 		total.Failures = append(total.Failures, sum.Failures...)
 	}
 
-	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d interrupted, %d deferred\n", total.Done, total.Failed, total.Interrupted, total.Deferred)
+	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d incomplete, %d interrupted, %d deferred\n",
+		total.Done, total.Failed, total.Incomplete, total.Interrupted, total.Deferred)
 	// The TUI closes when the run ends, so echo each failure's reason here — the console's
 	// alert may have flashed by on a fast preflight rejection. This keeps the actionable
 	// detail (e.g. missing db_owner for a shrink) on screen without opening the .log.
@@ -340,6 +343,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		for _, d := range f.Details {
 			fmt.Fprintf(stdout, "     %s\n", d)
 		}
+	}
+	if total.Incomplete > 0 {
+		fmt.Fprintf(stdout, "-- %d shrink manifest(s) incomplete (stopped short of target, work preserved); moved to failed/ for review — re-run to continue\n", total.Incomplete)
 	}
 	if total.Interrupted > 0 {
 		fmt.Fprintf(stdout, "-- %d interrupted manifest(s) left in processing; the next run will resume them\n", total.Interrupted)
@@ -658,6 +664,14 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 					})
 				}
 				program.Send(tui.BlockersMsg{Blockers: blockers})
+
+				// Mirror: report whether OUR operation is itself blocked (the victim), from
+				// the same snapshot. Sent every poll so the indicator clears when unblocked.
+				sb := mssql.FindSelfBlock(sessions, ddlSPID)
+				program.Send(tui.BlockedByMsg{
+					Blocked: sb.Blocked, SPID: sb.SPID, Login: sb.Login, Program: sb.Program,
+					WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
+				})
 			}
 			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
 				program.Send(progressMsg(p))

@@ -184,6 +184,54 @@ func (s Session) BlockedBy(ddlSPID int) bool {
 	return ddlSPID != 0 && s.BlockingSPID != 0 && s.BlockingSPID == ddlSPID
 }
 
+// SelfBlock describes our own DDL session being blocked by another session (the mirror
+// of BlockedBy: here our DDL is the victim, waiting on a lock someone else holds). It is
+// built from an ActiveSessions snapshot. Blocked is false when our session is not waiting
+// on anyone. SPID/WaitType/WaitMS come from our own row; Login/Program/Query are the
+// blocker's identity, populated only when the blocking session is present in the snapshot.
+type SelfBlock struct {
+	Blocked  bool
+	SPID     int // the direct blocking session (blocking_session_id)
+	WaitType string
+	WaitMS   int64
+	Login    string
+	Program  string
+	Query    string
+}
+
+// FindSelfBlock reports whether the ddlSPID session is blocked in the snapshot and, if
+// so, identifies its direct blocker. A zero ddlSPID (our SPID unknown) is never blocked.
+// The blocker's identity is filled from the same snapshot when present; if the blocker
+// is not in it (e.g. filtered out), Blocked/SPID/WaitType/WaitMS are still reported so
+// the operator at least sees which session and wait is holding the operation up.
+func FindSelfBlock(sessions []Session, ddlSPID int) SelfBlock {
+	if ddlSPID == 0 {
+		return SelfBlock{}
+	}
+	self, found := Session{}, false
+	for _, s := range sessions {
+		if s.SPID == ddlSPID {
+			self, found = s, true
+			break
+		}
+	}
+	if !found || self.BlockingSPID == 0 {
+		return SelfBlock{}
+	}
+	sb := SelfBlock{Blocked: true, SPID: self.BlockingSPID, WaitType: self.WaitType, WaitMS: self.WaitMS}
+	for _, s := range sessions {
+		if s.SPID != self.BlockingSPID {
+			continue
+		}
+		sb.Login, sb.Program = s.Login, s.Program
+		if sb.Query = s.ActiveQuery; sb.Query == "" {
+			sb.Query = s.ParentQuery // an idle-in-transaction blocker has no active statement
+		}
+		break
+	}
+	return sb
+}
+
 const activeSessionsSQL = `
 SELECT
     r.session_id, r.status, r.command,

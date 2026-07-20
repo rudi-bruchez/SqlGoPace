@@ -301,6 +301,12 @@ func TestShrinkDataNoProgressStops(t *testing.T) {
 			pauses++
 		}
 	}
+	// Even a shrink that never gains space must report progress to the console, so it is
+	// visible (target, current size, step) instead of appearing frozen — the regression
+	// behind "I don't see the shrink in the TUI".
+	var progress []ShrinkProgress
+	r.progress = func(p ShrinkProgress) { progress = append(progress, p) }
+
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
 	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink)
 	if err != nil {
@@ -312,6 +318,14 @@ func TestShrinkDataNoProgressStops(t *testing.T) {
 	// MaxNoProgress = 3 → stops on the 3rd no-progress chunk, having backed off twice.
 	if pauses < 2 {
 		t.Errorf("pause events = %d, want >= 2 (no-progress backoff)", pauses)
+	}
+	if len(progress) == 0 {
+		t.Fatal("no ShrinkProgress emitted for a no-progress shrink; the TUI would show no shrink line")
+	}
+	for _, p := range progress {
+		if p.File != "Data" || p.FinalMB != 440 || p.StartMB <= 0 {
+			t.Errorf("progress snapshot = %+v, want File=Data FinalMB=440 with a positive StartMB", p)
+		}
 	}
 }
 

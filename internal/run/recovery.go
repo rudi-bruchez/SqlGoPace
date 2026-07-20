@@ -44,7 +44,7 @@ func (a RecoveryAction) String() string {
 
 // RecoveryFacts are the correlated facts for one orphaned manifest.
 type RecoveryFacts struct {
-	OrphanAlive     bool // a live session matches the run's signature
+	OrphanAlive     bool // a session matching the run's signature is executing a request
 	ResumableExists bool // a resumable operation is known to the engine
 }
 
@@ -62,11 +62,17 @@ func DecideRecovery(f RecoveryFacts) RecoveryAction {
 	}
 }
 
-// matchesOrphan reports whether a live session is the one recorded in state. The
+// matchesOrphan reports whether the run recorded in state is still executing. The
 // SPID alone is unreliable (reused), so login_time must match and, when present,
-// the CONTEXT_INFO marker must prefix the session's context_info.
+// the CONTEXT_INFO marker must prefix the session's context_info. Identity is not
+// enough: a crashed process leaves a dangling idle connection whose session still
+// exists with the recorded signature but runs nothing, so the session must also
+// have a request in flight (id.Active). This assumes recovery runs against a
+// crashed prior run, never concurrently with a live SqlGoPace process — the only
+// case where our session is legitimately idle between requests (e.g. a shrink
+// between chunks); the tool does not support concurrent instances on one queue.
 func matchesOrphan(id mssql.SessionIdentity, st State) bool {
-	if !id.Exists || id.LoginTime != st.LoginTime {
+	if !id.Exists || !id.Active || id.LoginTime != st.LoginTime {
 		return false
 	}
 	if st.Marker != "" && !strings.HasPrefix(strings.ToLower(id.ContextInfo), strings.ToLower(st.Marker)) {

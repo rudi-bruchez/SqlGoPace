@@ -44,6 +44,51 @@ func TestModelUpdatesFromMessages(t *testing.T) {
 	}
 }
 
+func TestModelShowsBlockedByAndSuspendsStatus(t *testing.T) {
+	m := tui.New("shrink DataFile", nil)
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning})
+
+	// Running and not blocked: RUNNING, no blocked line.
+	if v := m.View(); !strings.Contains(v, "[RUNNING]") || strings.Contains(v, "BLOCKED by") {
+		t.Fatalf("before block: want [RUNNING] and no blocked line\n%s", v)
+	}
+
+	// Blocked: status flips to SUSPENDED and the blocker is shown.
+	m, _ = send(m, tui.BlockedByMsg{
+		Blocked: true, SPID: 104, Login: "SVC_OBS", WaitType: "LCK_M_SCH_M",
+		WaitMS: 120162, Query: "SELECT DL.SETTLEMENTDATE",
+	})
+	v := m.View()
+	for _, want := range []string{"[SUSPENDED]", "BLOCKED by SPID 104", "LCK_M_SCH_M", "SVC_OBS", "SELECT DL.SETTLEMENTDATE"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("while blocked: View() missing %q\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "[RUNNING]") {
+		t.Errorf("while blocked: status should not read RUNNING\n%s", v)
+	}
+
+	// Unblocked: reverts to RUNNING and the blocked line clears.
+	m, _ = send(m, tui.BlockedByMsg{Blocked: false})
+	if v := m.View(); !strings.Contains(v, "[RUNNING]") || strings.Contains(v, "BLOCKED by") {
+		t.Errorf("after unblock: want [RUNNING] and no blocked line\n%s", v)
+	}
+}
+
+func TestModelDrainStatusOutranksBlock(t *testing.T) {
+	// A block substitutes SUSPENDED only while RUNNING; a draining operation keeps DRAINING.
+	m := tui.New("shrink DataFile", nil)
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusDraining})
+	m, _ = send(m, tui.BlockedByMsg{Blocked: true, SPID: 104, WaitType: "LCK_M_SCH_M"})
+	v := m.View()
+	if !strings.Contains(v, "[DRAINING]") || strings.Contains(v, "SUSPENDED") {
+		t.Errorf("draining should outrank the block\n%s", v)
+	}
+	if !strings.Contains(v, "BLOCKED by SPID 104") {
+		t.Errorf("the blocked line should still show while draining\n%s", v)
+	}
+}
+
 func TestModelRendersWaits(t *testing.T) {
 	m := tui.New("rebuild_index dbo.T.IX", nil)
 	m, _ = send(m, tui.WaitsMsg{

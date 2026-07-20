@@ -28,6 +28,10 @@ const (
 	StatusDraining
 	// StatusDone means the operation finished.
 	StatusDone
+	// StatusSuspended means a running operation is currently blocked, waiting on a lock
+	// held by another session (the server's own request status for a blocked request). It
+	// is a display-only state derived from the block, never set as the lifecycle status.
+	StatusSuspended
 )
 
 // String returns the status label.
@@ -43,6 +47,8 @@ func (s Status) String() string {
 		return "DRAINING"
 	case StatusDone:
 		return "DONE"
+	case StatusSuspended:
+		return "SUSPENDED"
 	default:
 		return "UNKNOWN"
 	}
@@ -76,6 +82,18 @@ type (
 	}
 	// BlockersMsg carries the current set of blocked sessions.
 	BlockersMsg struct{ Blockers []Blocker }
+	// BlockedByMsg carries whether the running operation is itself blocked (the victim)
+	// and, when it is, the session blocking it. This is the mirror of BlockersMsg, which
+	// carries the sessions our DDL blocks; Blocked=false clears the indicator.
+	BlockedByMsg struct {
+		Blocked  bool
+		SPID     int
+		Login    string
+		Program  string
+		WaitType string
+		WaitMS   int64
+		Query    string
+	}
 	// WaitsMsg carries the running DDL's wait categories (what is slowing it down).
 	WaitsMsg struct {
 		Categories []WaitCategory
@@ -198,6 +216,7 @@ type Model struct {
 	hasShrink       bool
 	spid            int
 	alerts          []AlertMsg
+	blockedBy       BlockedByMsg // set when our operation is itself blocked (the victim)
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -217,6 +236,17 @@ func New(operation string, actions chan<- Action) Model {
 // elapsed timer live. All other updates are host-driven.
 func (m Model) Init() tea.Cmd { return tick() }
 
+// displayStatus is the status shown to the operator. A running operation that is
+// currently blocked reads SUSPENDED (the server's request status for a blocked
+// request); the lifecycle states (paused, draining, canceling, done) take precedence
+// over the transient block, so the substitution applies only while RUNNING.
+func (m Model) displayStatus() Status {
+	if m.status == StatusRunning && m.blockedBy.Blocked {
+		return StatusSuspended
+	}
+	return m.status
+}
+
 // Update implements tea.Model.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -224,6 +254,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.percent = msg.Percent
 		m.etaSeconds = msg.ETASeconds
 		m.rollbackPercent = msg.RollbackPercent
+	case BlockedByMsg:
+		m.blockedBy = msg
 	case BlockersMsg:
 		// Keep the selection pinned to the session's SPID across polls, not its list index:
 		// the poll replaces the whole slice, and a reorder/removal would otherwise leave the
@@ -382,7 +414,7 @@ func (m Model) View() string {
 	if m.stepTotal > 0 {
 		op = fmt.Sprintf("%d/%d %s", m.stepIndex, m.stepTotal, m.operation)
 	}
-	fmt.Fprintf(&b, "operation: %s   [%s]", op, m.status)
+	fmt.Fprintf(&b, "operation: %s   [%s]", op, m.displayStatus())
 	if m.spid > 0 {
 		fmt.Fprintf(&b, "   SPID %d", m.spid)
 	}
@@ -390,6 +422,20 @@ func (m Model) View() string {
 		fmt.Fprintf(&b, "   elapsed %s", formatElapsed(m.elapsed))
 	}
 	b.WriteString("\n")
+	if bb := m.blockedBy; bb.Blocked {
+		line := fmt.Sprintf("⚠ BLOCKED by SPID %d", bb.SPID)
+		if bb.Login != "" {
+			line += "  login=" + bb.Login
+		}
+		if bb.WaitType != "" {
+			line += "  wait=" + bb.WaitType
+		}
+		line += "  " + humanizeMS(bb.WaitMS)
+		fmt.Fprintf(&b, "%s\n", alertStyle.Render(line))
+		if bb.Query != "" {
+			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+truncate(bb.Query, 80)))
+		}
+	}
 	if m.hasBatch {
 		fmt.Fprintf(&b, "batch %s %s: %d/%d rows (%.0f%%)   batch=%d   %.0f rows/s\n",
 			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
