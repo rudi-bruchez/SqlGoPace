@@ -71,3 +71,32 @@ func TestAppendIgnoredSession(t *testing.T) {
 		t.Errorf("duplicate rule not deduped: %d rules", len(m.IgnoreBlockedSessions))
 	}
 }
+
+// TestAppendIgnoredSessionPreservesShrink is the regression for the TUI ignore-write bug:
+// the rewrite serialized a shrink as "operation: shrink_data" (its CommandType), which no
+// longer parses. The manifest must round-trip through the rewrite intact.
+func TestAppendIgnoredSessionPreservesShrink(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "shrink.yaml")
+	body := "description: shrink me\ndatabase: DB\noperations:\n" +
+		"  - operation: shrink\n    type: data\n    files: all\n    targetfreespace: 10%\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rule, _ := ddl.IgnoredSessionFor("login_name", "svc", 0)
+	if err := ddl.AppendIgnoredSession(path, rule); err != nil {
+		t.Fatalf("AppendIgnoredSession() error = %v", err)
+	}
+
+	m, err := ddl.LoadManifestFile(path) // an "operation: shrink_data" would fail here
+	if err != nil {
+		t.Fatalf("reload after append: %v", err)
+	}
+	if len(m.Operations) != 1 || m.Operations[0].CommandType() != "shrink_data" {
+		t.Fatalf("shrink operation lost or altered after rewrite: %+v", m.Operations)
+	}
+	sh, ok := m.Operations[0].(ddl.Shrink)
+	if !ok || sh.Type != "data" || sh.FilesOrAll() != "all" || sh.TargetFreeSpace != "10%" {
+		t.Errorf("shrink fields not preserved: %+v", m.Operations[0])
+	}
+}

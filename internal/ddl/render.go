@@ -85,8 +85,21 @@ func operationNode(op Operation) (*yaml.Node, error) {
 		return nil, err
 	}
 	compact(&node)
-	node.Content = append([]*yaml.Node{scalarNode("operation"), scalarNode(op.CommandType())}, node.Content...)
+	node.Content = append([]*yaml.Node{scalarNode("operation"), scalarNode(manifestDiscriminator(op))}, node.Content...)
 	return &node, nil
+}
+
+// manifestDiscriminator returns the value ParseManifest matches on to decode op. It is
+// CommandType for every operation except shrink: shrink's CommandType folds the file type
+// in (shrink_data / shrink_log), but the manifest discriminator is plain "shrink" with the
+// type carried by a separate field. Using CommandType here wrote "operation: shrink_data",
+// which no longer parses — so MarshalManifest must map back to the parse discriminator to
+// stay a true inverse of ParseManifest.
+func manifestDiscriminator(op Operation) string {
+	if _, ok := op.(Shrink); ok {
+		return "shrink"
+	}
+	return op.CommandType()
 }
 
 // ignoredSessionNode encodes one ignore_blocked_sessions entry, dropping its unset
@@ -112,12 +125,17 @@ func compact(n *yaml.Node) {
 	kept := n.Content[:0:0]
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		key, val := n.Content[i], n.Content[i+1]
-		if val.Kind == yaml.MappingNode {
+		switch {
+		case val.Kind == yaml.MappingNode:
 			compact(val)
 			if len(val.Content) == 0 {
 				continue
 			}
-		} else if isEmptyScalar(val) {
+		case val.Kind == yaml.SequenceNode:
+			if len(val.Content) == 0 {
+				continue // an empty list carries no information and decodes back to nil
+			}
+		case isEmptyScalar(val):
 			continue
 		}
 		kept = append(kept, key, val)

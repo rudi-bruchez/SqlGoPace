@@ -34,6 +34,13 @@ func TestMarshalManifestRoundTrip(t *testing.T) {
 			ddl.UpdateStatistics{Schema: "dbo", Table: "T", Statistic: "ST", FullScan: true},
 			ddl.UpdateStatistics{Schema: "dbo", Table: "T", SamplePercent: intPtr(30)},
 			ddl.CheckDB{Database: "MYDB", PhysicalOnly: true},
+			// shrink and batch fold a sub-type into CommandType (shrink_data/shrink_log,
+			// batch_update/batch_delete): the manifest discriminator is "shrink" / "batch_*",
+			// so these guard MarshalManifest against writing an unparseable "operation:".
+			ddl.Shrink{Type: "data", Files: "all", TargetFreeSpace: "10%"},
+			ddl.Shrink{Type: "log", Files: "MYDB_log", TargetFreeSpace: "100MB"},
+			ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "T", SetRaw: "status = 'X'", WhereRaw: "status IS NULL"},
+			ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "Events", WhereRaw: "created_at < '2020-01-01'"},
 		},
 	}
 
