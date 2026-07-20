@@ -108,13 +108,16 @@ type (
 	// fraction of the planned reduction (design §9), not the server's percent_complete
 	// (which is 0 for the chunked DBCC SHRINKFILE loop).
 	ShrinkMsg struct {
-		File      string
-		Type      string // "data" | "log"
-		CurrentMB int
-		StartMB   int
-		FinalMB   int
-		StepMB    int     // current chunk increment
-		Percent   float64 // 0..1
+		File            string
+		Type            string // "data" | "log"
+		CurrentMB       int
+		StartMB         int
+		FinalMB         int
+		StepMB          int     // current chunk increment
+		Percent         float64 // 0..1
+		Chunks          int     // chunks completed
+		ChunksRemaining int     // estimated chunks left
+		ETASeconds      int     // estimated seconds left
 	}
 	// SPIDMsg carries the session id of the DDL the console is monitoring, so the
 	// operator can see which server session (and which blocks) is ours.
@@ -398,14 +401,29 @@ func (m Model) View() string {
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
 	}
 	if m.hasShrink {
-		fmt.Fprintf(&b, "shrink %s (%s): %d → %d MB target (from %d MB, %.0f%%)   step %d MB\n",
-			m.shrink.File, m.shrink.Type, m.shrink.CurrentMB, m.shrink.FinalMB, m.shrink.StartMB, m.shrink.Percent*100, m.shrink.StepMB)
+		fmt.Fprintf(&b, "shrink %s (%s): %s → %s target (from %s, %.0f%%)   step %s\n",
+			m.shrink.File, m.shrink.Type,
+			HumanizeMB(m.shrink.CurrentMB), HumanizeMB(m.shrink.FinalMB), HumanizeMB(m.shrink.StartMB),
+			m.shrink.Percent*100, HumanizeMB(m.shrink.StepMB))
+		fmt.Fprintf(&b, "  chunk %d done", m.shrink.Chunks)
+		if m.shrink.ChunksRemaining > 0 {
+			fmt.Fprintf(&b, " · ~%d left", m.shrink.ChunksRemaining)
+		}
+		if m.shrink.ETASeconds > 0 {
+			fmt.Fprintf(&b, " · ETA %s", humanizeMS(int64(m.shrink.ETASeconds)*1000))
+		}
+		b.WriteString("\n")
 	}
-	fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
-	if m.rollbackPercent > 0 {
-		fmt.Fprintf(&b, "   rollback: %.0f%%", m.rollbackPercent)
+	// The server percent_complete is meaningless for the chunked shrink/batch loops (it
+	// stays 0 or garbage), so show the generic progress line only for ordinary DDL.
+	if !m.hasShrink && !m.hasBatch {
+		fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
+		if m.rollbackPercent > 0 {
+			fmt.Fprintf(&b, "   rollback: %.0f%%", m.rollbackPercent)
+		}
+		b.WriteString("\n")
 	}
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
 	fmt.Fprintf(&b, "blocked sessions (%d):\n", len(m.blockers))
 	for i, bl := range m.blockers {
@@ -440,6 +458,20 @@ func (m Model) View() string {
 		b.WriteString("\n" + m.notice)
 	}
 	return b.String()
+}
+
+// HumanizeMB renders a size in megabytes compactly, escalating to GB then TB so large
+// file sizes stay legible: "500 MB", "9.1 GB", "16.00 TB". Exported so the non-TUI
+// stdout progress line formats identically.
+func HumanizeMB(mb int) string {
+	switch {
+	case mb < 1024:
+		return fmt.Sprintf("%d MB", mb)
+	case mb < 1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(mb)/1024)
+	default:
+		return fmt.Sprintf("%.2f TB", float64(mb)/(1024*1024))
+	}
 }
 
 // humanizeMS renders a millisecond wait total compactly, escalating the unit so large

@@ -119,13 +119,28 @@ func TestModelHumanizesWaitDurations(t *testing.T) {
 func TestModelShowsShrinkProgress(t *testing.T) {
 	m := tui.New("shrink DataFile", false, nil)
 	m, _ = send(m, tui.ShrinkMsg{
-		File: "DataFile", Type: "data", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000, StepMB: 512, Percent: 0.32,
+		File: "DataFile", Type: "data", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000,
+		StepMB: 512, Percent: 0.32, Chunks: 128, ChunksRemaining: 140, ETASeconds: 2832,
 	})
 	v := m.View()
-	for _, want := range []string{"shrink DataFile (data)", "6000000", "900000 MB target", "32%", "step 512 MB"} {
+	// Sizes are humanized to GB/TB; chunk count, estimate and ETA appear on the detail line.
+	for _, want := range []string{"shrink DataFile (data)", "5.72 TB", "878.9 GB target", "32%",
+		"step 512 MB", "chunk 128 done", "~140 left", "ETA 47m12s"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("View() missing %q:\n%s", want, v)
 		}
+	}
+	if strings.Contains(v, "6000000") {
+		t.Errorf("raw megabyte values should be humanized:\n%s", v)
+	}
+}
+
+func TestHumanizeMBRendersReadableSizes(t *testing.T) {
+	// exercised through the shrink render; assert the boundary units directly here.
+	m := tui.New("op", false, nil)
+	m, _ = send(m, tui.ShrinkMsg{File: "F", Type: "data", CurrentMB: 500, StartMB: 500, FinalMB: 100, StepMB: 50})
+	if v := m.View(); !strings.Contains(v, "500 MB") {
+		t.Errorf("sub-GB should stay in MB:\n%s", v)
 	}
 }
 

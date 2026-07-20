@@ -379,7 +379,8 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	shrinkProgress := func(p run.ShrinkProgress) {
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
-		fmt.Fprintf(engineOut, "-- shrink %s (%s): %d MB (%.0f%%), step %d MB\n", p.File, p.Type, p.CurrentMB, p.Percent()*100, p.StepMB)
+		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds)\n",
+			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB), p.Chunks, p.ChunksRemaining, p.ETASeconds)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
@@ -759,6 +760,7 @@ func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
 	return tui.ShrinkMsg{
 		File: p.File, Type: p.Type, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
 		FinalMB: p.FinalMB, StepMB: p.StepMB, Percent: p.Percent(),
+		Chunks: p.Chunks, ChunksRemaining: p.ChunksRemaining, ETASeconds: p.ETASeconds,
 	}
 }
 
