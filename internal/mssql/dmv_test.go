@@ -6,6 +6,29 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
+func TestSessionBlockedBy(t *testing.T) {
+	tests := []struct {
+		name         string
+		blockingSPID int
+		ddlSPID      int
+		want         bool
+	}{
+		{"blocked by our DDL", 102, 102, true},
+		{"not blocked at all (bs_id 0) must never count", 0, 102, false},
+		{"blocked by another session", 88, 102, false},
+		{"our SPID unknown (0) must never match an idle session", 0, 0, false},
+		{"our SPID unknown (0) must never match a blocked session", 88, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := mssql.Session{SPID: 52, BlockingSPID: tt.blockingSPID}
+			if got := s.BlockedBy(tt.ddlSPID); got != tt.want {
+				t.Errorf("BlockedBy(%d) with BlockingSPID=%d = %v, want %v", tt.ddlSPID, tt.blockingSPID, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestLogSpaceUsedBytes(t *testing.T) {
 	tests := []struct {
 		name        string

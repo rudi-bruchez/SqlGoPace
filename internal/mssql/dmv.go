@@ -176,6 +176,14 @@ type Session struct {
 	ParentQuery      string
 }
 
+// BlockedBy reports whether this session is blocked directly by ddlSPID (our DDL's
+// session). A blocking_session_id of 0 means the session is not blocked by anyone, so
+// it never counts — and a zero ddlSPID (our SPID unknown) never matches, so an idle
+// session can never be mistaken for one our DDL is blocking.
+func (s Session) BlockedBy(ddlSPID int) bool {
+	return ddlSPID != 0 && s.BlockingSPID != 0 && s.BlockingSPID == ddlSPID
+}
+
 const activeSessionsSQL = `
 SELECT
     r.session_id, r.status, r.command,

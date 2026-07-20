@@ -66,7 +66,7 @@ func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *
 	now := e.now()
 	blocked := 0
 	for _, s := range sessions {
-		if s.BlockingSPID != spid || rules.ignores(s) {
+		if !s.BlockedBy(spid) || rules.ignores(s) {
 			continue
 		}
 		acc.add(s, now)
@@ -113,7 +113,7 @@ func (e *Engine) narrateHeld(ctx context.Context, ignore IgnoreSource, sink Reac
 func newHeldBlockers(sessions []mssql.Session, spid int, ignore IgnoredSessions, seen map[string]bool) []mssql.Session {
 	var out []mssql.Session
 	for _, s := range sessions {
-		if s.BlockingSPID != spid || !ignore.ignores(s) {
+		if !s.BlockedBy(spid) || !ignore.ignores(s) {
 			continue
 		}
 		key := fmt.Sprintf("%d|%s|%s|%s", s.SPID, s.Login, s.Host, s.Program)

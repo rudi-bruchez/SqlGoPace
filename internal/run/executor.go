@@ -297,7 +297,7 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 	}
 	var st BlockState
 	for _, sess := range sessions {
-		if sess.BlockingSPID != s.spid {
+		if !sess.BlockedBy(s.spid) {
 			continue
 		}
 		st.Any = true
