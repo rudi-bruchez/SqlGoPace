@@ -1,7 +1,10 @@
 # SqlGoPace developer tasks.
 # Integration tests are guarded by the `integration` build tag and excluded from `make test`.
 
-BINARY := sqlgopace
+# Append .exe on Windows so `make build` produces bin/sqlgopace.exe (GOEXE is ".exe" on
+# windows, empty elsewhere) — otherwise the output has no extension and a Windows shell
+# launching bin\sqlgopace.exe silently runs a stale build.
+BINARY := sqlgopace$(shell go env GOEXE)
 PKG    := ./...
 
 # Connection string for integration / e2e tests against the docker-compose server.

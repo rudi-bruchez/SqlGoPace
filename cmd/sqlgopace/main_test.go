@@ -7,11 +7,59 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
+
+func TestSuspensionTracker(t *testing.T) {
+	tr := newSuspensionTracker()
+	t0 := time.Unix(0, 0)
+	// not blocked → blocked by 104 for two polls (10s..30s) → free → blocked by 88 (40s..50s).
+	tr.observe(false, 0, "", t0)
+	tr.observe(true, 104, "SVC_OBS", t0.Add(10*time.Second))
+	tr.observe(true, 104, "SVC_OBS", t0.Add(20*time.Second)) // accrues 10s to 104
+	tr.observe(false, 0, "", t0.Add(30*time.Second))         // accrues another 10s to 104
+	tr.observe(true, 88, "SVC_X", t0.Add(40*time.Second))
+	tr.observe(false, 0, "", t0.Add(50*time.Second)) // accrues 10s to 88
+
+	snap := tr.snapshot()
+	if snap.Episodes != 2 {
+		t.Errorf("Episodes = %d, want 2", snap.Episodes)
+	}
+	if snap.TotalMS != (30 * time.Second).Milliseconds() {
+		t.Errorf("TotalMS = %d, want 30000 (20s by 104 + 10s by 88)", snap.TotalMS)
+	}
+	if len(snap.Blockers) != 2 {
+		t.Fatalf("Blockers = %d, want 2 (104 then 88, first-seen order)", len(snap.Blockers))
+	}
+	if b := snap.Blockers[0]; b.SPID != 104 || b.Count != 1 || b.TotalMS != 20000 || b.Login != "SVC_OBS" {
+		t.Errorf("Blockers[0] = %+v, want SPID 104 count 1 20000ms SVC_OBS", b)
+	}
+	if b := snap.Blockers[1]; b.SPID != 88 || b.Count != 1 || b.TotalMS != 10000 {
+		t.Errorf("Blockers[1] = %+v, want SPID 88 count 1 10000ms", b)
+	}
+}
+
+func TestSuspensionTrackerCountsRepeatBlocker(t *testing.T) {
+	// The same session blocking us in two separate episodes counts twice.
+	tr := newSuspensionTracker()
+	t0 := time.Unix(0, 0)
+	tr.observe(true, 104, "SVC_OBS", t0)
+	tr.observe(false, 0, "", t0.Add(10*time.Second))
+	tr.observe(true, 104, "SVC_OBS", t0.Add(20*time.Second))
+	tr.observe(false, 0, "", t0.Add(30*time.Second))
+
+	snap := tr.snapshot()
+	if snap.Episodes != 2 {
+		t.Errorf("Episodes = %d, want 2", snap.Episodes)
+	}
+	if len(snap.Blockers) != 1 || snap.Blockers[0].Count != 2 {
+		t.Errorf("Blockers = %+v, want a single SPID 104 with Count 2", snap.Blockers)
+	}
+}
 
 func TestQueuedDatabases(t *testing.T) {
 	dir := t.TempDir()

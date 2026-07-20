@@ -641,12 +641,84 @@ func (g *blockerGate) persistent(sessions []mssql.Session, ddlSPID int, now time
 	return out
 }
 
+// blockerAgg accumulates one blocking session's contribution to our suspension.
+type blockerAgg struct {
+	login string
+	count int
+	total time.Duration
+}
+
+// suspensionTracker accumulates how long and how often the operation has been blocked
+// (suspended) and by which sessions, fed one observation per poll. It is the inverse of
+// blockerGate (our op as victim, not aggressor). Durations are sampled at the poll
+// cadence, so totals are accurate to within one interval.
+type suspensionTracker struct {
+	episodes  int
+	total     time.Duration
+	blocked   bool      // were we blocked at the previous observation
+	curSPID   int       // the session blocking us in the current episode
+	last      time.Time // previous observation time, for interval accrual
+	byBlocker map[int]*blockerAgg
+	order     []int // SPIDs in first-seen order, for stable rendering
+}
+
+func newSuspensionTracker() *suspensionTracker {
+	return &suspensionTracker{byBlocker: make(map[int]*blockerAgg)}
+}
+
+// observe records one poll. It accrues the interval since the previous observation to the
+// session that was blocking us over it, and counts a new episode on each transition into a
+// block (or a change of blocker while still blocked).
+func (t *suspensionTracker) observe(blocked bool, spid int, login string, now time.Time) {
+	if t.blocked && !t.last.IsZero() {
+		if d := now.Sub(t.last); d > 0 {
+			t.total += d
+			if a := t.byBlocker[t.curSPID]; a != nil {
+				a.total += d
+			}
+		}
+	}
+	t.last = now
+
+	switch {
+	case !blocked:
+		t.blocked, t.curSPID = false, 0
+	case !t.blocked || spid != t.curSPID:
+		// A fresh block, or the blocking session changed mid-block: a new episode.
+		t.episodes++
+		t.blocked, t.curSPID = true, spid
+		a := t.byBlocker[spid]
+		if a == nil {
+			a = &blockerAgg{}
+			t.byBlocker[spid] = a
+			t.order = append(t.order, spid)
+		}
+		a.count++
+		if login != "" {
+			a.login = login
+		}
+	}
+}
+
+// snapshot renders the cumulative stats into a TUI message.
+func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
+	msg := tui.SuspensionMsg{Episodes: t.episodes, TotalMS: t.total.Milliseconds()}
+	for _, spid := range t.order {
+		a := t.byBlocker[spid]
+		msg.Blockers = append(msg.Blockers, tui.SuspensionBlocker{
+			SPID: spid, Login: a.login, Count: a.count, TotalMS: a.total.Milliseconds(),
+		})
+	}
+	return msg
+}
+
 // feedConsole polls the server and sends progress and blocker updates to the TUI. A
 // blocker is shown only once it has persisted for blockingTimeout (see blockerGate), so
 // transient blocks that clear on their own never reach the console.
 func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, interval, blockingTimeout time.Duration) {
 	program.Send(tui.SPIDMsg{SPID: ddlSPID}) // show which server session is ours
 	gate := newBlockerGate()
+	susp := newSuspensionTracker()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -672,6 +744,9 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 					Blocked: sb.Blocked, SPID: sb.SPID, Login: sb.Login, Program: sb.Program,
 					WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
 				})
+				// Accumulate the suspension history (how long/often/by whom) and send it.
+				susp.observe(sb.Blocked, sb.SPID, sb.Login, time.Now())
+				program.Send(susp.snapshot())
 			}
 			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
 				program.Send(progressMsg(p))

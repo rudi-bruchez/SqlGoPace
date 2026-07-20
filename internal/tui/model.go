@@ -94,6 +94,22 @@ type (
 		WaitMS   int64
 		Query    string
 	}
+	// SuspensionMsg carries the running history of how often and how long the operation
+	// has been blocked (suspended) and by which sessions — the cumulative counterpart of
+	// BlockedByMsg's live snapshot. Durations are sampled at the poll cadence.
+	SuspensionMsg struct {
+		Episodes int
+		TotalMS  int64
+		Blockers []SuspensionBlocker
+	}
+	// SuspensionBlocker is one session that has blocked our operation, with how many
+	// times it started blocking us and for how long in total.
+	SuspensionBlocker struct {
+		SPID    int
+		Login   string
+		Count   int
+		TotalMS int64
+	}
 	// WaitsMsg carries the running DDL's wait categories (what is slowing it down).
 	WaitsMsg struct {
 		Categories []WaitCategory
@@ -216,7 +232,8 @@ type Model struct {
 	hasShrink       bool
 	spid            int
 	alerts          []AlertMsg
-	blockedBy       BlockedByMsg // set when our operation is itself blocked (the victim)
+	blockedBy       BlockedByMsg  // set when our operation is itself blocked (the victim)
+	suspension      SuspensionMsg // cumulative suspension history (how long/often/by whom)
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -256,6 +273,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.rollbackPercent = msg.RollbackPercent
 	case BlockedByMsg:
 		m.blockedBy = msg
+	case SuspensionMsg:
+		m.suspension = msg
 	case BlockersMsg:
 		// Keep the selection pinned to the session's SPID across polls, not its list index:
 		// the poll replaces the whole slice, and a reorder/removal would otherwise leave the
@@ -435,6 +454,23 @@ func (m Model) View() string {
 		if bb.Query != "" {
 			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+truncate(bb.Query, 80)))
 		}
+	}
+	// Cumulative suspension history: how long/often the operation has been blocked and by
+	// whom. Shown whenever it has ever been suspended, so it persists after a block clears.
+	if s := m.suspension; s.Episodes > 0 {
+		line := fmt.Sprintf("suspended %d×, %s total", s.Episodes, humanizeMS(s.TotalMS))
+		if len(s.Blockers) > 0 {
+			parts := make([]string, 0, len(s.Blockers))
+			for _, bl := range s.Blockers {
+				who := fmt.Sprintf("SPID %d", bl.SPID)
+				if bl.Login != "" {
+					who += " " + bl.Login
+				}
+				parts = append(parts, fmt.Sprintf("%s (%d×, %s)", who, bl.Count, humanizeMS(bl.TotalMS)))
+			}
+			line += " — " + strings.Join(parts, " · ")
+		}
+		fmt.Fprintf(&b, "%s\n", line)
 	}
 	if m.hasBatch {
 		fmt.Fprintf(&b, "batch %s %s: %d/%d rows (%.0f%%)   batch=%d   %.0f rows/s\n",

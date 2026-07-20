@@ -75,6 +75,31 @@ func TestModelShowsBlockedByAndSuspendsStatus(t *testing.T) {
 	}
 }
 
+func TestModelShowsSuspensionHistory(t *testing.T) {
+	m := tui.New("shrink DataFile", nil)
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning})
+
+	// No suspensions yet: no history line.
+	if strings.Contains(m.View(), "suspended") {
+		t.Fatalf("history line shown before any suspension\n%s", m.View())
+	}
+
+	// History persists even when not currently blocked.
+	m, _ = send(m, tui.SuspensionMsg{
+		Episodes: 4, TotalMS: 145000,
+		Blockers: []tui.SuspensionBlocker{
+			{SPID: 104, Login: "SVC_OBS", Count: 2, TotalMS: 110000},
+			{SPID: 88, Login: "SVC_X", Count: 2, TotalMS: 35000},
+		},
+	})
+	v := m.View()
+	for _, want := range []string{"suspended 4×", "SPID 104 SVC_OBS (2×", "SPID 88 SVC_X (2×"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("View() missing %q\n%s", want, v)
+		}
+	}
+}
+
 func TestModelDrainStatusOutranksBlock(t *testing.T) {
 	// A block substitutes SUSPENDED only while RUNNING; a draining operation keeps DRAINING.
 	m := tui.New("shrink DataFile", nil)
