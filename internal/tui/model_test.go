@@ -187,6 +187,21 @@ func TestModelKillBlockerAction(t *testing.T) {
 	}
 }
 
+func TestModelKillTracksSPIDNotIndex(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", true, actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 51}, {SPID: 52}, {SPID: 53}}})
+	m, _ = send(m, key("down")) // select SPID 52 (index 1)
+	// A poll drops SPID 51 and reorders: SPID 52 is now at index 0. The cursor must follow
+	// the identity, so `x` still targets 52 — not whatever now sits at the old index 1.
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 52}, {SPID: 53}}})
+	_, _ = send(m, key("x"))
+	a, ok := drain(t, actions)
+	if !ok || a.Kind != tui.ActionKillBlocker || a.SPID != 52 {
+		t.Errorf("kill = %+v ok=%t, want KillBlocker SPID 52 (selection tracked by identity)", a, ok)
+	}
+}
+
 func TestModelKillDDLAndPause(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", true, actions)

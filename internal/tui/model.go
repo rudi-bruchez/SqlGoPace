@@ -233,9 +233,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.etaSeconds = msg.ETASeconds
 		m.rollbackPercent = msg.RollbackPercent
 	case BlockersMsg:
+		// Keep the selection pinned to the session's SPID across polls, not its list index:
+		// the poll replaces the whole slice, and a reorder/removal would otherwise leave the
+		// cursor over a DIFFERENT session — so `x` (kill) / `i` (ignore) could hit the wrong one.
+		selected := -1
+		if m.cursor >= 0 && m.cursor < len(m.blockers) {
+			selected = m.blockers[m.cursor].SPID
+		}
 		m.blockers = msg.Blockers
-		if m.cursor >= len(m.blockers) {
-			m.cursor = max(0, len(m.blockers)-1)
+		m.cursor = 0
+		for i, b := range m.blockers {
+			if b.SPID == selected {
+				m.cursor = i
+				break
+			}
 		}
 	case WaitsMsg:
 		m.waits = msg.Categories
@@ -506,8 +517,9 @@ func formatElapsed(d time.Duration) string {
 }
 
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	r := []rune(s)
+	if n <= 0 || len(r) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(r[:n-1]) + "…"
 }
