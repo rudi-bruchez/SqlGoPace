@@ -21,9 +21,10 @@ type fakeServer struct {
 	sizeMB   int
 	usedMB   int
 
-	truncateToMB *int // size after a TRUNCATEONLY pass, if set
-	noProgress   bool // chunk moves never change the size (simulate 49516 / data at end)
-	floorMB      int  // a chunk cannot shrink below this (also the active-log floor)
+	truncateToMB  *int // size after a TRUNCATEONLY pass, if set
+	noProgress    bool // chunk moves never change the size (simulate 49516 / data at end)
+	floorMB       int  // a chunk cannot shrink below this (also the active-log floor)
+	blockTruncate bool // model a long-running TRUNCATEONLY: block until the context is canceled
 
 	recovery string   // recovery_model_desc for LogReuse
 	reuse    []string // log_reuse_wait_desc returned per LogReuse call (last value repeats)
@@ -39,13 +40,17 @@ type fakeServer struct {
 
 func (s *fakeServer) SPID() int { return 99 }
 
-func (s *fakeServer) ExecDDL(_ context.Context, sql string) error {
+func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	if s.onExec != nil {
 		s.onExec(sql)
 	}
 	s.execLog = append(s.execLog, sql)
 	switch {
 	case strings.Contains(sql, "TRUNCATEONLY"):
+		if s.blockTruncate {
+			<-ctx.Done() // a long TRUNCATEONLY that only ends when the driver cancels it
+			return ctx.Err()
+		}
 		if s.truncateToMB != nil && *s.truncateToMB < s.sizeMB {
 			s.sizeMB = *s.truncateToMB
 		}
@@ -177,6 +182,39 @@ func TestShrinkStopsBetweenChunks(t *testing.T) {
 	}
 	if !strings.Contains(res[0].Reason, "graceful stop") {
 		t.Errorf("Reason = %q, want it to mention the graceful stop", res[0].Reason)
+	}
+}
+
+func TestShrinkTruncateOnlyStopsOnDrain(t *testing.T) {
+	drain := &DrainFlag{}
+	// A big file whose TRUNCATEONLY runs long: the fake blocks until the driver cancels it.
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 8_000_000, usedMB: 200, blockTruncate: true}
+	// The operator requests the graceful stop while the TRUNCATEONLY is running.
+	s.onExec = func(sql string) {
+		if strings.Contains(sql, "TRUNCATEONLY") {
+			drain.Request()
+		}
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.pollIntv = time.Millisecond // poll the stop flag promptly instead of the 1h default
+	r.stop = drain.Draining
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run() error = %v, want ErrStopped (graceful stop during TRUNCATEONLY)", err)
+	}
+	if len(res) != 1 || res[0].Chunks != 0 {
+		t.Fatalf("got %+v, want one partial result with 0 chunks (stopped before Phase B)", res)
+	}
+	if !strings.Contains(res[0].Reason, "graceful stop") {
+		t.Errorf("Reason = %q, want it to mention the graceful stop", res[0].Reason)
+	}
+	// It must have canceled the running statement, not issued any page-moving chunk.
+	for _, stmt := range s.execLog {
+		if strings.Contains(stmt, "DBCC SHRINKFILE") && !strings.Contains(stmt, "TRUNCATEONLY") {
+			t.Errorf("no page-moving chunk should run after a stop in Phase A; got %q", stmt)
+		}
 	}
 }
 

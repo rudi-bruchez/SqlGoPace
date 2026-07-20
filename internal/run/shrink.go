@@ -217,8 +217,12 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		return result, nil
 	}
 
-	// Phase A — TRUNCATEONLY: free and instant, no page movement, no fragmentation.
-	if err := r.exec.ExecDDL(ctx, ddl.ShrinkTruncateOnlySQL(f.Name)); err != nil {
+	// Phase A — TRUNCATEONLY: releases trailing free space with no page movement, no
+	// fragmentation. On a large file this can run for a while, so it is interruptible: a
+	// graceful stop cancels it and the space it already released is preserved (a re-run
+	// resumes from the smaller size), so it stops cleanly rather than failing.
+	stopped, err := r.runTruncateOnly(ctx, f.Name, sink)
+	if err != nil {
 		return result, fmt.Errorf("shrink %q: truncateonly: %w", f.Name, err)
 	}
 	size, err := r.reader.FileSizeMB(ctx, f.Name)
@@ -226,6 +230,10 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		return result, err
 	}
 	result.FinalMB = size
+	if stopped {
+		result.Reason = "stopped: graceful stop during TRUNCATEONLY (freed space preserved)"
+		return result, ErrStopped
+	}
 	if size <= final {
 		return result, nil // truncate-only was enough
 	}
@@ -421,6 +429,52 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 		<-done
 	}
 	return true, nil
+}
+
+// runTruncateOnly runs the free TRUNCATEONLY pass while watching for a graceful stop.
+// TRUNCATEONLY is a single statement, not a chunk loop, so a drain cannot be honored at
+// a chunk boundary; instead this polls the stop flag on the monitoring cadence and
+// cancels the running statement when a stop is requested. The trailing space it has
+// already released is preserved on the server (a re-run resumes from the smaller size),
+// so a stopped TRUNCATEONLY is a clean, re-entrant interruption. It returns stopped=true
+// when a drain canceled it (the caller turns that into ErrStopped) and the raw exec error
+// otherwise (nil on completion, ctx.Err on a hard cancel). It mirrors runChunk's cancel →
+// KILL-grace fallback, drawing the KILL from the pool via Executor.
+func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, sink ReactionSink) (stopped bool, err error) {
+	execCtx, cancelExec := context.WithCancel(ctx)
+	defer cancelExec()
+	done := make(chan error, 1)
+	go func() { done <- r.exec.ExecDDL(execCtx, ddl.ShrinkTruncateOnlySQL(file)) }()
+
+	ticker := time.NewTicker(r.pollIntv)
+	defer ticker.Stop()
+	for {
+		// Prefer a finished statement over a concurrent stop tick, so a TRUNCATEONLY that
+		// completes on its own is never mis-reported as stopped.
+		select {
+		case err := <-done:
+			return false, err
+		default:
+		}
+		select {
+		case err := <-done:
+			return false, err
+		case <-ticker.C:
+			if !stopRequested(r.stop) {
+				continue
+			}
+			sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q TRUNCATEONLY stopped on graceful stop; freed space preserved", file)})
+			cancelExec()
+			select {
+			case <-done:
+			case <-time.After(r.killGr):
+				sink(ReactionEvent{Kind: "kill", Detail: "TRUNCATEONLY did not stop within the grace period"})
+				_ = r.exec.Kill(context.Background(), r.exec.SPID())
+				<-done
+			}
+			return true, nil
+		}
+	}
 }
 
 // awaitRelief samples until the pressure that stopped a chunk clears, enforcing the
