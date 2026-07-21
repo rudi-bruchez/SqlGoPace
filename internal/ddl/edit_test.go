@@ -72,6 +72,51 @@ func TestAppendIgnoredSession(t *testing.T) {
 	}
 }
 
+func TestKilledSessionFor(t *testing.T) {
+	t.Run("login becomes anchored literal regexp with after=0", func(t *testing.T) {
+		s, ok := ddl.KilledSessionFor("login_name", "SVC_RPT", 0)
+		if !ok || s.LoginName != `^SVC_RPT$` || s.AfterSeconds != 0 {
+			t.Fatalf("KilledSessionFor(login_name) = (%+v, %v), want anchored login, after=0", s, ok)
+		}
+	})
+	t.Run("unknown criterion is rejected", func(t *testing.T) {
+		if _, ok := ddl.KilledSessionFor("nope", "x", 1); ok {
+			t.Error("KilledSessionFor with unknown criterion should return ok=false")
+		}
+	})
+}
+
+func TestAppendKilledSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	body := "description: edit me\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	rule, _ := ddl.KilledSessionFor("login_name", "SVC_RPT", 0)
+	if err := ddl.AppendKilledSession(path, rule); err != nil {
+		t.Fatalf("AppendKilledSession() error = %v", err)
+	}
+	m, err := ddl.LoadManifestFile(path)
+	if err != nil {
+		t.Fatalf("reload after append: %v", err)
+	}
+	if len(m.KillBlockedSessions) != 1 || m.KillBlockedSessions[0].LoginName != "^SVC_RPT$" {
+		t.Fatalf("after append, kill rules = %+v, want one ^SVC_RPT$ login rule", m.KillBlockedSessions)
+	}
+	if m.Description != "edit me" || len(m.Operations) != 1 {
+		t.Errorf("rewrite lost manifest content: desc=%q ops=%d", m.Description, len(m.Operations))
+	}
+	// Re-appending the same rule is a no-op (deduped).
+	if err := ddl.AppendKilledSession(path, rule); err != nil {
+		t.Fatalf("second AppendKilledSession() error = %v", err)
+	}
+	m, _ = ddl.LoadManifestFile(path)
+	if len(m.KillBlockedSessions) != 1 {
+		t.Errorf("duplicate kill rule not deduped: %d rules", len(m.KillBlockedSessions))
+	}
+}
+
 // TestAppendIgnoredSessionPreservesShrink is the regression for the TUI ignore-write bug:
 // the rewrite serialized a shrink as "operation: shrink_data" (its CommandType), which no
 // longer parses. The manifest must round-trip through the rewrite intact.

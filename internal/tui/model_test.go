@@ -272,6 +272,27 @@ func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 	}
 }
 
+func TestModelKillBlockerAutoAction(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
+		{SPID: 104, Login: "SVC_RPT", Host: "rpt01", Program: "Reporting"},
+	}})
+	m, _ = send(m, key("X")) // open the kill+remember criterion prompt
+	// The prompt should ask which criterion to match on.
+	if !strings.Contains(m.View(), "kill+auto-kill SPID 104") {
+		t.Fatalf("expected kill criterion prompt, view:\n%s", m.View())
+	}
+	_, _ = send(m, key("l")) // remember by login
+	a, ok := drain(t, actions)
+	if !ok {
+		t.Fatalf("no action emitted")
+	}
+	if a.Kind != tui.ActionKillBlockerAuto || a.SPID != 104 || a.Criterion != "login_name" || a.Value != "SVC_RPT" {
+		t.Errorf("action = %+v, want KillBlockerAuto SPID 104 login_name=SVC_RPT", a)
+	}
+}
+
 func TestModelKillDDL(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", actions)

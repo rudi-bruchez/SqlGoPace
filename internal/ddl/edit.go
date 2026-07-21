@@ -78,3 +78,45 @@ func sameIgnoredSession(a, b IgnoredSession) bool {
 	return a.AppName == b.AppName && a.HostName == b.HostName &&
 		a.LoginName == b.LoginName && a.Statement == b.Statement
 }
+
+// KilledSessionFor builds a single-criterion kill rule from an operator's choice, the
+// inverse of IgnoredSessionFor: same criteria (session_id exact, app/host/login anchored
+// literal regexp), with after=0 (kill on sight, since the operator explicitly authorized
+// it). It returns ok=false for an unknown criterion, a non-positive SPID, or an empty value.
+func KilledSessionFor(criterion, value string, spid int) (KilledSession, bool) {
+	ig, ok := IgnoredSessionFor(criterion, value, spid)
+	if !ok {
+		return KilledSession{}, false
+	}
+	return KilledSession{IgnoredSession: ig}, true
+}
+
+// AppendKilledSession adds a kill rule to the manifest at path and writes it back
+// atomically, mirroring AppendIgnoredSession, so the live reload never sees a torn file.
+// An exact duplicate is a no-op. Comments in the original file are not preserved.
+func AppendKilledSession(path string, s KilledSession) error {
+	m, err := LoadManifestFile(path)
+	if err != nil {
+		return err
+	}
+	for _, e := range m.KillBlockedSessions {
+		if sameKilledSession(e, s) {
+			return nil // already present
+		}
+	}
+	m.KillBlockedSessions = append(m.KillBlockedSessions, s)
+	data, err := MarshalManifest(m)
+	if err != nil {
+		return err
+	}
+	if err := fsutil.AtomicWrite(path, data); err != nil {
+		return fmt.Errorf("write manifest %q: %w", path, err)
+	}
+	return nil
+}
+
+// sameKilledSession reports whether two kill rules are field-for-field equal, including
+// the delay.
+func sameKilledSession(a, b KilledSession) bool {
+	return sameIgnoredSession(a.IgnoredSession, b.IgnoredSession) && a.AfterSeconds == b.AfterSeconds
+}

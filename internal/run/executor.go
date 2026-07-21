@@ -277,6 +277,7 @@ type ServerSampler struct {
 	spid          int
 	logMaxBytes   int64
 	logMaxPercent int
+	killer        *BlockerKiller // optional: kills matching blockers, reusing the Blocking snapshot
 }
 
 // NewServerSampler returns a sampler for the given DDL session and log thresholds.
@@ -285,6 +286,10 @@ func NewServerSampler(probe sampleProbe, spid int, logMaxBytes int64, logMaxPerc
 }
 
 var _ Sampler = (*ServerSampler)(nil)
+
+// SetKiller attaches a blocker-killer, consulted on every Blocking poll using the same
+// session snapshot. A nil killer (the default) leaves killing off.
+func (s *ServerSampler) SetKiller(k *BlockerKiller) { s.killer = k }
 
 // Blocking reports how our DDL is blocking other sessions: Any when it blocks at
 // least one session (ignored or not), Unignored when it blocks a session the operator
@@ -306,6 +311,9 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 			break
 		}
 	}
+	// Reuse the same snapshot to kill any session blocking our DDL that matches a kill
+	// rule (the inverse direction: here we are the victim). No-op when no killer is set.
+	s.killer.consider(ctx, sessions, s.spid)
 	return st, nil
 }
 

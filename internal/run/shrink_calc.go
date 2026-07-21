@@ -6,25 +6,42 @@ import (
 )
 
 // estimateShrink projects the chunks and time left from the reduction achieved so far.
-// chunksRemaining scales the remaining MB by the average MB per completed chunk;
-// etaSeconds scales the remaining MB by the achieved reduction rate. Both are zero until
-// there is signal (a completed chunk, some elapsed time, and MB still to reclaim), so a
-// just-started or finished shrink reports no estimate rather than a misleading one.
-func estimateShrink(start, current, final, chunksDone int, elapsed time.Duration) (chunksRemaining, etaSeconds int) {
+// chunksRemaining scales the remaining MB by the average MB per completed chunk; etaSeconds
+// scales the remaining MB by the achieved reduction rate over the full elapsed time (the
+// honest "with blocking" figure); etaNoBlockSeconds does the same over productive time only
+// (elapsed minus blocked), the rate the shrink would sustain if it were never starved. All
+// are zero until there is signal (a completed chunk, some elapsed time, and MB still to
+// reclaim), so a just-started or finished shrink reports no estimate rather than a
+// misleading one.
+func estimateShrink(start, current, final, chunksDone int, elapsed, blocked time.Duration) (chunksRemaining, etaSeconds, etaNoBlockSeconds int) {
 	doneMB := start - current
 	remainingMB := current - final
 	if doneMB <= 0 || remainingMB <= 0 {
-		return 0, 0
+		return 0, 0, 0
 	}
 	if chunksDone > 0 {
 		chunksRemaining = int(math.Ceil(float64(remainingMB) / (float64(doneMB) / float64(chunksDone))))
 	}
-	if secs := elapsed.Seconds(); secs > 0 {
-		if rate := float64(doneMB) / secs; rate > 0 {
-			etaSeconds = int(math.Ceil(float64(remainingMB) / rate))
-		}
+	etaSeconds = etaFrom(doneMB, remainingMB, elapsed)
+	etaNoBlockSeconds = etaFrom(doneMB, remainingMB, elapsed-blocked)
+	if etaNoBlockSeconds == 0 {
+		etaNoBlockSeconds = etaSeconds // no measurable productive time yet: fall back
 	}
-	return chunksRemaining, etaSeconds
+	return chunksRemaining, etaSeconds, etaNoBlockSeconds
+}
+
+// etaFrom scales remainingMB by the doneMB-per-window reduction rate. A non-positive window
+// or rate yields 0 (no estimate).
+func etaFrom(doneMB, remainingMB int, window time.Duration) int {
+	secs := window.Seconds()
+	if secs <= 0 {
+		return 0
+	}
+	rate := float64(doneMB) / secs
+	if rate <= 0 {
+		return 0
+	}
+	return int(math.Ceil(float64(remainingMB) / rate))
 }
 
 // ShrinkTuning is the run-side carrier of the DBCC SHRINKFILE driver parameters.
@@ -33,11 +50,13 @@ func estimateShrink(start, current, final, chunksDone int, elapsed time.Duration
 // consumes ddl.Policy rather than the raw config. cmd maps config.ShrinkConfig
 // into a ShrinkTuning when wiring the engine.
 type ShrinkTuning struct {
-	InitialStepSmallMB   int           // reclaim < 5 GB
-	InitialStepMediumMB  int           // reclaim 5–50 GB
-	InitialStepLargeMB   int           // reclaim > 50 GB
+	InitialStepSmallMB   int           // legacy tier: reclaim < 5 GB (used only when TargetChunks <= 0)
+	InitialStepMediumMB  int           // legacy tier: reclaim 5–50 GB
+	InitialStepLargeMB   int           // legacy tier: reclaim > 50 GB
+	TargetChunks         int           // aim to finish in ~this many chunks (initial step = reclaim / TargetChunks)
+	MaxStepPctOfFile     int           // per-file step ceiling as a percent of file size (0 disables)
 	MinStepMB            int           // step floor
-	MaxStepMB            int           // step ceiling
+	MaxStepMB            int           // absolute step ceiling
 	TargetBatch          time.Duration // ideal per-chunk duration
 	MaxNoProgress        int           // consecutive no-gain chunks before clean stop
 	NoProgressBackoff    time.Duration // initial backoff after a no-progress chunk
@@ -72,27 +91,50 @@ const (
 	blockingReduceSeconds = 30 // blocking others longer than this → back off
 )
 
-// InitialStepMB picks the starting chunk size in megabytes from the volume to
-// reclaim. The tiers are deliberately conservative starting points; AdjustStepMB
-// raises the step from here when the I/O keeps up.
-func InitialStepMB(reclaimMB int, t ShrinkTuning) int {
+// InitialStepMB picks the starting chunk size in megabytes from the volume to reclaim and
+// the file size. With TargetChunks set (the default), it sizes the first chunk to finish the
+// whole shrink in about that many chunks — step = ceil(reclaimMB / TargetChunks) — so a
+// multi-TB reclaim starts with large chunks and completes in ~TargetChunks moves instead of
+// tens of thousands. Without it, it falls back to the reclaim-volume tiers. The result is
+// clamped to [MinStepMB, effectiveMaxStepMB(fileSizeMB, t)]; AdjustStepMB adapts from here.
+func InitialStepMB(reclaimMB, fileSizeMB int, t ShrinkTuning) int {
+	var step int
 	switch {
+	case t.TargetChunks > 0:
+		step = (reclaimMB + t.TargetChunks - 1) / t.TargetChunks // ceil
 	case reclaimMB < reclaimSmallCeilingMB:
-		return t.InitialStepSmallMB
+		step = t.InitialStepSmallMB
 	case reclaimMB <= reclaimMediumCeilingMB:
-		return t.InitialStepMediumMB
+		step = t.InitialStepMediumMB
 	default:
-		return t.InitialStepLargeMB
+		step = t.InitialStepLargeMB
 	}
+	return clampStep(step, t.MinStepMB, effectiveMaxStepMB(fileSizeMB, t))
+}
+
+// effectiveMaxStepMB is the per-file step ceiling: MaxStepMB, further capped to
+// MaxStepPctOfFile percent of the file so a small file uses proportionally smaller chunks. A
+// zero percent disables the file-relative cap. The result never drops below MinStepMB.
+func effectiveMaxStepMB(fileSizeMB int, t ShrinkTuning) int {
+	m := t.MaxStepMB
+	if t.MaxStepPctOfFile > 0 {
+		if byFile := fileSizeMB * t.MaxStepPctOfFile / 100; byFile < m {
+			m = byFile
+		}
+	}
+	if m < t.MinStepMB {
+		m = t.MinStepMB
+	}
+	return m
 }
 
 // AdjustStepMB returns the next chunk size given the last chunk's duration and wait
 // deltas. It halves the step under I/O pressure or sustained blocking, doubles it
 // when I/O is light and the chunk finished within the target batch duration, and
-// clamps the result to [MinStepMB, MaxStepMB]. Reduction takes precedence: the two
-// conditions are mutually exclusive in practice (one needs high latency, the other
-// low), but the order makes the safe choice explicit.
-func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning) int {
+// clamps the result to [MinStepMB, maxStep] (the per-file effective ceiling). Reduction
+// takes precedence: the two conditions are mutually exclusive in practice (one needs high
+// latency, the other low), but the order makes the safe choice explicit.
+func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning, maxStep int) int {
 	reduce := w.WriteLogAvgMs > writeLogReduceMs ||
 		w.PageIOLatchExAvgMs > pageIOLatchReduceMs ||
 		w.BlockingSeconds > blockingReduceSeconds
@@ -107,7 +149,7 @@ func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning)
 	case grow:
 		step *= 2
 	}
-	return clampStep(step, t.MinStepMB, t.MaxStepMB)
+	return clampStep(step, t.MinStepMB, maxStep)
 }
 
 // clampStep bounds step to [lo, hi].

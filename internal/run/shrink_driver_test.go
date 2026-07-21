@@ -439,16 +439,21 @@ func TestShrinkLogFullTimesOutCleanly(t *testing.T) {
 
 func TestEstimateShrink(t *testing.T) {
 	// 400 MB reclaimed over 10 chunks in 100s, 600 MB left: avg 40 MB/chunk → 15 chunks,
-	// rate 4 MB/s → 150s.
-	if chunks, eta := estimateShrink(1000, 600, 0, 10, 100*time.Second); chunks != 15 || eta != 150 {
-		t.Errorf("estimateShrink = (%d chunks, %d s), want (15, 150)", chunks, eta)
+	// rate 4 MB/s → 150s with blocking. Of the 100s, 60s was blocked → 40s productive → 10
+	// MB/s → 60s without blocking.
+	if chunks, eta, etaNB := estimateShrink(1000, 600, 0, 10, 100*time.Second, 60*time.Second); chunks != 15 || eta != 150 || etaNB != 60 {
+		t.Errorf("estimateShrink = (%d chunks, %d s, %d s no-block), want (15, 150, 60)", chunks, eta, etaNB)
+	}
+	// No blocking: the two ETAs coincide.
+	if _, eta, etaNB := estimateShrink(1000, 600, 0, 10, 100*time.Second, 0); eta != 150 || etaNB != 150 {
+		t.Errorf("estimateShrink unblocked = (%d, %d), want both 150", eta, etaNB)
 	}
 	// No progress yet (nothing reclaimed): no estimate rather than a misleading one.
-	if chunks, eta := estimateShrink(1000, 1000, 0, 0, 0); chunks != 0 || eta != 0 {
-		t.Errorf("estimateShrink with no progress = (%d, %d), want (0, 0)", chunks, eta)
+	if chunks, eta, etaNB := estimateShrink(1000, 1000, 0, 0, 0, 0); chunks != 0 || eta != 0 || etaNB != 0 {
+		t.Errorf("estimateShrink with no progress = (%d, %d, %d), want (0, 0, 0)", chunks, eta, etaNB)
 	}
 	// Nothing left to reclaim: no estimate.
-	if chunks, eta := estimateShrink(1000, 500, 500, 5, 50*time.Second); chunks != 0 || eta != 0 {
+	if chunks, eta, _ := estimateShrink(1000, 500, 500, 5, 50*time.Second, 0); chunks != 0 || eta != 0 {
 		t.Errorf("estimateShrink at target = (%d, %d), want (0, 0)", chunks, eta)
 	}
 }
@@ -462,7 +467,7 @@ func TestShrinkStepAdjustsUnderIOPressure(t *testing.T) {
 	if d.WriteLogAvgMs != 30 {
 		t.Fatalf("waitDeltas WriteLogAvgMs = %v, want 30", d.WriteLogAvgMs)
 	}
-	if got := AdjustStepMB(400, time.Second, d, testTuning()); got != 200 {
+	if got := AdjustStepMB(400, time.Second, d, testTuning(), testTuning().MaxStepMB); got != 200 {
 		t.Errorf("AdjustStepMB under WRITELOG pressure = %d, want 200", got)
 	}
 }

@@ -307,6 +307,16 @@ func TestParseManifestErrors(t *testing.T) {
 			yaml:    "ignore_blocked_sessions:\n  - session_id: 0\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
+		{
+			name:    "kill_blocked_sessions empty entry",
+			yaml:    "kill_blocked_sessions:\n  - {}\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
+		{
+			name:    "kill_blocked_sessions negative after_seconds",
+			yaml:    "kill_blocked_sessions:\n  - login_name: \"^SVC$\"\n    after_seconds: -1\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wantErr: ddl.ErrInvalidManifest,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

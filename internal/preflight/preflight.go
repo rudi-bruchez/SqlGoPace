@@ -146,6 +146,17 @@ func CheckElevatedRights(hasAccess bool) Check {
 	return Check{"permissions", Pass, "db_owner or sysadmin"}
 }
 
+// CheckKillPermission warns (never fails) when the blocker-kill policy is armed but the
+// connected login cannot KILL another session. A missing grant would make every auto-kill a
+// silent no-op, so it is surfaced — but it does not block the run, which is otherwise valid.
+func CheckKillPermission(hasPerm bool) Check {
+	if !hasPerm {
+		return Check{"kill permission", Warn,
+			"blocker-killing is armed (kill_blockers or allow_abort_blockers) but the login lacks ALTER ANY CONNECTION (or sysadmin/processadmin); blocker kills will be no-ops"}
+	}
+	return Check{"kill permission", Pass, "ALTER ANY CONNECTION (or sysadmin/processadmin)"}
+}
+
 // CheckOperation verifies an operation's preconditions: the table must exist, and
 // the target object must exist (for rebuild/alter/drop) or not exist (for
 // create/add — already present means the idempotent guard will skip it).
@@ -189,6 +200,7 @@ type Prober interface {
 	ColumnExists(ctx context.Context, schema, table, column string) (bool, error)
 	ConstraintExists(ctx context.Context, schema, table, constraint string) (bool, error)
 	HasElevatedDBAccess(ctx context.Context) (bool, error)
+	HasAlterAnyConnection(ctx context.Context) (bool, error)
 	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
 }
 
@@ -200,8 +212,10 @@ type Thresholds struct {
 	LogMaxPercent int
 }
 
-// Run gathers server facts and builds the preflight report for a manifest.
-func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, th Thresholds) (Report, error) {
+// Run gathers server facts and builds the preflight report for a manifest. killArmed
+// requests the ALTER ANY CONNECTION advisory (the blocker-kill policy or ABORT_AFTER_WAIT =
+// BLOCKERS is enabled); it only ever warns, never fails.
+func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, th Thresholds, killArmed bool) (Report, error) {
 	var rep Report
 	rep.add(CheckServer(info))
 
@@ -230,6 +244,15 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 			return Report{}, fmt.Errorf("preflight elevated access: %w", err)
 		}
 		rep.add(CheckElevatedRights(access))
+	}
+
+	// When the blocker-kill policy is armed, advise (warn only) if the login cannot KILL.
+	if killArmed {
+		hasPerm, err := p.HasAlterAnyConnection(ctx)
+		if err != nil {
+			return Report{}, fmt.Errorf("preflight kill permission: %w", err)
+		}
+		rep.add(CheckKillPermission(hasPerm))
 	}
 
 	for _, op := range m.Operations {

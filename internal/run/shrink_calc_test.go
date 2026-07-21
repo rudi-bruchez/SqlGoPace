@@ -37,8 +37,35 @@ func TestInitialStepMB(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := run.InitialStepMB(tt.reclaimMB, tn); got != tt.want {
+			// A huge file size with MaxStepPctOfFile=0 (see tuning()) keeps the effective
+			// ceiling at MaxStepMB, so the legacy tier value is returned unchanged.
+			if got := run.InitialStepMB(tt.reclaimMB, 100*1024*1024, tn); got != tt.want {
 				t.Errorf("InitialStepMB(%d) = %d, want %d", tt.reclaimMB, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInitialStepMBTargetChunks(t *testing.T) {
+	tn := run.ShrinkTuning{TargetChunks: 1000, MaxStepPctOfFile: 5, MinStepMB: 50, MaxStepMB: 8192}
+	tests := []struct {
+		name       string
+		reclaimMB  int
+		fileSizeMB int
+		want       int
+	}{
+		// 7 TB reclaim / 1000 = ceil(7340032/1000) = 7341 MB (~7.2 GB) chunks, under the 8 GB
+		// ceiling — so the whole shrink is ~1000 moves instead of tens of thousands.
+		{"multi-TB reclaim bounded to ~target chunks", 7 * 1024 * 1024, 16 * 1024 * 1024, 7341},
+		// Small reclaim: 2 GB / 1000 = ~3 MB, clamped up to the MinStepMB floor.
+		{"tiny reclaim floors at min step", 2 * 1024, 10 * 1024, 50},
+		// Mid reclaim on a small file: 5% of a 20 GB file (1024 MB) caps the step.
+		{"file-percent ceiling caps the step", 10 * 1024 * 1024, 20 * 1024, 1024},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := run.InitialStepMB(tt.reclaimMB, tt.fileSizeMB, tn); got != tt.want {
+				t.Errorf("InitialStepMB(reclaim=%d, file=%d) = %d, want %d", tt.reclaimMB, tt.fileSizeMB, got, tt.want)
 			}
 		})
 	}
@@ -107,7 +134,8 @@ func TestAdjustStepMB(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := run.AdjustStepMB(tt.step, tt.elapsed, tt.w, tn); got != tt.want {
+			// pct=0 in tuning() so the effective ceiling equals MaxStepMB (1024).
+			if got := run.AdjustStepMB(tt.step, tt.elapsed, tt.w, tn, tn.MaxStepMB); got != tt.want {
 				t.Errorf("AdjustStepMB(%d, %v, %+v) = %d, want %d", tt.step, tt.elapsed, tt.w, got, tt.want)
 			}
 		})

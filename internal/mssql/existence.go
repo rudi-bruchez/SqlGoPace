@@ -28,6 +28,20 @@ func (c *Conn) HasElevatedDBAccess(ctx context.Context) (bool, error) {
 	return c.existsScalar(ctx, elevatedAccessSQL)
 }
 
+const alterAnyConnectionSQL = `
+SELECT CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1
+              OR IS_SRVROLEMEMBER('processadmin') = 1
+              OR HAS_PERMS_BY_NAME(NULL, NULL, 'ALTER ANY CONNECTION') = 1
+            THEN 1 ELSE 0 END;`
+
+// HasAlterAnyConnection reports whether the current login can KILL another session:
+// sysadmin/processadmin membership, or the server-level ALTER ANY CONNECTION permission.
+// The selective blocker-kill policy (and ABORT_AFTER_WAIT = BLOCKERS) needs it; preflight
+// warns — but does not fail — when it is missing so the operator learns kills will no-op.
+func (c *Conn) HasAlterAnyConnection(ctx context.Context) (bool, error) {
+	return c.existsScalar(ctx, alterAnyConnectionSQL)
+}
+
 const tableExistsSQL = `
 SELECT CASE WHEN OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table), 'U') IS NOT NULL
             THEN 1 ELSE 0 END;`

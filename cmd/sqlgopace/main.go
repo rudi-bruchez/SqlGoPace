@@ -370,8 +370,24 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
 	}
-	checker := run.NewPreflightChecker(conn, info, thresholds)
+	killArmed := cfg.KillBlockers.Enabled || cfg.OptionsOverride.AllowAbortBlockers
+	checker := run.NewPreflightChecker(conn, info, thresholds, killArmed)
 	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
+	// sampler's per-poll session snapshot; the engine feeds it each manifest's kill rules.
+	var killOpt run.EngineOption
+	if cfg.KillBlockers.Enabled {
+		killed := func(ev run.KillEvent) {
+			fmt.Fprintf(engineOut, "-- killed blocker SPID %d (login=%s) after %s blocking the DDL\n",
+				ev.SPID, ev.Login, ev.Waited.Round(time.Second))
+			if fwd != nil {
+				fwd.send(tui.LogMsg{Line: fmt.Sprintf("killed blocker SPID %d (%s) after %s", ev.SPID, ev.Login, ev.Waited.Round(time.Second))})
+			}
+		}
+		killer := run.NewBlockerKiller(conn.Kill, killed, nil)
+		sampler.SetKiller(killer)
+		killOpt = run.WithBlockerKiller(killer, cfg.KillBlockers.DefaultAfter())
+	}
 	runner := run.NewMonitoredRunner(conn, sampler, run.System, run.RunnerConfig{
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
 		LogPollInterval: cfg.Monitoring.LogPoll(),
@@ -385,8 +401,9 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	shrinkProgress := func(p run.ShrinkProgress) {
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
-		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds)\n",
-			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB), p.Chunks, p.ChunksRemaining, p.ETASeconds)
+		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds, %ds unblocked, blocked %ds)\n",
+			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB),
+			p.Chunks, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
@@ -432,6 +449,9 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithDrainSignal(drain),
 		run.WithOutput(engineOut),
 		run.WithStepSink(stepSink),
+	}
+	if killOpt != nil {
+		opts = append(opts, killOpt)
 	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
@@ -488,6 +508,8 @@ func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
 		InitialStepSmallMB:   s.InitialStepSmallMB,
 		InitialStepMediumMB:  s.InitialStepMediumMB,
 		InitialStepLargeMB:   s.InitialStepLargeMB,
+		TargetChunks:         s.TargetChunks,
+		MaxStepPctOfFile:     s.MaxStepPctOfFile,
 		MinStepMB:            s.MinStepMB,
 		MaxStepMB:            s.MaxStepMB,
 		TargetBatch:          s.TargetBatch(),
@@ -850,6 +872,7 @@ func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
 		File: p.File, Type: p.Type, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
 		FinalMB: p.FinalMB, StepMB: p.StepMB, Percent: p.Percent(),
 		Chunks: p.Chunks, ChunksRemaining: p.ChunksRemaining, ETASeconds: p.ETASeconds,
+		ETASecondsNoBlock: p.ETASecondsNoBlock, BlockedSeconds: p.BlockedSeconds,
 	}
 }
 
@@ -897,6 +920,8 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 				}
 			case tui.ActionIgnoreBlocker:
 				ignoreBlocker(program, current, a)
+			case tui.ActionKillBlockerAuto:
+				killBlockerAuto(ctx, program, conn, current, a)
 			}
 		}
 	}
@@ -921,6 +946,34 @@ func ignoreBlocker(program *tui.Program, current *currentManifest, a tui.Action)
 		return
 	}
 	program.Send(tui.LogMsg{Line: fmt.Sprintf("ignoring SPID %d by %s — added to manifest; holding the lock", a.SPID, a.Criterion)})
+}
+
+// killBlockerAuto kills the selected blocker now and writes a one-criterion kill rule into
+// the running manifest (after_seconds = 0, kill on sight). The engine hot-reloads it
+// (WithLiveReload), so a recurrence is auto-killed without a restart. Both effects are the
+// inverse of ignoreBlocker; the outcome is echoed to the console. The kill takes effect
+// regardless of whether kill_blockers is armed in config — it is an explicit operator act —
+// but the auto-kill rule only fires later if the killer is armed.
+func killBlockerAuto(ctx context.Context, program *tui.Program, conn *mssql.Conn, current *currentManifest, a tui.Action) {
+	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
+	if !ok {
+		program.Send(tui.LogMsg{Line: "kill: nothing to match on for that session"})
+		return
+	}
+	if err := conn.Kill(ctx, a.SPID); err != nil {
+		program.Send(tui.LogMsg{Line: fmt.Sprintf("kill SPID %d: %v", a.SPID, err)})
+		// Still record the rule below: a failed kill now should not prevent auto-kill later.
+	}
+	path := current.get()
+	if path == "" {
+		program.Send(tui.LogMsg{Line: "kill: no manifest is running (killed once, not remembered)"})
+		return
+	}
+	if err := ddl.AppendKilledSession(path, rule); err != nil {
+		program.Send(tui.LogMsg{Line: "kill: " + err.Error()})
+		return
+	}
+	program.Send(tui.LogMsg{Line: fmt.Sprintf("killed SPID %d and auto-killing by %s — added to manifest", a.SPID, a.Criterion)})
 }
 
 // loadConfig loads the config file when one is given, else returns nil.

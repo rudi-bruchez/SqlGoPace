@@ -21,6 +21,28 @@ func TestFormatElapsed(t *testing.T) {
 	}
 }
 
+func TestHumanizeMS(t *testing.T) {
+	const h = int64(3_600_000)
+	tests := []struct {
+		ms   int64
+		want string
+	}{
+		{500, "500ms"},
+		{2800, "2.8s"},
+		{6*60_000 + 35_000, "6m35s"},
+		{1*h + 4*60_000, "1h04m"},
+		// Past 72h the unit rolls from hours to days.
+		{71*h + 59*60_000, "71h59m"},
+		{72 * h, "3d00h"},
+		{774*h + 58*60_000, "32d06h"}, // the reported ETA: 774h58m
+	}
+	for _, tt := range tests {
+		if got := humanizeMS(tt.ms); got != tt.want {
+			t.Errorf("humanizeMS(%d) = %q, want %q", tt.ms, got, tt.want)
+		}
+	}
+}
+
 func TestTickUpdatesElapsed(t *testing.T) {
 	start := time.Unix(1000, 0)
 	m := Model{startedAt: start}

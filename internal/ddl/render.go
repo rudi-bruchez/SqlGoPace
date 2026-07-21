@@ -63,6 +63,17 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 		}
 		addPair(root, "ignore_blocked_sessions", seq)
 	}
+	if len(m.KillBlockedSessions) > 0 {
+		seq := &yaml.Node{Kind: yaml.SequenceNode}
+		for i, s := range m.KillBlockedSessions {
+			node, err := killedSessionNode(s)
+			if err != nil {
+				return nil, fmt.Errorf("kill_blocked_sessions[%d]: %w", i, err)
+			}
+			seq.Content = append(seq.Content, node)
+		}
+		addPair(root, "kill_blocked_sessions", seq)
+	}
 	addPair(root, "operations", operations)
 
 	var buf bytes.Buffer
@@ -106,6 +117,18 @@ func manifestDiscriminator(op Operation) string {
 // fields (nil session_id and empty regexps) so the rendered rule stays minimal and
 // round-trips through ParseManifest unchanged.
 func ignoredSessionNode(s IgnoredSession) (*yaml.Node, error) {
+	var node yaml.Node
+	if err := node.Encode(s); err != nil {
+		return nil, err
+	}
+	compact(&node)
+	return &node, nil
+}
+
+// killedSessionNode encodes one kill_blocked_sessions entry, dropping its unset fields
+// (nil session_id and empty regexps via compact; a zero after_seconds via ",omitempty"
+// on the field) so the rule round-trips through ParseManifest unchanged.
+func killedSessionNode(s KilledSession) (*yaml.Node, error) {
 	var node yaml.Node
 	if err := node.Encode(s); err != nil {
 		return nil, err

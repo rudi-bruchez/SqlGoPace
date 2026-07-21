@@ -62,6 +62,36 @@ func TestCheckElevatedRights(t *testing.T) {
 	}
 }
 
+func TestCheckKillPermission(t *testing.T) {
+	if got := preflight.CheckKillPermission(true).Severity; got != preflight.Pass {
+		t.Errorf("CheckKillPermission(true) = %v, want Pass", got)
+	}
+	if got := preflight.CheckKillPermission(false).Severity; got != preflight.Warn {
+		t.Errorf("CheckKillPermission(false) = %v, want Warn (advisory, never Fail)", got)
+	}
+}
+
+func TestRunWarnsWhenKillArmedWithoutPermission(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"},
+	}}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+
+	p := healthyProber()
+	p.alterAnyConn = false // login cannot KILL
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, true)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("kill-permission advisory must not fail the run:\n%v", rep.Checks)
+	}
+	if !rep.HasWarning() {
+		t.Errorf("Run() should warn when kill is armed but ALTER ANY CONNECTION is missing")
+	}
+}
+
 func TestCheckOperation(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -102,6 +132,7 @@ type fakeProber struct {
 	tableExists    bool
 	indexExists    bool
 	elevatedAccess bool
+	alterAnyConn   bool
 	dmlPermission  bool
 }
 
@@ -125,6 +156,9 @@ func (f fakeProber) ConstraintExists(context.Context, string, string, string) (b
 func (f fakeProber) HasElevatedDBAccess(context.Context) (bool, error) {
 	return f.elevatedAccess, nil
 }
+func (f fakeProber) HasAlterAnyConnection(context.Context) (bool, error) {
+	return f.alterAnyConn, nil
+}
 func (f fakeProber) HasDMLPermission(context.Context, string, string, string) (bool, error) {
 	return f.dmlPermission, nil
 }
@@ -147,7 +181,7 @@ func TestRun(t *testing.T) {
 	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
 
 	t.Run("healthy passes", func(t *testing.T) {
-		rep, err := preflight.Run(context.Background(), healthyProber(), info, manifest, th)
+		rep, err := preflight.Run(context.Background(), healthyProber(), info, manifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -159,7 +193,7 @@ func TestRun(t *testing.T) {
 	t.Run("missing index fails", func(t *testing.T) {
 		p := healthyProber()
 		p.indexExists = false
-		rep, err := preflight.Run(context.Background(), p, info, manifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -174,7 +208,7 @@ func TestRun(t *testing.T) {
 		shrinkManifest := &ddl.Manifest{Operations: []ddl.Operation{
 			ddl.Shrink{Type: "data", Files: "all"},
 		}}
-		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -189,7 +223,7 @@ func TestRun(t *testing.T) {
 		shrinkManifest := &ddl.Manifest{Operations: []ddl.Operation{
 			ddl.Shrink{Type: "data", Files: "all"},
 		}}
-		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, shrinkManifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -204,7 +238,7 @@ func TestRun(t *testing.T) {
 		checkManifest := &ddl.Manifest{Operations: []ddl.Operation{
 			ddl.CheckDB{Database: "MyDb"},
 		}}
-		rep, err := preflight.Run(context.Background(), p, info, checkManifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, checkManifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -216,7 +250,7 @@ func TestRun(t *testing.T) {
 	t.Run("ordinary DDL is not gated on elevated rights", func(t *testing.T) {
 		p := healthyProber()
 		p.elevatedAccess = false // not probed for a plain rebuild manifest
-		rep, err := preflight.Run(context.Background(), p, info, manifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}
@@ -228,7 +262,7 @@ func TestRun(t *testing.T) {
 	t.Run("log over cap fails", func(t *testing.T) {
 		p := healthyProber()
 		p.logSpace = mssql.LogSpace{TotalBytes: 5000, UsedPercent: 100}
-		rep, err := preflight.Run(context.Background(), p, info, manifest, th)
+		rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
 		if err != nil {
 			t.Fatalf("Run() error = %v", err)
 		}

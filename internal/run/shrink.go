@@ -34,15 +34,17 @@ var errLogReuseTimeout = errors.New("log reuse wait timed out")
 // the increment the shrink is moving by; Type is "data" or "log". Chunks/ChunksRemaining/
 // ETASeconds project the work left from what the completed chunks have achieved.
 type ShrinkProgress struct {
-	File            string
-	Type            string
-	StartMB         int
-	CurrentMB       int
-	FinalMB         int
-	StepMB          int
-	Chunks          int // page-moving chunks completed so far
-	ChunksRemaining int // estimated chunks left (from the average chunk so far)
-	ETASeconds      int // estimated seconds left (from the achieved reduction rate)
+	File              string
+	Type              string
+	StartMB           int
+	CurrentMB         int
+	FinalMB           int
+	StepMB            int
+	Chunks            int // page-moving chunks completed so far
+	ChunksRemaining   int // estimated chunks left (from the average chunk so far)
+	ETASeconds        int // estimated seconds left over the full elapsed time (with blocking)
+	ETASecondsNoBlock int // estimated seconds left over productive time only (without blocking)
+	BlockedSeconds    int // cumulative seconds spent blocked/stalled (unproductive)
 }
 
 // Percent returns the fraction of the planned reduction achieved, in [0,1].
@@ -241,7 +243,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// making no progress would otherwise show no shrink line at all).
 	r.emitProgress(ShrinkProgress{
 		File: f.Name, Type: "data", StartMB: f.SizeMB, CurrentMB: f.SizeMB,
-		FinalMB: final, StepMB: InitialStepMB(f.SizeMB-final, r.tuning),
+		FinalMB: final, StepMB: InitialStepMB(f.SizeMB-final, f.SizeMB, r.tuning),
 	})
 
 	// Phase A — TRUNCATEONLY: releases trailing free space with no page movement, no
@@ -267,11 +269,13 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 
 	// Phase B — chunked page-moving shrink.
 	start := size
-	step := InitialStepMB(size-final, r.tuning)
+	maxStep := effectiveMaxStepMB(size, r.tuning) // per-file step ceiling, fixed for this file
+	step := InitialStepMB(size-final, size, r.tuning)
 	current := size
 	noProgress := 0
 	backoff := r.tuning.NoProgressBackoff
 	var stallWaited time.Duration
+	var blocked time.Duration  // cumulative unproductive time (no-gain chunks, stalls, relief waits)
 	shrinkStart := r.clk.Now() // anchors the ETA from the reduction rate achieved so far
 
 	for current > final {
@@ -285,10 +289,11 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		// Emit progress every iteration, not only after a chunk gains space, so a shrink
 		// that is blocked or stalling still shows its live current size, chunk count, step
 		// and ETA in the console instead of appearing frozen.
-		chunksLeft, eta := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
+		chunksLeft, eta, etaNB := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
 		r.emitProgress(ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
+			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
 		})
 		next := NextTargetMB(current, step, final)
 
@@ -302,7 +307,8 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			if !mssql.IsFileAllocationError(err) {
 				return result, err
 			}
-			step = clampStep(step/2, r.tuning.MinStepMB, r.tuning.MaxStepMB)
+			step = clampStep(step/2, r.tuning.MinStepMB, maxStep)
+			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
 			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink); werr != nil {
 				return result, werr
 			} else if stop {
@@ -324,7 +330,10 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		// log-drain timeout is a clean stop (work preserved); a canceled context or
 		// any other error is propagated, not swallowed as success.
 		if stopped {
-			if err := r.awaitRelief(ctx, ignore, sink); err != nil {
+			r0 := r.clk.Now()
+			err := r.awaitRelief(ctx, ignore, sink)
+			blocked += r.clk.Since(r0) // waiting for pressure to clear is unproductive time
+			if err != nil {
 				if errors.Is(err, ErrLogDrainTimeout) {
 					result.FinalMB = current
 					result.Reason = "stopped: log did not drain before timeout (work preserved)"
@@ -338,7 +347,11 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			// No gain: WALP timeout (49516) or data pinned at the file end, or we are
 			// blocked by another session (self-wait, §8.2). Wait and retry, stopping
 			// cleanly at whichever bound trips first — count or total wait time.
-			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink); werr != nil {
+			blocked += elapsed // the chunk ran but moved nothing (WALP timeout / blocked)
+			s0 := r.clk.Now()
+			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink)
+			blocked += r.clk.Since(s0)
+			if werr != nil {
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
@@ -352,14 +365,15 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		noProgress = 0
 		backoff = r.tuning.NoProgressBackoff
 		stallWaited = 0
-		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), r.tuning)
+		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), r.tuning, maxStep)
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
-		chunksLeft, eta = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart))
+		chunksLeft, eta, etaNB = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
 		r.emitProgress(ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
+			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
 		})
 	}
 	return result, nil

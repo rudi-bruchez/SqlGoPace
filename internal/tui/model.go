@@ -142,16 +142,18 @@ type (
 	// fraction of the planned reduction (design §9), not the server's percent_complete
 	// (which is 0 for the chunked DBCC SHRINKFILE loop).
 	ShrinkMsg struct {
-		File            string
-		Type            string // "data" | "log"
-		CurrentMB       int
-		StartMB         int
-		FinalMB         int
-		StepMB          int     // current chunk increment
-		Percent         float64 // 0..1
-		Chunks          int     // chunks completed
-		ChunksRemaining int     // estimated chunks left
-		ETASeconds      int     // estimated seconds left
+		File              string
+		Type              string // "data" | "log"
+		CurrentMB         int
+		StartMB           int
+		FinalMB           int
+		StepMB            int     // current chunk increment
+		Percent           float64 // 0..1
+		Chunks            int     // chunks completed
+		ChunksRemaining   int     // estimated chunks left
+		ETASeconds        int     // estimated seconds left (with blocking)
+		ETASecondsNoBlock int     // estimated seconds left over productive time only
+		BlockedSeconds    int     // cumulative seconds spent blocked/stalled
 	}
 	// SPIDMsg carries the session id of the DDL the console is monitoring, so the
 	// operator can see which server session (and which blocks) is ours.
@@ -190,6 +192,10 @@ const (
 	// manifest (so the DDL holds its lock through it). Criterion/Value/SPID carry the
 	// chosen match.
 	ActionIgnoreBlocker
+	// ActionKillBlockerAuto kills the selected blocking session now AND adds a kill rule
+	// for it to the running manifest, so a recurrence is auto-killed without a restart.
+	// Criterion/Value/SPID carry the chosen match (the inverse of ActionIgnoreBlocker).
+	ActionKillBlockerAuto
 	// ActionQuit leaves the console.
 	ActionQuit
 )
@@ -197,22 +203,23 @@ const (
 // Action is an operator intent, dispatched to the host via the action channel.
 type Action struct {
 	Kind ActionKind
-	SPID int // set for ActionKillBlocker and ActionIgnoreBlocker
+	SPID int // set for ActionKillBlocker, ActionIgnoreBlocker, and ActionKillBlockerAuto
 
-	// Criterion and Value carry the ignore match for ActionIgnoreBlocker: Criterion is
-	// "session_id" | "app_name" | "login_name" | "host_name"; Value is the observed
-	// attribute (empty for session_id, which uses SPID).
+	// Criterion and Value carry the match for ActionIgnoreBlocker / ActionKillBlockerAuto:
+	// Criterion is "session_id" | "app_name" | "login_name" | "host_name"; Value is the
+	// observed attribute (empty for session_id, which uses SPID).
 	Criterion string
 	Value     string
 }
 
-// inputMode is the console's key-handling mode: normal, or prompting for the ignore
-// criterion after the operator pressed "i".
+// inputMode is the console's key-handling mode: normal, or prompting for the match
+// criterion after the operator pressed "i" (ignore) or "X" (kill + auto-kill).
 type inputMode int
 
 const (
-	modeNormal inputMode = iota
-	modeCriterion
+	modeNormal        inputMode = iota
+	modeCriterion               // ignore-this-session prompt (from "i")
+	modeKillCriterion           // kill-and-remember prompt (from "X")
 )
 
 // Model is the incident console state.
@@ -335,7 +342,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	if m.mode == modeCriterion {
+	if m.inCriterionMode() {
 		return m.handleCriterionKey(msg)
 	}
 	switch msg.String() {
@@ -359,6 +366,10 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.blockers) > 0 {
 			m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
 		}
+	case "X":
+		if len(m.blockers) > 0 {
+			m.mode = modeKillCriterion
+		}
 	case "k":
 		m.emit(Action{Kind: ActionKillDDL})
 	case "d":
@@ -374,25 +385,35 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleCriterionKey handles the "ignore this session by …" sub-prompt: it emits an
-// ActionIgnoreBlocker for the selected blocker and the chosen criterion, then returns
+// inCriterionMode reports whether a match-criterion sub-prompt is open (ignore or kill).
+func (m Model) inCriterionMode() bool {
+	return m.mode == modeCriterion || m.mode == modeKillCriterion
+}
+
+// handleCriterionKey handles the match-criterion sub-prompt shared by "ignore this session
+// by …" (modeCriterion) and "kill + remember this session by …" (modeKillCriterion): it
+// emits the corresponding action for the selected blocker and chosen criterion, then returns
 // to normal mode. Esc/q cancels; any other key keeps the prompt open.
 func (m Model) handleCriterionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.cursor >= len(m.blockers) { // the selection vanished while prompting
 		m.mode = modeNormal
 		return m, nil
 	}
+	kind := ActionIgnoreBlocker
+	if m.mode == modeKillCriterion {
+		kind = ActionKillBlockerAuto
+	}
 	bl := m.blockers[m.cursor]
 	switch msg.String() {
 	case "esc", "q":
 	case "s":
-		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "session_id"})
+		m.emit(Action{Kind: kind, SPID: bl.SPID, Criterion: "session_id"})
 	case "a":
-		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "app_name", Value: bl.Program})
+		m.emit(Action{Kind: kind, SPID: bl.SPID, Criterion: "app_name", Value: bl.Program})
 	case "l":
-		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "login_name", Value: bl.Login})
+		m.emit(Action{Kind: kind, SPID: bl.SPID, Criterion: "login_name", Value: bl.Login})
 	case "h":
-		m.emit(Action{Kind: ActionIgnoreBlocker, SPID: bl.SPID, Criterion: "host_name", Value: bl.Host})
+		m.emit(Action{Kind: kind, SPID: bl.SPID, Criterion: "host_name", Value: bl.Host})
 	default:
 		return m, nil // unrecognized key: stay in the prompt
 	}
@@ -488,6 +509,14 @@ func (m Model) View() string {
 		}
 		if m.shrink.ETASeconds > 0 {
 			fmt.Fprintf(&b, " · ETA %s", humanizeMS(int64(m.shrink.ETASeconds)*1000))
+			// Show the unblocked ETA too when blocking has meaningfully slowed the shrink,
+			// so the operator sees how much of the ETA is starvation rather than real work.
+			if m.shrink.ETASecondsNoBlock > 0 && m.shrink.ETASecondsNoBlock < m.shrink.ETASeconds {
+				fmt.Fprintf(&b, " (%s if unblocked)", humanizeMS(int64(m.shrink.ETASecondsNoBlock)*1000))
+			}
+		}
+		if m.shrink.BlockedSeconds > 0 {
+			fmt.Fprintf(&b, " · blocked %s", humanizeMS(int64(m.shrink.BlockedSeconds)*1000))
 		}
 		b.WriteString("\n")
 	}
@@ -524,11 +553,15 @@ func (m Model) View() string {
 		}
 	}
 
-	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [k] kill DDL  [d] drain/cancel  [q] quit"
-	if m.mode == modeCriterion && m.cursor < len(m.blockers) {
+	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [X] kill+auto  [k] kill DDL  [d] drain/cancel  [q] quit"
+	if m.inCriterionMode() && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
-		help = fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
-			bl.SPID, bl.Program, bl.Login, bl.Host)
+		verb := "ignore"
+		if m.mode == modeKillCriterion {
+			verb = "kill+auto-kill"
+		}
+		help = fmt.Sprintf("%s SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
+			verb, bl.SPID, bl.Program, bl.Login, bl.Host)
 	}
 	b.WriteString("\n" + helpStyle.Render(help))
 	if m.notice != "" {
@@ -551,9 +584,11 @@ func HumanizeMB(mb int) string {
 	}
 }
 
-// humanizeMS renders a millisecond wait total compactly, escalating the unit so large
-// accumulated values stay readable: "775ms", "2.8s", "6m35s", "1h04m".
+// humanizeMS renders a millisecond duration compactly, escalating the unit so large
+// values stay readable: "775ms", "2.8s", "6m35s", "1h04m", and — past 72h, where an
+// hours count becomes unwieldy (a multi-day shrink ETA) — days and hours: "32d06h".
 func humanizeMS(ms int64) string {
+	const hoursToDays = int64(72 * 3_600_000) // switch to days past 72h
 	switch {
 	case ms < 1000:
 		return fmt.Sprintf("%dms", ms)
@@ -562,9 +597,12 @@ func humanizeMS(ms int64) string {
 	case ms < 3_600_000:
 		s := ms / 1000
 		return fmt.Sprintf("%dm%02ds", s/60, s%60)
-	default:
+	case ms < hoursToDays:
 		s := ms / 1000
 		return fmt.Sprintf("%dh%02dm", s/3600, (s%3600)/60)
+	default:
+		s := ms / 1000
+		return fmt.Sprintf("%dd%02dh", s/86400, (s%86400)/3600)
 	}
 }
 

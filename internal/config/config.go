@@ -32,7 +32,23 @@ type Config struct {
 	History         HistoryConfig         `yaml:"history"`
 	Shrink          ShrinkConfig          `yaml:"shrink"`
 	BatchDML        BatchDMLConfig        `yaml:"batch_dml"`
+	KillBlockers    KillBlockersConfig    `yaml:"kill_blockers"`
 	MatrixFile      string                `yaml:"matrix_file"`
+}
+
+// KillBlockersConfig arms the selective blocker-kill policy. The match rules themselves
+// live per-manifest in kill_blocked_sessions (hot-reloadable, TUI-appendable); this global
+// block is the safety gate. Killing a session is destructive, so it is off by default and
+// only happens when Enabled is true. DefaultAfterSeconds seeds a rule's delay when it sets
+// none (0 = kill on sight).
+type KillBlockersConfig struct {
+	Enabled             bool `yaml:"enabled"`
+	DefaultAfterSeconds int  `yaml:"default_after_seconds"`
+}
+
+// DefaultAfter returns the default kill delay for a rule that sets none.
+func (k KillBlockersConfig) DefaultAfter() time.Duration {
+	return time.Duration(k.DefaultAfterSeconds) * time.Second
 }
 
 // DatabaseConfig holds connection settings. LoginTimeout is the connection
@@ -140,11 +156,13 @@ type OptionsOverrideConfig struct {
 // they depend on the instance's storage and SLA, not on the operation. They are
 // starting points and bounds that the driver's dynamic step calibration varies.
 type ShrinkConfig struct {
-	InitialStepSmallMB          int `yaml:"initial_step_small_mb"`           // reclaim < 5 GB
-	InitialStepMediumMB         int `yaml:"initial_step_medium_mb"`          // reclaim 5–50 GB
-	InitialStepLargeMB          int `yaml:"initial_step_large_mb"`           // reclaim > 50 GB
+	InitialStepSmallMB          int `yaml:"initial_step_small_mb"`           // legacy tier: reclaim < 5 GB (used only when target_chunks <= 0)
+	InitialStepMediumMB         int `yaml:"initial_step_medium_mb"`          // legacy tier: reclaim 5–50 GB
+	InitialStepLargeMB          int `yaml:"initial_step_large_mb"`           // legacy tier: reclaim > 50 GB
+	TargetChunks                int `yaml:"target_chunks"`                   // aim to finish in ~this many chunks: initial step = reclaim / target_chunks
+	MaxStepPctOfFile            int `yaml:"max_step_pct_of_file"`            // per-file ceiling: cap the step at this % of the file (0 disables)
 	MinStepMB                   int `yaml:"min_step_mb"`                     // floor: below this, per-loop overhead dominates
-	MaxStepMB                   int `yaml:"max_step_mb"`                     // ceiling: avoid saturating I/O in one move
+	MaxStepMB                   int `yaml:"max_step_mb"`                     // absolute ceiling: avoid saturating I/O in one move
 	TargetBatchSeconds          int `yaml:"target_batch_seconds"`            // an "ideal" chunk lasts a few seconds
 	MaxNoProgress               int `yaml:"max_no_progress"`                 // consecutive no-gain chunks before clean stop
 	NoProgressBackoffSeconds    int `yaml:"no_progress_backoff_seconds"`     // wait before retry, doubled each no-progress
@@ -315,8 +333,10 @@ func (s *ShrinkConfig) applyDefaults() {
 	setIf(&s.InitialStepSmallMB, 100)
 	setIf(&s.InitialStepMediumMB, 250)
 	setIf(&s.InitialStepLargeMB, 500)
+	setIf(&s.TargetChunks, 1000)
+	setIf(&s.MaxStepPctOfFile, 5)
 	setIf(&s.MinStepMB, 50)
-	setIf(&s.MaxStepMB, 1024)
+	setIf(&s.MaxStepMB, 8192)
 	setIf(&s.TargetBatchSeconds, 5)
 	setIf(&s.MaxNoProgress, 3)
 	setIf(&s.NoProgressBackoffSeconds, 30)

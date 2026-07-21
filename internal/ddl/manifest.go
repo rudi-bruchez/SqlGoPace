@@ -199,6 +199,38 @@ func (s IgnoredSession) validate() error {
 	return nil
 }
 
+// KilledSession is a rule for a session the engine may KILL when it blocks this run's DDL.
+// It embeds IgnoredSession's match fields (session_id + app/host/login/statement regexps) and
+// adds AfterSeconds: the session is killed only once it has blocked our operation continuously
+// for at least that long (0 = on sight). It is the inverse of IgnoredSession — ignore holds
+// the lock through a session, kill terminates it — so it reuses IgnoredSession's matching,
+// validation, and rendering directly through the embedded value.
+type KilledSession struct {
+	IgnoredSession `yaml:",inline"`
+	// AfterSeconds is omitempty so a zero delay (kill on sight) is not rendered back.
+	AfterSeconds int `yaml:"after_seconds,omitempty"`
+}
+
+// String renders the rule for --explain, appending the delay when set.
+func (s KilledSession) String() string {
+	if s.AfterSeconds > 0 {
+		return fmt.Sprintf("%s after %ds", s.IgnoredSession.String(), s.AfterSeconds)
+	}
+	return s.IgnoredSession.String()
+}
+
+// validate reuses the ignore-rule checks (≥1 match field, positive session_id, valid
+// regexps) and additionally rejects a negative delay.
+func (s KilledSession) validate() error {
+	if err := s.IgnoredSession.validate(); err != nil {
+		return err
+	}
+	if s.AfterSeconds < 0 {
+		return fmt.Errorf("after_seconds must be >= 0, got %d: %w", s.AfterSeconds, ErrInvalidManifest)
+	}
+	return nil
+}
+
 // Manifest is one task: an ordered list of operations run sequentially.
 type Manifest struct {
 	Description string
@@ -211,6 +243,11 @@ type Manifest struct {
 	// operations (see IgnoredSession). It is the single durable source of exclusions:
 	// read at start, re-read live during the run, and copied into the recovery manifest.
 	IgnoreBlockedSessions []IgnoredSession
+	// KillBlockedSessions lists sessions the engine may KILL when they block this run's
+	// operations (see KilledSession). Like IgnoreBlockedSessions it is read at start,
+	// re-read live during the run, and copied into the recovery manifest; the TUI appends
+	// to it on operator request. Kills only occur when armed by config (kill_blockers.enabled).
+	KillBlockedSessions []KilledSession
 	// AbortBlockingResumable lets the engine clear a stale/foreign paused resumable that
 	// blocks a fresh REBUILD of the target index (SQL Server Msg 10637), with ALTER INDEX
 	// … ABORT, before running the operation. Off by default (the run fails with an
@@ -243,6 +280,11 @@ func (m *Manifest) Validate() error {
 			return fmt.Errorf("ignore_blocked_sessions[%d]: %w", i, err)
 		}
 	}
+	for i, s := range m.KillBlockedSessions {
+		if err := s.validate(); err != nil {
+			return fmt.Errorf("kill_blocked_sessions[%d]: %w", i, err)
+		}
+	}
 	if m.Window != nil {
 		if err := m.Window.Validate(); err != nil {
 			return fmt.Errorf("window: %w", err)
@@ -268,6 +310,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		OnFailure              string           `yaml:"on_failure"`
 		Intent                 string           `yaml:"intent"`
 		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
+		KillBlockedSessions    []KilledSession  `yaml:"kill_blocked_sessions"`
 		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
 		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
@@ -284,6 +327,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 	m.OnFailure = OnFailure(strings.TrimSpace(raw.OnFailure))
 	m.Intent = Intent(strings.TrimSpace(raw.Intent))
 	m.IgnoreBlockedSessions = raw.IgnoreBlockedSessions
+	m.KillBlockedSessions = raw.KillBlockedSessions
 	m.AbortBlockingResumable = raw.AbortBlockingResumable
 	m.Window = raw.Window
 	m.Operations = make([]Operation, 0, len(raw.Operations))
@@ -742,7 +786,7 @@ type ReorganizeIndex struct {
 	Schema        string `yaml:"schema"`
 	Table         string `yaml:"table"`
 	Index         string `yaml:"index"`
-	Partition     *int   `yaml:"partition"`      // nil = whole index
+	Partition     *int   `yaml:"partition"`                // nil = whole index
 	LOBCompaction bool   `yaml:"lob_compaction,omitempty"` // WITH (LOB_COMPACTION = ON)
 }
 
@@ -782,10 +826,10 @@ func (o RebuildHeap) Validate() error {
 type UpdateStatistics struct {
 	Schema        string `yaml:"schema"`
 	Table         string `yaml:"table"`
-	Statistic     string `yaml:"statistic"`      // optional; empty = all statistics on the table
-	FullScan      bool   `yaml:"full_scan,omitempty"`      // WITH FULLSCAN
-	SamplePercent *int   `yaml:"sample_percent"` // WITH SAMPLE n PERCENT (1..100)
-	Resample      bool   `yaml:"resample,omitempty"`       // WITH RESAMPLE
+	Statistic     string `yaml:"statistic"`           // optional; empty = all statistics on the table
+	FullScan      bool   `yaml:"full_scan,omitempty"` // WITH FULLSCAN
+	SamplePercent *int   `yaml:"sample_percent"`      // WITH SAMPLE n PERCENT (1..100)
+	Resample      bool   `yaml:"resample,omitempty"`  // WITH RESAMPLE
 }
 
 func (o UpdateStatistics) CommandType() string { return "update_statistics" }
@@ -840,11 +884,11 @@ func (o CheckDB) Validate() error {
 // Like check_db it is file/database-scoped, so its Target carries the file name in
 // Name and never a schema.table (see ObjectRef and the check_db target convention).
 type Shrink struct {
-	Type            string          `yaml:"type"`            // "data" | "log"
-	Files           string          `yaml:"files"`           // "all" | logical file name; defaults to "all"
-	EmptyFile       bool            `yaml:"emptyfile,omitempty"`       // reserved for Phase 2; must be false in v1
-	TargetFreeSpace string          `yaml:"targetfreespace"` // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
-	Options         OptionOverrides `yaml:"options"`         // only WaitAtLowPriority is relevant
+	Type            string          `yaml:"type"`                // "data" | "log"
+	Files           string          `yaml:"files"`               // "all" | logical file name; defaults to "all"
+	EmptyFile       bool            `yaml:"emptyfile,omitempty"` // reserved for Phase 2; must be false in v1
+	TargetFreeSpace string          `yaml:"targetfreespace"`     // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
+	Options         OptionOverrides `yaml:"options"`             // only WaitAtLowPriority is relevant
 }
 
 // FilesOrAll returns the configured logical file name, defaulting to "all".

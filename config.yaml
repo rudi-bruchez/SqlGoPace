@@ -58,11 +58,13 @@ history:
 # — these depend on the instance's storage and SLA. They are starting points and bounds
 # the driver's dynamic calibration varies, so usually left untouched.
 shrink:
-  initial_step_small_mb:  100   # initial chunk when reclaiming < 5 GB
-  initial_step_medium_mb: 250   # 5–50 GB
-  initial_step_large_mb:  500   # > 50 GB
+  target_chunks:         1000   # aim to finish in ~this many chunks: initial step = reclaim / target_chunks
+  max_step_pct_of_file:     5    # per-file chunk ceiling as a percent of the file (0 disables)
+  initial_step_small_mb:  100   # legacy tier (used only when target_chunks <= 0): reclaim < 5 GB
+  initial_step_medium_mb: 250   # legacy tier: 5–50 GB
+  initial_step_large_mb:  500   # legacy tier: > 50 GB
   min_step_mb:             50    # chunk floor
-  max_step_mb:           1024    # chunk ceiling
+  max_step_mb:           8192    # absolute chunk ceiling
   target_batch_seconds:     5    # aim each chunk at a few seconds
   max_no_progress:          3    # consecutive no-gain chunks before a clean stop
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
@@ -84,5 +86,16 @@ batch_dml:
   escalation_cap_rows:   4000    # batch ceiling when RCSI is off
   target_batch_seconds:     5    # aim each batch at a few seconds
   self_wait_timeout_minutes: 5   # max total wait while stopped under pressure before a clean stop
+
+# Selective blocker-kill policy. When enabled, sessions that block a running operation and
+# match a manifest's kill_blocked_sessions rule are KILLed once they have blocked for the
+# rule's delay (after_seconds; 0 = on sight). Killing is destructive, so it is OFF by
+# default; preflight WARNS (does not fail) if the login lacks ALTER ANY CONNECTION. The
+# match rules live per-manifest (hot-reloadable; the TUI's "X" key appends to them without a
+# restart). This is finer-grained than allow_abort_blockers, works on every edition, and —
+# unlike WAIT_AT_LOW_PRIORITY — needs no SQL 2022.
+kill_blockers:
+  enabled: false               # master arm; kills only happen when true
+  default_after_seconds: 0     # delay applied to a rule that sets no after_seconds
 
 matrix_file: "./ddl_compatibility.yaml"
