@@ -200,6 +200,52 @@ func TestModelOperationsPanel(t *testing.T) {
 	}
 }
 
+func TestModelOperationsRowShowsDraining(t *testing.T) {
+	// Regression: once the operations panel is populated, the running row must still reflect
+	// the lifecycle status (DRAINING/etc.), not stay stuck on [RUNNING].
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{{Index: 1, Label: "shrink_data all", Status: "TO RUN"}}})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 1, StepTotal: 1})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusDraining}) // operator pressed 'd'
+	if v := m.View(); !strings.Contains(v, "[DRAINING]") {
+		t.Errorf("running row should read DRAINING once the drain is requested:\n%s", v)
+	}
+}
+
+func TestModelResetsBlockIndicatorOnNewOp(t *testing.T) {
+	// Regression: a new operation must not inherit the previous op's block indicator.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 1, StepTotal: 2, StartedAt: time.Unix(1000, 0)})
+	m, _ = send(m, tui.BlockedByMsg{Blocked: true, SPID: 104, WaitType: "LCK_M_SCH_M"})
+	if v := m.View(); !strings.Contains(v, "BLOCKED by SPID 104") {
+		t.Fatalf("op 1 should show the block:\n%s", v)
+	}
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 2, StepTotal: 2, StartedAt: time.Unix(1100, 0)})
+	if v := m.View(); strings.Contains(v, "BLOCKED by SPID 104") {
+		t.Errorf("op 2 must not inherit op 1's stale block indicator:\n%s", v)
+	}
+}
+
+func TestModelExpandSQLResetsWhenBlockerGone(t *testing.T) {
+	const sql = "SELECT * FROM dbo.BIG WHERE REGIONID = 5 AND STATUS = 'ACTIVE_LONG_TAIL'"
+	m := tui.New("op", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 104, Login: "SVC", Query: sql}}})
+	m, _ = send(m, key("enter"))
+	if v := m.View(); !strings.Contains(v, "ACTIVE_LONG_TAIL") {
+		t.Fatalf("SPID 104 SQL should be expanded:\n%s", v)
+	}
+	// A poll where 104 is gone, replaced by a different session: the expand must reset so the
+	// new session's full SQL is not auto-shown.
+	const other = "UPDATE dbo.OTHER SET X = 1 WHERE Y = 2 AND Z = 'DIFFERENT_TAIL_MARKER'"
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 200, Login: "SVC2", Query: other}}})
+	if v := m.View(); strings.Contains(v, "DIFFERENT_TAIL_MARKER") {
+		t.Errorf("expand must reset when the pinned blocker disappears; SPID 200 full SQL leaked:\n%s", v)
+	}
+}
+
 func TestModelServerBanner(t *testing.T) {
 	m := tui.New("(running)", nil)
 	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})

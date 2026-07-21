@@ -32,9 +32,12 @@ var (
 	basePanel = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(0, 1)
 )
 
-// boxChrome is the horizontal width a panel's border (1+1) and padding (1+1) add around its
-// content, so a panel with inner width w occupies w+boxChrome columns. colGap is the gap
-// between two side-by-side panels.
+// boxChrome is subtracted from the terminal width to size a panel's inner Width. lipgloss
+// counts padding inside Width and adds only the border (2 cols) outside it, so 2 would fill
+// the terminal exactly; we use 4 to leave a 2-column safety margin, so a line whose visible
+// width lipgloss under-counts (an ambiguous-width glyph like ⚠, or a wide ellipsis) can't push
+// the box past the terminal edge and force a corrupting wrap. colGap is the gap between two
+// side-by-side panels.
 const (
 	boxChrome = 4
 	colGap    = 2

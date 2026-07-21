@@ -358,11 +358,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.blockers = msg.Blockers
 		m.cursor = 0
+		found := false
 		for i, b := range m.blockers {
 			if b.SPID == selected {
-				m.cursor = i
+				m.cursor, found = i, true
 				break
 			}
+		}
+		if !found {
+			// The session whose SQL was expanded is gone; don't auto-expand whatever now
+			// sits at index 0 — the operator never selected it.
+			m.expandSQL = false
 		}
 	case WaitsMsg:
 		m.waits = msg.Categories
@@ -377,11 +383,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.setOpStatus(msg.StepIndex, "RUNNING")
 		}
 		if !msg.StartedAt.IsZero() {
-			// A new operation started: reset the timer and drop the previous batch/shrink line.
+			// A new operation started: reset the timer, the previous batch/shrink line, and
+			// the victim/progress state — otherwise a short op inherits the prior op's
+			// "BLOCKED"/SUSPENDED indicator (and stale percent) until the next poll refreshes it.
 			m.startedAt = msg.StartedAt
 			m.elapsed = 0
 			m.hasBatch = false
 			m.hasShrink = false
+			m.blockedBy = BlockedByMsg{}
+			m.percent, m.etaSeconds, m.rollbackPercent = 0, 0, 0
 		}
 	case ServerInfoMsg:
 		m.server = msg

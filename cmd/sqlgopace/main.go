@@ -596,8 +596,13 @@ func isYAMLManifest(name string) bool {
 func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", actions))
-	fwd.attach(program)  // engine step/batch/shrink progress now reaches the console
-	program.Send(banner) // the header banner (app + server identity), sent once
+	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
+	// The header banner is sent from a goroutine: Program.Send blocks on an unbuffered
+	// channel until the event loop (started by program.Run below) drains it, so a
+	// synchronous Send here would deadlock before Run is ever reached. The goroutine
+	// blocks harmlessly until Run starts, then delivers; if the run finishes first,
+	// program.Quit cancels the program context and the Send unblocks and drops the banner.
+	go program.Send(banner)
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()

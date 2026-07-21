@@ -106,9 +106,10 @@ func (m Model) operationsBody() string {
 		if status == "" {
 			status = "TO RUN"
 		}
-		// The current running op shows SUSPENDED while we are the victim of a block.
-		if o.Index == m.stepIndex && status == "RUNNING" && m.blockedBy.Blocked {
-			status = "SUSPENDED"
+		// The current op's row reflects the live lifecycle status — SUSPENDED while we are
+		// the victim of a block, or DRAINING/CANCELING/PAUSED when set — not just RUNNING.
+		if o.Index == m.stepIndex && status == "RUNNING" {
+			status = m.displayStatus().String()
 		}
 		fmt.Fprintf(&b, "%d - %s   %s", o.Index, o.Label, opStatusStyled(status))
 		if o.Index == m.stepIndex {
@@ -134,7 +135,7 @@ func (m Model) opStatusBody() string {
 	if m.blockedBy.Blocked {
 		b.WriteString(alertStyle.Render(m.blockedByLine()))
 		b.WriteByte('\n')
-		if q := m.blockedBy.Query; q != "" {
+		if q := flatten(m.blockedBy.Query); q != "" {
 			fmt.Fprintf(&b, "    %s\n", truncate(q, 100))
 		}
 	}
@@ -229,11 +230,11 @@ func (m Model) blockedBody(width int) string {
 			line = selStyle.Render(line)
 		}
 		b.WriteString(marker + line)
-		if bl.Query != "" {
+		if q := flatten(bl.Query); q != "" {
 			if i == m.cursor && m.expandSQL {
-				fmt.Fprintf(&b, "\n    %s", wrapText(bl.Query, qw))
+				fmt.Fprintf(&b, "\n    %s", wrapText(q, qw))
 			} else {
-				fmt.Fprintf(&b, "\n    %s", truncate(bl.Query, qw))
+				fmt.Fprintf(&b, "\n    %s", truncate(q, qw))
 			}
 		}
 	}
@@ -300,4 +301,11 @@ func wrapText(s string, width int) string {
 		return s
 	}
 	return lipgloss.NewStyle().Width(width).Render(s)
+}
+
+// flatten collapses each run of whitespace (including the newlines and tabs common in
+// DMV-captured SQL text) into a single space, so a query renders on one clean line before
+// truncation or wrapping instead of scattering across rows.
+func flatten(s string) string {
+	return strings.Join(strings.Fields(s), " ")
 }
