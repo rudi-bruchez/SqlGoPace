@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -243,6 +244,42 @@ func TestModelExpandSQLResetsWhenBlockerGone(t *testing.T) {
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 200, Login: "SVC2", Query: other}}})
 	if v := m.View(); strings.Contains(v, "DIFFERENT_TAIL_MARKER") {
 		t.Errorf("expand must reset when the pinned blocker disappears; SPID 200 full SQL leaked:\n%s", v)
+	}
+}
+
+func TestModelOperationsWindowsToFitViewport(t *testing.T) {
+	// A manifest expanded to many ops (index: ALL) must not push the lower panels off the
+	// fixed alt-screen: the operations panel windows around the running op with a summary.
+	const rows = 40
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: rows})
+	ops := make([]tui.OperationRow, 60)
+	for i := range ops {
+		ops[i] = tui.OperationRow{Index: i + 1, Label: fmt.Sprintf("rebuild_index dbo.T.IX%03d", i+1), Status: "TO RUN"}
+	}
+	m, _ = send(m, tui.OperationsMsg{Ops: ops})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 30, StepTotal: 60})
+	for i := 1; i <= 29; i++ {
+		m, _ = send(m, tui.StepDoneMsg{Index: i, Outcome: "success"})
+	}
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58, Login: "app"}}})
+	m, _ = send(m, tui.WaitsMsg{TotalMS: 1000, Categories: []tui.WaitCategory{{Name: "Locking", WaitMS: 1000, Tasks: 3}}})
+	v := m.View()
+
+	// The whole dashboard fits the viewport — the lower, actionable panels are not clipped.
+	if h := strings.Count(v, "\n") + 1; h > rows {
+		t.Fatalf("view is %d lines, exceeds the %d-row terminal (lower panels clip):\n%s", h, rows, v)
+	}
+	for _, want := range []string{"30 - rebuild_index dbo.T.IX030", "60 ops", "29 done", "blocked sessions", "waits slowing the DDL", "[q] quit"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("windowed view missing %q:\n%s", want, v)
+		}
+	}
+	// Ops far from the running one are windowed out.
+	for _, gone := range []string{"IX001", "IX060"} {
+		if strings.Contains(v, gone) {
+			t.Errorf("op %q should be windowed out of the operations panel:\n%s", gone, v)
+		}
 	}
 }
 

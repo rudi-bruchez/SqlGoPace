@@ -11,6 +11,12 @@ import (
 // dashboard: a header banner (app + server), an operations panel (all ops with status), an
 // op-status panel (current op detail), a blocked | waits row, and a shortcuts footer. The
 // two-panel row sits side by side on a wide terminal and stacks on a narrow one.
+//
+// Every block except the operations panel is rendered first and measured; the operations
+// panel then takes the leftover terminal height and, when its list is taller than that,
+// shows a window around the running op with a summary line (see operationsBody). This keeps
+// the lower, actionable panels (blocked sessions, footer) on screen for a manifest expanded
+// to many operations (index: ALL), which would otherwise overflow the fixed alt-screen.
 func (m Model) View() string {
 	w := m.width
 	if w <= 0 {
@@ -18,52 +24,83 @@ func (m Model) View() string {
 	}
 	full := max(w-boxChrome, 20) // inner width of a full-width bordered panel
 
-	var b strings.Builder
+	// Every block other than the operations panel, so its body can take the remaining height.
+	alerts := m.alertsBlock()
 
-	// Alerts stay prominent, above the dashboard.
-	for _, a := range m.alerts {
-		fmt.Fprintf(&b, "%s\n", alertStyle.Render("⚠ "+a.Title))
-		for _, line := range a.Lines {
-			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+line))
-		}
-	}
-
-	// 1. Header — name+version box | server-info box (the server box fills the rest).
 	nameBox := panel("", titleStyle.Render("SqlGoPace")+"  "+m.server.App, accentColor, 0)
 	rightW := max(w-lipgloss.Width(nameBox)-colGap-boxChrome, 20)
-	serverBox := panel("", m.serverBanner(), accentColor, rightW)
-	b.WriteString(joinRow(w, nameBox, serverBox))
-	b.WriteByte('\n')
+	header := joinRow(w, nameBox, panel("", m.serverBanner(), accentColor, rightW))
 
-	// 2. operations
-	b.WriteString(panel("operations", m.operationsBody(), accentColor, full))
-	b.WriteByte('\n')
-
-	// 3. op N status
 	statusTitle := "op status"
 	if m.stepTotal > 0 {
 		statusTitle = fmt.Sprintf("op %d/%d status", m.stepIndex, m.stepTotal)
 	}
-	b.WriteString(panel(statusTitle, m.opStatusBody(), accentColor, full))
-	b.WriteByte('\n')
+	opStatus := panel(statusTitle, m.opStatusBody(), accentColor, full)
 
-	// 4. blocked | waits — one column width; joinRow places them side by side (wide) or
-	// stacked (narrow) on the same threshold.
 	col := full
 	if w >= sideBySideMin {
 		col = max((w-colGap)/2-boxChrome, 20)
 	}
-	blocked := panel("", m.blockedBody(col), secondaryColor, col)
-	waits := panel("", m.waitsBody(), secondaryColor, col)
-	b.WriteString(joinRow(w, blocked, waits))
-	b.WriteByte('\n')
+	blockedWaits := joinRow(w,
+		panel("", m.blockedBody(col), secondaryColor, col),
+		panel("", m.waitsBody(), secondaryColor, col))
 
-	// 5. shortcuts footer (toggle with '?').
+	footer := ""
 	if m.showHelp {
-		b.WriteString(panel("", m.helpBody(), secondaryColor, full))
+		footer = panel("", m.helpBody(), secondaryColor, full)
+	}
+
+	// Height budget for the operations panel body: whatever the terminal has left after the
+	// other blocks, the single-newline separators between all blocks, this panel's own chrome
+	// (title + top/bottom border = 3), and a small safety margin. 0 means "no cap, show all".
+	others := []string{alerts, header, opStatus, blockedWaits, footer}
+	opsBudget := 0
+	if m.height > 0 {
+		used, blocks := 0, 1 // the operations panel itself is always one block
+		for _, blk := range others {
+			if blk != "" {
+				used += lipgloss.Height(blk)
+				blocks++
+			}
+		}
+		if m.notice != "" {
+			used++
+		}
+		opsBudget = max(m.height-used-(blocks-1)-3-1, minOpsRows)
+	}
+	ops := panel("operations", m.operationsBody(opsBudget), accentColor, full)
+
+	// Assemble top to bottom, blocks separated by a single newline.
+	var b strings.Builder
+	for _, blk := range []string{alerts, header, ops, opStatus, blockedWaits, footer} {
+		if blk == "" {
+			continue
+		}
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(blk)
 	}
 	if m.notice != "" {
 		b.WriteString("\n" + m.notice)
+	}
+	return b.String()
+}
+
+// alertsBlock renders the sticky failure alerts shown above the dashboard, or "" when none.
+func (m Model) alertsBlock() string {
+	if len(m.alerts) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, a := range m.alerts {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(alertStyle.Render("⚠ " + a.Title))
+		for _, line := range a.Lines {
+			b.WriteString("\n" + alertStyle.Render("    "+line))
+		}
 	}
 	return b.String()
 }
@@ -80,9 +117,15 @@ func (m Model) serverBanner() string {
 	return l1 + "\n" + l2
 }
 
-// operationsBody renders every operation of the running manifest with its status. Before the
-// full list arrives it falls back to the single current operation.
-func (m Model) operationsBody() string {
+// minOpsRows is the fewest operation rows the panel ever shows, even on a tiny terminal, so
+// the running op and a summary always remain visible.
+const minOpsRows = 3
+
+// operationsBody renders the operations panel body. Before the full list arrives it falls
+// back to the single current operation. When the list has more rows than budget allows
+// (budget > 0), it shows a summary line plus a window of rows centered on the running op, so
+// a long list (index: ALL) never pushes the lower panels off the fixed alt-screen.
+func (m Model) operationsBody(budget int) string {
 	if len(m.ops) == 0 {
 		op := m.operation
 		if op == "" {
@@ -97,31 +140,67 @@ func (m Model) operationsBody() string {
 		}
 		return line
 	}
-	var b strings.Builder
+	rows := make([]string, len(m.ops))
 	for i, o := range m.ops {
-		if i > 0 {
-			b.WriteByte('\n')
+		rows[i] = m.opRow(o)
+	}
+	if budget <= 0 || len(rows) <= budget {
+		return strings.Join(rows, "\n")
+	}
+
+	// Too many ops for the viewport: one summary line + a window centered on the running op.
+	win := max(budget-1, 1)
+	start := max(m.stepIndex-1-win/2, 0) // stepIndex is 1-based; 0 when no op is running yet
+	start = min(start, len(rows)-win)
+	out := make([]string, 0, win+1)
+	out = append(out, helpStyle.Render(m.opsSummary()))
+	out = append(out, rows[start:start+win]...)
+	return strings.Join(out, "\n")
+}
+
+// opRow renders one operation's row: "N - label  [STATUS]" plus SPID/elapsed on the running
+// row. The running row reflects the live lifecycle status (SUSPENDED while blocked, or
+// DRAINING/CANCELING/PAUSED when set), not just RUNNING.
+func (m Model) opRow(o OperationRow) string {
+	status := o.Status
+	if status == "" {
+		status = "TO RUN"
+	}
+	if o.Index == m.stepIndex && status == "RUNNING" {
+		status = m.displayStatus().String()
+	}
+	line := fmt.Sprintf("%d - %s   %s", o.Index, o.Label, opStatusStyled(status))
+	if o.Index == m.stepIndex {
+		if m.spid > 0 {
+			line += fmt.Sprintf("   SPID %d", m.spid)
 		}
-		status := o.Status
-		if status == "" {
-			status = "TO RUN"
-		}
-		// The current op's row reflects the live lifecycle status — SUSPENDED while we are
-		// the victim of a block, or DRAINING/CANCELING/PAUSED when set — not just RUNNING.
-		if o.Index == m.stepIndex && status == "RUNNING" {
-			status = m.displayStatus().String()
-		}
-		fmt.Fprintf(&b, "%d - %s   %s", o.Index, o.Label, opStatusStyled(status))
-		if o.Index == m.stepIndex {
-			if m.spid > 0 {
-				fmt.Fprintf(&b, "   SPID %d", m.spid)
-			}
-			if m.elapsed > 0 {
-				fmt.Fprintf(&b, "   elapsed %s", formatElapsed(m.elapsed))
-			}
+		if m.elapsed > 0 {
+			line += "   elapsed " + formatElapsed(m.elapsed)
 		}
 	}
-	return b.String()
+	return line
+}
+
+// opsSummary is the one-line roll-up shown when the operations list is windowed: total ops
+// and how many are done / failed / still to run.
+func (m Model) opsSummary() string {
+	var done, failed, toRun int
+	for _, o := range m.ops {
+		switch o.Status {
+		case "DONE", "SKIPPED":
+			done++
+		case "FAILED", "INTERRUPTED", "INCOMPLETE":
+			failed++
+		case "RUNNING": // the running op is shown in the window, not counted here
+		default:
+			toRun++ // "TO RUN" or unset
+		}
+	}
+	s := fmt.Sprintf("… %d ops · %d done", len(m.ops), done)
+	if failed > 0 {
+		s += fmt.Sprintf(" · %d failed", failed)
+	}
+	return s + fmt.Sprintf(" · %d to run", toRun)
 }
 
 // opStatusBody renders the current operation's detail: the suspension summary, the live

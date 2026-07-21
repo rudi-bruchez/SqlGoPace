@@ -284,6 +284,7 @@ type Model struct {
 	server    ServerInfoMsg  // header banner; zero value renders no server line
 	ops       []OperationRow // the running manifest's operations, with live status
 	width     int            // terminal width, from WindowSizeMsg (0 until first resize)
+	height    int            // terminal height, budgets the operations panel so lower panels stay visible
 	expandSQL bool           // Enter toggles: show the selected blocker's full SQL
 	showHelp  bool           // '?' toggles the shortcuts footer
 }
@@ -400,7 +401,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case StepDoneMsg:
 		m.setOpStatus(msg.Index, opStatusLabel(msg.Outcome))
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
+		m.width, m.height = msg.Width, msg.Height
 	case BatchMsg:
 		m.hasBatch = true
 		m.batch = msg
