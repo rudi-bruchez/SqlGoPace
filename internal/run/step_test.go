@@ -81,6 +81,33 @@ func TestStepSinkEmitsStartedAndFinishedPerOp(t *testing.T) {
 	}
 }
 
+func TestOpListSinkEmitsFullListOnce(t *testing.T) {
+	var got [][]run.OpInfo
+	sink := func(ops []run.OpInfo) { got = append(got, ops) }
+	eng, dirs := setupEngine(t, fakePreflighter{}, &fakeOpRunner{}, run.WithOpListSink(sink))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("op list emitted %d times, want once per manifest: %+v", len(got), got)
+	}
+	ops := got[0]
+	if len(ops) != 2 {
+		t.Fatalf("op list = %d ops, want 2 (the whole manifest up front): %+v", len(ops), ops)
+	}
+	for i, o := range ops {
+		if o.Index != i+1 || o.Command != "rebuild_index" || o.Target == "" {
+			t.Errorf("op[%d] = {Index:%d Command:%q Target:%q}, want {%d rebuild_index <non-empty>}",
+				i, o.Index, o.Command, o.Target, i+1)
+		}
+	}
+}
+
 func TestStepSinkReportsFailedOutcome(t *testing.T) {
 	rec := &stepRecorder{}
 	runner := &fakeOpRunner{err: io.ErrUnexpectedEOF}

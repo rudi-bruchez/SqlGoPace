@@ -43,6 +43,39 @@ func TestHumanizeMS(t *testing.T) {
 	}
 }
 
+func TestOpStatusLabel(t *testing.T) {
+	tests := map[string]string{
+		"success": "DONE", "failed": "FAILED", "interrupted": "INTERRUPTED",
+		"incomplete": "INCOMPLETE", "skipped": "SKIPPED", "weird": "WEIRD",
+	}
+	for outcome, want := range tests {
+		if got := opStatusLabel(outcome); got != want {
+			t.Errorf("opStatusLabel(%q) = %q, want %q", outcome, got, want)
+		}
+	}
+}
+
+func TestJoinRowStacksWhenNarrow(t *testing.T) {
+	a, b := "AAA", "BBB"
+	// Wide: side by side, so the two panels share lines (their content is not separated by a
+	// bare newline join). Narrow: stacked, so a newline separates them.
+	if got := joinRow(sideBySideMin, a, b); got == a+"\n"+b {
+		t.Errorf("at width %d joinRow should place panels side by side, got stacked", sideBySideMin)
+	}
+	if got := joinRow(sideBySideMin-1, a, b); got != a+"\n"+b {
+		t.Errorf("below the threshold joinRow should stack: got %q", got)
+	}
+}
+
+func TestSetOpStatus(t *testing.T) {
+	m := Model{ops: []OperationRow{{Index: 1, Status: "TO RUN"}, {Index: 2, Status: "TO RUN"}}}
+	m.setOpStatus(2, "RUNNING")
+	if m.ops[1].Status != "RUNNING" || m.ops[0].Status != "TO RUN" {
+		t.Errorf("setOpStatus targeted the wrong row: %+v", m.ops)
+	}
+	m.setOpStatus(99, "DONE") // unknown index: no-op, no panic
+}
+
 func TestTickUpdatesElapsed(t *testing.T) {
 	start := time.Unix(1000, 0)
 	m := Model{startedAt: start}

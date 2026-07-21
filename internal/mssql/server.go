@@ -16,6 +16,7 @@ import (
 
 // ServerInfo is the detected state of the target server and database.
 type ServerInfo struct {
+	ServerName    string // SERVERPROPERTY('ServerName'), for the console banner
 	EngineEdition int
 	MajorVersion  int
 	Database      string
@@ -52,6 +53,7 @@ func ContextInfoLiteral(marker [16]byte) string {
 // detectBaseSQL reads the facts available on every supported version.
 const detectBaseSQL = `
 SELECT
+    CAST(SERVERPROPERTY('ServerName') AS nvarchar(256)),
     CAST(SERVERPROPERTY('EngineEdition') AS int),
     CAST(SERVERPROPERTY('ProductMajorVersion') AS int),
     DB_NAME(),
@@ -72,16 +74,18 @@ WHERE database_id = DB_ID();`
 // (where available) ADR state.
 func DetectServer(ctx context.Context, conn *sql.Conn) (ServerInfo, error) {
 	var (
-		info  ServerInfo
-		major sql.NullInt64
+		info    ServerInfo
+		major   sql.NullInt64
+		srvName sql.NullString
 	)
 	err := conn.QueryRowContext(ctx, detectBaseSQL).
-		Scan(&info.EngineEdition, &major, &info.Database, &info.RecoveryModel,
+		Scan(&srvName, &info.EngineEdition, &major, &info.Database, &info.RecoveryModel,
 			&info.RCSIEnabled, &info.SnapshotIsolation)
 	if err != nil {
 		return ServerInfo{}, fmt.Errorf("detect server: %w", err)
 	}
 	info.MajorVersion = int(major.Int64)
+	info.ServerName = srvName.String
 
 	// ADR is 2019+ (major 15) and Azure (evergreen).
 	if info.MajorVersion >= 15 || info.Tier() == ddl.TierAzure {

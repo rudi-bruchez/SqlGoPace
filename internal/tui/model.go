@@ -10,7 +10,6 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
 )
 
 // Status is the lifecycle state of the running operation.
@@ -70,6 +69,15 @@ type WaitCategory struct {
 	Name   string
 	WaitMS int64
 	Tasks  int64
+}
+
+// OperationRow is one operation of the running manifest, with its live status, for the
+// operations panel. Status is a display label: "TO RUN" | "RUNNING" | "SUSPENDED" | "DONE"
+// | "FAILED" | "INTERRUPTED" | "INCOMPLETE" | "SKIPPED".
+type OperationRow struct {
+	Index  int
+	Label  string // "<command> <target>", e.g. "shrink_data all"
+	Status string
 }
 
 // Messages the host feeds from the monitor stream.
@@ -168,6 +176,29 @@ type (
 	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
+	// ServerInfoMsg carries the target's identity for the header banner. Sent once at
+	// startup; App is the SqlGoPace version, Product the SQL Server year label.
+	ServerInfoMsg struct {
+		App         string
+		Name        string
+		Product     string
+		Database    string
+		Edition     string
+		Recovery    string
+		ADR         bool
+		RCSI        bool
+		SnapshotIso bool
+	}
+	// OperationsMsg carries the full operation list of the running manifest, sent once when
+	// it starts, so the operations panel can show pending ops (not just the current one).
+	OperationsMsg struct{ Ops []OperationRow }
+	// StepDoneMsg reports an operation's terminal outcome so its row can show DONE/FAILED/…
+	// (Outcome mirrors run.StepEvent.Outcome: "success"|"failed"|"interrupted"|
+	// "incomplete"|"skipped").
+	StepDoneMsg struct {
+		Index   int
+		Outcome string
+	}
 )
 
 // tickMsg drives the once-a-second re-render that keeps the elapsed timer live.
@@ -249,11 +280,17 @@ type Model struct {
 	notice          string // last host feedback line (e.g. "ignoring SPID 53 …")
 	actions         chan<- Action
 	quitting        bool
+
+	server    ServerInfoMsg  // header banner; zero value renders no server line
+	ops       []OperationRow // the running manifest's operations, with live status
+	width     int            // terminal width, from WindowSizeMsg (0 until first resize)
+	expandSQL bool           // Enter toggles: show the selected blocker's full SQL
+	showHelp  bool           // '?' toggles the shortcuts footer
 }
 
 // New returns a console model for the given operation. actions may be nil (no dispatch).
 func New(operation string, actions chan<- Action) Model {
-	return Model{operation: operation, status: StatusRunning, actions: actions}
+	return Model{operation: operation, status: StatusRunning, actions: actions, showHelp: true}
 }
 
 // Init implements tea.Model; it starts the once-a-second tick that keeps the
@@ -269,6 +306,35 @@ func (m Model) displayStatus() Status {
 		return StatusSuspended
 	}
 	return m.status
+}
+
+// setOpStatus sets the status of the operation with the given 1-based index in the
+// operations panel, if present (a no-op before the OperationsMsg arrives).
+func (m *Model) setOpStatus(index int, status string) {
+	for i := range m.ops {
+		if m.ops[i].Index == index {
+			m.ops[i].Status = status
+			return
+		}
+	}
+}
+
+// opStatusLabel maps a run.StepEvent.Outcome to the operations-panel label.
+func opStatusLabel(outcome string) string {
+	switch outcome {
+	case "success":
+		return "DONE"
+	case "failed":
+		return "FAILED"
+	case "interrupted":
+		return "INTERRUPTED"
+	case "incomplete":
+		return "INCOMPLETE"
+	case "skipped":
+		return "SKIPPED"
+	default:
+		return strings.ToUpper(outcome)
+	}
 }
 
 // Update implements tea.Model.
@@ -308,6 +374,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.StepTotal > 0 {
 			m.stepIndex, m.stepTotal = msg.StepIndex, msg.StepTotal
+			m.setOpStatus(msg.StepIndex, "RUNNING")
 		}
 		if !msg.StartedAt.IsZero() {
 			// A new operation started: reset the timer and drop the previous batch/shrink line.
@@ -316,6 +383,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.hasBatch = false
 			m.hasShrink = false
 		}
+	case ServerInfoMsg:
+		m.server = msg
+	case OperationsMsg:
+		m.ops = msg.Ops
+	case StepDoneMsg:
+		m.setOpStatus(msg.Index, opStatusLabel(msg.Outcome))
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
 	case BatchMsg:
 		m.hasBatch = true
 		m.batch = msg
@@ -362,6 +437,13 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.blockers) > 0 {
 			m.mode = modeCriterion
 		}
+	case "enter":
+		// Toggle showing the selected blocker's full SQL (the mockup's "click to see full sql").
+		if len(m.blockers) > 0 {
+			m.expandSQL = !m.expandSQL
+		}
+	case "?":
+		m.showHelp = !m.showHelp
 	case "x":
 		if len(m.blockers) > 0 {
 			m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
@@ -430,144 +512,6 @@ func (m Model) emit(a Action) {
 	case m.actions <- a:
 	default:
 	}
-}
-
-var (
-	titleStyle = lipgloss.NewStyle().Bold(true)
-	selStyle   = lipgloss.NewStyle().Reverse(true)
-	helpStyle  = lipgloss.NewStyle().Faint(true)
-	alertStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9")) // bright red
-)
-
-// View implements tea.Model.
-func (m Model) View() string {
-	var b strings.Builder
-	b.WriteString(titleStyle.Render("SqlGoPace") + "\n\n")
-	for _, a := range m.alerts {
-		fmt.Fprintf(&b, "%s\n", alertStyle.Render("⚠ "+a.Title))
-		for _, line := range a.Lines {
-			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+line))
-		}
-		b.WriteString("\n")
-	}
-	op := m.operation
-	if m.stepTotal > 0 {
-		op = fmt.Sprintf("%d/%d %s", m.stepIndex, m.stepTotal, m.operation)
-	}
-	fmt.Fprintf(&b, "operation: %s   [%s]", op, m.displayStatus())
-	if m.spid > 0 {
-		fmt.Fprintf(&b, "   SPID %d", m.spid)
-	}
-	if m.elapsed > 0 {
-		fmt.Fprintf(&b, "   elapsed %s", formatElapsed(m.elapsed))
-	}
-	b.WriteString("\n")
-	if bb := m.blockedBy; bb.Blocked {
-		line := fmt.Sprintf("⚠ BLOCKED by SPID %d", bb.SPID)
-		if bb.Login != "" {
-			line += "  login=" + bb.Login
-		}
-		if bb.WaitType != "" {
-			line += "  wait=" + bb.WaitType
-		}
-		line += "  " + humanizeMS(bb.WaitMS)
-		fmt.Fprintf(&b, "%s\n", alertStyle.Render(line))
-		if bb.Query != "" {
-			fmt.Fprintf(&b, "%s\n", alertStyle.Render("    "+truncate(bb.Query, 80)))
-		}
-	}
-	// Cumulative suspension history: how long/often the operation has been blocked and by
-	// whom. Shown whenever it has ever been suspended, so it persists after a block clears.
-	if s := m.suspension; s.Episodes > 0 {
-		line := fmt.Sprintf("suspended %d×, %s total", s.Episodes, humanizeMS(s.TotalMS))
-		if len(s.Blockers) > 0 {
-			parts := make([]string, 0, len(s.Blockers))
-			for _, bl := range s.Blockers {
-				who := fmt.Sprintf("SPID %d", bl.SPID)
-				if bl.Login != "" {
-					who += " " + bl.Login
-				}
-				parts = append(parts, fmt.Sprintf("%s (%d×, %s)", who, bl.Count, humanizeMS(bl.TotalMS)))
-			}
-			line += " — " + strings.Join(parts, " · ")
-		}
-		fmt.Fprintf(&b, "%s\n", line)
-	}
-	if m.hasBatch {
-		fmt.Fprintf(&b, "batch %s %s: %d/%d rows (%.0f%%)   batch=%d   %.0f rows/s\n",
-			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
-			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
-	}
-	if m.hasShrink {
-		fmt.Fprintf(&b, "shrink %s (%s): %s → %s target (from %s, %.0f%%)   step %s\n",
-			m.shrink.File, m.shrink.Type,
-			HumanizeMB(m.shrink.CurrentMB), HumanizeMB(m.shrink.FinalMB), HumanizeMB(m.shrink.StartMB),
-			m.shrink.Percent*100, HumanizeMB(m.shrink.StepMB))
-		fmt.Fprintf(&b, "  chunk %d done", m.shrink.Chunks)
-		if m.shrink.ChunksRemaining > 0 {
-			fmt.Fprintf(&b, " · ~%d left", m.shrink.ChunksRemaining)
-		}
-		if m.shrink.ETASeconds > 0 {
-			fmt.Fprintf(&b, " · ETA %s", humanizeMS(int64(m.shrink.ETASeconds)*1000))
-			// Show the unblocked ETA too when blocking has meaningfully slowed the shrink,
-			// so the operator sees how much of the ETA is starvation rather than real work.
-			if m.shrink.ETASecondsNoBlock > 0 && m.shrink.ETASecondsNoBlock < m.shrink.ETASeconds {
-				fmt.Fprintf(&b, " (%s if unblocked)", humanizeMS(int64(m.shrink.ETASecondsNoBlock)*1000))
-			}
-		}
-		if m.shrink.BlockedSeconds > 0 {
-			fmt.Fprintf(&b, " · blocked %s", humanizeMS(int64(m.shrink.BlockedSeconds)*1000))
-		}
-		b.WriteString("\n")
-	}
-	// The server percent_complete is meaningless for the chunked shrink/batch loops (it
-	// stays 0 or garbage), so show the generic progress line only for ordinary DDL.
-	if !m.hasShrink && !m.hasBatch {
-		fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
-		if m.rollbackPercent > 0 {
-			fmt.Fprintf(&b, "   rollback: %.0f%%", m.rollbackPercent)
-		}
-		b.WriteString("\n")
-	}
-	b.WriteString("\n")
-
-	fmt.Fprintf(&b, "blocked sessions (%d):\n", len(m.blockers))
-	for i, bl := range m.blockers {
-		marker := "  "
-		line := fmt.Sprintf("SPID %d  login=%s host=%s wait=%s (%dms)",
-			bl.SPID, bl.Login, bl.Host, bl.WaitType, bl.WaitMS)
-		if i == m.cursor {
-			marker = "> "
-			line = selStyle.Render(line)
-		}
-		fmt.Fprintf(&b, "%s%s\n", marker, line)
-		if bl.Query != "" {
-			fmt.Fprintf(&b, "    %s\n", truncate(bl.Query, 80))
-		}
-	}
-
-	if len(m.waits) > 0 {
-		fmt.Fprintf(&b, "\nwaits slowing the DDL (total %s):\n", humanizeMS(m.waitTotalMS))
-		for _, w := range m.waits {
-			fmt.Fprintf(&b, "  %-20s %10s  %10d tasks\n", w.Name, humanizeMS(w.WaitMS), w.Tasks)
-		}
-	}
-
-	help := "[↑/↓] select  [i] ignore  [x] kill blocker  [X] kill+auto  [k] kill DDL  [d] drain/cancel  [q] quit"
-	if m.inCriterionMode() && m.cursor < len(m.blockers) {
-		bl := m.blockers[m.cursor]
-		verb := "ignore"
-		if m.mode == modeKillCriterion {
-			verb = "kill+auto-kill"
-		}
-		help = fmt.Sprintf("%s SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
-			verb, bl.SPID, bl.Program, bl.Login, bl.Host)
-	}
-	b.WriteString("\n" + helpStyle.Render(help))
-	if m.notice != "" {
-		b.WriteString("\n" + m.notice)
-	}
-	return b.String()
 }
 
 // HumanizeMB renders a size in megabytes compactly, escalating to GB then TB so large

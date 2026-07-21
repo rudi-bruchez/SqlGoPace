@@ -313,7 +313,8 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
 		var sum run.Summary
 		if useTUI {
-			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
+			banner := serverBanner(dbInfo, matrix)
+			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, banner, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
@@ -453,6 +454,9 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	if killOpt != nil {
 		opts = append(opts, killOpt)
 	}
+	if fwd != nil {
+		opts = append(opts, run.WithOpListSink(fwd.ops)) // operations panel (TUI only)
+	}
 	if cfg.Notifications.WebhookURL != "" {
 		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
 	}
@@ -589,10 +593,11 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", actions))
-	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
+	fwd.attach(program)  // engine step/batch/shrink progress now reaches the console
+	program.Send(banner) // the header banner (app + server identity), sent once
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
@@ -804,6 +809,27 @@ func waitsMsg(waits []mssql.SessionWait) tui.WaitsMsg {
 	return tui.WaitsMsg{Categories: out, TotalMS: total}
 }
 
+// serverBanner builds the console header banner from the detected server info: the app
+// version, the SQL Server product year (via the matrix's major→year map, falling back to the
+// raw major), the edition tier, and the recovery/ADR/RCSI/snapshot flags.
+func serverBanner(info mssql.ServerInfo, matrix *ddl.Matrix) tui.ServerInfoMsg {
+	product := fmt.Sprintf("SQL Server (major %d)", info.MajorVersion)
+	if year, ok := matrix.Year(info.MajorVersion); ok {
+		product = fmt.Sprintf("SQL Server %d", year)
+	}
+	return tui.ServerInfoMsg{
+		App:         version.Version(),
+		Name:        info.ServerName,
+		Product:     product,
+		Database:    info.Database,
+		Edition:     info.Tier().String(),
+		Recovery:    info.RecoveryModel,
+		ADR:         info.ADREnabled,
+		RCSI:        info.RCSIEnabled,
+		SnapshotIso: info.SnapshotIsolation,
+	}
+}
+
 // tuiForwarder relays engine-side progress (per-operation step events, batch-DML and
 // shrink progress) to the incident console. The console's program is created after the
 // engine is built, so the forwarder holds a deferred reference, attached once the
@@ -821,12 +847,30 @@ func (f *tuiForwarder) send(msg any) {
 	}
 }
 
-// step forwards the start of an operation to the console.
+// step forwards an operation's start (as a StatusMsg — label, i/N counter, timer anchor)
+// or its terminal outcome (as a StepDoneMsg, so the operations panel can mark it DONE/FAILED).
 func (f *tuiForwarder) step(ev run.StepEvent) {
+	if ev.Phase == run.StepFinished {
+		f.send(tui.StepDoneMsg{Index: ev.Index, Outcome: ev.Outcome})
+		return
+	}
 	if msg, ok := stepStatusMsg(ev); ok {
 		f.send(msg)
 	}
 }
+
+// ops forwards the manifest's full operation list to the console's operations panel.
+func (f *tuiForwarder) ops(list []run.OpInfo) {
+	rows := make([]tui.OperationRow, len(list))
+	for i, o := range list {
+		rows[i] = tui.OperationRow{Index: o.Index, Label: opLabel(o.Command, o.Target), Status: "TO RUN"}
+	}
+	f.send(tui.OperationsMsg{Ops: rows})
+}
+
+// opLabel is the "<command> <target>" display label an operation shows in the console, used
+// for both the operations-panel rows and the current-op status line so they never diverge.
+func opLabel(command, target string) string { return strings.TrimSpace(command + " " + target) }
 
 // batch forwards batch-DML progress to the console.
 func (f *tuiForwarder) batch(p run.BatchDMLProgress) { f.send(batchMsg(p)) }
@@ -850,7 +894,7 @@ func stepStatusMsg(ev run.StepEvent) (tui.StatusMsg, bool) {
 	}
 	return tui.StatusMsg{
 		Status:    tui.StatusRunning,
-		Operation: ev.Command + " " + ev.Target,
+		Operation: opLabel(ev.Command, ev.Target),
 		StepIndex: ev.Index,
 		StepTotal: ev.Total,
 		StartedAt: ev.StartedAt,

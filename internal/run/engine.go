@@ -174,6 +174,7 @@ type Engine struct {
 	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)       // manifest-level per-operation progress (stdout + TUI)
+	opListSink       func([]OpInfo)        // full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure) // notified when a manifest fails, so the TUI can show why
 	compression      CompressionReader     // reads current index compression for the intent: compression skip
 	drain            func() bool           // reports a requested graceful stop (cancellable DrainFlag)
@@ -231,6 +232,10 @@ func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w }
 // another when it finishes, so stdout and the TUI can show manifest-level progress
 // (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
 func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
+
+// WithOpListSink receives the full operation list of each manifest once, before its
+// operations run, so the TUI can show pending operations, not just the current one.
+func WithOpListSink(f func([]OpInfo)) EngineOption { return func(e *Engine) { e.opListSink = f } }
 
 // WithAlertSink registers a callback fed one ManifestFailure whenever a manifest fails,
 // so the incident console can show the reason (notably a preflight rejection like a
@@ -476,6 +481,16 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	if err != nil {
 		rep.Error = "plan: " + err.Error()
 		return e.finalize(ctx, name, rep, start, false)
+	}
+
+	// Surface the whole operation list once, so the console can show pending operations
+	// (not just the running one). Per-op status then follows from the step events.
+	if e.opListSink != nil {
+		ops := make([]OpInfo, len(planned))
+		for i, step := range planned {
+			ops[i] = OpInfo{Index: i + 1, Command: step.Operation.CommandType(), Target: opTarget(step.Operation)}
+		}
+		e.emitOpList(ops)
 	}
 
 	// Validate the resume cursor against the current plan: a cursor past the plan length, or a

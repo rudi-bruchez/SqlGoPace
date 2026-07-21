@@ -119,6 +119,14 @@ type Matrix struct {
 	Commands         map[string]CommandRules `yaml:"commands"`
 }
 
+// Year returns the marketing year for a SQL Server major version (e.g. 16 -> 2022),
+// from the matrix's major_to_year map. ok is false for an unmapped major (Azure, or a
+// version newer than the matrix knows), so callers can fall back to the raw major.
+func (m *Matrix) Year(major int) (int, bool) {
+	year, ok := m.MajorToYear[major]
+	return year, ok
+}
+
 // Load decodes a Matrix from YAML, rejecting unknown fields so typos surface early.
 func Load(r io.Reader) (*Matrix, error) {
 	dec := yaml.NewDecoder(r)

@@ -28,7 +28,7 @@ type StepEvent struct {
 	StartedAt    time.Time     // operation start; the elapsed-time anchor
 	Phase        StepPhase     // StepStarted | StepFinished
 	Duration     time.Duration // set on StepFinished
-	Outcome      string        // set on StepFinished: "success" | "failed" | "interrupted" | "skipped"
+	Outcome      string        // set on StepFinished: "success" | "failed" | "interrupted" | "incomplete" | "skipped"
 	Detail       string        // optional note on StepFinished, e.g. a skip reason ("already PAGE")
 }
 
@@ -42,10 +42,26 @@ func (e StepEvent) finished(outcome string, dur time.Duration) StepEvent {
 	return e
 }
 
+// OpInfo is one operation of a manifest, for the whole-list signal the TUI uses to show
+// pending operations (not just the running one). Emitted once per manifest, before the
+// operation loop, via WithOpListSink.
+type OpInfo struct {
+	Index   int    // 1-based position, after plan/expansion
+	Command string // operation CommandType, e.g. "shrink_data"
+	Target  string // schema.table[.name] / file / database label
+}
+
 // emitStep delivers a step event to the sink when one is wired.
 func (e *Engine) emitStep(ev StepEvent) {
 	if e.stepSink != nil {
 		e.stepSink(ev)
+	}
+}
+
+// emitOpList delivers the full operation list to the sink when one is wired.
+func (e *Engine) emitOpList(ops []OpInfo) {
+	if e.opListSink != nil {
+		e.opListSink(ops)
 	}
 }
 

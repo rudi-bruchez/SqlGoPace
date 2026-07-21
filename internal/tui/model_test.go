@@ -165,6 +165,93 @@ func TestModelShowsSPID(t *testing.T) {
 	}
 }
 
+func TestModelOperationsPanel(t *testing.T) {
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{
+		{Index: 1, Label: "shrink_data all", Status: "TO RUN"},
+		{Index: 2, Label: "rebuild_index dbo.T.IX", Status: "TO RUN"},
+	}})
+
+	// Op 1 starts, then finishes; op 2 starts.
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 1, StepTotal: 2})
+	if v := m.View(); !strings.Contains(v, "1 - shrink_data all") || !strings.Contains(v, "[RUNNING]") {
+		t.Fatalf("op 1 should read RUNNING:\n%s", v)
+	}
+	m, _ = send(m, tui.StepDoneMsg{Index: 1, Outcome: "success"})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 2, StepTotal: 2})
+	v := m.View()
+	for _, want := range []string{"1 - shrink_data all", "[DONE]", "2 - rebuild_index dbo.T.IX", "[RUNNING]"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("operations panel missing %q:\n%s", want, v)
+		}
+	}
+
+	// The running op reads SUSPENDED while we are a victim.
+	m, _ = send(m, tui.BlockedByMsg{Blocked: true, SPID: 104})
+	if v := m.View(); !strings.Contains(v, "[SUSPENDED]") {
+		t.Errorf("running op should read SUSPENDED while blocked:\n%s", v)
+	}
+
+	// A failed op shows FAILED.
+	m, _ = send(m, tui.StepDoneMsg{Index: 2, Outcome: "failed"})
+	if v := m.View(); !strings.Contains(v, "[FAILED]") {
+		t.Errorf("op 2 should read FAILED:\n%s", v)
+	}
+}
+
+func TestModelServerBanner(t *testing.T) {
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.ServerInfoMsg{
+		App: "0.3.0", Name: "SQLPROD01", Product: "SQL Server 2022", Database: "PRODDB",
+		Edition: "standard", Recovery: "SIMPLE", ADR: false, RCSI: false, SnapshotIso: false,
+	})
+	v := m.View()
+	for _, want := range []string{"SqlGoPace", "0.3.0", "SQLPROD01", "SQL Server 2022", "PRODDB", "ed=standard", "recovery=SIMPLE", "adr=f", "rcsi=f", "si=f"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("server banner missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelExpandSQL(t *testing.T) {
+	const sql = "SELECT DL.SETTLEMENTDATE, V.VERSION FROM dbo.MEASUREMENT DL JOIN dbo.VERSIONS V ON V.ID = DL.VID WHERE DL.REGIONID = 5"
+	m := tui.New("op", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 104, Login: "SVC_OBS", Query: sql}}})
+
+	// Collapsed: the query is truncated (ends with the ellipsis, full text absent).
+	if v := m.View(); strings.Contains(v, sql) {
+		t.Fatalf("collapsed: full SQL should be truncated, not shown in full:\n%s", v)
+	}
+	// Enter expands: the full SQL becomes visible.
+	m, _ = send(m, key("enter"))
+	if v := m.View(); !strings.Contains(v, "SETTLEMENTDATE") || !strings.Contains(v, "REGIONID = 5") {
+		t.Errorf("expanded: full SQL should be shown:\n%s", v)
+	}
+	// Enter again collapses.
+	m, _ = send(m, key("enter"))
+	if v := m.View(); strings.Contains(v, "REGIONID = 5") {
+		t.Errorf("collapsed again: full SQL tail should be hidden:\n%s", v)
+	}
+}
+
+func TestModelResponsiveStacksNarrow(t *testing.T) {
+	m := tui.New("op", nil)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58}}})
+	m, _ = send(m, tui.WaitsMsg{TotalMS: 1000, Categories: []tui.WaitCategory{{Name: "Locking", WaitMS: 1000, Tasks: 3}}})
+
+	// Both a wide and a narrow terminal must render both panels (side by side vs stacked).
+	for _, w := range []int{140, 50} {
+		m, _ = send(m, tea.WindowSizeMsg{Width: w, Height: 40})
+		v := m.View()
+		if !strings.Contains(v, "blocked sessions") || !strings.Contains(v, "waits slowing the DDL") {
+			t.Errorf("width %d: both panels should render:\n%s", w, v)
+		}
+	}
+}
+
 func TestModelHumanizesWaitDurations(t *testing.T) {
 	m := tui.New("op", nil)
 	m, _ = send(m, tui.WaitsMsg{
