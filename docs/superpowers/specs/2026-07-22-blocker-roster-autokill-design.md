@@ -121,7 +121,9 @@ dashboard (simplest given the fixed alt-screen height):
 
 - Title: `blockers that stalled this run — grouped by login|host`.
 - One row per group: `<value>   N×   <total-blocked>   [✓ armed]`, selected row
-  highlighted; the "(unknown)" row last.
+  highlighted; rows in first-seen order (the "(unknown)" group — blockers whose
+  login/host was absent from the snapshot — renders inline, non-armable, wherever
+  it was first seen).
 - Empty state: `(no blockers yet)`.
 - Footer: `[↑/↓] select  [space] arm/disarm  [g] group by host|login  [b/esc/q] close`
   plus the config warning when `killerArmed` is false.
