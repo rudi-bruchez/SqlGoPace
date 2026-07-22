@@ -314,7 +314,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var sum run.Summary
 		if useTUI {
 			banner := serverBanner(dbInfo, matrix)
-			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, banner, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
+			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, banner, cfg.KillBlockers.Enabled, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
@@ -597,7 +597,7 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, killerArmed bool, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", actions))
 	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
@@ -607,6 +607,7 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 	// blocks harmlessly until Run starts, then delivers; if the run finishes first,
 	// program.Quit cancels the program context and the Send unblocks and drops the banner.
 	go program.Send(banner)
+	go program.Send(tui.KillerArmedMsg{Armed: killerArmed})
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
@@ -980,6 +981,10 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 				ignoreBlocker(program, current, a)
 			case tui.ActionKillBlockerAuto:
 				killBlockerAuto(ctx, program, conn, current, a)
+			case tui.ActionArmKillRule:
+				armKillRule(program, current, a)
+			case tui.ActionDisarmKillRule:
+				disarmKillRule(program, current, a)
 			}
 		}
 	}
@@ -1032,6 +1037,48 @@ func killBlockerAuto(ctx context.Context, program *tui.Program, conn *mssql.Conn
 		return
 	}
 	program.Send(tui.LogMsg{Line: fmt.Sprintf("killed SPID %d and auto-killing by %s — added to manifest", a.SPID, a.Criterion)})
+}
+
+// armKillRule appends a kill_blocked_sessions rule (by login/host) to the running manifest
+// without killing anyone now — a session that later blocks the DDL and matches is terminated by
+// the armed BlockerKiller. It is killBlockerAuto without the immediate KILL: the roster arms
+// recurrences, it does not act on a live session. The outcome is echoed to the console.
+func armKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
+	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
+	if !ok {
+		program.Send(tui.LogMsg{Line: "arm: nothing to match on for that group"})
+		return
+	}
+	path := current.get()
+	if path == "" {
+		program.Send(tui.LogMsg{Line: "arm: no manifest is running"})
+		return
+	}
+	if err := ddl.AppendKilledSession(path, rule); err != nil {
+		program.Send(tui.LogMsg{Line: "arm: " + err.Error()})
+		return
+	}
+	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill armed by %s=%s — added to manifest", a.Criterion, a.Value)})
+}
+
+// disarmKillRule removes the matching kill_blocked_sessions rule from the running manifest — the
+// inverse of armKillRule. The outcome is echoed to the console.
+func disarmKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
+	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
+	if !ok {
+		program.Send(tui.LogMsg{Line: "disarm: nothing to match on for that group"})
+		return
+	}
+	path := current.get()
+	if path == "" {
+		program.Send(tui.LogMsg{Line: "disarm: no manifest is running"})
+		return
+	}
+	if err := ddl.RemoveKilledSession(path, rule); err != nil {
+		program.Send(tui.LogMsg{Line: "disarm: " + err.Error()})
+		return
+	}
+	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill disarmed by %s=%s — removed from manifest", a.Criterion, a.Value)})
 }
 
 // loadConfig loads the config file when one is given, else returns nil.
