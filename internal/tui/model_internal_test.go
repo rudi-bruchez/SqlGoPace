@@ -3,6 +3,8 @@ package tui
 import (
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestFormatElapsed(t *testing.T) {
@@ -110,5 +112,110 @@ func TestTickUpdatesElapsed(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Error("tick should reschedule itself (non-nil cmd)")
+	}
+}
+
+func TestRosterGroupsAggregate(t *testing.T) {
+	m := New("op", nil)
+	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{
+		{SPID: 104, Login: "APP01", Host: "SRV1", Count: 1, TotalMS: 1000},
+		{SPID: 105, Login: "APP01", Host: "SRV2", Count: 2, TotalMS: 2000},
+	}}
+	// Default grouping is by login: one APP01 group, count 3, total 3000.
+	g := m.rosterGroups()
+	if len(g) != 1 || g[0].Criterion != "login_name" || g[0].Value != "APP01" || g[0].Count != 3 || g[0].TotalMS != 3000 {
+		t.Fatalf("login groups = %+v", g)
+	}
+	// By host: two groups.
+	m.rosterByHost = true
+	if g := m.rosterGroups(); len(g) != 2 || g[0].Criterion != "host_name" {
+		t.Fatalf("host groups = %+v, want 2 by host_name", g)
+	}
+}
+
+func TestRosterOpenToggleAndClose(t *testing.T) {
+	actions := make(chan Action, 8)
+	m := New("op", actions)
+	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{
+		{SPID: 104, Login: "APP01", Host: "SRV1", Count: 1, TotalMS: 1000},
+		{SPID: 105, Login: "APP02", Host: "SRV2", Count: 1, TotalMS: 1000},
+	}}
+	// b opens.
+	mo, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("b")})
+	m = mo.(Model)
+	if !m.rosterOpen {
+		t.Fatal("b should open the roster")
+	}
+	// g toggles grouping and resets the cursor.
+	m.rosterCursor = 1
+	mg, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("g")})
+	m = mg.(Model)
+	if !m.rosterByHost || m.rosterCursor != 0 {
+		t.Fatalf("g should group by host and reset cursor: byHost=%v cursor=%d", m.rosterByHost, m.rosterCursor)
+	}
+	// q closes the roster without quitting or emitting an action.
+	mc, cmd := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("q")})
+	m = mc.(Model)
+	if m.rosterOpen || m.quitting || cmd != nil {
+		t.Fatalf("q should close roster only: open=%v quitting=%v cmd=%v", m.rosterOpen, m.quitting, cmd)
+	}
+	select {
+	case a := <-actions:
+		t.Errorf("closing roster emitted an action: %+v", a)
+	default:
+	}
+}
+
+func TestRosterArmThenDisarm(t *testing.T) {
+	actions := make(chan Action, 8)
+	m := New("op", actions)
+	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{
+		{SPID: 104, Login: "APP01", Host: "SRV1", Count: 2, TotalMS: 20000},
+	}}
+	m.rosterOpen = true
+
+	// space arms the selected (login) group.
+	ma, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = ma.(Model)
+	a := <-actions
+	if a.Kind != ActionArmKillRule || a.Criterion != "login_name" || a.Value != "APP01" {
+		t.Fatalf("arm action = %+v", a)
+	}
+	if !m.armed["login_name=APP01"] {
+		t.Error("armed set not updated after arm")
+	}
+
+	// space again disarms.
+	md, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = md.(Model)
+	a = <-actions
+	if a.Kind != ActionDisarmKillRule || a.Criterion != "login_name" || a.Value != "APP01" {
+		t.Fatalf("disarm action = %+v", a)
+	}
+	if m.armed["login_name=APP01"] {
+		t.Error("armed set not cleared after disarm")
+	}
+}
+
+func TestRosterUnknownRowIsNotArmable(t *testing.T) {
+	actions := make(chan Action, 8)
+	m := New("op", actions)
+	// A blocker with no login/host (blocker was not in the snapshot).
+	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{{SPID: 104, Count: 1, TotalMS: 1000}}}
+	m.rosterOpen = true
+	mu, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = mu.(Model)
+	select {
+	case a := <-actions:
+		t.Errorf("arming the (unknown) row should emit nothing, got %+v", a)
+	default:
+	}
+}
+
+func TestKillerArmedMsg(t *testing.T) {
+	m := New("op", nil)
+	mo, _ := m.Update(KillerArmedMsg{Armed: true})
+	if !mo.(Model).killerArmed {
+		t.Error("KillerArmedMsg{Armed:true} should set killerArmed")
 	}
 }

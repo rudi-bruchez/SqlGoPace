@@ -203,6 +203,9 @@ type (
 		Index   int
 		Outcome string
 	}
+	// KillerArmedMsg tells the console whether kill_blockers is enabled in config, so the roster
+	// can warn that armed rules will not fire until it is. Sent once at startup.
+	KillerArmedMsg struct{ Armed bool }
 )
 
 // tickMsg drives the once-a-second re-render that keeps the elapsed timer live.
@@ -231,6 +234,13 @@ const (
 	// for it to the running manifest, so a recurrence is auto-killed without a restart.
 	// Criterion/Value/SPID carry the chosen match (the inverse of ActionIgnoreBlocker).
 	ActionKillBlockerAuto
+	// ActionArmKillRule appends a kill_blocked_sessions rule (Criterion/Value) to the running
+	// manifest without killing now: a session that later blocks the DDL and matches the rule is
+	// terminated by the armed BlockerKiller. Emitted from the blocker roster.
+	ActionArmKillRule
+	// ActionDisarmKillRule removes the matching kill_blocked_sessions rule from the running
+	// manifest — the inverse of ActionArmKillRule.
+	ActionDisarmKillRule
 	// ActionQuit leaves the console.
 	ActionQuit
 )
@@ -291,11 +301,17 @@ type Model struct {
 	height    int            // terminal height, budgets the operations panel so lower panels stay visible
 	expandSQL bool           // Enter toggles: show the selected blocker's full SQL
 	showHelp  bool           // '?' toggles the shortcuts footer
+
+	rosterOpen   bool            // the blocker roster modal is showing
+	rosterCursor int             // selected group within the roster
+	rosterByHost bool            // roster grouping key: false = login, true = host
+	armed        map[string]bool // roster-armed kill rules, keyed "criterion=value" (drives ✓)
+	killerArmed  bool            // whether kill_blockers is enabled in config (roster warning)
 }
 
 // New returns a console model for the given operation. actions may be nil (no dispatch).
 func New(operation string, actions chan<- Action) Model {
-	return Model{operation: operation, status: StatusRunning, actions: actions, showHelp: true}
+	return Model{operation: operation, status: StatusRunning, actions: actions, showHelp: true, armed: map[string]bool{}}
 }
 
 // Init implements tea.Model; it starts the once-a-second tick that keeps the
@@ -322,6 +338,44 @@ func (m *Model) setOpStatus(index int, status string) {
 			return
 		}
 	}
+}
+
+// rosterGroup is one row of the blocker roster: a distinct login or host that has blocked the
+// DDL this run, with its aggregate episode count and total blocked time. Value is "" for the
+// non-armable "(unknown)" group (the blocking session was absent from the snapshot).
+type rosterGroup struct {
+	Criterion string // "login_name" | "host_name"
+	Value     string
+	Count     int
+	TotalMS   int64
+}
+
+// rosterKey is the armed-set key for a group: "<criterion>=<value>".
+func rosterKey(criterion, value string) string { return criterion + "=" + value }
+
+// rosterGroups folds the suspension history (sessions that blocked us) by the active grouping
+// key, summing episode count and total blocked time, preserving first-seen order.
+func (m Model) rosterGroups() []rosterGroup {
+	criterion := "login_name"
+	pick := func(b SuspensionBlocker) string { return b.Login }
+	if m.rosterByHost {
+		criterion = "host_name"
+		pick = func(b SuspensionBlocker) string { return b.Host }
+	}
+	idx := make(map[string]int)
+	var out []rosterGroup
+	for _, b := range m.suspension.Blockers {
+		v := pick(b)
+		i, ok := idx[v]
+		if !ok {
+			i = len(out)
+			idx[v] = i
+			out = append(out, rosterGroup{Criterion: criterion, Value: v})
+		}
+		out[i].Count += b.Count
+		out[i].TotalMS += b.TotalMS
+	}
+	return out
 }
 
 // opStatusLabel maps a run.StepEvent.Outcome to the operations-panel label.
@@ -416,6 +470,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spid = msg.SPID
 	case AlertMsg:
 		m.alerts = append(m.alerts, msg)
+	case KillerArmedMsg:
+		m.killerArmed = msg.Armed
 	case tickMsg:
 		if !m.startedAt.IsZero() {
 			if t := time.Time(msg); !t.Before(m.startedAt) {
@@ -434,6 +490,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.inCriterionMode() {
 		return m.handleCriterionKey(msg)
+	}
+	if m.rosterOpen {
+		return m.handleRosterKey(msg)
 	}
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -459,6 +518,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "?":
 		m.showHelp = !m.showHelp
+	case "b":
+		m.rosterOpen = true
+		m.rosterCursor = 0
 	case "x":
 		if len(m.blockers) > 0 {
 			m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
@@ -515,6 +577,45 @@ func (m Model) handleCriterionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil // unrecognized key: stay in the prompt
 	}
 	m.mode = modeNormal
+	return m, nil
+}
+
+// handleRosterKey drives the blocker-roster modal: navigate groups, toggle the login/host
+// grouping, and arm/disarm a kill rule for the selected group. b/esc/q close it (q closes the
+// roster, it does not quit the app while the roster is open).
+func (m Model) handleRosterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	groups := m.rosterGroups()
+	switch msg.String() {
+	case "b", "esc", "q":
+		m.rosterOpen = false
+	case "up":
+		if m.rosterCursor > 0 {
+			m.rosterCursor--
+		}
+	case "down":
+		if m.rosterCursor < len(groups)-1 {
+			m.rosterCursor++
+		}
+	case "g":
+		m.rosterByHost = !m.rosterByHost
+		m.rosterCursor = 0
+	case "enter", " ":
+		if m.rosterCursor >= len(groups) {
+			return m, nil
+		}
+		g := groups[m.rosterCursor]
+		if g.Value == "" {
+			return m, nil // the (unknown) row has no criterion value to match on
+		}
+		key := rosterKey(g.Criterion, g.Value)
+		if m.armed[key] {
+			m.emit(Action{Kind: ActionDisarmKillRule, Criterion: g.Criterion, Value: g.Value})
+			delete(m.armed, key)
+		} else {
+			m.emit(Action{Kind: ActionArmKillRule, Criterion: g.Criterion, Value: g.Value})
+			m.armed[key] = true
+		}
+	}
 	return m, nil
 }
 
