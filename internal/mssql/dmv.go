@@ -196,6 +196,7 @@ type SelfBlock struct {
 	WaitMS   int64
 	Login    string
 	Program  string
+	Host     string
 	Query    string
 }
 
@@ -223,7 +224,7 @@ func FindSelfBlock(sessions []Session, ddlSPID int) SelfBlock {
 		if s.SPID != self.BlockingSPID {
 			continue
 		}
-		sb.Login, sb.Program = s.Login, s.Program
+		sb.Login, sb.Program, sb.Host = s.Login, s.Program, s.Host
 		if sb.Query = s.ActiveQuery; sb.Query == "" {
 			sb.Query = s.ParentQuery // an idle-in-transaction blocker has no active statement
 		}

@@ -85,6 +85,20 @@ func TestFindSelfBlock(t *testing.T) {
 	})
 }
 
+func TestFindSelfBlockCapturesHost(t *testing.T) {
+	sessions := []mssql.Session{
+		{SPID: 119, WaitType: "LCK_M_SCH_M", WaitMS: 5000, BlockingSPID: 104},
+		{SPID: 104, Login: "app_login", Host: "APPSRV01", Program: "SQLCMD"},
+	}
+	sb := mssql.FindSelfBlock(sessions, 119)
+	if !sb.Blocked || sb.SPID != 104 {
+		t.Fatalf("expected blocked by 104, got %+v", sb)
+	}
+	if sb.Host != "APPSRV01" {
+		t.Errorf("Host = %q, want APPSRV01", sb.Host)
+	}
+}
+
 func TestLogSpaceUsedBytes(t *testing.T) {
 	tests := []struct {
 		name        string
