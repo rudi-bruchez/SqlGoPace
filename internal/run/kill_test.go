@@ -115,6 +115,43 @@ func TestBlockerKillerNoSourceIsNoOp(t *testing.T) {
 	}
 }
 
+func TestBlockerKillerMatchesRosterArmedRule(t *testing.T) {
+	// The roster builds kill rules via ddl.KilledSessionFor(criterion, value, 0); this test
+	// locks that such a rule actually matches what BlockerKiller.consider evaluates against the
+	// blocking session — the one seam a criterion-string mismatch would silently no-op.
+	t.Run("host_name", func(t *testing.T) {
+		rule, ok := ddl.KilledSessionFor("host_name", "BATCH01", 0)
+		if !ok {
+			t.Fatal("KilledSessionFor(host_name) returned ok=false")
+		}
+		rec := &killRecorder{}
+		now := time.Unix(0, 0)
+		k := killerFor(t, rec, &now, []ddl.KilledSession{rule})
+		// ddlSPID 100 blocked by 104, whose Host is BATCH01.
+		snap := []mssql.Session{
+			{SPID: 100, BlockingSPID: 104, WaitType: "LCK_M_SCH_M"},
+			{SPID: 104, Host: "BATCH01", Login: "svc", Program: "Batch"},
+		}
+		k.consider(context.Background(), snap, 100)
+		if len(rec.spids) != 1 || rec.spids[0] != 104 {
+			t.Fatalf("a roster-armed host_name rule should kill the matching blocker, got %v", rec.spids)
+		}
+	})
+	t.Run("login_name", func(t *testing.T) {
+		rule, ok := ddl.KilledSessionFor("login_name", "SVC_RPT", 0)
+		if !ok {
+			t.Fatal("KilledSessionFor(login_name) returned ok=false")
+		}
+		rec := &killRecorder{}
+		now := time.Unix(0, 0)
+		k := killerFor(t, rec, &now, []ddl.KilledSession{rule})
+		k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+		if len(rec.spids) != 1 || rec.spids[0] != 104 {
+			t.Fatalf("a roster-armed login_name rule should kill the matching blocker, got %v", rec.spids)
+		}
+	})
+}
+
 func TestManifestKillSourceReloadPicksUpNewRule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.yaml")
 	base := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"

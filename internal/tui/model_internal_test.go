@@ -213,6 +213,20 @@ func TestRosterUnknownRowIsNotArmable(t *testing.T) {
 	}
 }
 
+func TestRosterCtrlCQuits(t *testing.T) {
+	actions := make(chan Action, 8)
+	m := New("op", actions)
+	m.rosterOpen = true
+	mc, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = mc.(Model)
+	if !m.quitting {
+		t.Error("ctrl+c in the roster should quit the app")
+	}
+	if cmd == nil {
+		t.Error("ctrl+c should return a quit command")
+	}
+}
+
 func TestKillerArmedMsg(t *testing.T) {
 	m := New("op", nil)
 	mo, _ := m.Update(KillerArmedMsg{Armed: true})

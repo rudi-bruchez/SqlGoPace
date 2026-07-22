@@ -588,6 +588,10 @@ func (m Model) handleRosterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "b", "esc", "q":
 		m.rosterOpen = false
+	case "ctrl+c":
+		m.quitting = true
+		m.emit(Action{Kind: ActionQuit})
+		return m, tea.Quit
 	case "up":
 		if m.rosterCursor > 0 {
 			m.rosterCursor--
