@@ -18,6 +18,9 @@ import (
 // the lower, actionable panels (blocked sessions, footer) on screen for a manifest expanded
 // to many operations (index: ALL), which would otherwise overflow the fixed alt-screen.
 func (m Model) View() string {
+	if m.rosterOpen {
+		return m.rosterView()
+	}
 	w := m.width
 	if w <= 0 {
 		w = 100 // before the first WindowSizeMsg (alt-screen sends one promptly)
@@ -344,6 +347,46 @@ func (m Model) blockedBody(width int) string {
 	return b.String()
 }
 
+// rosterView renders the blocker-roster modal: every login (or host) that has stalled the DDL
+// this run, with its episode count and total blocked time, and a ✓ on armed groups. It replaces
+// the dashboard while open (the alt-screen is a fixed height, so a full-screen modal is simplest).
+func (m Model) rosterView() string {
+	groupBy, other := "login", "host"
+	if m.rosterByHost {
+		groupBy, other = "host", "login"
+	}
+	var b strings.Builder
+	b.WriteString(titleStyle.Render("blockers that stalled this run") + " — grouped by " + groupBy + "\n\n")
+
+	groups := m.rosterGroups()
+	if len(groups) == 0 {
+		b.WriteString("  (no blockers yet)\n")
+	}
+	for i, g := range groups {
+		label := g.Value
+		if label == "" {
+			label = "(unknown)"
+		}
+		line := fmt.Sprintf("%-30s  %d×  blocked %s", label, g.Count, humanizeMS(g.TotalMS))
+		if g.Value != "" && m.armed[rosterKey(g.Criterion, g.Value)] {
+			line += "  " + okStyle.Render("[✓ armed]")
+		}
+		marker := "  "
+		if i == m.rosterCursor {
+			marker = "> "
+			line = selStyle.Render(line)
+		}
+		b.WriteString(marker + line + "\n")
+	}
+
+	b.WriteString("\n")
+	if !m.killerArmed {
+		b.WriteString(alertStyle.Render("kill_blockers disabled in config — armed rules won't fire until it's enabled") + "\n")
+	}
+	b.WriteString(helpStyle.Render(fmt.Sprintf("[↑/↓] select  [space] arm/disarm  [g] group by %s  [b/esc/q] close", other)))
+	return b.String()
+}
+
 // waitsBody renders the wait-category table (what is slowing the DDL).
 func (m Model) waitsBody() string {
 	var b strings.Builder
@@ -368,7 +411,7 @@ func (m Model) helpBody() string {
 		return fmt.Sprintf("%s SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
 			verb, bl.SPID, bl.Program, bl.Login, bl.Host)
 	}
-	return helpStyle.Render("[↑/↓] select  [enter] sql  [i] ignore  [x] kill  [X] kill+auto  [k] kill DDL  [d] drain  [?] help  [q] quit")
+	return helpStyle.Render("[↑/↓] select  [enter] sql  [i] ignore  [x] kill  [X] kill+auto  [b] blockers  [k] kill DDL  [d] drain  [?] help  [q] quit")
 }
 
 // opStatusStyled renders a bracketed, color-coded operation status label.

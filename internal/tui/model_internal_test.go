@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -217,5 +218,33 @@ func TestKillerArmedMsg(t *testing.T) {
 	mo, _ := m.Update(KillerArmedMsg{Armed: true})
 	if !mo.(Model).killerArmed {
 		t.Error("KillerArmedMsg{Armed:true} should set killerArmed")
+	}
+}
+
+func TestRosterViewShowsArmedAndWarning(t *testing.T) {
+	m := New("op", nil)
+	m.width = 100
+	m.killerArmed = false // config has kill_blockers disabled
+	m.rosterOpen = true
+	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{
+		{SPID: 104, Login: "APP01", Host: "SRV1", Count: 2, TotalMS: 20000},
+	}}
+	m.armed["login_name=APP01"] = true
+
+	out := m.View()
+	for _, want := range []string{"APP01", "armed", "kill_blockers disabled"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("roster view missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestRosterViewEmpty(t *testing.T) {
+	m := New("op", nil)
+	m.width = 100
+	m.killerArmed = true
+	m.rosterOpen = true
+	if out := m.View(); !strings.Contains(out, "no blockers yet") {
+		t.Errorf("empty roster should say so:\n%s", out)
 	}
 }
