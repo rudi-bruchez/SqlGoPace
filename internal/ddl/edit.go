@@ -3,6 +3,7 @@ package ddl
 import (
 	"fmt"
 	"regexp"
+	"slices"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/fsutil"
 )
@@ -130,19 +131,13 @@ func RemoveKilledSession(path string, s KilledSession) error {
 	if err != nil {
 		return err
 	}
-	kept := make([]KilledSession, 0, len(m.KillBlockedSessions))
-	removed := false
-	for _, e := range m.KillBlockedSessions {
-		if sameKilledSession(e, s) {
-			removed = true
-			continue
-		}
-		kept = append(kept, e)
+	before := len(m.KillBlockedSessions)
+	m.KillBlockedSessions = slices.DeleteFunc(m.KillBlockedSessions, func(e KilledSession) bool {
+		return sameKilledSession(e, s)
+	})
+	if len(m.KillBlockedSessions) == before {
+		return nil // nothing matched: don't rewrite the file
 	}
-	if !removed {
-		return nil
-	}
-	m.KillBlockedSessions = kept
 	data, err := MarshalManifest(m)
 	if err != nil {
 		return err

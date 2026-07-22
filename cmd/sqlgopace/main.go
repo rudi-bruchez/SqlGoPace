@@ -1042,43 +1042,37 @@ func killBlockerAuto(ctx context.Context, program *tui.Program, conn *mssql.Conn
 // armKillRule appends a kill_blocked_sessions rule (by login/host) to the running manifest
 // without killing anyone now — a session that later blocks the DDL and matches is terminated by
 // the armed BlockerKiller. It is killBlockerAuto without the immediate KILL: the roster arms
-// recurrences, it does not act on a live session. The outcome is echoed to the console.
+// recurrences, it does not act on a live session.
 func armKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
-	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
-	if !ok {
-		program.Send(tui.LogMsg{Line: "arm: nothing to match on for that group"})
-		return
-	}
-	path := current.get()
-	if path == "" {
-		program.Send(tui.LogMsg{Line: "arm: no manifest is running"})
-		return
-	}
-	if err := ddl.AppendKilledSession(path, rule); err != nil {
-		program.Send(tui.LogMsg{Line: "arm: " + err.Error()})
-		return
-	}
-	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill armed by %s=%s — added to manifest", a.Criterion, a.Value)})
+	editKillRule(program, current, a, "arm", "armed", "added to", ddl.AppendKilledSession)
 }
 
 // disarmKillRule removes the matching kill_blocked_sessions rule from the running manifest — the
-// inverse of armKillRule. The outcome is echoed to the console.
+// inverse of armKillRule.
 func disarmKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
+	editKillRule(program, current, a, "disarm", "disarmed", "removed from", ddl.RemoveKilledSession)
+}
+
+// editKillRule is the shared body of the roster's arm/disarm: it resolves the one-criterion kill
+// rule and the running manifest path, applies mutate (append or remove), and echoes the outcome.
+// verb prefixes the error/guard lines ("arm"/"disarm"); outcome and prep phrase the success line
+// ("auto-kill armed … added to manifest" / "auto-kill disarmed … removed from manifest").
+func editKillRule(program *tui.Program, current *currentManifest, a tui.Action, verb, outcome, prep string, mutate func(path string, rule ddl.KilledSession) error) {
 	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
 	if !ok {
-		program.Send(tui.LogMsg{Line: "disarm: nothing to match on for that group"})
+		program.Send(tui.LogMsg{Line: verb + ": nothing to match on for that group"})
 		return
 	}
 	path := current.get()
 	if path == "" {
-		program.Send(tui.LogMsg{Line: "disarm: no manifest is running"})
+		program.Send(tui.LogMsg{Line: verb + ": no manifest is running"})
 		return
 	}
-	if err := ddl.RemoveKilledSession(path, rule); err != nil {
-		program.Send(tui.LogMsg{Line: "disarm: " + err.Error()})
+	if err := mutate(path, rule); err != nil {
+		program.Send(tui.LogMsg{Line: verb + ": " + err.Error()})
 		return
 	}
-	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill disarmed by %s=%s — removed from manifest", a.Criterion, a.Value)})
+	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill %s by %s=%s — %s manifest", outcome, a.Criterion, a.Value, prep)})
 }
 
 // loadConfig loads the config file when one is given, else returns nil.
