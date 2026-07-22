@@ -29,7 +29,9 @@ func (m Model) View() string {
 
 	nameBox := panel("", titleStyle.Render("SqlGoPace")+"  "+m.server.App, accentColor, 0)
 	rightW := max(w-lipgloss.Width(nameBox)-colGap-boxChrome, 20)
-	header := joinRow(w, nameBox, panel("", m.serverBanner(), accentColor, rightW))
+	// The banner right-aligns against the right box's inner text area (contentWidth minus the
+	// two padding columns), so the server identity hugs the terminal's right edge.
+	header := joinRow(w, nameBox, panel("", m.serverBanner(rightW-2), accentColor, rightW))
 
 	statusTitle := "op status"
 	if m.stepTotal > 0 {
@@ -105,16 +107,22 @@ func (m Model) alertsBlock() string {
 	return b.String()
 }
 
-// serverBanner renders the two-line server-info body of the header's right box.
-func (m Model) serverBanner() string {
+// serverBanner renders the two-line server-info body of the header's right box, right-aligned
+// to width columns (the box's inner text area) so it hugs the right edge; width <= 0 leaves it
+// unaligned (used before the box width is known).
+func (m Model) serverBanner(width int) string {
 	s := m.server
-	if s.Name == "" && s.Product == "" && s.Database == "" {
-		return "server info pending…"
+	body := "server info pending…"
+	if s.Name != "" || s.Product != "" || s.Database != "" {
+		l1 := fmt.Sprintf("%s, %s — %s", s.Name, s.Product, s.Database)
+		l2 := fmt.Sprintf("ed=%s  adr=%s  recovery=%s  rcsi=%s  si=%s",
+			s.Edition, tf(s.ADR), s.Recovery, tf(s.RCSI), tf(s.SnapshotIso))
+		body = l1 + "\n" + l2
 	}
-	l1 := fmt.Sprintf("%s, %s — %s", s.Name, s.Product, s.Database)
-	l2 := fmt.Sprintf("ed=%s  adr=%s  recovery=%s  rcsi=%s  si=%s",
-		s.Edition, tf(s.ADR), s.Recovery, tf(s.RCSI), tf(s.SnapshotIso))
-	return l1 + "\n" + l2
+	if width <= 0 {
+		return body
+	}
+	return lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(body)
 }
 
 // minOpsRows is the fewest operation rows the panel ever shows, even on a tiny terminal, so
@@ -289,6 +297,18 @@ func (m Model) shrinkLines() string {
 	}
 	if sh.BlockedSeconds > 0 {
 		fmt.Fprintf(&b, " · blocked %s", humanizeMS(int64(sh.BlockedSeconds)*1000))
+	}
+	// The literal statement in flight, so the operator sees exactly what runs each step: the
+	// TRUNCATEONLY pass first, then each DBCC SHRINKFILE (file, target) chunk with its target.
+	if sh.Statement != "" {
+		fmt.Fprintf(&b, "\n  → %s", sh.Statement)
+		if sh.ChunkTargetMB > 0 {
+			fmt.Fprintf(&b, "   (shrink to %s)", HumanizeMB(sh.ChunkTargetMB))
+		}
+		// SQL Server's own percent_complete for the running chunk, when it reports one.
+		if sh.PercentComplete > 0 {
+			fmt.Fprintf(&b, "   server %.0f%%", sh.PercentComplete)
+		}
 	}
 	return b.String()
 }

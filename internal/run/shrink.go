@@ -20,6 +20,9 @@ type ShrinkReader interface {
 	LogReuse(ctx context.Context) (recoveryModel, reuseWaitDesc string, err error)
 	ActiveLogFloorMB(ctx context.Context) (int, error)
 	SessionWaits(ctx context.Context, spid int) ([]mssql.SessionWait, error)
+	// Progress reads the running statement's percent_complete from dm_exec_requests, which
+	// SQL Server populates for DBCC SHRINKFILE — the server's own view of the current chunk.
+	Progress(ctx context.Context, spid int) (mssql.Progress, bool, error)
 }
 
 var _ ShrinkReader = (*mssql.Conn)(nil)
@@ -45,6 +48,18 @@ type ShrinkProgress struct {
 	ETASeconds        int // estimated seconds left over the full elapsed time (with blocking)
 	ETASecondsNoBlock int // estimated seconds left over productive time only (without blocking)
 	BlockedSeconds    int // cumulative seconds spent blocked/stalled (unproductive)
+
+	// PercentComplete is SQL Server's own percent_complete for the running chunk statement
+	// (dm_exec_requests), sampled live while a chunk executes; 0 when unavailable or between
+	// chunks. It can be nonlinear (flat for long stretches) — a cross-check, not the ETA basis.
+	PercentComplete float64
+
+	// ChunkTargetMB and Statement expose the exact work in flight so the console can show it
+	// verbatim: ChunkTargetMB is the target size the next chunk shrinks the file to (0 during
+	// the TRUNCATEONLY phase), and Statement is the literal T-SQL about to run — the
+	// TRUNCATEONLY pass first, then each DBCC SHRINKFILE (file, target) chunk.
+	ChunkTargetMB int
+	Statement     string
 }
 
 // Percent returns the fraction of the planned reduction achieved, in [0,1].
@@ -244,6 +259,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	r.emitProgress(ShrinkProgress{
 		File: f.Name, Type: "data", StartMB: f.SizeMB, CurrentMB: f.SizeMB,
 		FinalMB: final, StepMB: InitialStepMB(f.SizeMB-final, f.SizeMB, r.tuning),
+		Statement: ddl.ShrinkTruncateOnlySQL(f.Name), // the first statement is the free TRUNCATEONLY pass
 	})
 
 	// Phase A — TRUNCATEONLY: releases trailing free space with no page movement, no
@@ -287,19 +303,21 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 			return result, ErrStopped
 		}
 		// Emit progress every iteration, not only after a chunk gains space, so a shrink
-		// that is blocked or stalling still shows its live current size, chunk count, step
-		// and ETA in the console instead of appearing frozen.
+		// that is blocked or stalling still shows its live current size, chunk count, step,
+		// ETA and the exact chunk statement in the console instead of appearing frozen.
+		next := NextTargetMB(current, step, final)
 		chunksLeft, eta, etaNB := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
-		r.emitProgress(ShrinkProgress{
+		prog := ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
 			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
-		})
-		next := NextTargetMB(current, step, final)
+			ChunkTargetMB: next, Statement: ddl.ShrinkChunkSQL(f.Name, next, res),
+		}
+		r.emitProgress(prog)
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
-		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink)
+		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog)
 		if err != nil {
 			// Msg 5240: the file can't be adjusted to this target right now (pages pinned at
 			// the file end, or concurrent allocation). Not a failure — try a smaller move and
@@ -369,11 +387,13 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
+		nextT := NextTargetMB(current, step, final)
 		chunksLeft, eta, etaNB = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
 		r.emitProgress(ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
 			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
+			ChunkTargetMB: nextT, Statement: ddl.ShrinkChunkSQL(f.Name, nextT, res),
 		})
 	}
 	return result, nil
@@ -460,7 +480,7 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 // cancel, KILL via the pool as a fallback) with its committed work preserved;
 // stopped=false when the statement finished on its own (err carries a real DDL
 // failure, if any). It mirrors MonitoredRunner.runStatement.
-func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) (stopped bool, err error) {
+func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, base ShrinkProgress) (stopped bool, err error) {
 	stmt := ddl.ShrinkChunkSQL(file, targetMB, res)
 
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -472,6 +492,8 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	defer stopSampling()
 	samples := make(chan Sample)
 	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+	// Re-emit progress with the chunk's live server-side percent_complete while it runs.
+	go r.pumpChunkProgress(sampleCtx, base)
 
 	// A shrink chunk is cancel-safe: each internal ~32-page batch commits, so a stop
 	// preserves work and is re-entrant. It is never resumable in the ALTER sense.
@@ -560,6 +582,32 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 func (r *ShrinkRunner) emitProgress(p ShrinkProgress) {
 	if r.progress != nil {
 		r.progress(p)
+	}
+}
+
+// pumpChunkProgress polls the running chunk's server-side percent_complete
+// (dm_exec_requests, which SQL Server populates for DBCC SHRINKFILE) on the blocking cadence
+// and re-emits base with it filled in, so the console shows the server's own view of the
+// current chunk while it runs. Reads go through the pooled connection, concurrent with the
+// chunk on its own pooled connection — the same pattern the sampler uses. It stops when the
+// chunk's sampling context is canceled. A rollback (a chunk being aborted under pressure)
+// reports rollback progress, not forward progress, so it is skipped.
+func (r *ShrinkRunner) pumpChunkProgress(ctx context.Context, base ShrinkProgress) {
+	t := time.NewTicker(r.pollIntv)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			p, found, err := r.reader.Progress(ctx, r.exec.SPID())
+			if err != nil || !found || p.PercentComplete <= 0 || p.IsRollback() {
+				continue
+			}
+			b := base
+			b.PercentComplete = p.PercentComplete
+			r.emitProgress(b)
+		}
 	}
 }
 

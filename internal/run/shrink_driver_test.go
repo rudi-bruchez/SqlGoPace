@@ -34,6 +34,8 @@ type fakeServer struct {
 
 	waits []mssql.SessionWait // returned by SessionWaits (constant across calls)
 
+	percentComplete float64 // dm_exec_requests percent_complete for the running chunk (0 = no active request)
+
 	execLog  []string
 	killed   bool
 	reuseIdx int
@@ -105,6 +107,13 @@ func (s *fakeServer) ActiveLogFloorMB(_ context.Context) (int, error) { return s
 
 func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
 	return s.waits, nil
+}
+
+func (s *fakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {
+	if s.percentComplete <= 0 {
+		return mssql.Progress{}, false, nil
+	}
+	return mssql.Progress{PercentComplete: s.percentComplete, Command: "DbccFilesCompact"}, true, nil
 }
 
 // noPressureSampler never reports blocking or log pressure.
@@ -285,6 +294,60 @@ func TestShrinkDataConverges(t *testing.T) {
 	if s.sizeMB != 440 {
 		t.Errorf("server size = %d, want 440", s.sizeMB)
 	}
+}
+
+// TestShrinkEmitsServerPercentComplete verifies the driver re-emits progress with SQL
+// Server's own percent_complete (dm_exec_requests) while a chunk runs. A short poll interval
+// drives the progress pump, and the chunk statement blocks until the test has observed one
+// such emit, so the assertion is deterministic rather than timing-dependent.
+func TestShrinkEmitsServerPercentComplete(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 2000, usedMB: 1800, floorMB: 1800, percentComplete: 42,
+	}
+	seen := make(chan float64, 1)
+	release := make(chan struct{})
+	s.onExec = func(sql string) {
+		if strings.Contains(sql, "DBCC SHRINKFILE") && !strings.Contains(sql, "TRUNCATEONLY") {
+			<-release // hold the chunk open so the progress pump has time to fire
+		}
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := NewShrinkRunner(s, s, noPressureSampler{}, clk, ShrinkRunnerConfig{
+		Tuning:          testTuning(),
+		PollInterval:    2 * time.Millisecond, // fast enough that the pump fires during the held chunk
+		LogPollInterval: time.Hour,
+		BlockingTimeout: time.Minute,
+		LogDrainTimeout: time.Minute,
+		KillGrace:       time.Second,
+	}, WithShrinkProgress(func(p ShrinkProgress) {
+		if p.PercentComplete > 0 {
+			select {
+			case seen <- p.PercentComplete:
+			default:
+			}
+		}
+	}))
+	r.wait = func(_ context.Context, d time.Duration) error { clk.Advance(d); return nil }
+
+	done := make(chan struct{})
+	go func() {
+		op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final = 1980, one chunk
+		_, _ = r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+		close(done)
+	}()
+
+	select {
+	case got := <-seen:
+		if got != 42 {
+			t.Errorf("emitted PercentComplete = %v, want 42", got)
+		}
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("no progress carrying server percent_complete within 2s")
+	}
+	close(release) // let the chunk (and the run) finish
+	<-done
 }
 
 func TestShrinkDataNoProgressStops(t *testing.T) {

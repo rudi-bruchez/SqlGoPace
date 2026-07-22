@@ -162,6 +162,9 @@ type (
 		ETASeconds        int     // estimated seconds left (with blocking)
 		ETASecondsNoBlock int     // estimated seconds left over productive time only
 		BlockedSeconds    int     // cumulative seconds spent blocked/stalled
+		ChunkTargetMB     int     // target size the current chunk shrinks to (0 in the TRUNCATEONLY phase)
+		Statement         string  // the literal T-SQL in flight (TRUNCATEONLY, then each DBCC SHRINKFILE chunk)
+		PercentComplete   float64 // SQL Server's own percent_complete for the running chunk (0 when unavailable)
 	}
 	// SPIDMsg carries the session id of the DDL the console is monitoring, so the
 	// operator can see which server session (and which blocks) is ours.

@@ -402,9 +402,13 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	shrinkProgress := func(p run.ShrinkProgress) {
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
-		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds, %ds unblocked, blocked %ds)\n",
+		server := ""
+		if p.PercentComplete > 0 {
+			server = fmt.Sprintf(", server %.0f%%", p.PercentComplete)
+		}
+		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds, %ds unblocked, blocked %ds%s)\n",
 			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB),
-			p.Chunks, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds)
+			p.Chunks, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds, server)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
@@ -922,6 +926,7 @@ func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
 		FinalMB: p.FinalMB, StepMB: p.StepMB, Percent: p.Percent(),
 		Chunks: p.Chunks, ChunksRemaining: p.ChunksRemaining, ETASeconds: p.ETASeconds,
 		ETASecondsNoBlock: p.ETASecondsNoBlock, BlockedSeconds: p.BlockedSeconds,
+		ChunkTargetMB: p.ChunkTargetMB, Statement: p.Statement, PercentComplete: p.PercentComplete,
 	}
 }
 
