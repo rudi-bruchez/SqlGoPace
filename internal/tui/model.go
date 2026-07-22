@@ -115,6 +115,7 @@ type (
 	SuspensionBlocker struct {
 		SPID    int
 		Login   string
+		Host    string
 		Count   int
 		TotalMS int64
 	}

@@ -680,6 +680,7 @@ func (g *blockerGate) persistent(sessions []mssql.Session, ddlSPID int, now time
 // blockerAgg accumulates one blocking session's contribution to our suspension.
 type blockerAgg struct {
 	login string
+	host  string
 	count int
 	total time.Duration
 }
@@ -705,7 +706,7 @@ func newSuspensionTracker() *suspensionTracker {
 // observe records one poll. It accrues the interval since the previous observation to the
 // session that was blocking us over it, and counts a new episode on each transition into a
 // block (or a change of blocker while still blocked).
-func (t *suspensionTracker) observe(blocked bool, spid int, login string, now time.Time) {
+func (t *suspensionTracker) observe(blocked bool, spid int, login, host string, now time.Time) {
 	if t.blocked && !t.last.IsZero() {
 		if d := now.Sub(t.last); d > 0 {
 			t.total += d
@@ -733,6 +734,9 @@ func (t *suspensionTracker) observe(blocked bool, spid int, login string, now ti
 		if login != "" {
 			a.login = login
 		}
+		if host != "" {
+			a.host = host
+		}
 	}
 }
 
@@ -742,7 +746,7 @@ func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
 	for _, spid := range t.order {
 		a := t.byBlocker[spid]
 		msg.Blockers = append(msg.Blockers, tui.SuspensionBlocker{
-			SPID: spid, Login: a.login, Count: a.count, TotalMS: a.total.Milliseconds(),
+			SPID: spid, Login: a.login, Host: a.host, Count: a.count, TotalMS: a.total.Milliseconds(),
 		})
 	}
 	return msg
@@ -781,7 +785,7 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 					WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
 				})
 				// Accumulate the suspension history (how long/often/by whom) and send it.
-				susp.observe(sb.Blocked, sb.SPID, sb.Login, time.Now())
+				susp.observe(sb.Blocked, sb.SPID, sb.Login, sb.Host, time.Now())
 				program.Send(susp.snapshot())
 			}
 			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
