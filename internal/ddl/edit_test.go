@@ -145,3 +145,35 @@ func TestAppendIgnoredSessionPreservesShrink(t *testing.T) {
 		t.Errorf("shrink fields not preserved: %+v", m.Operations[0])
 	}
 }
+
+func TestRemoveKilledSession(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	body := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rule, ok := ddl.KilledSessionFor("host_name", "SRV1", 0)
+	if !ok {
+		t.Fatal("KilledSessionFor(host_name) returned ok=false")
+	}
+	if err := ddl.AppendKilledSession(path, rule); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	m, err := ddl.LoadManifestFile(path)
+	if err != nil || len(m.KillBlockedSessions) != 1 {
+		t.Fatalf("after append: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	}
+
+	if err := ddl.RemoveKilledSession(path, rule); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	m, err = ddl.LoadManifestFile(path)
+	if err != nil || len(m.KillBlockedSessions) != 0 {
+		t.Fatalf("after remove: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	}
+
+	// Removing an absent rule is a no-op (no error).
+	if err := ddl.RemoveKilledSession(path, rule); err != nil {
+		t.Fatalf("remove absent: %v", err)
+	}
+}

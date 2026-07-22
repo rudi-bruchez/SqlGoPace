@@ -120,3 +120,35 @@ func AppendKilledSession(path string, s KilledSession) error {
 func sameKilledSession(a, b KilledSession) bool {
 	return sameIgnoredSession(a.IgnoredSession, b.IgnoredSession) && a.AfterSeconds == b.AfterSeconds
 }
+
+// RemoveKilledSession drops every kill rule field-equal to s from the manifest at path and
+// writes it back atomically, the inverse of AppendKilledSession. Removing a rule that is not
+// present is a no-op — the file is rewritten only when something actually changed, so an
+// unrelated concurrent reader never sees a needless torn write.
+func RemoveKilledSession(path string, s KilledSession) error {
+	m, err := LoadManifestFile(path)
+	if err != nil {
+		return err
+	}
+	kept := make([]KilledSession, 0, len(m.KillBlockedSessions))
+	removed := false
+	for _, e := range m.KillBlockedSessions {
+		if sameKilledSession(e, s) {
+			removed = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if !removed {
+		return nil
+	}
+	m.KillBlockedSessions = kept
+	data, err := MarshalManifest(m)
+	if err != nil {
+		return err
+	}
+	if err := fsutil.AtomicWrite(path, data); err != nil {
+		return fmt.Errorf("write manifest %q: %w", path, err)
+	}
+	return nil
+}
