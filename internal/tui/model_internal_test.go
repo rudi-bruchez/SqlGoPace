@@ -43,6 +43,30 @@ func TestHumanizeMS(t *testing.T) {
 	}
 }
 
+func TestHumanizeCount(t *testing.T) {
+	tests := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0"},
+		{21, "21"},
+		{999, "999"},
+		{1000, "1.0k"},
+		{1500, "1.5k"},
+		{21000, "21k"},
+		{768162, "768k"},
+		{999999, "1000k"}, // rounds up within the thousands band
+		{1_000_000, "1.0m"},
+		{7446916, "7.4m"},
+		{104_492_000, "104m"},
+	}
+	for _, tt := range tests {
+		if got := humanizeCount(tt.n); got != tt.want {
+			t.Errorf("humanizeCount(%d) = %q, want %q", tt.n, got, tt.want)
+		}
+	}
+}
+
 func TestOpStatusLabel(t *testing.T) {
 	tests := map[string]string{
 		"success": "DONE", "failed": "FAILED", "interrupted": "INTERRUPTED",

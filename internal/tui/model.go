@@ -564,6 +564,27 @@ func humanizeMS(ms int64) string {
 	}
 }
 
+// humanizeCount renders a task/row tally compactly with k/m suffixes so large wait-task
+// counts stay readable: 21 -> "21", 768162 -> "768k", 7446916 -> "7.4m". Values under a
+// thousand are shown as-is; a scaled value keeps one decimal only while it is below ten.
+func humanizeCount(n int64) string {
+	switch {
+	case n < 1000:
+		return fmt.Sprintf("%d", n)
+	case n < 1_000_000:
+		return scaledCount(float64(n)/1000, "k")
+	default:
+		return scaledCount(float64(n)/1_000_000, "m")
+	}
+}
+
+func scaledCount(v float64, unit string) string {
+	if v < 10 {
+		return fmt.Sprintf("%.1f%s", v, unit)
+	}
+	return fmt.Sprintf("%.0f%s", v, unit)
+}
+
 // formatElapsed renders a duration as mm:ss, or h:mm:ss past an hour.
 func formatElapsed(d time.Duration) string {
 	d = d.Round(time.Second)

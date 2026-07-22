@@ -349,7 +349,7 @@ func (m Model) waitsBody() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "waits slowing the DDL (total %s):", humanizeMS(m.waitTotalMS))
 	for _, wc := range m.waits {
-		fmt.Fprintf(&b, "\n  %-20s %10s  %d tasks", wc.Name, humanizeMS(wc.WaitMS), wc.Tasks)
+		fmt.Fprintf(&b, "\n  %-20s %10s  %s tasks", wc.Name, humanizeMS(wc.WaitMS), humanizeCount(wc.Tasks))
 	}
 	if len(m.waits) == 0 {
 		b.WriteString("\n  (none)")
