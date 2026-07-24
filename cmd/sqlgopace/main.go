@@ -383,6 +383,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 				ev.SPID, ev.Login, ev.Waited.Round(time.Second))
 			if fwd != nil {
 				fwd.send(tui.LogMsg{Line: fmt.Sprintf("killed blocker SPID %d (%s) after %s", ev.SPID, ev.Login, ev.Waited.Round(time.Second))})
+				fwd.send(tui.KilledMsg{SPID: ev.SPID, Login: ev.Login}) // annotate the suspension-history entry
 			}
 		}
 		killer := run.NewBlockerKiller(conn.Kill, killed, nil)

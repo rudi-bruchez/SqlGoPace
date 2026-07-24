@@ -206,6 +206,12 @@ type (
 	// KillerArmedMsg tells the console whether kill_blockers is enabled in config, so the roster
 	// can warn that armed rules will not fire until it is. Sent once at startup.
 	KillerArmedMsg struct{ Armed bool }
+	// KilledMsg reports that the engine terminated a blocking session, so the suspension
+	// history can annotate that SPID with a "N× killed" tally. Sent once per kill.
+	KilledMsg struct {
+		SPID  int
+		Login string
+	}
 )
 
 // tickMsg drives the once-a-second re-render that keeps the elapsed timer live.
@@ -286,6 +292,7 @@ type Model struct {
 	alerts          []AlertMsg
 	blockedBy       BlockedByMsg  // set when our operation is itself blocked (the victim)
 	suspension      SuspensionMsg // cumulative suspension history (how long/often/by whom)
+	kills           map[int]int   // times each blocker SPID was killed (drives the "N× killed" tally)
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
@@ -311,7 +318,7 @@ type Model struct {
 
 // New returns a console model for the given operation. actions may be nil (no dispatch).
 func New(operation string, actions chan<- Action) Model {
-	return Model{operation: operation, status: StatusRunning, actions: actions, showHelp: true, armed: map[string]bool{}}
+	return Model{operation: operation, status: StatusRunning, actions: actions, showHelp: true, armed: map[string]bool{}, kills: map[int]int{}}
 }
 
 // Init implements tea.Model; it starts the once-a-second tick that keeps the
@@ -374,6 +381,42 @@ func (m Model) rosterGroups() []rosterGroup {
 		}
 		out[i].Count += b.Count
 		out[i].TotalMS += b.TotalMS
+	}
+	return out
+}
+
+// suspensionGroup folds one login's blocking SPIDs into a single suspension-line entry.
+type suspensionGroup struct {
+	login   string
+	spids   string // this login's SPIDs, comma-joined in first-seen order
+	count   int
+	totalMS int64
+	killed  int
+}
+
+// suspensionGroups folds the suspension history by login so every SPID a single login used
+// to block us collapses into one entry (summing episodes, blocked time, and kills) — a login
+// that reconnects under fresh SPIDs reads as one offender. Blockers with no captured login
+// stay separate (keyed by SPID). First-seen order is preserved.
+func (m Model) suspensionGroups() []suspensionGroup {
+	idx := make(map[string]int)
+	var out []suspensionGroup
+	for _, b := range m.suspension.Blockers {
+		key := b.Login
+		if key == "" {
+			key = fmt.Sprintf("spid:%d", b.SPID) // no login: don't merge with others
+		}
+		i, ok := idx[key]
+		if !ok {
+			i = len(out)
+			idx[key] = i
+			out = append(out, suspensionGroup{login: b.Login, spids: fmt.Sprintf("%d", b.SPID)})
+		} else {
+			out[i].spids += fmt.Sprintf(",%d", b.SPID)
+		}
+		out[i].count += b.Count
+		out[i].totalMS += b.TotalMS
+		out[i].killed += m.kills[b.SPID]
 	}
 	return out
 }
@@ -472,6 +515,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.alerts = append(m.alerts, msg)
 	case KillerArmedMsg:
 		m.killerArmed = msg.Armed
+	case KilledMsg:
+		m.kills[msg.SPID]++
 	case tickMsg:
 		if !m.startedAt.IsZero() {
 			if t := time.Time(msg); !t.Before(m.startedAt) {

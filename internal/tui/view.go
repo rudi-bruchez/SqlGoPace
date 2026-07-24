@@ -253,14 +253,19 @@ func (m Model) opStatusBody() string {
 func (m Model) suspensionLine() string {
 	s := m.suspension
 	line := fmt.Sprintf("suspended %d×, %s total", s.Episodes, humanizeMS(s.TotalMS))
-	if len(s.Blockers) > 0 {
-		parts := make([]string, 0, len(s.Blockers))
-		for _, bl := range s.Blockers {
-			who := fmt.Sprintf("SPID %d", bl.SPID)
-			if bl.Login != "" {
-				who += " " + bl.Login
+	groups := m.suspensionGroups()
+	if len(groups) > 0 {
+		parts := make([]string, 0, len(groups))
+		for _, g := range groups {
+			who := "SPID " + g.spids
+			if g.login != "" {
+				who += " " + g.login
 			}
-			parts = append(parts, fmt.Sprintf("%s (%d×, %s)", who, bl.Count, humanizeMS(bl.TotalMS)))
+			killed := ""
+			if g.killed > 0 {
+				killed = fmt.Sprintf(", %d killed", g.killed)
+			}
+			parts = append(parts, fmt.Sprintf("%s (%d×, %s%s)", who, g.count, humanizeMS(g.totalMS), killed))
 		}
 		line += " — " + strings.Join(parts, " · ")
 	}

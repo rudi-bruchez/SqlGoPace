@@ -116,6 +116,48 @@ func TestTickUpdatesElapsed(t *testing.T) {
 	}
 }
 
+func TestSuspensionLineGroupsByLoginAndCountsKills(t *testing.T) {
+	m := New("shrink DataFile", nil)
+	m.suspension = SuspensionMsg{
+		Episodes: 3, TotalMS: 238000,
+		Blockers: []SuspensionBlocker{
+			{SPID: 103, Login: "SVC_OBS", Count: 1, TotalMS: 60000},
+			{SPID: 88, Login: "SVC_OBS", Count: 1, TotalMS: 89000},
+			{SPID: 86, Login: "SVC_OBS", Count: 1, TotalMS: 89000},
+		},
+	}
+	// Two of the three SPIDs from this login were killed; the group folds their SPIDs,
+	// episode counts, blocked time, and kills into one entry.
+	for _, spid := range []int{88, 86} {
+		updated, _ := m.Update(KilledMsg{SPID: spid, Login: "SVC_OBS"})
+		m = updated.(Model)
+	}
+	line := m.suspensionLine()
+	if want := "SPID 103,88,86 SVC_OBS (3×, 3m58s, 2 killed)"; !strings.Contains(line, want) {
+		t.Errorf("suspensionLine() = %q, want it to contain %q", line, want)
+	}
+}
+
+func TestSuspensionLineKeepsDistinctLoginsSeparate(t *testing.T) {
+	m := New("shrink DataFile", nil)
+	m.suspension = SuspensionMsg{
+		Episodes: 2, TotalMS: 120000,
+		Blockers: []SuspensionBlocker{
+			{SPID: 103, Login: "SVC_OBS", Count: 1, TotalMS: 60000},
+			{SPID: 88, Login: "SVC_ARC", Count: 1, TotalMS: 60000},
+		},
+	}
+	line := m.suspensionLine()
+	for _, want := range []string{"SPID 103 SVC_OBS (1×, 1m00s)", "SPID 88 SVC_ARC (1×, 1m00s)"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("suspensionLine() = %q, want it to contain %q", line, want)
+		}
+	}
+	if strings.Contains(line, "killed") {
+		t.Errorf("suspensionLine() = %q, want no kill annotation when nothing was killed", line)
+	}
+}
+
 func TestRosterGroupsAggregate(t *testing.T) {
 	m := New("op", nil)
 	m.suspension = SuspensionMsg{Blockers: []SuspensionBlocker{
