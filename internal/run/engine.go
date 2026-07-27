@@ -228,7 +228,9 @@ func WithSession(s SessionInfo) EngineOption { return func(e *Engine) { e.sessio
 
 // WithNotifier adds a notification channel (webhook or email). May be called once
 // per channel; all wired notifiers receive every enabled event.
-func WithNotifier(n Notifier) EngineOption { return func(e *Engine) { e.notifiers = append(e.notifiers, n) } }
+func WithNotifier(n Notifier) EngineOption {
+	return func(e *Engine) { e.notifiers = append(e.notifiers, n) }
+}
 
 // WithHistory enables run-history persistence.
 func WithHistory(h *report.History) EngineOption { return func(e *Engine) { e.history = h } }
