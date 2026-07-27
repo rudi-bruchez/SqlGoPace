@@ -73,6 +73,13 @@ func (p ShrinkProgress) Percent() float64 {
 	return float64(done) / float64(total)
 }
 
+// TempdbProfile carries the tempdb-shrink-specific knobs into the shared chunk loop.
+// Nil for a normal (non-tempdb) shrink. Fields are added in the flush-escalation task.
+type TempdbProfile struct {
+	FlushCaches bool
+	flushed     *bool // once-per-run guard, shared across a RunTempdb's files
+}
+
 // ShrinkResult is the outcome of shrinking one file, for the run report.
 type ShrinkResult struct {
 	File      string
@@ -285,10 +292,18 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	}
 
 	// Phase B — chunked page-moving shrink.
-	start := size
-	maxStep := effectiveMaxStepMB(size, r.tuning) // per-file step ceiling, fixed for this file
-	step := InitialStepMB(size-final, size, r.tuning)
-	current := size
+	return r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil)
+}
+
+// chunkLoop runs the page-moving chunk loop for one already-truncated file, from start
+// down to final MB. It is shared by shrinkData (prof == nil, a normal shrink) and
+// RunTempdb (prof carries tempdb-specific escalation knobs, currently unused).
+func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, final int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, prof *TempdbProfile) (ShrinkResult, error) {
+	result := ShrinkResult{File: f.Name, Type: "data", InitialMB: f.SizeMB, TargetMB: final, FinalMB: start}
+
+	maxStep := effectiveMaxStepMB(start, r.tuning) // per-file step ceiling, fixed for this file
+	step := InitialStepMB(start-final, start, r.tuning)
+	current := start
 	noProgress := 0
 	backoff := r.tuning.NoProgressBackoff
 	var stallWaited time.Duration
