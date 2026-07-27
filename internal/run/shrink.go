@@ -47,6 +47,7 @@ type ShrinkProgress struct {
 	ChunksRemaining   int // estimated chunks left (from the average chunk so far)
 	ETASeconds        int // estimated seconds left over the full elapsed time (with blocking)
 	ETASecondsNoBlock int // estimated seconds left over productive time only (without blocking)
+	AvgChunkSeconds   int // observed wall-clock cadence: elapsed per completed chunk (waits included)
 	BlockedSeconds    int // cumulative seconds spent blocked/stalled (unproductive)
 
 	// PercentComplete is SQL Server's own percent_complete for the running chunk statement
@@ -306,11 +307,11 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		// that is blocked or stalling still shows its live current size, chunk count, step,
 		// ETA and the exact chunk statement in the console instead of appearing frozen.
 		next := NextTargetMB(current, step, final)
-		chunksLeft, eta, etaNB := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
+		chunksLeft, eta, etaNB, avg := estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
 		prog := ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
-			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
+			ETASecondsNoBlock: etaNB, AvgChunkSeconds: avg, BlockedSeconds: int(blocked.Seconds()),
 			ChunkTargetMB: next, Statement: ddl.ShrinkChunkSQL(f.Name, next, res),
 		}
 		r.emitProgress(prog)
@@ -388,11 +389,11 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		result.Chunks++
 		result.FinalMB = current
 		nextT := NextTargetMB(current, step, final)
-		chunksLeft, eta, etaNB = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
+		chunksLeft, eta, etaNB, avg = estimateShrink(start, current, final, result.Chunks, r.clk.Since(shrinkStart), blocked)
 		r.emitProgress(ShrinkProgress{
 			File: f.Name, Type: "data", StartMB: start, CurrentMB: current, FinalMB: final,
 			StepMB: step, Chunks: result.Chunks, ChunksRemaining: chunksLeft, ETASeconds: eta,
-			ETASecondsNoBlock: etaNB, BlockedSeconds: int(blocked.Seconds()),
+			ETASecondsNoBlock: etaNB, AvgChunkSeconds: avg, BlockedSeconds: int(blocked.Seconds()),
 			ChunkTargetMB: nextT, Statement: ddl.ShrinkChunkSQL(f.Name, nextT, res),
 		})
 	}

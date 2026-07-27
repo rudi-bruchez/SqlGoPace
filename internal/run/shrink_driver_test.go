@@ -503,21 +503,22 @@ func TestShrinkLogFullTimesOutCleanly(t *testing.T) {
 func TestEstimateShrink(t *testing.T) {
 	// 400 MB reclaimed over 10 chunks in 100s, 600 MB left: avg 40 MB/chunk → 15 chunks,
 	// rate 4 MB/s → 150s with blocking. Of the 100s, 60s was blocked → 40s productive → 10
-	// MB/s → 60s without blocking.
-	if chunks, eta, etaNB := estimateShrink(1000, 600, 0, 10, 100*time.Second, 60*time.Second); chunks != 15 || eta != 150 || etaNB != 60 {
-		t.Errorf("estimateShrink = (%d chunks, %d s, %d s no-block), want (15, 150, 60)", chunks, eta, etaNB)
+	// MB/s → 60s without blocking. Wall-clock cadence: 100s / 10 chunks → 10s per chunk.
+	if chunks, eta, etaNB, avg := estimateShrink(1000, 600, 0, 10, 100*time.Second, 60*time.Second); chunks != 15 || eta != 150 || etaNB != 60 || avg != 10 {
+		t.Errorf("estimateShrink = (%d chunks, %d s, %d s no-block, %d s/chunk), want (15, 150, 60, 10)", chunks, eta, etaNB, avg)
 	}
 	// No blocking: the two ETAs coincide.
-	if _, eta, etaNB := estimateShrink(1000, 600, 0, 10, 100*time.Second, 0); eta != 150 || etaNB != 150 {
+	if _, eta, etaNB, _ := estimateShrink(1000, 600, 0, 10, 100*time.Second, 0); eta != 150 || etaNB != 150 {
 		t.Errorf("estimateShrink unblocked = (%d, %d), want both 150", eta, etaNB)
 	}
-	// No progress yet (nothing reclaimed): no estimate rather than a misleading one.
-	if chunks, eta, etaNB := estimateShrink(1000, 1000, 0, 0, 0, 0); chunks != 0 || eta != 0 || etaNB != 0 {
-		t.Errorf("estimateShrink with no progress = (%d, %d, %d), want (0, 0, 0)", chunks, eta, etaNB)
+	// No progress yet (no completed chunk): every projection, average included, is zero.
+	if chunks, eta, etaNB, avg := estimateShrink(1000, 1000, 0, 0, 0, 0); chunks != 0 || eta != 0 || etaNB != 0 || avg != 0 {
+		t.Errorf("estimateShrink with no progress = (%d, %d, %d, %d), want all 0", chunks, eta, etaNB, avg)
 	}
-	// Nothing left to reclaim: no estimate.
-	if chunks, eta, _ := estimateShrink(1000, 500, 500, 5, 50*time.Second, 0); chunks != 0 || eta != 0 {
-		t.Errorf("estimateShrink at target = (%d, %d), want (0, 0)", chunks, eta)
+	// Nothing left to reclaim: no ETA, but the average survives from the completed chunks
+	// (50s / 5 chunks → 10s/chunk) so the last frame still shows the cadence.
+	if chunks, eta, _, avg := estimateShrink(1000, 500, 500, 5, 50*time.Second, 0); chunks != 0 || eta != 0 || avg != 10 {
+		t.Errorf("estimateShrink at target = (%d, %d, %d s/chunk), want (0, 0, 10)", chunks, eta, avg)
 	}
 }
 

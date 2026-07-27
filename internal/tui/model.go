@@ -162,6 +162,7 @@ type (
 		ChunksRemaining   int     // estimated chunks left
 		ETASeconds        int     // estimated seconds left (with blocking)
 		ETASecondsNoBlock int     // estimated seconds left over productive time only
+		AvgChunkSeconds   int     // observed wall-clock cadence: elapsed per completed chunk
 		BlockedSeconds    int     // cumulative seconds spent blocked/stalled
 		ChunkTargetMB     int     // target size the current chunk shrinks to (0 in the TRUNCATEONLY phase)
 		Statement         string  // the literal T-SQL in flight (TRUNCATEONLY, then each DBCC SHRINKFILE chunk)

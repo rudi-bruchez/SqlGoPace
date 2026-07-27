@@ -24,6 +24,51 @@ func TestFormatElapsed(t *testing.T) {
 	}
 }
 
+func TestHelpBodyGatesShortcutsOnState(t *testing.T) {
+	blockerKeys := []string{"[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill", "[X] kill+auto"}
+
+	// No blockers and no suspension history: only the always-valid keys, none of the
+	// blocker keys and no [b] blockers.
+	idle := Model{}.helpBody()
+	for _, k := range blockerKeys {
+		if strings.Contains(idle, k) {
+			t.Errorf("idle footer advertises no-op %q:\n%s", k, idle)
+		}
+	}
+	if strings.Contains(idle, "[b] blockers") {
+		t.Errorf("idle footer shows [b] blockers with no history:\n%s", idle)
+	}
+	for _, k := range []string{"[k] kill DDL", "[d] drain", "[?] help", "[q] quit"} {
+		if !strings.Contains(idle, k) {
+			t.Errorf("idle footer missing always-valid key %q:\n%s", k, idle)
+		}
+	}
+
+	// A live blocker brings back the blocker keys.
+	blocked := Model{blockers: []Blocker{{SPID: 51}}}.helpBody()
+	for _, k := range blockerKeys {
+		if !strings.Contains(blocked, k) {
+			t.Errorf("blocked footer missing %q:\n%s", k, blocked)
+		}
+	}
+
+	// Suspension history (but nothing blocking right now) enables [b] but not the
+	// per-session action keys.
+	history := Model{suspension: SuspensionMsg{Blockers: []SuspensionBlocker{{Login: "SVC_RPT"}}}}.helpBody()
+	if !strings.Contains(history, "[b] blockers") {
+		t.Errorf("footer with suspension history missing [b] blockers:\n%s", history)
+	}
+	if strings.Contains(history, "[x] kill") {
+		t.Errorf("footer with no live blocker still shows [x] kill:\n%s", history)
+	}
+
+	// Draining flips [d] to a resume affordance.
+	draining := Model{status: StatusDraining}.helpBody()
+	if !strings.Contains(draining, "[d] resume") || strings.Contains(draining, "[d] drain") {
+		t.Errorf("draining footer should offer [d] resume, not [d] drain:\n%s", draining)
+	}
+}
+
 func TestHumanizeMS(t *testing.T) {
 	const h = int64(3_600_000)
 	tests := []struct {

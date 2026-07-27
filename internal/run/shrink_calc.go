@@ -9,15 +9,20 @@ import (
 // chunksRemaining scales the remaining MB by the average MB per completed chunk; etaSeconds
 // scales the remaining MB by the achieved reduction rate over the full elapsed time (the
 // honest "with blocking" figure); etaNoBlockSeconds does the same over productive time only
-// (elapsed minus blocked), the rate the shrink would sustain if it were never starved. All
-// are zero until there is signal (a completed chunk, some elapsed time, and MB still to
-// reclaim), so a just-started or finished shrink reports no estimate rather than a
-// misleading one.
-func estimateShrink(start, current, final, chunksDone int, elapsed, blocked time.Duration) (chunksRemaining, etaSeconds, etaNoBlockSeconds int) {
+// (elapsed minus blocked), the rate the shrink would sustain if it were never starved;
+// avgChunkSeconds is the observed wall-clock cadence, elapsed per completed chunk (waits
+// included, matching etaSeconds). The three projections are zero until there is signal (a
+// completed chunk, some elapsed time, and MB still to reclaim), so a just-started or finished
+// shrink reports no estimate rather than a misleading one; avgChunkSeconds needs only a
+// completed chunk, so it survives to the last frame when the ETA has already vanished.
+func estimateShrink(start, current, final, chunksDone int, elapsed, blocked time.Duration) (chunksRemaining, etaSeconds, etaNoBlockSeconds, avgChunkSeconds int) {
 	doneMB := start - current
 	remainingMB := current - final
+	if chunksDone > 0 && elapsed > 0 {
+		avgChunkSeconds = int(math.Round(elapsed.Seconds() / float64(chunksDone)))
+	}
 	if doneMB <= 0 || remainingMB <= 0 {
-		return 0, 0, 0
+		return 0, 0, 0, avgChunkSeconds
 	}
 	if chunksDone > 0 {
 		chunksRemaining = int(math.Ceil(float64(remainingMB) / (float64(doneMB) / float64(chunksDone))))
@@ -27,7 +32,7 @@ func estimateShrink(start, current, final, chunksDone int, elapsed, blocked time
 	if etaNoBlockSeconds == 0 {
 		etaNoBlockSeconds = etaSeconds // no measurable productive time yet: fall back
 	}
-	return chunksRemaining, etaSeconds, etaNoBlockSeconds
+	return chunksRemaining, etaSeconds, etaNoBlockSeconds, avgChunkSeconds
 }
 
 // etaFrom scales remainingMB by the doneMB-per-window reduction rate. A non-positive window
