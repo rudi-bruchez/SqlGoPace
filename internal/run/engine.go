@@ -158,7 +158,7 @@ type Engine struct {
 	adr              bool
 	clk              Clock
 	session          SessionInfo
-	notifier         *report.Notifier
+	notifiers        []Notifier
 	history          *report.History
 	expander         IndexExpander
 	progress         ProgressReader
@@ -190,6 +190,13 @@ const defaultHoldPoll = 30 * time.Second
 // EngineOption configures optional Engine behavior.
 type EngineOption func(*Engine)
 
+// Notifier delivers a run event to an external channel. Both *report.Notifier
+// (webhook) and *report.EmailNotifier (email) satisfy it; the engine fans out to
+// every wired notifier.
+type Notifier interface {
+	Notify(ctx context.Context, event string, payload map[string]any) error
+}
+
 // WithADR sets the target's Accelerated Database Recovery state (biases reactions).
 func WithADR(adr bool) EngineOption { return func(e *Engine) { e.adr = adr } }
 
@@ -219,8 +226,11 @@ func WithClock(c Clock) EngineOption { return func(e *Engine) { e.clk = c } }
 // WithSession enables crash-recovery sidecars from the execution session.
 func WithSession(s SessionInfo) EngineOption { return func(e *Engine) { e.session = s } }
 
-// WithNotifier enables webhook notifications.
-func WithNotifier(n *report.Notifier) EngineOption { return func(e *Engine) { e.notifier = n } }
+// WithNotifier adds a notification channel (webhook or email). May be called once
+// per channel; all wired notifiers receive every enabled event.
+func WithNotifier(n Notifier) EngineOption {
+	return func(e *Engine) { e.notifiers = append(e.notifiers, n) }
+}
 
 // WithHistory enables run-history persistence.
 func WithHistory(h *report.History) EngineOption { return func(e *Engine) { e.history = h } }
@@ -1200,11 +1210,11 @@ func (e *Engine) now() string               { return e.clk.Now().UTC().Format(ti
 func (e *Engine) msSince(t time.Time) int64 { return e.clk.Since(t).Milliseconds() }
 
 func (e *Engine) notify(ctx context.Context, event, name, detail string) {
-	if e.notifier == nil {
-		return
-	}
-	if err := e.notifier.Notify(ctx, event, map[string]any{"manifest": name, "detail": detail}); err != nil {
-		fmt.Fprintf(e.out, "notify %s: %v\n", name, err)
+	payload := map[string]any{"manifest": name, "detail": detail}
+	for _, n := range e.notifiers {
+		if err := n.Notify(ctx, event, payload); err != nil {
+			fmt.Fprintf(e.out, "notify %s: %v\n", name, err)
+		}
 	}
 }
 

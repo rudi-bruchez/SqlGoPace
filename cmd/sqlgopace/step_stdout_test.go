@@ -89,11 +89,12 @@ func TestBatchMsgMapsProgress(t *testing.T) {
 func TestShrinkMsgMapsProgress(t *testing.T) {
 	msg := shrinkMsg(run.ShrinkProgress{
 		File: "DataFile", Type: "data", StartMB: 8_388_608, CurrentMB: 6_000_000, FinalMB: 900_000,
-		StepMB: 512, Chunks: 10, ChunksRemaining: 20, ETASeconds: 300,
+		StepMB: 512, Chunks: 10, ChunksRemaining: 20, ETASeconds: 300, AvgChunkSeconds: 30,
 	})
 	if msg.File != "DataFile" || msg.Type != "data" || msg.StartMB != 8_388_608 || msg.CurrentMB != 6_000_000 ||
-		msg.FinalMB != 900_000 || msg.StepMB != 512 || msg.Chunks != 10 || msg.ChunksRemaining != 20 || msg.ETASeconds != 300 {
-		t.Errorf("shrinkMsg = %+v, want the fields mapped through including chunks/ETA", msg)
+		msg.FinalMB != 900_000 || msg.StepMB != 512 || msg.Chunks != 10 || msg.ChunksRemaining != 20 ||
+		msg.ETASeconds != 300 || msg.AvgChunkSeconds != 30 {
+		t.Errorf("shrinkMsg = %+v, want the fields mapped through including chunks/ETA/avg", msg)
 	}
 	// Percent is (start-current)/(start-final) = 2388608 / 7488608 ≈ 0.319.
 	if got := msg.Percent; got < 0.31 || got > 0.33 {

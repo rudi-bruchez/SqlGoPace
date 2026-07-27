@@ -361,11 +361,13 @@ func TestModelShowsShrinkProgress(t *testing.T) {
 	m, _ = send(m, tui.ShrinkMsg{
 		File: "DataFile", Type: "data", CurrentMB: 6_000_000, StartMB: 8_388_608, FinalMB: 900_000,
 		StepMB: 512, Percent: 0.32, Chunks: 128, ChunksRemaining: 140, ETASeconds: 2832,
+		AvgChunkSeconds: 12,
 	})
 	v := m.View()
-	// Sizes are humanized to GB/TB; chunk count, estimate and ETA appear on the detail line.
+	// Sizes are humanized to GB/TB; chunk count, average cadence, estimate and ETA appear on
+	// the detail line.
 	for _, want := range []string{"shrink DataFile (data)", "5.72 TB", "878.9 GB target", "32%",
-		"step 512 MB", "chunk 128 done", "~140 left", "ETA 47m12s"} {
+		"step 512 MB", "chunk 128 done", "avg 12.0s/chunk", "~140 left", "ETA 47m12s"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("View() missing %q:\n%s", want, v)
 		}

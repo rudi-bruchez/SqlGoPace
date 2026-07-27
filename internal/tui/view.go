@@ -294,6 +294,9 @@ func (m Model) shrinkLines() string {
 		sh.File, sh.Type, HumanizeMB(sh.CurrentMB), HumanizeMB(sh.FinalMB), HumanizeMB(sh.StartMB),
 		sh.Percent*100, HumanizeMB(sh.StepMB))
 	fmt.Fprintf(&b, "  chunk %d done", sh.Chunks)
+	if sh.AvgChunkSeconds > 0 {
+		fmt.Fprintf(&b, " · avg %s/chunk", humanizeMS(int64(sh.AvgChunkSeconds)*1000))
+	}
 	if sh.ChunksRemaining > 0 {
 		fmt.Fprintf(&b, " · ~%d left", sh.ChunksRemaining)
 	}
@@ -406,6 +409,9 @@ func (m Model) waitsBody() string {
 }
 
 // helpBody is the footer: the normal shortcut line, or the active criterion sub-prompt.
+// The normal line lists only shortcuts that do something in the current state — the
+// blocker keys appear only when a session is actually blocked, [b] only when there is
+// suspension history to review — so the footer never advertises a no-op.
 func (m Model) helpBody() string {
 	if m.inCriterionMode() && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
@@ -416,7 +422,21 @@ func (m Model) helpBody() string {
 		return fmt.Sprintf("%s SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
 			verb, bl.SPID, bl.Program, bl.Login, bl.Host)
 	}
-	return helpStyle.Render("[↑/↓] select  [enter] sql  [i] ignore  [x] kill  [X] kill+auto  [b] blockers  [k] kill DDL  [d] drain  [?] help  [q] quit")
+	var keys []string
+	if len(m.blockers) > 0 {
+		keys = append(keys, "[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill", "[X] kill+auto")
+	}
+	if len(m.suspension.Blockers) > 0 {
+		keys = append(keys, "[b] blockers")
+	}
+	keys = append(keys, "[k] kill DDL")
+	if m.status == StatusDraining {
+		keys = append(keys, "[d] resume")
+	} else {
+		keys = append(keys, "[d] drain")
+	}
+	keys = append(keys, "[?] help", "[q] quit")
+	return helpStyle.Render(strings.Join(keys, "  "))
 }
 
 // opStatusStyled renders a bracketed, color-coded operation status label.

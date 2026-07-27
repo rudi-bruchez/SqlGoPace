@@ -207,6 +207,56 @@ func TestShrinkConfigRejectsMinAboveMax(t *testing.T) {
 	}
 }
 
+// yamlWithoutNotifications strips validYAML's existing notifications: block so a
+// test can append its own without producing a duplicate top-level key.
+func yamlWithoutNotifications(t *testing.T) string {
+	t.Helper()
+	const block = "notifications:\n  webhook_url: \"\"\n  on_events: [fail]\n"
+	stripped := strings.Replace(validYAML, block, "", 1)
+	if stripped == validYAML {
+		t.Fatal("yamlWithoutNotifications: notifications block not found in validYAML")
+	}
+	return stripped
+}
+
+func TestEmailConfigParsesAndDefaultsPort(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+	t.Setenv("SMTP_PASS", "s3cret")
+	yaml := yamlWithoutNotifications(t) + "notifications:\n" +
+		"  on_events: [fail, incomplete]\n" +
+		"  email:\n" +
+		"    host: smtp.internal\n" +
+		"    from: sqlgopace@example.com\n" +
+		"    to: [dba@example.com]\n" +
+		"    password: \"${SMTP_PASS}\"\n"
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	e := cfg.Notifications.Email
+	if e.Host != "smtp.internal" || e.Port != 25 || e.From != "sqlgopace@example.com" ||
+		len(e.To) != 1 || e.To[0] != "dba@example.com" || e.Password != "s3cret" {
+		t.Errorf("email config = %+v, want host/port(25 default)/from/to/expanded password", e)
+	}
+}
+
+func TestEmailConfigRequiresFromAndTo(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+	yaml := yamlWithoutNotifications(t) + "notifications:\n  email:\n    host: smtp.internal\n"
+	if _, err := config.Parse([]byte(yaml)); err == nil {
+		t.Fatal("Parse() want error when email.host set without from/to")
+	}
+}
+
+func TestEmailConfigRequiresPasswordWhenUsername(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+	yaml := yamlWithoutNotifications(t) + "notifications:\n  email:\n" +
+		"    host: smtp.internal\n    from: a@x\n    to: [b@y]\n    username: u\n"
+	if _, err := config.Parse([]byte(yaml)); err == nil {
+		t.Fatal("Parse() want error when username set without password")
+	}
+}
+
 func TestLoadShippedConfig(t *testing.T) {
 	t.Setenv("DB_SERVER", "localhost")
 	t.Setenv("DB_NAME", "testdb")

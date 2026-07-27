@@ -407,9 +407,9 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		if p.PercentComplete > 0 {
 			server = fmt.Sprintf(", server %.0f%%", p.PercentComplete)
 		}
-		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (~%d left, ETA %ds, %ds unblocked, blocked %ds%s)\n",
+		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (avg %ds/chunk, ~%d left, ETA %ds, %ds unblocked, blocked %ds%s)\n",
 			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB),
-			p.Chunks, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds, server)
+			p.Chunks, p.AvgChunkSeconds, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds, server)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)
@@ -462,9 +462,17 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	if fwd != nil {
 		opts = append(opts, run.WithOpListSink(fwd.ops)) // operations panel (TUI only)
 	}
-	if cfg.Notifications.WebhookURL != "" {
-		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
-	}
+	opts = append(opts,
+		run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)),
+		run.WithNotifier(report.NewEmailNotifier(report.EmailConfig{
+			Host:     cfg.Notifications.Email.Host,
+			Port:     cfg.Notifications.Email.Port,
+			From:     cfg.Notifications.Email.From,
+			To:       cfg.Notifications.Email.To,
+			Username: cfg.Notifications.Email.Username,
+			Password: cfg.Notifications.Email.Password,
+			StartTLS: cfg.Notifications.Email.StartTLS,
+		}, cfg.Notifications.OnEvents)))
 	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
@@ -931,7 +939,7 @@ func shrinkMsg(p run.ShrinkProgress) tui.ShrinkMsg {
 		File: p.File, Type: p.Type, CurrentMB: p.CurrentMB, StartMB: p.StartMB,
 		FinalMB: p.FinalMB, StepMB: p.StepMB, Percent: p.Percent(),
 		Chunks: p.Chunks, ChunksRemaining: p.ChunksRemaining, ETASeconds: p.ETASeconds,
-		ETASecondsNoBlock: p.ETASecondsNoBlock, BlockedSeconds: p.BlockedSeconds,
+		ETASecondsNoBlock: p.ETASecondsNoBlock, AvgChunkSeconds: p.AvgChunkSeconds, BlockedSeconds: p.BlockedSeconds,
 		ChunkTargetMB: p.ChunkTargetMB, Statement: p.Statement, PercentComplete: p.PercentComplete,
 	}
 }

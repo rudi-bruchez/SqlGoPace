@@ -157,7 +157,7 @@ Key `config.yaml` sections:
 | `monitoring`       | Poll intervals, log size/percent ceilings, blocking timeout, kill grace, retries. |
 | `preflight`        | Data free-space, tempdb, and Availability Group send-queue checks.      |
 | `options_override` | Force `online` / `resumable` / `wait_at_low_priority` / `maxdop` / `sort_in_tempdb` on/off/auto, globally. |
-| `notifications`    | Optional webhook URL and the events that trigger it.                    |
+| `notifications`    | Optional webhook URL and email channel, and the events that trigger them. |
 | `history`          | Optional SQLite run history.                                            |
 | `shrink`           | Tuning for the `shrink` driver (chunk sizes, batch target, no-progress/self-wait/log-reuse timeouts). Optional — every field defaults. |
 | `matrix_file`      | Path to the DDL compatibility matrix (resolved relative to the config). |
@@ -180,6 +180,31 @@ shrink:
   no_progress_backoff_max_seconds: 300   # backoff ceiling
   self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
   log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
+```
+
+### Notifications
+
+`notifications` fires a webhook and/or an email for the events in `on_events`: `fail` (hard
+error), `incomplete` (a shrink stopped short of target, work preserved), `interrupted`
+(Ctrl+C/drain), and the reaction events `pause` / `cancel` / `abort`.
+
+The `email` sub-block adds an SMTP channel that shares the same `on_events` filter as the
+webhook. It is disabled when `host` is empty; `port` defaults to `25`; `username` empty means
+an anonymous relay (no auth); `password` is only used when `username` is set and comes from
+`${VAR}` like every other secret.
+
+```yaml
+notifications:
+  webhook_url: ""
+  on_events: [fail, incomplete, interrupted]
+  email:
+    host: "smtp.internal.example"   # empty → email disabled
+    port: 25                         # default 25
+    from: "sqlgopace@example.com"
+    to: ["dba-team@example.com"]
+    username: ""                     # empty → anonymous relay (no auth)
+    password: "${SMTP_PASS}"         # from .env; only used when username is set
+    starttls: false                  # opportunistic STARTTLS before auth
 ```
 
 ## Manifest format
