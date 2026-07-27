@@ -462,9 +462,17 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	if fwd != nil {
 		opts = append(opts, run.WithOpListSink(fwd.ops)) // operations panel (TUI only)
 	}
-	if cfg.Notifications.WebhookURL != "" {
-		opts = append(opts, run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)))
-	}
+	opts = append(opts,
+		run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)),
+		run.WithNotifier(report.NewEmailNotifier(report.EmailConfig{
+			Host:     cfg.Notifications.Email.Host,
+			Port:     cfg.Notifications.Email.Port,
+			From:     cfg.Notifications.Email.From,
+			To:       cfg.Notifications.Email.To,
+			Username: cfg.Notifications.Email.Username,
+			Password: cfg.Notifications.Email.Password,
+			StartTLS: cfg.Notifications.Email.StartTLS,
+		}, cfg.Notifications.OnEvents)))
 	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
