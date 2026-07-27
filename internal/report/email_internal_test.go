@@ -177,3 +177,38 @@ func TestSMTPSendPlaintext(t *testing.T) {
 		t.Errorf("body = %q, want to contain 'hello world'", got.body)
 	}
 }
+
+func TestSMTPSendHonorsCtxCancel(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, "220 stalling\r\n")
+		select {} // never respond to EHLO -> client blocks on read until the conn is closed
+	}()
+	host, portStr, _ := net.SplitHostPort(ln.Addr().String())
+	port, _ := strconv.Atoi(portStr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- smtpSend(ctx, EmailConfig{Host: host, Port: port, From: "a@x", To: []string{"b@y"}}, []byte("x"))
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("want error after ctx cancel, got nil")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("smtpSend did not return after ctx cancel — ctx not honored past dial")
+	}
+}

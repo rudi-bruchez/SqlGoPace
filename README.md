@@ -186,7 +186,7 @@ shrink:
 
 `notifications` fires a webhook and/or an email for the events in `on_events`: `fail` (hard
 error), `incomplete` (a shrink stopped short of target, work preserved), `interrupted`
-(Ctrl+C/drain), and the reaction events `pause` / `resume` / `kill` / `abort`.
+(Ctrl+C/drain), and the reaction events `pause` / `cancel` / `abort`.
 
 The `email` sub-block adds an SMTP channel that shares the same `on_events` filter as the
 webhook. It is disabled when `host` is empty; `port` defaults to `25`; `username` empty means

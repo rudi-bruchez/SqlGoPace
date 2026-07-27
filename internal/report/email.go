@@ -90,8 +90,11 @@ func (n *EmailNotifier) Notify(ctx context.Context, event string, payload map[st
 }
 
 // smtpSend performs the SMTP conversation for one message: dial (bounded by a
-// 10s timeout and honoring ctx during connect), optional STARTTLS, optional PLAIN
-// auth, then MAIL/RCPT/DATA/QUIT. It is the production default for EmailNotifier.send.
+// 10s timeout and honoring ctx during connect), then the whole post-connect
+// conversation (optional STARTTLS, optional PLAIN auth, MAIL/RCPT/DATA/QUIT) is
+// bounded by a deadline on the connection plus a watcher that closes it on ctx
+// cancellation, so a relay that stalls after connect cannot hang the run. It is
+// the production default for EmailNotifier.send.
 func smtpSend(ctx context.Context, cfg EmailConfig, msg []byte) error {
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	d := net.Dialer{Timeout: 10 * time.Second}
@@ -99,6 +102,21 @@ func smtpSend(ctx context.Context, cfg EmailConfig, msg []byte) error {
 	if err != nil {
 		return fmt.Errorf("smtp dial %s: %w", addr, err)
 	}
+	// Bound the whole conversation, not just the dial: a relay that stalls after
+	// connect must not hang the run. A watcher closes the connection on ctx
+	// cancellation (Ctrl+C / run teardown), unblocking any in-flight I/O; an
+	// absolute deadline is the backstop when ctx carries none.
+	deadline := time.Now().Add(30 * time.Second)
+	if dl, ok := ctx.Deadline(); ok && dl.Before(deadline) {
+		deadline = dl
+	}
+	_ = conn.SetDeadline(deadline)
+	watchCtx, cancelWatch := context.WithCancel(ctx)
+	defer cancelWatch()
+	go func() {
+		<-watchCtx.Done()
+		_ = conn.Close()
+	}()
 	c, err := smtp.NewClient(conn, cfg.Host)
 	if err != nil {
 		return fmt.Errorf("smtp client: %w", err)
