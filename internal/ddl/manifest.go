@@ -410,6 +410,8 @@ func decodeOperation(node *yaml.Node) (Operation, error) {
 		return decodeInto[DropConstraint](node)
 	case "shrink":
 		return decodeInto[Shrink](node)
+	case "shrink_tempdb":
+		return decodeInto[ShrinkTempdb](node)
 	case "batch_update":
 		return decodeBatchDML(node, "update")
 	case "batch_delete":
@@ -919,6 +921,26 @@ func (o Shrink) Validate() error {
 	}
 	if _, err := ParseTargetFreeSpace(o.TargetFreeSpace); err != nil {
 		return fmt.Errorf("shrink: %w", err)
+	}
+	return nil
+}
+
+// ShrinkTempdb shrinks every tempdb data file to a common absolute size. It is a
+// dedicated operation (not a Shrink variant): tempdb is always database_id 2, has
+// no schema.table target, and the runtime driver adds tempdb-specific escalation
+// (see specs/TEMPDB-SHRINK.md). Like check_db it is database-scoped.
+type ShrinkTempdb struct {
+	TargetSizeMB int             `yaml:"targetsizemb"`          // common absolute target per data file, MB
+	FlushCaches  bool            `yaml:"flushcaches,omitempty"` // opt-in cache-flush escalation on persistent stall
+	Options      OptionOverrides `yaml:"options"`               // only WaitAtLowPriority is relevant
+}
+
+func (o ShrinkTempdb) CommandType() string { return "shrink_tempdb" }
+func (o ShrinkTempdb) Target() ObjectRef   { return ObjectRef{Database: "tempdb"} }
+
+func (o ShrinkTempdb) Validate() error {
+	if o.TargetSizeMB <= 0 {
+		return fmt.Errorf("shrink_tempdb: targetsizemb must be > 0, got %d: %w", o.TargetSizeMB, ErrInvalidManifest)
 	}
 	return nil
 }
