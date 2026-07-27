@@ -242,10 +242,24 @@ func (b *BatchDMLConfig) applyDefaults() {
 	setIf(&b.SelfWaitTimeoutMinutes, 5)
 }
 
-// NotificationsConfig holds webhook settings.
+// NotificationsConfig holds webhook and email settings.
 type NotificationsConfig struct {
-	WebhookURL string   `yaml:"webhook_url"`
-	OnEvents   []string `yaml:"on_events"`
+	WebhookURL string      `yaml:"webhook_url"`
+	OnEvents   []string    `yaml:"on_events"`
+	Email      EmailConfig `yaml:"email"`
+}
+
+// EmailConfig holds SMTP delivery settings. An empty Host disables the email
+// channel (no-op). Port defaults to 25. Username/Password are optional (empty =
+// anonymous relay); Password is injected from ${VAR} like every other secret.
+type EmailConfig struct {
+	Host     string   `yaml:"host"`
+	Port     int      `yaml:"port"`
+	From     string   `yaml:"from"`
+	To       []string `yaml:"to"`
+	Username string   `yaml:"username"`
+	Password string   `yaml:"password"`
+	StartTLS bool     `yaml:"starttls"`
 }
 
 // HistoryConfig holds run-history persistence settings.
@@ -320,6 +334,9 @@ func (c *Config) applyDefaults() {
 	}
 	c.Shrink.applyDefaults()
 	c.BatchDML.applyDefaults()
+	if c.Notifications.Email.Host != "" && c.Notifications.Email.Port <= 0 {
+		c.Notifications.Email.Port = 25
+	}
 }
 
 // applyDefaults fills any unset (zero or negative) shrink field with its default,
@@ -394,6 +411,14 @@ func (c *Config) validate() error {
 	if c.BatchDML.MinRows > c.BatchDML.MaxRows {
 		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",
 			c.BatchDML.MinRows, c.BatchDML.MaxRows, ErrInvalidConfig)
+	}
+	if e := c.Notifications.Email; e.Host != "" {
+		if strings.TrimSpace(e.From) == "" || len(e.To) == 0 {
+			return fmt.Errorf("notifications.email.from and at least one to are required when host is set: %w", ErrInvalidConfig)
+		}
+		if e.Username != "" && e.Password == "" {
+			return fmt.Errorf("notifications.email.password is required when username is set: %w", ErrInvalidConfig)
+		}
 	}
 	return nil
 }
