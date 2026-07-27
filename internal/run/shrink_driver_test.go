@@ -29,6 +29,11 @@ type fakeServer struct {
 	blockTruncate bool // model a long-running TRUNCATEONLY: block until the context is canceled
 	allocError    bool // every page-moving chunk returns Msg 5240 (could not adjust allocation)
 
+	// chunkErrs scripts transient chunk errors (e.g. Msg 845): each page-moving chunk exec
+	// pops and returns the front error instead of its normal behavior, until the queue is
+	// empty, then chunks proceed normally. Mirrors the reuse queue below.
+	chunkErrs []error
+
 	recovery string   // recovery_model_desc for LogReuse
 	reuse    []string // log_reuse_wait_desc returned per LogReuse call (last value repeats)
 
@@ -62,6 +67,11 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	case strings.Contains(sql, "CHECKPOINT"):
 		// no size change
 	case strings.Contains(sql, "DBCC SHRINKFILE"):
+		if len(s.chunkErrs) > 0 {
+			err := s.chunkErrs[0]
+			s.chunkErrs = s.chunkErrs[1:]
+			return err
+		}
 		if s.allocError {
 			return mssqldb.Error{Number: 5240, Message: "Could not adjust the space allocation for file 'Data'."}
 		}
@@ -533,5 +543,76 @@ func TestShrinkStepAdjustsUnderIOPressure(t *testing.T) {
 	}
 	if got := AdjustStepMB(400, time.Second, d, testTuning(), testTuning().MaxStepMB); got != 200 {
 		t.Errorf("AdjustStepMB under WRITELOG pressure = %d, want 200", got)
+	}
+}
+
+// TestTempdbFlushesOnceOnPersistentStall drives chunkLoop directly with a file that never
+// gains space (fakeServer.noProgress), so the stall ladder engages every chunk. With
+// NoProgressBeforeFlush reached before MaxNoProgress, the tempdb cache flush must fire
+// exactly once, and the once-per-run guard must be set so a later stall never repeats it.
+func TestTempdbFlushesOnceOnPersistentStall(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "tempdev",
+		sizeMB: 1000, usedMB: 500, floorMB: 1000, noProgress: true, // chunks never shrink
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+	r.tuning.NoProgressBeforeFlush = 2 // reached well before testTuning's MaxNoProgress (3)
+
+	flushed := false
+	prof := &TempdbProfile{FlushCaches: true, flushed: &flushed}
+
+	f := mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 500}
+	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof)
+	if err != nil {
+		t.Fatalf("chunkLoop() error = %v", err)
+	}
+	if res.Reason == "" {
+		t.Errorf("got Reason = %q, want a stop reason (persistent stall)", res.Reason)
+	}
+
+	var flushCount int
+	for _, stmt := range s.execLog {
+		if strings.Contains(stmt, "FREESYSTEMCACHE ('Temporary Tables & Table Variables')") {
+			flushCount++
+		}
+	}
+	if flushCount != 1 {
+		t.Errorf("flush ran %d times, want exactly 1; exec log = %v", flushCount, s.execLog)
+	}
+	if !flushed {
+		t.Errorf("flushed guard not set")
+	}
+}
+
+// TestTempdb845RetriesWithoutFailing scripts a single Msg 845 (buffer latch time-out) on
+// the first chunk, then lets subsequent chunks succeed normally. The chunk loop must treat
+// it as a non-fatal, retryable no-progress event (same path as Msg 5240) and still converge
+// to the target — with FlushCaches false, proving 845 alone never triggers the flush.
+func TestTempdb845RetriesWithoutFailing(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "tempdev",
+		sizeMB: 1000, usedMB: 500, floorMB: 500,
+		chunkErrs: []error{mssqldb.Error{Number: 845, Message: "Time-out occurred while waiting for buffer latch"}},
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+	prof := &TempdbProfile{flushed: new(bool)} // FlushCaches false: 845 alone must not flush
+
+	f := mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 500}
+	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof)
+	if err != nil {
+		t.Fatalf("845 must not be fatal, got err = %v", err)
+	}
+	if res.FinalMB != 500 {
+		t.Errorf("FinalMB = %d, want 500 (converged after retrying past the 845)", res.FinalMB)
+	}
+	if res.Chunks == 0 {
+		t.Errorf("Chunks = 0, want > 0 (progress made after the 845 retry)")
+	}
+	for _, stmt := range s.execLog {
+		if strings.Contains(stmt, "FREESYSTEMCACHE") {
+			t.Errorf("flush must not run when FlushCaches is false; exec log = %v", s.execLog)
+		}
 	}
 }

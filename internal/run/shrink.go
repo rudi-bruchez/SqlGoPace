@@ -74,7 +74,9 @@ func (p ShrinkProgress) Percent() float64 {
 }
 
 // TempdbProfile carries the tempdb-shrink-specific knobs into the shared chunk loop.
-// Nil for a normal (non-tempdb) shrink. Fields are added in the flush-escalation task.
+// Nil for a normal (non-tempdb) shrink. When FlushCaches is set, stall escalates a
+// persistent no-progress run (Msg 5240 / Msg 845 / real no-gain) into one targeted
+// temp-object cache flush, guarded by flushed so it never runs more than once per run.
 type TempdbProfile struct {
 	FlushCaches bool
 	flushed     *bool // once-per-run guard, shared across a RunTempdb's files
@@ -297,7 +299,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 
 // chunkLoop runs the page-moving chunk loop for one already-truncated file, from start
 // down to final MB. It is shared by shrinkData (prof == nil, a normal shrink) and
-// RunTempdb (prof carries tempdb-specific escalation knobs, currently unused).
+// RunTempdb (prof carries tempdb-specific escalation knobs — see stall).
 func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, final int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, prof *TempdbProfile) (ShrinkResult, error) {
 	result := ShrinkResult{File: f.Name, Type: "data", InitialMB: f.SizeMB, TargetMB: final, FinalMB: start}
 
@@ -335,15 +337,16 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		t0 := r.clk.Now()
 		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog)
 		if err != nil {
-			// Msg 5240: the file can't be adjusted to this target right now (pages pinned at
-			// the file end, or concurrent allocation). Not a failure — try a smaller move and
-			// treat it as no-progress, so a persistent stall stops cleanly with work preserved.
-			if !mssql.IsFileAllocationError(err) {
+			// Msg 5240 (could not adjust the file's space allocation) or Msg 845 (buffer latch
+			// time-out, tempdb under severe contention): neither is a failure — try a smaller
+			// move and treat it as no-progress, so a persistent stall stops cleanly with work
+			// preserved (or, on the tempdb path, escalates to a cache flush).
+			if !mssql.IsFileAllocationError(err) && !mssql.IsBufferLatchTimeout(err) {
 				return result, err
 			}
 			step = clampStep(step/2, r.tuning.MinStepMB, maxStep)
 			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
-			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink); werr != nil {
+			if stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof); werr != nil {
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
@@ -383,7 +386,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			// cleanly at whichever bound trips first — count or total wait time.
 			blocked += elapsed // the chunk ran but moved nothing (WALP timeout / blocked)
 			s0 := r.clk.Now()
-			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink)
+			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			blocked += r.clk.Since(s0)
 			if werr != nil {
 				return result, werr
@@ -627,13 +630,26 @@ func (r *ShrinkRunner) pumpChunkProgress(ctx context.Context, base ShrinkProgres
 	}
 }
 
-// stall records a no-progress chunk (a real no-gain, or a Msg 5240 that could not adjust
-// the file) and decides whether to give up. It returns stop=true once the no-progress
-// count or the total self-wait budget trips, so the caller ends the shrink cleanly with
-// the reduction so far preserved; otherwise it backs off (doubling each time) and returns
-// stop=false so the caller retries. The pointers are the loop's running counters.
-func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink) (stop bool, err error) {
+// stall records a no-progress chunk (a real no-gain, a Msg 5240 that could not adjust the
+// file, or a Msg 845 buffer latch time-out) and decides whether to give up. On the tempdb
+// path (prof != nil && prof.FlushCaches), once the stall persists to NoProgressBeforeFlush
+// it flushes the temp-object cache exactly once (the flushed guard) and gives the loop a
+// fresh no-progress budget rather than counting straight through to a give-up. Otherwise it
+// returns stop=true once the no-progress count or the total self-wait budget trips, so the
+// caller ends the shrink cleanly with the reduction so far preserved; otherwise it backs off
+// (doubling each time) and returns stop=false so the caller retries. The pointers are the
+// loop's running counters.
+func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink, prof *TempdbProfile) (stop bool, err error) {
 	*noProgress++
+	// Tempdb escalation: once, when the stall is persistent and flushing is enabled.
+	if prof != nil && prof.FlushCaches && prof.flushed != nil && !*prof.flushed && *noProgress >= r.tuning.NoProgressBeforeFlush {
+		if ferr := r.flushTempdbCaches(ctx, sink); ferr != nil {
+			return false, ferr
+		}
+		*prof.flushed = true
+		*noProgress = 0 // give the freed pages a fresh budget
+		return false, nil
+	}
 	if *noProgress >= r.tuning.MaxNoProgress || *stallWaited >= r.tuning.SelfWaitTimeout {
 		return true, nil
 	}
@@ -644,6 +660,15 @@ func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, 
 	*stallWaited += *backoff
 	*backoff = nextBackoff(*backoff, r.tuning.NoProgressBackoffMax)
 	return false, nil
+}
+
+// flushTempdbCaches releases the temp-object cachestore that pins tempdb pages, preceded
+// by a CHECKPOINT. Targeted, not instance-wide: it deliberately avoids FREEPROCCACHE /
+// FREESYSTEMCACHE('ALL') (whole-plan-cache recompile storm) and DROPCLEANBUFFERS
+// (buffer-pool wipe). Runs on the tempdb-scoped exec connection.
+func (r *ShrinkRunner) flushTempdbCaches(ctx context.Context, sink ReactionSink) error {
+	sink(ReactionEvent{Kind: "pause", Detail: "tempdb stall: flushing temp-object cache (CHECKPOINT + FREESYSTEMCACHE)"})
+	return r.exec.ExecDDL(ctx, "CHECKPOINT;\nDBCC FREESYSTEMCACHE ('Temporary Tables & Table Variables') WITH NO_INFOMSGS;")
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait
