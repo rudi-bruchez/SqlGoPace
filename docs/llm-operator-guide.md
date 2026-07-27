@@ -32,7 +32,7 @@ raw SQL and never the `WITH (...)` clause.
 - **Never hand-write `WITH (...)` options** (ONLINE/RESUMABLE/WALP/MAXDOP/SORT_IN_TEMPDB).
   The engine injects them from the matrix. Only set them under `options:` when the user
   explicitly wants to **override** the automatic choice.
-- **Never invent an operation type.** Only the 13 in §3 exist. If the request needs
+- **Never invent an operation type.** Only the 14 in §3 exist. If the request needs
   something else (e.g. `MERGE`, data updates, creating a table), say it is out of scope.
 - **No raw SQL.** A capability that has no `operation:` type cannot be expressed.
 - **Always recommend a `--dry-run --explain` first** (§7) before a real run.
@@ -85,6 +85,7 @@ operations:                # required; at least one; run SEQUENTIALLY, in order
 | `update_statistics` | `UPDATE STATISTICS` | `schema`, `table` | `statistic` (empty = all on table); at most one of `full_scan: true`, `sample_percent: 1..100`, `resample: true`. |
 | `check_db` | `DBCC CHECKDB` | `database` | Database-scoped (no schema/table). `physical_only`, `data_purity`; `options.maxdop`. |
 | `shrink` | `DBCC SHRINKFILE` (chunked) | `type` (`data`\|`log`), `targetfreespace` | `files` (`all` or a logical file name; default `all`); `targetfreespace: "10%"` or `"100MB"`. Only WALP is relevant. |
+| `shrink_tempdb` | `DBCC SHRINKFILE` (chunked, per tempdb data file) | `targetsizemb` (per-file MB) | Database-scoped (no schema/table). `flushcaches` (opt-in cache-flush escalation on persistent stall). Only WALP is relevant (2022+); resolves `ABORT_AFTER_WAIT = SELF` only — tempdb never kills a blocking session. |
 
 Field names are exact YAML keys. Unknown operation values are rejected at parse time.
 
@@ -240,7 +241,7 @@ Before a real run, verify and call out:
 
 ## 9. Recipe: natural language → manifest
 
-1. **Identify the intent** and map it to one of the 13 operations (§3). If it does not map,
+1. **Identify the intent** and map it to one of the 14 operations (§3). If it does not map,
    say so plainly.
 2. **Collect the targets**: schema, table, and index/column/constraint names. If the user
    pasted scripted DDL (e.g. `ALTER INDEX [ix] ON [dbo].[T] REBUILD WITH (DATA_COMPRESSION = PAGE)`),

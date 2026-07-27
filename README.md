@@ -315,6 +315,7 @@ window:
 | `add_constraint`  | `ALTER TABLE … ADD CONSTRAINT … WITH (…)`  |
 | `drop_constraint` | `ALTER TABLE … DROP CONSTRAINT …`          |
 | `shrink`          | `DBCC SHRINKFILE (…) WITH (…)`             |
+| `shrink_tempdb`   | `DBCC SHRINKFILE (…) WITH (…)` per tempdb data file |
 
 ### Ignoring unimportant blocked sessions
 
@@ -422,6 +423,82 @@ Behaviour worth knowing:
   afterwards if needed. (Automatic before/after fragmentation reporting is a future feature.)
 - Reactions reuse the engine's monitoring: under blocking or log pressure the driver pauses
   between chunks (free — committed work is kept) and shrinks the next chunk smaller.
+
+### Shrinking tempdb: `operation: shrink_tempdb`
+
+`shrink_tempdb` is a dedicated operation for tempdb's data files — there is no `database:` field
+because the operation *is* tempdb. It shrinks every data file down to a common absolute target
+size, using the same chunked `DBCC SHRINKFILE` driver as `shrink` (a `TRUNCATEONLY` pass on every
+file first, then calibrated chunk moves), with a clean, re-entrant give-up when the target can't
+be reached live.
+
+```yaml
+- operation: shrink_tempdb
+  targetsizemb: 20480    # every tempdb data file is shrunk to 20 GB
+  flushcaches: false      # opt-in escalation on a persistent stall (see below)
+```
+
+- **`targetsizemb`** (required, > 0): the common absolute target, in MB, applied to **every**
+  tempdb data file. A file whose used space already exceeds the target stops at that used floor
+  (clamped) rather than failing.
+- **`flushcaches`** (optional, default `false`): opt-in for a targeted cache-flush escalation used
+  only when a file's shrink stalls persistently (see below). Off by default because it has a
+  real, if narrow, performance cost.
+
+**Non-goals** (deliberate):
+
+- **Not a monitor.** This is a maintenance operation, not tempdb surveillance — there is no
+  continuous tracking of what fills tempdb and no query-plan capture. The run report lists the
+  blockers observed *while shrinking* (a by-product of choosing the reaction), which is incident
+  reporting on the operation itself, not general tempdb monitoring.
+- **Not a guaranteed shrink.** Internal objects held by live queries (work tables, sort/hash
+  spills, the version store) can pin pages at the end of a file and refuse to move. The operation
+  does its best and stops cleanly when it can't go further, reporting so plainly — bringing a
+  400 GB tempdb down to 20 GB live is often impossible without a restart, and that is expected.
+- **Data files only.** The tempdb log is out of scope.
+
+**Never kills a blocker.** Live sessions blocking the shrink are always waited out, never killed
+— they are legitimate application queries. Where available (SQL Server **2022+ only**), the
+driver adds `WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF)`: this only makes *our* chunk yield
+and retry, it never aborts the blocker. On SQL Server 2019 the matrix disables this option for
+`shrink_tempdb`, so the reaction degrades to a plain bounded wait followed by a clean give-up.
+
+**The `flushcaches` trade-off.** When a file's shrink shows no progress repeatedly (a no-gain
+chunk, `Msg 5240` "work table page could not be moved", or error 845 buffer-latch time-out), the
+driver first backs off and retries — these conditions often clear on their own as transient
+tempdb objects age out. If the stall persists past a threshold *and* `flushcaches: true`, it
+issues one targeted escalation, at most once per run across all files:
+
+```sql
+CHECKPOINT;
+DBCC FREESYSTEMCACHE ('Temporary Tables & Table Variables');
+```
+
+This frees only the temp-object cachestore (`CACHESTORE_TEMPTABLES`) — cached temp tables/table
+variables that can pin tempdb pages — after stabilizing state with a `CHECKPOINT`. It deliberately
+does **not** reach for the broader sledgehammers a naive "soft restart" recipe uses:
+
+- `DBCC FREESYSTEMCACHE ('ALL')` / `DBCC FREEPROCCACHE` empty the **whole** plan cache
+  instance-wide, triggering a recompilation storm and CPU spike that can time out application
+  connections — too costly to fire automatically.
+- `DBCC DROPCLEANBUFFERS` empties the buffer pool for zero tempdb gain.
+
+Widening the flush to `('ALL')` behind an `aggressive` flag is a possible future escalation but is
+**deferred out of v1** — only the targeted `'Temporary Tables & Table Variables'` flush exists
+today, and only when `flushcaches: true`.
+
+**The `Unbalanced tempdb files` warning.** If the data files do not all end at the same size
+(some clamped to their used floor, some stalled above target on pinned pages), the report emits
+this warning. Uneven tempdb files defeat SQL Server's proportional-fill allocation: a file that
+later frees its pinned pages ends up with far more free space than the others, so new allocations
+skew toward it and concentrate `PAGELATCH` contention on a single file. The warning is a signal to
+follow up (a re-run, or manual intervention) — SqlGoPace does not force a common floor by
+under-shrinking every file to match the worst one.
+
+**Side benefit.** `DBCC SHRINKFILE` below a file's *created* size also corrects that file's boot
+size in `sys.master_files` — so besides reclaiming disk now, a successful shrink undoes a manual
+`ALTER DATABASE ... MODIFY FILE (SIZE = ...)` bump made during an incident, and tempdb comes back
+at the right size on the next restart.
 
 ## Usage
 

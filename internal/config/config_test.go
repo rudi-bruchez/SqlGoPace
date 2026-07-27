@@ -160,6 +160,7 @@ func TestShrinkConfigDefaultsWhenAbsent(t *testing.T) {
 		{"max_step_mb", s.MaxStepMB, 8192},
 		{"target_batch_seconds", s.TargetBatchSeconds, 5},
 		{"max_no_progress", s.MaxNoProgress, 3},
+		{"no_progress_before_flush", s.NoProgressBeforeFlush, 2},
 		{"no_progress_backoff_seconds", s.NoProgressBackoffSeconds, 30},
 		{"no_progress_backoff_max_seconds", s.NoProgressBackoffMaxSeconds, 300},
 		{"self_wait_timeout_minutes", s.SelfWaitTimeoutMinutes, 5},
@@ -204,6 +205,15 @@ func TestShrinkConfigRejectsMinAboveMax(t *testing.T) {
 	yaml := validYAML + "shrink:\n  min_step_mb: 2048\n  max_step_mb: 1024\n"
 	if _, err := config.Parse([]byte(yaml)); err == nil {
 		t.Errorf("Parse() with min > max error = nil, want non-nil")
+	}
+}
+
+func TestShrinkConfigRejectsFlushNotBelowMaxNoProgress(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "shrink:\n  max_no_progress: 3\n  no_progress_before_flush: 3\n"
+	if _, err := config.Parse([]byte(yaml)); err == nil {
+		t.Errorf("Parse() with no_progress_before_flush >= max_no_progress error = nil, want non-nil")
 	}
 }
 

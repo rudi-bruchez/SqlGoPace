@@ -393,3 +393,42 @@ func TestLoadShippedExampleManifest(t *testing.T) {
 		t.Errorf("len(Operations) = %d, want %d", got, want)
 	}
 }
+
+func TestShrinkTempdbDecodeAndValidate(t *testing.T) {
+	const y = `
+operations:
+  - operation: shrink_tempdb
+    targetsizemb: 20480
+    flushcaches: true
+`
+	m, err := ddl.ParseManifest(strings.NewReader(y))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v, want nil", err)
+	}
+	if len(m.Operations) != 1 {
+		t.Fatalf("got %d operations, want 1", len(m.Operations))
+	}
+
+	st, ok := m.Operations[0].(ddl.ShrinkTempdb)
+	if !ok {
+		t.Fatalf("op 0 type = %T, want ddl.ShrinkTempdb", m.Operations[0])
+	}
+	if st.TargetSizeMB != 20480 || !st.FlushCaches {
+		t.Fatalf("decoded = %+v", st)
+	}
+	if got := st.CommandType(); got != "shrink_tempdb" {
+		t.Errorf("CommandType = %q, want shrink_tempdb", got)
+	}
+	if got := st.Target(); got != (ddl.ObjectRef{Database: "tempdb"}) {
+		t.Errorf("Target = %+v, want {Database: tempdb}", got)
+	}
+	if err := st.Validate(); err != nil {
+		t.Errorf("Validate() = %v, want nil", err)
+	}
+}
+
+func TestShrinkTempdbValidateRejectsNonPositive(t *testing.T) {
+	if err := (ddl.ShrinkTempdb{TargetSizeMB: 0}).Validate(); !errors.Is(err, ddl.ErrInvalidManifest) {
+		t.Fatalf("Validate() error = %v, want ErrInvalidManifest", err)
+	}
+}

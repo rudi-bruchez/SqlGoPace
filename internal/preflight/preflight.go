@@ -117,11 +117,11 @@ func CheckBlocking(sessions []mssql.Session) Check {
 }
 
 // requiresElevatedRights reports whether an operation needs db_owner or sysadmin:
-// DBCC SHRINKFILE (shrink) and DBCC CHECKDB (check_db) both do. Lesser DDL rights
-// (db_ddladmin, ALTER on a table) are not enough for these.
+// DBCC SHRINKFILE (shrink, shrink_tempdb) and DBCC CHECKDB (check_db) all do. Lesser
+// DDL rights (db_ddladmin, ALTER on a table) are not enough for these.
 func requiresElevatedRights(op ddl.Operation) bool {
 	switch op.(type) {
-	case ddl.CheckDB, ddl.Shrink:
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
 		return true
 	default:
 		return false
@@ -163,11 +163,11 @@ func CheckKillPermission(hasPerm bool) Check {
 func CheckOperation(op ddl.Operation, tableExists, targetExists bool) Check {
 	ref := op.Target()
 
-	// Database- and file-scoped operations (check_db, shrink) have no schema.table
-	// precondition; their target (database/file) is validated by the engine at run
-	// time (DBCC resolves the file list / database itself).
+	// Database- and file-scoped operations (check_db, shrink, shrink_tempdb) have no
+	// schema.table precondition; their target (database/file) is validated by the
+	// engine at run time (DBCC resolves the file list / database itself).
 	switch op.(type) {
-	case ddl.CheckDB, ddl.Shrink:
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
 		return Check{fmt.Sprintf("%s %s", op.CommandType(), ref), Pass, "no table precondition (database/file-scoped)"}
 	}
 
@@ -316,10 +316,10 @@ func CheckBatchDMLIsolation(info mssql.ServerInfo, op ddl.BatchDML) Check {
 // objectExistence resolves whether the operation's table and target object exist.
 // The target lookup is skipped when the table is absent (the check already fails).
 func objectExistence(ctx context.Context, p Prober, op ddl.Operation) (table, target bool, err error) {
-	// Database- and file-scoped operations (check_db, shrink) have no schema.table
-	// to verify; skip the lookup so CheckOperation can pass them through.
+	// Database- and file-scoped operations (check_db, shrink, shrink_tempdb) have no
+	// schema.table to verify; skip the lookup so CheckOperation can pass them through.
 	switch op.(type) {
-	case ddl.CheckDB, ddl.Shrink:
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
 		return true, true, nil
 	}
 

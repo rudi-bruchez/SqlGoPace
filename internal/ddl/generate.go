@@ -41,6 +41,8 @@ func Generate(op Operation, res ResolvedOptions) (string, error) {
 		return generateDropConstraint(o), nil
 	case Shrink:
 		return generateShrink(o, res), nil
+	case ShrinkTempdb:
+		return generateShrinkTempdb(o, res), nil
 	case BatchDML:
 		return generateBatchDML(o, res), nil
 	default:
@@ -309,6 +311,15 @@ func generateShrink(o Shrink, res ResolvedOptions) string {
 		"-- shrink is built at run time per chunk; representative statement:\n"+
 			"DBCC SHRINKFILE (%s, <target_mb>)%s;",
 		nLiteral(o.FilesOrAll()), shrinkWith(res))
+}
+
+// generateShrinkTempdb returns an INDICATIVE statement. Real SQL is multi-statement
+// and built at run time (per file, target from live DMV reads), run in tempdb context.
+func generateShrinkTempdb(o ShrinkTempdb, res ResolvedOptions) string {
+	return fmt.Sprintf(
+		"-- shrink_tempdb is built at run time per file (tempdb context); representative statement:\n"+
+			"USE [tempdb]; DBCC SHRINKFILE (<file>, %d)%s;",
+		o.TargetSizeMB, shrinkWith(res))
 }
 
 func renderLiteral(l Literal) string {

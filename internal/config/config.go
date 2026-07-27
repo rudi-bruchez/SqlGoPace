@@ -165,6 +165,7 @@ type ShrinkConfig struct {
 	MaxStepMB                   int `yaml:"max_step_mb"`                     // absolute ceiling: avoid saturating I/O in one move
 	TargetBatchSeconds          int `yaml:"target_batch_seconds"`            // an "ideal" chunk lasts a few seconds
 	MaxNoProgress               int `yaml:"max_no_progress"`                 // consecutive no-gain chunks before clean stop
+	NoProgressBeforeFlush       int `yaml:"no_progress_before_flush"`        // no-progress events before the tempdb cache-flush escalation; must be < MaxNoProgress
 	NoProgressBackoffSeconds    int `yaml:"no_progress_backoff_seconds"`     // wait before retry, doubled each no-progress
 	NoProgressBackoffMaxSeconds int `yaml:"no_progress_backoff_max_seconds"` // backoff ceiling
 	SelfWaitTimeoutMinutes      int `yaml:"self_wait_timeout_minutes"`       // max wait on Sch-M / snapshot before clean stop
@@ -356,6 +357,7 @@ func (s *ShrinkConfig) applyDefaults() {
 	setIf(&s.MaxStepMB, 8192)
 	setIf(&s.TargetBatchSeconds, 5)
 	setIf(&s.MaxNoProgress, 3)
+	setIf(&s.NoProgressBeforeFlush, 2)
 	setIf(&s.NoProgressBackoffSeconds, 30)
 	setIf(&s.NoProgressBackoffMaxSeconds, 300)
 	setIf(&s.SelfWaitTimeoutMinutes, 5)
@@ -407,6 +409,10 @@ func (c *Config) validate() error {
 	if c.Shrink.MinStepMB > c.Shrink.MaxStepMB {
 		return fmt.Errorf("shrink.min_step_mb (%d) must be <= max_step_mb (%d): %w",
 			c.Shrink.MinStepMB, c.Shrink.MaxStepMB, ErrInvalidConfig)
+	}
+	if c.Shrink.NoProgressBeforeFlush >= c.Shrink.MaxNoProgress {
+		return fmt.Errorf("shrink.no_progress_before_flush (%d) must be < max_no_progress (%d): %w",
+			c.Shrink.NoProgressBeforeFlush, c.Shrink.MaxNoProgress, ErrInvalidConfig)
 	}
 	if c.BatchDML.MinRows > c.BatchDML.MaxRows {
 		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",

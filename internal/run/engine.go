@@ -40,6 +40,14 @@ type ShrinkDriver interface {
 
 var _ ShrinkDriver = (*ShrinkRunner)(nil)
 
+// TempdbShrinkDriver runs a shrink_tempdb operation. *ShrinkRunner satisfies it;
+// it is wired to a tempdb-scoped connection so its DBCC/reads run in tempdb context.
+type TempdbShrinkDriver interface {
+	RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error)
+}
+
+var _ TempdbShrinkDriver = (*ShrinkRunner)(nil)
+
 // BatchDMLDriver runs a batched UPDATE/DELETE, which like a shrink does not fit the
 // one-statement OpRunner model: it loops a per-batch statement at run time. The
 // engine routes ddl.BatchDML operations here, supplying a watermark store so a
@@ -154,6 +162,7 @@ type Engine struct {
 	pf               Preflighter
 	runner           OpRunner
 	shrink           ShrinkDriver
+	tempdbShrink     TempdbShrinkDriver
 	batchDML         BatchDMLDriver
 	adr              bool
 	clk              Clock
@@ -205,6 +214,13 @@ func WithADR(adr bool) EngineOption { return func(e *Engine) { e.adr = adr } }
 // OpRunner, whose indicative PlannedOperation.SQL is not the real per-chunk SQL —
 // so a shrink driver should always be wired when shrink manifests are expected.
 func WithShrinkRunner(d ShrinkDriver) EngineOption { return func(e *Engine) { e.shrink = d } }
+
+// WithTempdbShrinkRunner routes ddl.ShrinkTempdb operations to the dedicated tempdb
+// shrink driver. Without it, a shrink_tempdb operation fails: it has no meaningful
+// OpRunner fallback (there is no single indicative statement to run).
+func WithTempdbShrinkRunner(d TempdbShrinkDriver) EngineOption {
+	return func(e *Engine) { e.tempdbShrink = d }
+}
 
 // WithBlockerKiller arms the selective blocker-kill policy: the killer terminates sessions
 // blocking this run's DDL that match the manifest's kill_blocked_sessions (after each rule's
@@ -658,6 +674,14 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				} else {
 					runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
 				}
+			case ddl.ShrinkTempdb:
+				if e.tempdbShrink != nil {
+					// shrink_tempdb is likewise a multi-statement, run-time-built loop; route
+					// to the tempdb driver rather than the OpRunner.
+					shrinkResults, runErr = e.tempdbShrink.RunTempdb(ctx, op, step.Options, ignore, sink)
+				} else {
+					runErr = fmt.Errorf("shrink_tempdb requires a tempdb shrink runner (not configured)")
+				}
 			case ddl.BatchDML:
 				if e.batchDML != nil {
 					// Batched DML is a per-batch loop built at run time; route to its driver.
@@ -747,7 +771,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// out with work preserved). That is not a clean success: record it as a distinct
 		// INCOMPLETE outcome so it is never mistaken for done, and route the manifest to
 		// failed for review. Terminal for the manifest (like a non-continue failure).
-		if _, isShrink := step.Operation.(ddl.Shrink); isShrink && shrinkStoppedShort(shrinkResults) {
+		if isShrinkOp(step.Operation) && shrinkStoppedShort(shrinkResults) {
 			opRep.Outcome = "incomplete"
 			e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
 			rep.Operations = append(rep.Operations, opRep)
@@ -839,6 +863,18 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 		return outcomeDone
 	}
 	return outcomeFailed
+}
+
+// isShrinkOp reports whether op is one of the shrink operation types (ddl.Shrink or
+// ddl.ShrinkTempdb), which both drive a chunk loop that can stop short of target with
+// work preserved rather than fail outright.
+func isShrinkOp(op ddl.Operation) bool {
+	switch op.(type) {
+	case ddl.Shrink, ddl.ShrinkTempdb:
+		return true
+	default:
+		return false
+	}
 }
 
 // shrinkStoppedShort reports whether a completed shrink (no error) failed to reach

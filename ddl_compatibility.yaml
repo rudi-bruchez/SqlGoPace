@@ -78,6 +78,11 @@ commands:
   shrink_log:        {}             # DBCC SHRINKFILE on a log file: no injectable option.
                                     # WALP does not apply to log files (VLF truncation, no IAM Sch-M).
 
+  shrink_tempdb:                    # DBCC SHRINKFILE on a tempdb data file
+    # Same WAIT_AT_LOW_PRIORITY gating as shrink_data (2022+, all editions). ABORT_AFTER_WAIT
+    # is always SELF for tempdb, regardless of policy — enforced in resolve.go, not the matrix.
+    wait_at_low_priority: { min_major: 16, editions: [enterprise, standard, express, azure] }  # 2022
+
   batch_update:                     # chunked UPDATE (run in batches by the runtime driver)
     maxdop:               { min_major: 9,  editions: [enterprise, standard, express, azure] }  # OPTION (MAXDOP n)
     # No ONLINE/RESUMABLE/WAIT_AT_LOW_PRIORITY: those are index/table DDL options, not DML.

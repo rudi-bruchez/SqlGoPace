@@ -51,6 +51,10 @@ func TestShippedMatrixParses(t *testing.T) {
 		// rebuild_heap never supports RESUMABLE or WAIT_AT_LOW_PRIORITY.
 		{"heap resumable never", 16, ddl.TierEnterprise, "rebuild_heap", "resumable", false},
 		{"heap walp never", 16, ddl.TierEnterprise, "rebuild_heap", "wait_at_low_priority", false},
+		// shrink_tempdb WAIT_AT_LOW_PRIORITY mirrors shrink_data: 2022+ (major 16), all editions.
+		{"shrink_tempdb walp 2019 no", 15, ddl.TierEnterprise, "shrink_tempdb", "wait_at_low_priority", false},
+		{"shrink_tempdb walp 2022 yes", 16, ddl.TierEnterprise, "shrink_tempdb", "wait_at_low_priority", true},
+		{"shrink_tempdb walp 2022 standard yes", 16, ddl.TierStandard, "shrink_tempdb", "wait_at_low_priority", true},
 	}
 	for _, f := range facts {
 		t.Run(f.name, func(t *testing.T) {

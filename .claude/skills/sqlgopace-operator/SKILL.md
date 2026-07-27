@@ -19,10 +19,10 @@ manifest**, explain usage, and warn about what to verify before running.
 ## How to use this skill
 
 1. **Read `docs/llm-operator-guide.md`** (in the repo root's `docs/`). It is the source of
-   truth: the manifest schema, the 13 valid operations with their exact fields, the
+   truth: the manifest schema, the 14 valid operations with their exact fields, the
    option-injection matrix, the queue lifecycle, the safe dry-run-first workflow, and the
    pre-run warnings. Follow it rather than relying on memory of T-SQL.
-2. **Map the request** to one of the 13 operations. If it does not map (raw SQL, data
+2. **Map the request** to one of the 14 operations. If it does not map (raw SQL, data
    changes, table creation, MERGE, …), tell the user it is out of scope — SqlGoPace only
    runs the operation types it knows.
 3. **Produce the manifest** (top-level `description` / `database` / `operations`, one

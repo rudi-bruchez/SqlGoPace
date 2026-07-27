@@ -55,19 +55,20 @@ func etaFrom(doneMB, remainingMB int, window time.Duration) int {
 // consumes ddl.Policy rather than the raw config. cmd maps config.ShrinkConfig
 // into a ShrinkTuning when wiring the engine.
 type ShrinkTuning struct {
-	InitialStepSmallMB   int           // legacy tier: reclaim < 5 GB (used only when TargetChunks <= 0)
-	InitialStepMediumMB  int           // legacy tier: reclaim 5–50 GB
-	InitialStepLargeMB   int           // legacy tier: reclaim > 50 GB
-	TargetChunks         int           // aim to finish in ~this many chunks (initial step = reclaim / TargetChunks)
-	MaxStepPctOfFile     int           // per-file step ceiling as a percent of file size (0 disables)
-	MinStepMB            int           // step floor
-	MaxStepMB            int           // absolute step ceiling
-	TargetBatch          time.Duration // ideal per-chunk duration
-	MaxNoProgress        int           // consecutive no-gain chunks before clean stop
-	NoProgressBackoff    time.Duration // initial backoff after a no-progress chunk
-	NoProgressBackoffMax time.Duration // backoff ceiling
-	SelfWaitTimeout      time.Duration // max wait while blocked (Sch-M/snapshot)
-	LogReuseWaitTimeout  time.Duration // max wait for a scheduled log backup
+	InitialStepSmallMB    int           // legacy tier: reclaim < 5 GB (used only when TargetChunks <= 0)
+	InitialStepMediumMB   int           // legacy tier: reclaim 5–50 GB
+	InitialStepLargeMB    int           // legacy tier: reclaim > 50 GB
+	TargetChunks          int           // aim to finish in ~this many chunks (initial step = reclaim / TargetChunks)
+	MaxStepPctOfFile      int           // per-file step ceiling as a percent of file size (0 disables)
+	MinStepMB             int           // step floor
+	MaxStepMB             int           // absolute step ceiling
+	TargetBatch           time.Duration // ideal per-chunk duration
+	MaxNoProgress         int           // consecutive no-gain chunks before clean stop
+	NoProgressBeforeFlush int           // no-progress events before the tempdb cache flush (tempdb path only)
+	NoProgressBackoff     time.Duration // initial backoff after a no-progress chunk
+	NoProgressBackoffMax  time.Duration // backoff ceiling
+	SelfWaitTimeout       time.Duration // max wait while blocked (Sch-M/snapshot)
+	LogReuseWaitTimeout   time.Duration // max wait for a scheduled log backup
 }
 
 // WaitDeltas captures the per-chunk change in the waits that gate shrink stepsize:

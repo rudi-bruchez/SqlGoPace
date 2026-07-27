@@ -113,6 +113,7 @@ func TestCheckOperation(t *testing.T) {
 		{"shrink data passes without a table", ddl.Shrink{Type: "data", Files: "all"}, false, false, preflight.Pass},
 		{"shrink log passes without a table", ddl.Shrink{Type: "log", Files: "MyDb_Log"}, false, false, preflight.Pass},
 		{"check_db passes without a table", ddl.CheckDB{Database: "MyDb"}, false, false, preflight.Pass},
+		{"shrink_tempdb passes without a table", ddl.ShrinkTempdb{TargetSizeMB: 20480}, false, false, preflight.Pass},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -244,6 +245,36 @@ func TestRun(t *testing.T) {
 		}
 		if !rep.HasFailure() {
 			t.Errorf("Run() should fail a check_db when the login lacks db_owner/sysadmin")
+		}
+	})
+
+	t.Run("file-scoped shrink_tempdb passes without a matching table", func(t *testing.T) {
+		p := healthyProber()
+		p.tableExists = false // no table named "" exists; shrink_tempdb must not require one
+		shrinkTempdbManifest := &ddl.Manifest{Operations: []ddl.Operation{
+			ddl.ShrinkTempdb{TargetSizeMB: 20480},
+		}}
+		rep, err := preflight.Run(context.Background(), p, info, shrinkTempdbManifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.OK() {
+			t.Errorf("Run() report not OK for a shrink_tempdb manifest:\n%v", rep.Checks)
+		}
+	})
+
+	t.Run("shrink_tempdb without db_owner fails on permissions", func(t *testing.T) {
+		p := healthyProber()
+		p.elevatedAccess = false
+		shrinkTempdbManifest := &ddl.Manifest{Operations: []ddl.Operation{
+			ddl.ShrinkTempdb{TargetSizeMB: 20480},
+		}}
+		rep, err := preflight.Run(context.Background(), p, info, shrinkTempdbManifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() should fail a shrink_tempdb when the login lacks db_owner/sysadmin")
 		}
 	})
 
