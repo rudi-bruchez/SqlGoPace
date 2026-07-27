@@ -522,19 +522,20 @@ func batchTuning(b config.BatchDMLConfig) run.BatchTuning {
 // has already applied its defaults), mirroring how cfg.Policy() maps to ddl.Policy.
 func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
 	return run.ShrinkTuning{
-		InitialStepSmallMB:   s.InitialStepSmallMB,
-		InitialStepMediumMB:  s.InitialStepMediumMB,
-		InitialStepLargeMB:   s.InitialStepLargeMB,
-		TargetChunks:         s.TargetChunks,
-		MaxStepPctOfFile:     s.MaxStepPctOfFile,
-		MinStepMB:            s.MinStepMB,
-		MaxStepMB:            s.MaxStepMB,
-		TargetBatch:          s.TargetBatch(),
-		MaxNoProgress:        s.MaxNoProgress,
-		NoProgressBackoff:    s.NoProgressBackoff(),
-		NoProgressBackoffMax: s.NoProgressBackoffMax(),
-		SelfWaitTimeout:      s.SelfWaitTimeout(),
-		LogReuseWaitTimeout:  s.LogReuseWaitTimeout(),
+		InitialStepSmallMB:    s.InitialStepSmallMB,
+		InitialStepMediumMB:   s.InitialStepMediumMB,
+		InitialStepLargeMB:    s.InitialStepLargeMB,
+		TargetChunks:          s.TargetChunks,
+		MaxStepPctOfFile:      s.MaxStepPctOfFile,
+		MinStepMB:             s.MinStepMB,
+		MaxStepMB:             s.MaxStepMB,
+		TargetBatch:           s.TargetBatch(),
+		MaxNoProgress:         s.MaxNoProgress,
+		NoProgressBeforeFlush: s.NoProgressBeforeFlush,
+		NoProgressBackoff:     s.NoProgressBackoff(),
+		NoProgressBackoffMax:  s.NoProgressBackoffMax(),
+		SelfWaitTimeout:       s.SelfWaitTimeout(),
+		LogReuseWaitTimeout:   s.LogReuseWaitTimeout(),
 	}
 }
 
