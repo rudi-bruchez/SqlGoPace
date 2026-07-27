@@ -66,8 +66,10 @@ operation:
   - `Validate()`: `TargetSizeMB > 0`.
   - `CommandType()`: `"shrink_tempdb"` — feeds the compatibility matrix so WALP eligibility is
     version/edition-gated exactly like the other shrink command types.
-  - `Target()`: targets tempdb (a database/file, **not** `schema.table` — cf. the *check_db target
-    shape* note; do not abuse `ObjectRef.table`).
+  - `Target()`: `func (o ShrinkTempdb) Target() ObjectRef { return ObjectRef{Database: "tempdb"} }`
+    — the `check_db` convention (database-scoped, **not** `schema.table`; do not abuse
+    `ObjectRef.Table`). Empty `Schema`/`Table` is what makes preflight skip the existence check
+    (fixed in 028602a), so this shape is load-bearing, not cosmetic.
 - `resolve.go`: a dedicated branch, modelled on the existing shrink branch — resolve **only**
   `wait_at_low_priority` via the matrix; **do not** touch online/resumable/sort_in_tempdb and do
   not apply the "WALP requires ONLINE" rule. `ABORT_AFTER_WAIT = SELF` **always** (never
@@ -79,22 +81,52 @@ operation:
 
 ## 4. Driver — `internal/run` (specialization, no duplication)
 
-No new runner. `ShrinkRunner` gains an optional **`*TempdbProfile`**
-(`TargetSizeMB`, `FlushCaches`, `NoProgressBeforeFlush`). `processOne` routes `ddl.ShrinkTempdb`
-to the **same** `ShrinkRunner` in tempdb mode. The tempdb-specific behavior is a handful of
-**localized branches** in the existing methods (`shrinkData`, `stall`, `runChunk`), not a fork of
-the chunk loop.
+No new runner. The `*ShrinkRunner` is reused; the tempdb path is a **new orchestrator method on
+it**, not a fork of the chunk primitives.
+
+**Wiring the runner (the interface change).** `ShrinkDriver` currently exposes one method typed to
+`ddl.Shrink`:
+
+```go
+type ShrinkDriver interface {
+    Run(ctx, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error)
+    RunTempdb(ctx, op ddl.ShrinkTempdb, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error) // new
+}
+```
+
+- A **second method** `RunTempdb` is added (type-safe; no `any` union, no translating
+  `ShrinkTempdb` into a sentinel `ddl.Shrink`). `*ShrinkRunner` implements both.
+- `processOne` gains `case ddl.ShrinkTempdb:` next to the existing `case ddl.Shrink:`, calling
+  `RunTempdb`.
+- The existing **stop-short → `incomplete`** detection keys on `ddl.Shrink`; it must cover both op
+  types. Extract a small predicate `isShrinkOp(step.Operation)` (true for `ddl.Shrink` **and**
+  `ddl.ShrinkTempdb`) and use it there. Both paths already return `[]ShrinkResult`, so
+  `shrinkStoppedShort` is unchanged.
+
+**No duplication, made verifiable.** The per-file page-moving loop currently lives inside
+`shrinkData`. Extract it into a shared primitive (e.g. `chunkLoop(ctx, f, final, res, ignore, sink,
+profile)`) that both `shrinkData` (data/log path) and `runTempdb` call. `runTempdb` then reuses the
+existing `runTruncateOnly` and this extracted `chunkLoop`; it adds **orchestration**, not copies of
+the loop. `RunTempdb` builds a `TempdbProfile{TargetSizeMB, FlushCaches, NoProgressBeforeFlush}`
+from the op and threads it into `chunkLoop`/`stall`, where the tempdb-specific escalation (§5)
+reads it.
 
 - **Per-file target**: `target = max(targetsizemb, file.UsedMB)`. A file whose used space already
   exceeds the common target stops at its used floor (clamp), and the result records why.
 - **File resolution**: all tempdb data files (`FileTypeRows`), shrunk **sequentially** (never two
   of the single tempdb filegroup in parallel — the existing sequential loop guarantees it).
-- **Two-phase order** (a tempdb-specific reordering of the shared driver — the base `shrinkData`
-  interleaves truncate+chunk per file):
-  - **Phase 0 — `TRUNCATEONLY` on *all* files first**, before any page movement. Releasing every
-    file's empty tail up front returns space to the OS immediately and can shift internal
-    allocations, easing the subsequent page moves.
-  - **Phase 1 — per-file chunk loop** (the existing loop), sequentially.
+- **Two-phase order** — this is why `runTempdb` is a separate orchestrator and not a branch inside
+  the per-file `shrinkData` (which interleaves truncate+chunk per file):
+  - **Phase 0 — `TRUNCATEONLY` on *all* files first** (calling `runTruncateOnly` per file), before
+    any page movement. Releasing every file's empty tail up front returns space to the OS
+    immediately and can shift internal allocations, easing the subsequent page moves.
+  - **Phase 1 — per-file chunk loop across all files** (calling the extracted `chunkLoop`),
+    sequentially.
+- **Log sampling**: tempdb is always SIMPLE recovery, so the FULL/BULK_LOGGED log-reuse wait path
+  (`awaitLogReuse`, `shrinkLog`) is **never** taken here — data-only, no `BACKUP LOG` gate. Each
+  chunk still writes tempdb transaction log, but SIMPLE self-truncates on checkpoint, so the log
+  dimension of the sampler stays quiet; the reaction that matters for tempdb is blocking, not log
+  drain.
 - **Live blockers**: reuse the existing `awaitRelief` → bounded wait → clean give-up at timeout.
   **Never KILL a blocker** (they are legitimate application queries). WALP, when available (2022+),
   only makes *our* chunk yield (`ABORT_AFTER_WAIT = SELF`); it never aborts blockers.
@@ -124,8 +156,14 @@ no-gain chunk / Msg 5240 / 845
     far too costly on the busy production instance this feature targets.
   - `DBCC DROPCLEANBUFFERS` empties the buffer pool (clean pages) without freeing any tempdb
     allocation: severe perf cost for zero tempdb gain.
-  - A config `aggressive` flag **may** widen the flush to `('ALL')` for the rare case where the
-    targeted cachestore is not enough, but it is **off by default**.
+  - Widening the flush to `('ALL')` (an `aggressive` escape hatch) is **deferred out of v1** to keep
+    the surface small and unambiguous. If ever added, it would require `flushcaches: true` (it only
+    widens the same escalation, never a separate trigger).
+
+`NoProgressBeforeFlush` **default = `3`** no-progress events. It must be **`< MaxNoProgress`** (the
+existing give-up count) so the flush fires *before* the clean give-up rather than after it; keep it
+low so the (costly) flush is not attempted for a stall that clears on its own within a couple of
+back-offs.
 - **Flush runs at most once per run** (the caches are instance-wide; flushing per file would repeat
   the perf hit for nothing). A shared `flushed` flag spans all files.
 - **845** is folded in as a retryable no-progress event; the flush (which frees internal caches) is
@@ -141,7 +179,9 @@ no-gain chunk / Msg 5240 / 845
 - **Report**: one `ShrinkResult` per file (initial / final / target / chunks / reason) plus the
   **blockers observed** during the shrink, written to the `.log` sidecar. The email
   fail/incomplete events already emitted by the engine cover notification.
-- **Unbalanced-files warning**: if the data files do **not** all end at the same size (some clamped
+- **Unbalanced-files warning**: file sizes are read in whole MB, so the check is **exact equality
+  in MB** — any MB difference between final data-file sizes trips the warning (no tolerance band).
+  If the data files do **not** all end at the same size (some clamped
   to used, or stalled on work-table pages above target), the report emits a clear
   `Unbalanced tempdb files` warning. Uneven files defeat SQL Server's proportional-fill balancing:
   a file that later frees its pinned pages ends up with far more free space than the others, so new
@@ -152,14 +192,16 @@ no-gain chunk / Msg 5240 / 845
 
 - **`internal/ddl`** — `ShrinkTempdb` op (manifest struct, `Validate`, `CommandType`, `Target`);
   resolve branch (WALP only, `SELF`); generate branch (run-time per-file DBCC SHRINKFILE).
-- **`internal/run`** — `TempdbProfile` on `ShrinkRunner`; `processOne` routing; per-file
-  equal-size target + clamp; the unified no-progress escalation with the optional flush; 845 in
-  the retryable set.
+- **`internal/run`** — the `RunTempdb` method + `ShrinkDriver` interface addition; the extracted
+  `chunkLoop` primitive and the `runTempdb` two-phase orchestrator; `TempdbProfile` on
+  `ShrinkRunner`; `processOne` `case ddl.ShrinkTempdb` + the `isShrinkOp` predicate for the
+  stop-short/`incomplete` path; per-file equal-size target + clamp; the unified no-progress
+  escalation with the optional flush; 845 in the retryable set.
 - **`internal/mssql`** — reuse `FileSpace(FileTypeRows)` / `FileSizeMB`; add the flush statements
   (a small exec helper). tempdb is always SIMPLE recovery, so no log-reuse gate on the data path.
 - **`internal/preflight`** — tempdb reachability/file checks on the existing shrink model.
-- **`internal/config`** — defaults for `NoProgressBeforeFlush`, the optional `aggressive` flush
-  widening (default off), and the shrink tuning already used.
+- **`internal/config`** — default for `NoProgressBeforeFlush` (`3`, `< MaxNoProgress`) and the
+  shrink tuning already used. (`aggressive` widening is deferred out of v1, §5.)
 - **README / operator skill** — document the operation, its non-goals, and the `flushcaches`
   trade-off.
 
@@ -167,9 +209,12 @@ no-gain chunk / Msg 5240 / 845
 
 - **`ddl` (pure)**: YAML decode of `shrink_tempdb`; `Validate` (reject `targetsizemb ≤ 0`);
   generate (per-file DBCC SHRINKFILE); resolve (WALP `SELF`; disabled on the 2019 matrix row).
-- **`run` (pure)**: equal-size target + clamp to each file's used; the unified escalation —
-  `Msg 5240` / no-gain / `845` → backoff → flush **once** (when enabled) → clean give-up when the
-  budget trips; **never** a blocker KILL; flush executed a single time across multiple files.
+- **`run` (pure)**: equal-size target + clamp to each file's used; **two-phase order** —
+  `TRUNCATEONLY` runs on *all* files before any chunk moves a page; the unified escalation —
+  `Msg 5240` / no-gain / `845` → backoff → flush **once** at `NoProgressBeforeFlush` (when enabled)
+  → clean give-up when the budget trips; **never** a blocker KILL; flush executed a single time
+  across multiple files; `isShrinkOp` true for both `ddl.Shrink` and `ddl.ShrinkTempdb` (stop-short
+  → `incomplete`).
 - **`mssql`**: reads and flush behind the `integration` tag.
 
 ## 9. Limits (deliberate, documented)
