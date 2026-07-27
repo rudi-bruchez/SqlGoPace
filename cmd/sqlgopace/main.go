@@ -403,13 +403,13 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 	shrinkProgress := func(p run.ShrinkProgress) {
 		// Deterministic per-chunk progress (design §9), unlike the fluctuating
 		// dm_exec_requests percent used for other operations.
-		server := ""
+		completion := ""
 		if p.PercentComplete > 0 {
-			server = fmt.Sprintf(", server %.0f%%", p.PercentComplete)
+			completion = fmt.Sprintf(", completion %.0f%%", p.PercentComplete)
 		}
 		fmt.Fprintf(engineOut, "-- shrink %s (%s): %s (%.0f%%), step %s, chunk %d (avg %ds/chunk, ~%d left, ETA %ds, %ds unblocked, blocked %ds%s)\n",
 			p.File, p.Type, tui.HumanizeMB(p.CurrentMB), p.Percent()*100, tui.HumanizeMB(p.StepMB),
-			p.Chunks, p.AvgChunkSeconds, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds, server)
+			p.Chunks, p.AvgChunkSeconds, p.ChunksRemaining, p.ETASeconds, p.ETASecondsNoBlock, p.BlockedSeconds, completion)
 	}
 	batchProgress := func(p run.BatchDMLProgress) {
 		fmt.Fprintf(engineOut, "-- batch %s %s.%s: %d rows (%.0f%%)\n", p.Verb, p.Schema, p.Table, p.RowsDone, p.Percent()*100)

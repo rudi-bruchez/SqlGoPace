@@ -318,7 +318,7 @@ func (m Model) shrinkLines() string {
 		}
 		// SQL Server's own percent_complete for the running chunk, when it reports one.
 		if sh.PercentComplete > 0 {
-			fmt.Fprintf(&b, "   server %.0f%%", sh.PercentComplete)
+			fmt.Fprintf(&b, "   completion %.0f%%", sh.PercentComplete)
 		}
 	}
 	return b.String()
