@@ -78,8 +78,9 @@ func (p ShrinkProgress) Percent() float64 {
 // persistent no-progress run (Msg 5240 / Msg 845 / real no-gain) into one targeted
 // temp-object cache flush, guarded by flushed so it never runs more than once per run.
 type TempdbProfile struct {
-	FlushCaches bool
-	flushed     *bool // once-per-run guard, shared across a RunTempdb's files
+	FlushCaches  bool
+	TargetSizeMB int
+	flushed      *bool // once-per-run guard, shared across a RunTempdb's files
 }
 
 // ShrinkResult is the outcome of shrinking one file, for the run report.
@@ -243,6 +244,82 @@ func (r *ShrinkRunner) resolveFiles(ctx context.Context, op ddl.Shrink) ([]mssql
 		}
 	}
 	return nil, fmt.Errorf("shrink: file %q not found among %s files", op.Files, fileType)
+}
+
+// RunTempdb shrinks every tempdb data file to a common absolute target, two-phase:
+// Phase 0 runs TRUNCATEONLY on all files (free tails returned to the OS first), then
+// Phase 1 runs the shared chunkLoop per file. The per-file target is clamped to the
+// file's used space. It reuses this runner's exec/reader, which the wiring binds to a
+// tempdb-scoped connection. See specs/TEMPDB-SHRINK.md.
+func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error) {
+	files, err := r.resolveFiles(ctx, ddl.Shrink{Type: "data", Files: "all"})
+	if err != nil {
+		return nil, err
+	}
+	flushed := false
+	prof := &TempdbProfile{FlushCaches: op.FlushCaches, TargetSizeMB: op.TargetSizeMB, flushed: &flushed}
+
+	// State the total explicitly (spec §6): targetsizemb is PER FILE, easy to misread.
+	sink(ReactionEvent{Kind: "tempdb", Detail: fmt.Sprintf(
+		"shrinking %d tempdb data files to %d MB each (total target %d MB)",
+		len(files), op.TargetSizeMB, len(files)*op.TargetSizeMB)})
+
+	// Phase 0 — TRUNCATEONLY on all files first.
+	for _, f := range files {
+		if stopRequested(r.stop) {
+			return nil, ErrStopped
+		}
+		if stopped, terr := r.runTruncateOnly(ctx, f.Name, sink); terr != nil {
+			return nil, fmt.Errorf("shrink_tempdb %q: truncateonly: %w", f.Name, terr)
+		} else if stopped {
+			return nil, ErrStopped
+		}
+	}
+
+	// Phase 1 — per-file chunk loop.
+	results := make([]ShrinkResult, 0, len(files))
+	for _, f := range files {
+		if stopRequested(r.stop) {
+			return results, ErrStopped
+		}
+		size, ferr := r.reader.FileSizeMB(ctx, f.Name)
+		if ferr != nil {
+			return results, ferr
+		}
+		final := op.TargetSizeMB
+		if final < f.UsedMB {
+			final = f.UsedMB // clamp: cannot shrink below used
+		}
+		f.SizeMB = size
+		if size <= final {
+			results = append(results, ShrinkResult{File: f.Name, Type: "data", InitialMB: size, TargetMB: final, FinalMB: size, NoOp: true, Reason: "already at or below target"})
+			continue
+		}
+		res2, cerr := r.chunkLoop(ctx, f, size, final, res, ignore, sink, prof)
+		if cerr != nil {
+			if errors.Is(cerr, ErrStopped) {
+				results = append(results, res2)
+			}
+			return results, cerr
+		}
+		results = append(results, res2)
+	}
+	warnIfUnbalanced(results, sink)
+	return results, nil
+}
+
+// warnIfUnbalanced emits a warning when the data files did not all end at the same
+// whole-MB size: an asymmetric tempdb defeats proportional fill (see spec §6).
+func warnIfUnbalanced(results []ShrinkResult, sink ReactionSink) {
+	first := -1
+	for _, r := range results {
+		if first == -1 {
+			first = r.FinalMB
+		} else if r.FinalMB != first {
+			sink(ReactionEvent{Kind: "tempdb", Detail: "Unbalanced tempdb files: data files ended at different sizes; proportional fill will skew — re-run or intervene"})
+			return
+		}
+	}
 }
 
 // shrinkData runs the data-file algorithm (design §7.1): no-op gating, a free

@@ -585,6 +585,239 @@ func TestTempdbFlushesOnceOnPersistentStall(t *testing.T) {
 	}
 }
 
+// tempdbFakeServer models tempdb's several data files for RunTempdb tests (unlike
+// fakeServer, which models a single file): each named file tracks its own size and
+// used space, and ExecDDL dispatches TRUNCATEONLY / DBCC SHRINKFILE by the file name
+// literal embedded in the statement, so the two-phase (truncate-all-then-chunk)
+// ordering and the per-file clamp can be observed across multiple files.
+type tempdbFakeServer struct {
+	sizes map[string]int
+	used  map[string]int
+	order []string // file names, in FileSpace() order
+
+	floorMB map[string]int // per-file chunk floor (defaults to 0 if absent)
+
+	execLog []string
+	onExec  func(sql string)
+}
+
+func newTempdbFakeServer(files ...mssql.FileSpace) *tempdbFakeServer {
+	s := &tempdbFakeServer{sizes: map[string]int{}, used: map[string]int{}, floorMB: map[string]int{}}
+	for _, f := range files {
+		s.order = append(s.order, f.Name)
+		s.sizes[f.Name] = f.SizeMB
+		s.used[f.Name] = f.UsedMB
+	}
+	return s
+}
+
+func (s *tempdbFakeServer) SPID() int { return 99 }
+
+// fileNameFromStmt extracts the N'...' file literal from a shrink statement.
+func fileNameFromStmt(sql string) string {
+	i := strings.Index(sql, "N'")
+	if i < 0 {
+		return ""
+	}
+	rest := sql[i+2:]
+	j := strings.Index(rest, "'")
+	if j < 0 {
+		return ""
+	}
+	return rest[:j]
+}
+
+func (s *tempdbFakeServer) ExecDDL(_ context.Context, sql string) error {
+	if s.onExec != nil {
+		s.onExec(sql)
+	}
+	s.execLog = append(s.execLog, sql)
+	name := fileNameFromStmt(sql)
+	switch {
+	case strings.Contains(sql, "TRUNCATEONLY"):
+		// No truncate-only gain modeled here; the chunk loop tests exercise Phase B.
+	case strings.Contains(sql, "DBCC SHRINKFILE"):
+		target := max(parseChunkTarget(sql), s.floorMB[name])
+		if target < s.sizes[name] {
+			s.sizes[name] = target
+		}
+	}
+	return nil
+}
+
+func (s *tempdbFakeServer) Kill(_ context.Context, _ int) error { return nil }
+
+func (s *tempdbFakeServer) FileSpace(_ context.Context, fileType string) ([]mssql.FileSpace, error) {
+	if fileType != mssql.FileTypeRows {
+		return nil, nil
+	}
+	out := make([]mssql.FileSpace, len(s.order))
+	for i, name := range s.order {
+		out[i] = mssql.FileSpace{Name: name, TypeDesc: fileType, SizeMB: s.sizes[name], UsedMB: s.used[name], FreeMB: s.sizes[name] - s.used[name]}
+	}
+	return out, nil
+}
+
+func (s *tempdbFakeServer) FileSizeMB(_ context.Context, file string) (int, error) { return s.sizes[file], nil }
+
+func (s *tempdbFakeServer) LogReuse(_ context.Context) (string, string, error) { return "SIMPLE", "NOTHING", nil }
+func (s *tempdbFakeServer) ActiveLogFloorMB(_ context.Context) (int, error)    { return 0, nil }
+func (s *tempdbFakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
+	return nil, nil
+}
+func (s *tempdbFakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {
+	return mssql.Progress{}, false, nil
+}
+
+// newTestTempdbRunner wires a ShrinkRunner over a tempdbFakeServer, mirroring
+// newTestRunner's large poll intervals and manual-clock wait.
+func newTestTempdbRunner(s *tempdbFakeServer, clk *ManualClock) *ShrinkRunner {
+	r := NewShrinkRunner(s, s, noPressureSampler{}, clk, ShrinkRunnerConfig{
+		Tuning:          testTuning(),
+		PollInterval:    time.Hour,
+		LogPollInterval: time.Hour,
+		BlockingTimeout: time.Minute,
+		LogDrainTimeout: time.Minute,
+		KillGrace:       time.Second,
+	})
+	r.wait = func(_ context.Context, d time.Duration) error { clk.Advance(d); return nil }
+	return r
+}
+
+// assertTruncateOnlyBeforeAnyChunk asserts every TRUNCATEONLY statement in the log
+// precedes any page-moving DBCC SHRINKFILE statement, and that there is at least one
+// TRUNCATEONLY per expected file count.
+func assertTruncateOnlyBeforeAnyChunk(t *testing.T, log []string, wantTruncateOnly int) {
+	t.Helper()
+	var sawChunk bool
+	var truncCount int
+	for _, stmt := range log {
+		isTrunc := strings.Contains(stmt, "TRUNCATEONLY")
+		isChunk := strings.Contains(stmt, "DBCC SHRINKFILE") && !isTrunc
+		if isTrunc {
+			truncCount++
+			if sawChunk {
+				t.Fatalf("TRUNCATEONLY ran after a page-moving chunk; exec log = %v", log)
+			}
+		}
+		if isChunk {
+			sawChunk = true
+		}
+	}
+	if truncCount != wantTruncateOnly {
+		t.Fatalf("got %d TRUNCATEONLY statements, want %d (one per file); exec log = %v", truncCount, wantTruncateOnly, log)
+	}
+}
+
+func TestRunTempdbTruncatesAllFilesBeforeChunking(t *testing.T) {
+	s := newTempdbFakeServer(
+		mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 100},
+		mssql.FileSpace{Name: "tempdev2", SizeMB: 1000, UsedMB: 100},
+	)
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestTempdbRunner(s, clk)
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v", err)
+	}
+	if len(res) != 2 {
+		t.Fatalf("got %d results, want 2", len(res))
+	}
+	assertTruncateOnlyBeforeAnyChunk(t, s.execLog, 2)
+}
+
+func TestRunTempdbClampsTargetToUsed(t *testing.T) {
+	// A single file whose used space (500) exceeds the requested per-file target (200):
+	// the chunk target floor must be 500, never below it.
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "tempdev", sizeMB: 1000, usedMB: 500, floorMB: 500}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v", err)
+	}
+	if len(res) != 1 || res[0].TargetMB != 500 || res[0].FinalMB != 500 {
+		t.Fatalf("got %+v, want a single result clamped to TargetMB=FinalMB=500", res)
+	}
+	for _, stmt := range s.execLog {
+		if strings.Contains(stmt, "DBCC SHRINKFILE") && !strings.Contains(stmt, "TRUNCATEONLY") {
+			if target := parseChunkTarget(stmt); target < 500 {
+				t.Errorf("chunk targeted %d MB, want >= 500 (used space floor); stmt = %q", target, stmt)
+			}
+		}
+	}
+}
+
+// unbalancedWarning reports whether sink recorded the "Unbalanced tempdb files" warning.
+func unbalancedWarning(events []ReactionEvent) bool {
+	for _, e := range events {
+		if e.Kind == "tempdb" && strings.Contains(e.Detail, "Unbalanced tempdb files") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunTempdbWarnsOnUnbalancedFinalSizes(t *testing.T) {
+	s := newTempdbFakeServer(
+		mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 100},  // final clamps to target 200
+		mssql.FileSpace{Name: "tempdev2", SizeMB: 1000, UsedMB: 350}, // final clamps to used 350
+	)
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestTempdbRunner(s, clk)
+
+	var events []ReactionEvent
+	sink := func(e ReactionEvent) { events = append(events, e) }
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, sink)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v", err)
+	}
+	if len(res) != 2 || res[0].FinalMB == res[1].FinalMB {
+		t.Fatalf("got %+v, want two results with different FinalMB (unbalanced)", res)
+	}
+	if !unbalancedWarning(events) {
+		t.Errorf("no 'Unbalanced tempdb files' warning emitted; events = %+v", events)
+	}
+}
+
+func TestRunTempdbNoWarningWhenBalanced(t *testing.T) {
+	s := newTempdbFakeServer(
+		mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 100},
+		mssql.FileSpace{Name: "tempdev2", SizeMB: 1000, UsedMB: 100},
+	)
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestTempdbRunner(s, clk)
+
+	var events []ReactionEvent
+	sink := func(e ReactionEvent) { events = append(events, e) }
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, sink)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v", err)
+	}
+	if len(res) != 2 || res[0].FinalMB != res[1].FinalMB {
+		t.Fatalf("got %+v, want two results with equal FinalMB (balanced)", res)
+	}
+	if unbalancedWarning(events) {
+		t.Errorf("unexpected 'Unbalanced tempdb files' warning for balanced files; events = %+v", events)
+	}
+}
+
+func TestIsShrinkOpCoversBoth(t *testing.T) {
+	if !isShrinkOp(ddl.Shrink{}) {
+		t.Error("isShrinkOp(ddl.Shrink{}) = false, want true")
+	}
+	if !isShrinkOp(ddl.ShrinkTempdb{}) {
+		t.Error("isShrinkOp(ddl.ShrinkTempdb{}) = false, want true")
+	}
+	if isShrinkOp(ddl.CheckDB{}) {
+		t.Error("isShrinkOp(ddl.CheckDB{}) = true, want false")
+	}
+}
+
 // TestTempdb845RetriesWithoutFailing scripts a single Msg 845 (buffer latch time-out) on
 // the first chunk, then lets subsequent chunks succeed normally. The chunk loop must treat
 // it as a non-fatal, retryable no-progress event (same path as Msg 5240) and still converge
