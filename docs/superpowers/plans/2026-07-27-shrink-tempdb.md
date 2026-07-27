@@ -20,7 +20,7 @@
 - **Windows binary lock:** stop a running `bin/sqlgopace.exe` before rebuilding to the same path.
 - **US spelling** in comments/identifiers.
 - **Never kill a blocker** in the tempdb path: WALP resolves to `ABORT_AFTER_WAIT = SELF` always.
-- **`NoProgressBeforeFlush` default = 3**, must be `< MaxNoProgress` (3 today) — see note in Task 4.
+- **`NoProgressBeforeFlush` default = 2**, must be `< MaxNoProgress` (3 today) so the flush fires before the give-up *and* leaves retry room; config validation rejects `>= MaxNoProgress`. See Task 4.
 
 ---
 
@@ -32,14 +32,15 @@
 | `internal/ddl/resolve.go` | route `shrink_tempdb` to WALP-only resolution, force `SELF`; `overridesOf` case | 2 |
 | `ddl_compatibility.yaml` | `shrink_tempdb` matrix rows for `wait_at_low_priority` | 2 |
 | `internal/ddl/generate.go` | indicative statement for `ShrinkTempdb` (real SQL built at run time) | 3 |
-| `internal/config/config.go` | `NoProgressBeforeFlush` config + default | 4 |
+| `internal/config/config.go` | `NoProgressBeforeFlush` config + default + validation | 4 |
 | `internal/run/shrink_calc.go` | `ShrinkTuning.NoProgressBeforeFlush` field | 4 |
-| `cmd/sqlgopace/main.go` | map config → tuning; open tempdb conn; wire second runner | 4, 9 |
+| `cmd/sqlgopace/main.go` | map config → tuning; open tempdb conn; wire second runner | 4, 10 |
 | `internal/mssql/analysis.go` | `IsBufferLatchTimeout` (error 845) detector | 5 |
-| `internal/mssql/conn.go` | `OpenScoped` — a `*Conn` whose context is another database (tempdb) | 9 |
 | `internal/run/shrink.go` | extract `chunkLoop`; `TempdbProfile`; flush escalation; `RunTempdb` | 6, 7, 8 |
 | `internal/run/engine.go` | `TempdbShrinkDriver` interface; `processOne` case; `isShrinkOp` | 8 |
-| `README.md`, operator skill | document the op + non-goals + `flushcaches` trade-off | 10 |
+| `internal/preflight/preflight.go` | recognize `ShrinkTempdb` in the three op switches | 9 |
+| `internal/mssql/conn.go` | `OpenScoped` — a `*Conn` whose context is another database (tempdb) | 10 |
+| `README.md`, operator skill | document the op + non-goals + `flushcaches` trade-off | 11 |
 
 ---
 
@@ -309,14 +310,27 @@ git commit -m "feat(ddl): generate indicative statement for shrink_tempdb"
 - Test: `internal/config/config_test.go`
 
 **Interfaces:**
-- Produces: `config.ShrinkConfig.NoProgressBeforeFlush int` (yaml `no_progress_before_flush`, default `3`); `run.ShrinkTuning.NoProgressBeforeFlush int`.
+- Produces: `config.ShrinkConfig.NoProgressBeforeFlush int` (yaml `no_progress_before_flush`, default `2`); `run.ShrinkTuning.NoProgressBeforeFlush int`; `config.Validate` rejects `NoProgressBeforeFlush >= MaxNoProgress`.
 
 - [ ] **Step 1: Write the failing test**
 
 In `config_test.go`, add to the defaults table (near line 162, alongside `max_no_progress`):
 
 ```go
-		{"no_progress_before_flush", s.NoProgressBeforeFlush, 3},
+		{"no_progress_before_flush", s.NoProgressBeforeFlush, 2},
+```
+
+And a validation-rejection test (mirror the existing rejection-table style):
+
+```go
+func TestShrinkConfigRejectsFlushNotBelowMaxNoProgress(t *testing.T) {
+	cfg := validParsedConfig(t)          // however the other tests build a valid cfg
+	cfg.Shrink.MaxNoProgress = 3
+	cfg.Shrink.NoProgressBeforeFlush = 3 // not < MaxNoProgress → invalid
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected Validate error when no_progress_before_flush >= max_no_progress")
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -336,9 +350,19 @@ In the shrink defaults (find where `MaxNoProgress` gets its default of 3) add:
 
 ```go
 	if s.NoProgressBeforeFlush <= 0 {
-		s.NoProgressBeforeFlush = 3
+		s.NoProgressBeforeFlush = 2
 	}
 ```
+
+In `config.Validate` (where other shrink/config bounds are enforced), add:
+
+```go
+	if s := c.Shrink; s.NoProgressBeforeFlush >= s.MaxNoProgress {
+		return fmt.Errorf("shrink.no_progress_before_flush (%d) must be < max_no_progress (%d)", s.NoProgressBeforeFlush, s.MaxNoProgress)
+	}
+```
+
+> Apply defaults **before** this check so a zero-value config validates against the defaulted `2`, not `0`. Match how the existing shrink-field validation is structured (it may live in a `ShrinkConfig.validate()` helper — put it there if so).
 
 In `internal/run/shrink_calc.go`, add to `ShrinkTuning`:
 
@@ -520,9 +544,24 @@ func TestTempdbChunkLoopFlushesOnceOnStall(t *testing.T) {
 }
 
 func TestTempdb845IsRetryableNotFatal(t *testing.T) {
-	// Fake exec returns Msg 845 on the first chunk, then succeeds and shrinks.
-	// Assert chunkLoop does not return the 845 as an error and makes progress.
-	// (Construct with the same fakes; assert final err == nil and FinalMB < start.)
+	// Exec returns Msg 845 on the first chunk, then succeeds thereafter.
+	exec := &scriptedExec{errs: []error{mssql.Error{Number: 845, Message: "buffer latch time-out"}}}
+	// Reader: first size read 1000, then shrinks 100 MB per successful chunk down to 500.
+	reader := &steppingReader{sizes: []int{1000, 1000, 900, 800, 700, 600, 500}}
+	r := newTestShrinkRunner(t, exec, reader, ShrinkTuning{
+		MinStepMB: 50, MaxNoProgress: 3, NoProgressBeforeFlush: 2, NoProgressBackoff: 0,
+	})
+	prof := &TempdbProfile{flushed: new(bool)} // FlushCaches false: prove 845 alone is non-fatal
+
+	res, err := r.chunkLoop(ctx, mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 500},
+		1000, 500, ddl.ResolvedOptions{}, noIgnore, discardSink, prof)
+
+	if err != nil {
+		t.Fatalf("845 must not be fatal, got err = %v", err)
+	}
+	if res.FinalMB >= 1000 {
+		t.Errorf("expected progress after 845 retry, FinalMB = %d", res.FinalMB)
+	}
 }
 ```
 
@@ -806,7 +845,79 @@ git commit -m "feat(run): RunTempdb two-phase orchestrator and engine routing"
 
 ---
 
-## Task 9: tempdb-scoped connection + main.go wiring
+## Task 9: Preflight — recognize `shrink_tempdb`
+
+**Files:**
+- Modify: `internal/preflight/preflight.go` (`requiresElevatedRights` ~line 124; `CheckOperation` ~line 170; `objectExistence` ~line 322)
+- Test: `internal/preflight/preflight_test.go`
+
+**Why this is required:** `CheckOperation` and `objectExistence` only skip the `schema.table` existence check for `ddl.CheckDB, ddl.Shrink`. `ShrinkTempdb` has empty `Schema`/`Table`, so without adding it to these switches it falls through and **fails preflight with `table [].[] does not exist`** — the exact regression CLAUDE.md records was fixed for shrink/check_db in 028602a. It also issues `DBCC SHRINKFILE`, so it needs db_owner/sysadmin like the others.
+
+**Interfaces:**
+- Consumes: `ddl.ShrinkTempdb` (Task 1).
+- Produces: preflight passes `shrink_tempdb` with "no table precondition (database/file-scoped)" and includes it in the elevated-rights probe.
+
+- [ ] **Step 1: Write the failing test**
+
+```go
+func TestPreflightShrinkTempdbSkipsTableCheck(t *testing.T) {
+	op := ddl.ShrinkTempdb{TargetSizeMB: 20480}
+	// objectExistence must not consult the table; CheckOperation must Pass.
+	c := CheckOperation(op, false /*tableExists*/, false /*targetExists*/)
+	if c.Severity != Pass {
+		t.Fatalf("CheckOperation = %v, want Pass (database/file-scoped)", c)
+	}
+}
+
+func TestShrinkTempdbNeedsElevatedRights(t *testing.T) {
+	if !requiresElevatedRights(ddl.ShrinkTempdb{}) {
+		t.Fatal("shrink_tempdb issues DBCC SHRINKFILE; must require db_owner/sysadmin")
+	}
+}
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `go test ./internal/preflight -run 'TestPreflightShrinkTempdb|TestShrinkTempdbNeedsElevated' -v`
+Expected: FAIL (CheckOperation returns Fail "table [].[] does not exist"; `requiresElevatedRights` false).
+
+- [ ] **Step 3: Write minimal implementation**
+
+Add `ddl.ShrinkTempdb` to all three switches:
+
+```go
+// requiresElevatedRights (~line 124)
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
+		return true
+```
+
+```go
+// CheckOperation (~line 170)
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
+		return Check{fmt.Sprintf("%s %s", op.CommandType(), ref), Pass, "no table precondition (database/file-scoped)"}
+```
+
+```go
+// objectExistence (~line 322)
+	case ddl.CheckDB, ddl.Shrink, ddl.ShrinkTempdb:
+		return true, true, nil
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `go test ./internal/preflight`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add internal/preflight/preflight.go internal/preflight/preflight_test.go
+git commit -m "feat(preflight): recognize shrink_tempdb (skip table check, require db_owner)"
+```
+
+---
+
+## Task 10: tempdb-scoped connection + main.go wiring
 
 **Files:**
 - Modify: `internal/mssql/conn.go` (add `OpenScoped` / DSN-with-database helper)
@@ -835,7 +946,7 @@ Reuse the existing `Open` internals; only the database segment of the DSN change
 
 - [ ] **Step 3: Wire in main.go**
 
-After the primary `shrinkRunner` is built (~line 423) and only when a tempdb runner is warranted (always safe to build; it lazily connects), add:
+After the primary `shrinkRunner` is built (~line 423), open the tempdb connection and build the second runner. `OpenScoped` connects immediately, so treat its error as fatal to startup (like the primary `conn`):
 
 ```go
 	tempdbConn, err := mssql.OpenScoped(ctx, cfg.Database.ConnectionString, "tempdb")
@@ -877,7 +988,7 @@ git commit -m "feat: wire tempdb-scoped connection for shrink_tempdb"
 
 ---
 
-## Task 10: Documentation + version bump
+## Task 11: Documentation + version bump
 
 **Files:**
 - Modify: `README.md` (operations section — add `shrink_tempdb`)
@@ -890,7 +1001,7 @@ git commit -m "feat: wire tempdb-scoped connection for shrink_tempdb"
 In `README.md`, add a `shrink_tempdb` subsection near `shrink`:
 - Manifest example (`targetsizemb`, `flushcaches`).
 - Non-goals: not a monitor, not guaranteed, data files only.
-- The `flushcaches` trade-off (targeted flush; `('ALL')`/`FREEPROCCACHE` deliberately excluded).
+- The `flushcaches` trade-off (targeted flush; `('ALL')`/`FREEPROCCACHE` deliberately excluded); note the `aggressive` `('ALL')` widening is deferred out of v1.
 - Never kills blockers; WALP is `SELF`-only and 2022+.
 - The `Unbalanced tempdb files` warning and what it means.
 

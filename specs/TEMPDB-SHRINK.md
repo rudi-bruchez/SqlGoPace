@@ -160,10 +160,10 @@ no-gain chunk / Msg 5240 / 845
     the surface small and unambiguous. If ever added, it would require `flushcaches: true` (it only
     widens the same escalation, never a separate trigger).
 
-`NoProgressBeforeFlush` **default = `3`** no-progress events. It must be **`< MaxNoProgress`** (the
-existing give-up count) so the flush fires *before* the clean give-up rather than after it; keep it
-low so the (costly) flush is not attempted for a stall that clears on its own within a couple of
-back-offs.
+`NoProgressBeforeFlush` **default = `2`** no-progress events. It must be **`< MaxNoProgress`** (the
+existing give-up count, `3`) so the flush fires *before* the clean give-up **and leaves retry room
+after** — at `2`, the flush fires on the second stall, the counter resets, and there is still budget
+before the give-up at `3`. Config validation rejects `NoProgressBeforeFlush >= MaxNoProgress`.
 - **Flush runs at most once per run** (the caches are instance-wide; flushing per file would repeat
   the perf hit for nothing). A shared `flushed` flag spans all files.
 - **845** is folded in as a retryable no-progress event; the flush (which frees internal caches) is
