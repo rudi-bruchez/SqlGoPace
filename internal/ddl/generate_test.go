@@ -259,6 +259,16 @@ func TestGenerateShrinkIsIndicative(t *testing.T) {
 	}
 }
 
+func TestGenerateShrinkTempdbIsIndicative(t *testing.T) {
+	sql, err := ddl.Generate(ddl.ShrinkTempdb{TargetSizeMB: 20480}, ddl.ResolvedOptions{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	if !strings.Contains(sql, "DBCC SHRINKFILE") || !strings.Contains(sql, "tempdb") {
+		t.Errorf("indicative statement missing tempdb/DBCC: %q", sql)
+	}
+}
+
 // unknownOp is an Operation the generator does not recognize.
 type unknownOp struct{}
 
