@@ -78,9 +78,8 @@ func (p ShrinkProgress) Percent() float64 {
 // persistent no-progress run (Msg 5240 / Msg 845 / real no-gain) into one targeted
 // temp-object cache flush, guarded by flushed so it never runs more than once per run.
 type TempdbProfile struct {
-	FlushCaches  bool
-	TargetSizeMB int
-	flushed      *bool // once-per-run guard, shared across a RunTempdb's files
+	FlushCaches bool
+	flushed     *bool // once-per-run guard, shared across a RunTempdb's files
 }
 
 // ShrinkResult is the outcome of shrinking one file, for the run report.
@@ -257,7 +256,7 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 		return nil, err
 	}
 	flushed := false
-	prof := &TempdbProfile{FlushCaches: op.FlushCaches, TargetSizeMB: op.TargetSizeMB, flushed: &flushed}
+	prof := &TempdbProfile{FlushCaches: op.FlushCaches, flushed: &flushed}
 
 	// State the total explicitly (spec §6): targetsizemb is PER FILE, easy to misread.
 	sink(ReactionEvent{Kind: "tempdb", Detail: fmt.Sprintf(
