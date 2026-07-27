@@ -65,7 +65,7 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	// Shrink does not share the index/table option model: DBCC SHRINKFILE has no
 	// ONLINE clause, so the "WALP requires ONLINE" dependency must never fire, and
 	// online/resumable/sort_in_tempdb are not options here. Resolve WALP alone.
-	if cmd == "shrink_data" || cmd == "shrink_log" {
+	if cmd == "shrink_data" || cmd == "shrink_log" || cmd == "shrink_tempdb" {
 		return resolveShrink(op, t, m, p)
 	}
 
@@ -187,12 +187,13 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	return res, decisions
 }
 
-// resolveShrink resolves options for a DBCC SHRINKFILE operation. Only
-// WAIT_AT_LOW_PRIORITY is injectable (2022+, data files only — gated by the
-// matrix). There is no ONLINE clause for DBCC, so no "WALP requires ONLINE"
-// dependency is applied and no MAX_DURATION is emitted (the engine fixes the
-// shrink WALP timeout at ~1 minute). ABORT_AFTER_WAIT defaults to SELF and only
-// becomes BLOCKERS when the global policy opts in.
+// resolveShrink resolves options for a DBCC SHRINKFILE operation, including
+// shrink_tempdb. Only WAIT_AT_LOW_PRIORITY is injectable (2022+, data files
+// only — gated by the matrix). There is no ONLINE clause for DBCC, so no "WALP
+// requires ONLINE" dependency is applied and no MAX_DURATION is emitted (the
+// engine fixes the shrink WALP timeout at ~1 minute). ABORT_AFTER_WAIT defaults
+// to SELF and only becomes BLOCKERS when the global policy opts in — except for
+// shrink_tempdb, which is always SELF: tempdb never kills a blocking session.
 func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []Decision) {
 	cmd := op.CommandType()
 	ov := overridesOf(op)
@@ -203,7 +204,7 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 	res := ResolvedOptions{WaitAtLowPriority: walp}
 	if walp {
 		res.AbortAfterWait = "SELF"
-		if p.AllowAbortBlockers {
+		if p.AllowAbortBlockers && cmd != "shrink_tempdb" {
 			res.AbortAfterWait = "BLOCKERS"
 		}
 		// No MAX_DURATION for shrink WALP: the engine uses a fixed ~1-minute wait.
@@ -290,6 +291,8 @@ func overridesOf(op Operation) OptionOverrides {
 	case AddConstraint:
 		return o.Options
 	case Shrink:
+		return o.Options
+	case ShrinkTempdb:
 		return o.Options
 	case BatchDML:
 		return o.Options

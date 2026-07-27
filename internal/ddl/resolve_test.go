@@ -30,6 +30,11 @@ func resolveMatrix() *ddl.Matrix {
 				}},
 			},
 			"shrink_log": {},
+			"shrink_tempdb": {
+				"wait_at_low_priority": {MinMajor: 16, Editions: []ddl.Tier{
+					ddl.TierEnterprise, ddl.TierStandard, ddl.TierExpress, ddl.TierAzure,
+				}},
+			},
 		},
 	}
 }
@@ -290,6 +295,35 @@ func TestResolveShrinkAbortBlockers(t *testing.T) {
 	if !got.WaitAtLowPriority || got.AbortAfterWait != "BLOCKERS" {
 		t.Errorf("Resolve(shrink, AllowAbortBlockers) = {WALP:%t Abort:%q}, want {true BLOCKERS}",
 			got.WaitAtLowPriority, got.AbortAfterWait)
+	}
+}
+
+func TestResolveShrinkTempdbAlwaysSelf(t *testing.T) {
+	m := resolveMatrix()
+	// 2022 tier where WALP is supported, with AllowAbortBlockers ON: tempdb must
+	// still never kill a blocker.
+	op := ddl.ShrinkTempdb{TargetSizeMB: 20480}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{AllowAbortBlockers: true})
+
+	if !got.WaitAtLowPriority {
+		t.Fatalf("expected WALP eligible on 2022")
+	}
+	if got.AbortAfterWait != "SELF" {
+		t.Errorf("AbortAfterWait = %q, want SELF (never BLOCKERS for tempdb)", got.AbortAfterWait)
+	}
+}
+
+func TestResolveShrinkTempdbNoWALPOn2019(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.ShrinkTempdb{TargetSizeMB: 20480}
+	target := ddl.Target{MajorVersion: 15, Tier: ddl.TierEnterprise}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.WaitAtLowPriority {
+		t.Errorf("WALP must be off for shrink_tempdb on 2019")
 	}
 }
 
