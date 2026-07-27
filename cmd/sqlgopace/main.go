@@ -310,7 +310,15 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			fwd = &tuiForwarder{}
 			extra = append(extra, run.WithManifestObserver(current.set), run.WithAlertSink(fwd.alert))
 		}
-		engine := buildEngine(cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
+		engine, tempdbConn, berr := buildEngine(runCtx, cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
+		if berr != nil {
+			if !reused {
+				_ = dbConn.Close()
+			}
+			fmt.Fprintf(stdout, "-- database %s: %v\n", db, berr)
+			runErr = berr
+			continue
+		}
 		var sum run.Summary
 		if useTUI {
 			banner := serverBanner(dbInfo, matrix)
@@ -318,6 +326,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
+		_ = tempdbConn.Close()
 		if !reused {
 			_ = dbConn.Close()
 		}
@@ -365,8 +374,13 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 
 // buildEngine wires a run.Engine for one database's connection, sharing the given
 // history (may be nil) and reading policy, monitoring, and notification settings
-// from cfg. It is called once per database in a multi-database run.
-func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, drain func() bool, extra ...run.EngineOption) *run.Engine {
+// from cfg. It is called once per database in a multi-database run. It also opens
+// a second connection scoped to tempdb (FILEPROPERTY/DBCC SHRINKFILE/sys.database_files
+// are current-database-scoped, so shrink_tempdb cannot run over the primary
+// connection whatever database that is attached to) and returns it alongside the
+// engine so the caller closes it once that database's run is done, mirroring conn's
+// own lifecycle.
+func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, drain func() bool, extra ...run.EngineOption) (*run.Engine, *mssql.Conn, error) {
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
@@ -428,6 +442,21 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
 	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
+	// shrink_tempdb always executes over a connection whose database context is
+	// tempdb, regardless of which database this engine otherwise targets; the
+	// sampler stays the shared, instance-wide one.
+	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version())
+	if err != nil {
+		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
+	}
+	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, sampler, run.System, run.ShrinkRunnerConfig{
+		Tuning:          shrinkTuning(cfg.Shrink),
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
 		Tuning:          batchTuning(cfg.BatchDML),
 		RCSI:            info.RCSIEnabled,
@@ -450,6 +479,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithDatabase(info.Database),
 		run.WithShrinkRunner(shrinkRunner),
+		run.WithTempdbShrinkRunner(tempdbShrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
 		run.WithCompressionReader(conn),
 		run.WithDrainSignal(drain),
@@ -480,7 +510,7 @@ func buildEngine(cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info 
 		opts = append(opts, run.WithServerClock(conn))
 	}
 	opts = append(opts, extra...)
-	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...)
+	return run.NewEngine(dirs, info.Target(), matrix, cfg.Policy(), checker, runner, opts...), tempdbConn, nil
 }
 
 // stepSinkTo formats manifest-level step events to w: one line when an operation
