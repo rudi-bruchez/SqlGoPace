@@ -48,6 +48,15 @@ options_override:
 notifications:
   webhook_url: "${WEBHOOK_URL}"      # empty = disabled
   on_events: [cancel, fail, pause, log_full, abort]
+  # Optional email channel. Shares on_events with the webhook. Empty host = disabled.
+  # email:
+  #   host: "smtp.internal.example"
+  #   port: 25
+  #   from: "sqlgopace@example.com"
+  #   to: ["dba-team@example.com"]
+  #   username: ""            # empty = anonymous relay
+  #   password: "${SMTP_PASS}"
+  #   starttls: false
 
 history:
   enabled: true
