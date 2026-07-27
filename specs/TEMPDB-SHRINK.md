@@ -197,8 +197,15 @@ back-offs.
   `ShrinkRunner`; `processOne` `case ddl.ShrinkTempdb` + the `isShrinkOp` predicate for the
   stop-short/`incomplete` path; per-file equal-size target + clamp; the unified no-progress
   escalation with the optional flush; 845 in the retryable set.
-- **`internal/mssql`** — reuse `FileSpace(FileTypeRows)` / `FileSizeMB`; add the flush statements
-  (a small exec helper). tempdb is always SIMPLE recovery, so no log-reuse gate on the data path.
+- **`internal/mssql`** — **tempdb-scoped connection.** `FileSpace`/`FileSizeMB` read
+  `sys.database_files` and `FILEPROPERTY(..., 'SpaceUsed')` in the **connected** database, and
+  `DBCC SHRINKFILE` shrinks the **current** database's file. So the tempdb shrink cannot run on the
+  main config-DB connection: `RunTempdb` needs an exec + reader whose context **is tempdb**. Open a
+  second `*mssql.Conn` against tempdb (clone the config DSN with `database=tempdb`) and use it as
+  **both** the `Executor` and `ShrinkReader` for the tempdb path; the `Sampler` stays on the main
+  connection (its DMVs are instance-wide). No new read SQL is needed — the existing reads are
+  correct once the context is tempdb. Add only the flush exec helper. tempdb is always SIMPLE
+  recovery, so no log-reuse gate on the data path.
 - **`internal/preflight`** — tempdb reachability/file checks on the existing shrink model.
 - **`internal/config`** — default for `NoProgressBeforeFlush` (`3`, `< MaxNoProgress`) and the
   shrink tuning already used. (`aggressive` widening is deferred out of v1, §5.)
