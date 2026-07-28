@@ -642,6 +642,32 @@ sqlgopace --config config.yaml
 | `--dry-run`    | Print the manifests instead of writing them.                                 |
 | `--explain`    | Show the reasoning behind each decision.                                     |
 
+### `shrink:` (pre-shrink reorganize + reclaim)
+
+Optional. When enabled, `sqlgopace plan` emits an extra manifest for the connected
+database that reorganizes the low-density rowstore indexes (the tables large deletes
+left half-empty), then shrinks the data file. It also prints and writes a `.heaps.yaml`
+advisory listing the heaps a shrink cannot benefit from (reorganize cannot compact a
+heap's in-row data — rebuild them in a window). Applies to the connected database only.
+
+```yaml
+shrink:
+  enabled: true          # off/absent = no shrink manifest (default)
+  type: data             # data | log  (log skips reorganize + the advisory)
+  files: all             # all | a logical file name
+  targetfreespace: 10%   # percent or absolute MB (e.g. 100MB)
+  pre_reorganize: true   # false = emit the shrink op alone (default true)
+  reorganize_below_density_percent: 65  # reorganize rowstore indexes below this SAMPLED page density
+  max_block_minutes: 10  # optional; carried into the shrink op's options
+```
+
+Notes:
+- The index size floor reuses `index.page_count_floor`.
+- Session policy (`ignore_blocked_sessions` / `kill_blocking_sessions`) is not generated —
+  add it by editing the generated manifest.
+- The reorganize selection runs a SAMPLED `sys.dm_db_index_physical_stats` scan of the
+  database's indexes at plan time (heavier than the maintenance pass's LIMITED scan).
+
 ## Compatibility matrix
 
 `ddl_compatibility.yaml` declares, per operation, which options are eligible by minimum
