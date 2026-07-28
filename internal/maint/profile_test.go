@@ -286,3 +286,53 @@ func TestCompressionDataCompression(t *testing.T) {
 		}
 	}
 }
+
+func TestShrinkRulesParseAndDefaults(t *testing.T) {
+	p, err := maint.Parse([]byte("shrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  max_block_minutes: 10\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !p.Shrink.Enabled || p.Shrink.Type != "data" || p.Shrink.Files != "all" {
+		t.Errorf("shrink parsed wrong: %+v", p.Shrink)
+	}
+	if p.Shrink.ReorganizeBelowDensityPercent != 65 {
+		t.Errorf("density default = %v, want 65", p.Shrink.ReorganizeBelowDensityPercent)
+	}
+	if !p.Shrink.PreReorganizeEnabled() {
+		t.Error("PreReorganizeEnabled() = false, want true (default when enabled)")
+	}
+	if p.Shrink.MaxBlockMinutes != 10 {
+		t.Errorf("max_block_minutes = %d, want 10", p.Shrink.MaxBlockMinutes)
+	}
+}
+
+func TestShrinkRulesPreReorganizeExplicitFalse(t *testing.T) {
+	p, err := maint.Parse([]byte("shrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  pre_reorganize: false\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if p.Shrink.PreReorganizeEnabled() {
+		t.Error("PreReorganizeEnabled() = true, want false (explicit)")
+	}
+}
+
+func TestShrinkRulesValidation(t *testing.T) {
+	for name, body := range map[string]string{
+		"bad type":      "shrink:\n  enabled: true\n  type: index\n  files: all\n  targetfreespace: 10%\n",
+		"empty files":   "shrink:\n  enabled: true\n  type: data\n  files: \"\"\n  targetfreespace: 10%\n",
+		"bad target":    "shrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: nonsense\n",
+		"density > 100": "shrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 150\n",
+		"neg maxblock":  "shrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  max_block_minutes: -1\n",
+	} {
+		if _, err := maint.Parse([]byte(body)); err == nil {
+			t.Errorf("%s: expected a validation error, got nil", name)
+		}
+	}
+}
+
+func TestShrinkRulesDisabledIsInert(t *testing.T) {
+	// An absent shrink section (or enabled:false) must not error even with no other fields.
+	if _, err := maint.Parse([]byte("index:\n  reorganize_from_percent: 5\n")); err != nil {
+		t.Fatalf("parse without shrink section: %v", err)
+	}
+}
