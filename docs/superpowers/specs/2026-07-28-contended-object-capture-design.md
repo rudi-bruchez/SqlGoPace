@@ -81,6 +81,12 @@ WHERE l.request_session_id = @spid
 
 `LockedObject` carries `ObjectID int64`, `Schema string`, `Table string`, `Mode string`.
 
+`OBJECT_SCHEMA_NAME` / `OBJECT_NAME` return `NULL` if the object was dropped between
+lock acquisition and the read, or the caller lacks metadata visibility. The Go read
+scans both into `sql.NullString` and, on `NULL`, keeps the entry with `object_id` only
+(empty schema/table) — a name miss never fails the capture, since `object_id` is the
+join key the planner actually uses.
+
 Why this is robust (verified against Microsoft's lock documentation):
 - `Sch-M` / `Sch-S` are **object-level** locks; for `resource_type = OBJECT` the
   `resource_associated_entity_id` **is** the `object_id` (a bigint) — no fragile
@@ -108,10 +114,25 @@ Injection point: the reaction `sink` in `processOne` (`engine.go`), where
 engine calls `HeldObjectLocks(ctx, spid)` and folds the result into the accumulator. No
 new sampling cadence — it reuses the existing reaction snapshots.
 
-Because a `Sch-M` lock is transient (held while an allocation unit is relocated), a
-single snapshot may return empty even if the shrink was blocking a moment earlier. This
-is accepted: capture runs across every reaction, so recurrent objects surface. Like the
-existing blocked-session capture, it is best-effort.
+**The snapshot is taken while the lock is still held — by construction.** In the shrink
+driver's `runChunk` (`shrink.go`), the pressure-pause fires *before* the chunk is
+cancelled:
+
+```
+supervise() detects pressure  → the DBCC statement is STILL running (Sch-M held)
+sink("pause", …)              ← emitted here, synchronously
+r.cancelAndAwait(…)           ← the chunk is cancelled only after
+```
+
+So when the sink runs `captureBlockers` (and, added here, `HeldObjectLocks`), the shrink
+still holds its `Sch-M`. This is not incidental: the pause is triggered *by* detecting
+that we block other sessions, and a victim `BlockedBy(our spid)` is proof we hold the
+object lock at that instant. Consequently `HeldObjectLocks` is non-empty **exactly when
+it matters** — whenever `captureBlockers` returns a positive count. The `Sch-M` is
+transient across the run, so the *number* of distinct objects captured is bounded by the
+number of reactions (five in the PRODDB run), but the capture is not "often empty":
+it is coupled to the blocked-session capture that already works. Best-effort, like that
+capture.
 
 ## 3. Sidecar `.contended.yaml` (run output)
 
@@ -177,6 +198,15 @@ unchanged. Present → `plan` loads the sidecar, asserts `database:` equals the 
 database (else an actionable error), and passes the set of confirmed `object_id`s (with
 `times_blocked`) into the generation.
 
+Guards:
+- **`--confirmed` with no `shrink` section (or `shrink.enabled: false`):** the confirmed
+  set has nowhere to go. `plan` errors: `--confirmed requires shrink.enabled in the
+  maintenance profile`.
+- **Stale `object_id`:** a table dropped/rebuilt between the run and this `plan` may not
+  appear in the current density/heap scan. An unresolvable confirmed id is **skipped
+  with a log line** (`confirmed object <id> not found in <db>; skipping`), never an
+  error — the rest of the confirmed set still applies.
+
 The effect is to **augment**, not replace, the DB-wide density selection (the partial
 -evidence constraint from Scope). In the pure `internal/maint` selection function:
 
@@ -195,6 +225,24 @@ The effect is to **augment**, not replace, the DB-wide density selection (the pa
    reinforced wording (`observed blocking the shrink at HH:MM, times_blocked=N`). A
    confirmed heap lifts the §3 "candidates, not confirmed" limit **without** running
    `page_allocations`.
+
+**Annotation mechanism (not a manifest field).** The `# confirmed blocker …` text is a
+YAML **comment**, not a new operation field. `ddl/render.go` already builds the manifest
+from hand-constructed `yaml.Node`s (`operationNode`, `addPair`), so the renderer sets
+`node.HeadComment` on the confirmed operation — the `yaml.v3` encoder emits it, and
+`ParseManifest` ignores it (round-trip intact, no schema change). A `note:` struct field
+is deliberately **not** added: nothing in the engine consumes it, so it would be an
+unused round-tripping field (YAGNI). The planner threads the annotations to the renderer
+as a small `map[operationIndex]string`, keeping the comment text (planner knowledge) out
+of the pure `ddl` operation types.
+
+**Heap-advisory rendering dependency.** Upgrading a heap entry to CONFIRMED requires the
+pre-shrink heap-advisory renderer to receive the confirmed set (object_id → times_blocked).
+Because `.heaps.yaml` is advisory-only (never read back), this is a **render-time
+parameter**, not a round-trippable struct field — the confirmation info is passed into the
+advisory rendering, not stored on the heap-measurement type. This is the one structural
+touch-point on the companion pre-shrink work; it is additive (absent confirmed set →
+today's "candidate" wording).
 
 Prioritisation among confirmed objects: by `times_blocked` descending (most recurrent
 first), then `first_seen`.
@@ -240,8 +288,18 @@ All decision logic lands in pure code (no database):
   - ordering by `times_blocked` desc then `first_seen`;
   - **without `--confirmed`** → output identical to the current pre-shrink (non
     -regression).
+- **Engine injection gate:** with a fake blocker reader, a `ddl.Shrink` step whose sink
+  fires a `pause` triggers `HeldObjectLocks` and writes `.contended.yaml`; a non-shrink
+  step (e.g. `ddl.RebuildIndex`) with the same reaction does **not**. Guards the
+  "shrink runs only" scope at the injection point.
 - **`HeldObjectLocks`:** covered by the `integration`-tagged tests (real DMV), like the
   other `internal/mssql` reads — not in unit tests.
+
+Overlap note: a confirmed object may also be picked by the regular index-maintenance
+pass, so its `reorganize_index` can appear in both that manifest and the shrink manifest.
+This is already accepted by the pre-shrink design (self-contained manifest, `REORGANIZE`
+idempotent); `--confirmed` only ever touches the shrink manifest, so it adds no new
+cross-manifest duplication concern.
 
 ## Non-goals
 
