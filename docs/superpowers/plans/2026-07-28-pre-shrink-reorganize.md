@@ -286,6 +286,18 @@ func TestDecidePreShrinkReorganizeCarriesLOBCompaction(t *testing.T) {
 	}
 	_ = ddl.ReorganizeIndex{} // ensure ddl import is used
 }
+
+func TestDecidePreShrinkDensityBoundary(t *testing.T) {
+	p := shrinkProfile(t) // threshold 65
+	indexes := []maint.ShrinkIndexMeasurement{
+		{Schema: "dbo", Table: "AtThreshold", Index: "IX", PageCount: 5000, AvgPageSpaceUsedPercent: 65},  // == threshold → skip (only below qualifies)
+		{Schema: "dbo", Table: "Below", Index: "IX", PageCount: 5000, AvgPageSpaceUsedPercent: 64.9},      // below → reorganize
+	}
+	pl := maint.DecidePreShrink(indexes, nil, p)
+	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Table != "Below" {
+		t.Errorf("boundary: density == threshold must be skipped; got %+v", pl.Reorganizes)
+	}
+}
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -407,6 +419,7 @@ package plan_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
@@ -417,15 +430,19 @@ import (
 // fakeShrinkReader returns canned inventory + sampled physical stats; the other Reader
 // methods are unused by AnalyzePreShrink and return nil.
 type fakeShrinkReader struct {
-	inv     []mssql.InventoryObject
-	density map[int64]float64 // objectID → avg_page_space_used_in_percent
-	pages   map[int64]int64   // objectID → page_count
+	inv        []mssql.InventoryObject
+	density    map[int64]float64 // objectID → avg_page_space_used_in_percent
+	pages      map[int64]int64   // objectID → page_count
+	errObjects map[int64]bool    // objectID → PhysicalStats returns an error (per-object read failure)
 }
 
 func (f *fakeShrinkReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
 	return f.inv, nil
 }
 func (f *fakeShrinkReader) PhysicalStats(_ context.Context, objectID int64, _ int, _ *int, mode string) ([]mssql.PhysicalStats, error) {
+	if f.errObjects[objectID] {
+		return nil, fmt.Errorf("sampled scan failed for object %d", objectID)
+	}
 	return []mssql.PhysicalStats{{
 		PartitionNumber: 1, PageCount: f.pages[objectID],
 		AvgPageSpaceUsedPercent: f.density[objectID], RecordCount: 100,
@@ -463,6 +480,29 @@ func TestAnalyzePreShrink(t *testing.T) {
 	}
 	if len(pl.HeapAdvisories) != 1 || pl.HeapAdvisories[0].Table != "H" {
 		t.Errorf("advisories = %+v, want one for dbo.H", pl.HeapAdvisories)
+	}
+}
+
+func TestAnalyzePreShrinkSkipsFailedObjectNotFatal(t *testing.T) {
+	p, err := maint.Parse([]byte("index:\n  page_count_floor: 1000\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 65\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "Bad", ObjectID: 1, IndexID: 1, IndexName: "IX_Bad", Type: 1, PartitionNumber: 1, SizeMB: 100},
+			{Schema: "dbo", Table: "Good", ObjectID: 2, IndexID: 1, IndexName: "IX_Good", Type: 1, PartitionNumber: 1, SizeMB: 100},
+		},
+		density:    map[int64]float64{2: 40},
+		pages:      map[int64]int64{2: 5000},
+		errObjects: map[int64]bool{1: true}, // object 1's sampled scan errors; must be skipped, not fatal
+	}
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("a per-object read error must not be fatal, got %v", err)
+	}
+	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Table != "Good" {
+		t.Errorf("failed object should be skipped, survivor kept; got %+v", pl.Reorganizes)
 	}
 }
 ```
@@ -1107,7 +1147,7 @@ shrink:
 
 Notes:
 - The index size floor reuses `index.page_count_floor`.
-- Session policy (`ignore_blocked_sessions` / `kill_blocked_sessions`) is not generated —
+- Session policy (`ignore_blocked_sessions` / `kill_blocking_sessions`) is not generated —
   add it by editing the generated manifest.
 - The reorganize selection runs a SAMPLED `sys.dm_db_index_physical_stats` scan of the
   database's indexes at plan time (heavier than the maintenance pass's LIMITED scan).
