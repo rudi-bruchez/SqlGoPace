@@ -17,7 +17,7 @@ victims our DDL blocks — and only on a session that is live right now.
 
 A key that opens a roster of **every session that has blocked our DDL this run**,
 grouped by **login** or **host**, from which the operator can arm (and un-arm)
-auto-kill rules keyed on that login/host. Arming appends a `kill_blocked_sessions`
+auto-kill rules keyed on that login/host. Arming appends a `kill_blocking_sessions`
 rule to the running manifest; the engine hot-reloads it and the already-armed
 `BlockerKiller` terminates any present-or-future session from that group on the
 next blocking poll. Nothing is killed at arm time — recurrences are handled by
@@ -101,7 +101,7 @@ Two new `ActionKind`s carrying `Criterion` (`login_name` | `host_name`) + `Value
 
 New manifest edit `ddl.RemoveKilledSession(path string, s KilledSession) error`:
 load the manifest, drop every field-equal (`sameKilledSession`) entry from
-`KillBlockedSessions`, write back atomically (temp + rename), mirroring
+`KillBlockingSessions`, write back atomically (temp + rename), mirroring
 `AppendKilledSession`. Removing a rule that isn't present is a no-op. (Note: if a
 config-supplied rule happened to match the same login/host, disarm removes it
 too — that is the operator's explicit intent when toggling the group off.)

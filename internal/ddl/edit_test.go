@@ -101,8 +101,8 @@ func TestAppendKilledSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload after append: %v", err)
 	}
-	if len(m.KillBlockedSessions) != 1 || m.KillBlockedSessions[0].LoginName != "^SVC_RPT$" {
-		t.Fatalf("after append, kill rules = %+v, want one ^SVC_RPT$ login rule", m.KillBlockedSessions)
+	if len(m.KillBlockingSessions) != 1 || m.KillBlockingSessions[0].LoginName != "^SVC_RPT$" {
+		t.Fatalf("after append, kill rules = %+v, want one ^SVC_RPT$ login rule", m.KillBlockingSessions)
 	}
 	if m.Description != "edit me" || len(m.Operations) != 1 {
 		t.Errorf("rewrite lost manifest content: desc=%q ops=%d", m.Description, len(m.Operations))
@@ -112,8 +112,8 @@ func TestAppendKilledSession(t *testing.T) {
 		t.Fatalf("second AppendKilledSession() error = %v", err)
 	}
 	m, _ = ddl.LoadManifestFile(path)
-	if len(m.KillBlockedSessions) != 1 {
-		t.Errorf("duplicate kill rule not deduped: %d rules", len(m.KillBlockedSessions))
+	if len(m.KillBlockingSessions) != 1 {
+		t.Errorf("duplicate kill rule not deduped: %d rules", len(m.KillBlockingSessions))
 	}
 }
 
@@ -160,16 +160,16 @@ func TestRemoveKilledSession(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 	m, err := ddl.LoadManifestFile(path)
-	if err != nil || len(m.KillBlockedSessions) != 1 {
-		t.Fatalf("after append: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	if err != nil || len(m.KillBlockingSessions) != 1 {
+		t.Fatalf("after append: %d rules, err=%v", len(m.KillBlockingSessions), err)
 	}
 
 	if err := ddl.RemoveKilledSession(path, rule); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	m, err = ddl.LoadManifestFile(path)
-	if err != nil || len(m.KillBlockedSessions) != 0 {
-		t.Fatalf("after remove: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	if err != nil || len(m.KillBlockingSessions) != 0 {
+		t.Fatalf("after remove: %d rules, err=%v", len(m.KillBlockingSessions), err)
 	}
 
 	// Removing an absent rule is a no-op (no error).

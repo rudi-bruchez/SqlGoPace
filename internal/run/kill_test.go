@@ -155,14 +155,14 @@ func TestBlockerKillerMatchesRosterArmedRule(t *testing.T) {
 func TestManifestKillSourceReloadPicksUpNewRule(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "m.yaml")
 	base := "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n"
-	if err := os.WriteFile(path, []byte("kill_blocked_sessions:\n  - login_name: \"^SVC_RPT$\"\n"+base), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("kill_blocking_sessions:\n  - login_name: \"^SVC_RPT$\"\n"+base), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	m, err := ddl.LoadManifestFile(path)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	initial, err := compileKilledSessions(m.KillBlockedSessions, 0)
+	initial, err := compileKilledSessions(m.KillBlockingSessions, 0)
 	if err != nil {
 		t.Fatalf("compile: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestManifestKillSourceReloadPicksUpNewRule(t *testing.T) {
 	}
 
 	// Append a second rule mid-run; live reload must pick it up.
-	if err := os.WriteFile(path, []byte("kill_blocked_sessions:\n  - login_name: \"^SVC_RPT$\"\n  - host_name: \"^BATCH01$\"\n"+base), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("kill_blocking_sessions:\n  - login_name: \"^SVC_RPT$\"\n  - host_name: \"^BATCH01$\"\n"+base), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	future := time.Now().Add(2 * time.Second)

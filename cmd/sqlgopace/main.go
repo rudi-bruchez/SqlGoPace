@@ -1084,7 +1084,7 @@ func killBlockerAuto(ctx context.Context, program *tui.Program, conn *mssql.Conn
 	program.Send(tui.LogMsg{Line: fmt.Sprintf("killed SPID %d and auto-killing by %s — added to manifest", a.SPID, a.Criterion)})
 }
 
-// armKillRule appends a kill_blocked_sessions rule (by login/host) to the running manifest
+// armKillRule appends a kill_blocking_sessions rule (by login/host) to the running manifest
 // without killing anyone now — a session that later blocks the DDL and matches is terminated by
 // the armed BlockerKiller. It is killBlockerAuto without the immediate KILL: the roster arms
 // recurrences, it does not act on a live session.
@@ -1092,7 +1092,7 @@ func armKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
 	editKillRule(program, current, a, "arm", "armed", "added to", ddl.AppendKilledSession)
 }
 
-// disarmKillRule removes the matching kill_blocked_sessions rule from the running manifest — the
+// disarmKillRule removes the matching kill_blocking_sessions rule from the running manifest — the
 // inverse of armKillRule.
 func disarmKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
 	editKillRule(program, current, a, "disarm", "disarmed", "removed from", ddl.RemoveKilledSession)

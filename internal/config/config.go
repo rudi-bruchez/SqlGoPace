@@ -37,7 +37,7 @@ type Config struct {
 }
 
 // KillBlockersConfig arms the selective blocker-kill policy. The match rules themselves
-// live per-manifest in kill_blocked_sessions (hot-reloadable, TUI-appendable); this global
+// live per-manifest in kill_blocking_sessions (hot-reloadable, TUI-appendable); this global
 // block is the safety gate. Killing a session is destructive, so it is off by default and
 // only happens when Enabled is true. DefaultAfterSeconds seeds a rule's delay when it sets
 // none (0 = kill on sight).

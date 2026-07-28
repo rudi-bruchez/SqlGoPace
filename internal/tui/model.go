@@ -241,11 +241,11 @@ const (
 	// for it to the running manifest, so a recurrence is auto-killed without a restart.
 	// Criterion/Value/SPID carry the chosen match (the inverse of ActionIgnoreBlocker).
 	ActionKillBlockerAuto
-	// ActionArmKillRule appends a kill_blocked_sessions rule (Criterion/Value) to the running
+	// ActionArmKillRule appends a kill_blocking_sessions rule (Criterion/Value) to the running
 	// manifest without killing now: a session that later blocks the DDL and matches the rule is
 	// terminated by the armed BlockerKiller. Emitted from the blocker roster.
 	ActionArmKillRule
-	// ActionDisarmKillRule removes the matching kill_blocked_sessions rule from the running
+	// ActionDisarmKillRule removes the matching kill_blocking_sessions rule from the running
 	// manifest — the inverse of ActionArmKillRule.
 	ActionDisarmKillRule
 	// ActionQuit leaves the console.

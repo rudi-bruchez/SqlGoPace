@@ -308,13 +308,13 @@ func TestParseManifestErrors(t *testing.T) {
 			wantErr: ddl.ErrInvalidManifest,
 		},
 		{
-			name:    "kill_blocked_sessions empty entry",
-			yaml:    "kill_blocked_sessions:\n  - {}\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			name:    "kill_blocking_sessions empty entry",
+			yaml:    "kill_blocking_sessions:\n  - {}\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
 		{
-			name:    "kill_blocked_sessions negative after_seconds",
-			yaml:    "kill_blocked_sessions:\n  - login_name: \"^SVC$\"\n    after_seconds: -1\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			name:    "kill_blocking_sessions negative after_seconds",
+			yaml:    "kill_blocking_sessions:\n  - login_name: \"^SVC$\"\n    after_seconds: -1\noperations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
 			wantErr: ddl.ErrInvalidManifest,
 		},
 	}

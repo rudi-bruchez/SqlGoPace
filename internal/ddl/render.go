@@ -63,16 +63,16 @@ func MarshalManifest(m *Manifest) ([]byte, error) {
 		}
 		addPair(root, "ignore_blocked_sessions", seq)
 	}
-	if len(m.KillBlockedSessions) > 0 {
+	if len(m.KillBlockingSessions) > 0 {
 		seq := &yaml.Node{Kind: yaml.SequenceNode}
-		for i, s := range m.KillBlockedSessions {
+		for i, s := range m.KillBlockingSessions {
 			node, err := killedSessionNode(s)
 			if err != nil {
-				return nil, fmt.Errorf("kill_blocked_sessions[%d]: %w", i, err)
+				return nil, fmt.Errorf("kill_blocking_sessions[%d]: %w", i, err)
 			}
 			seq.Content = append(seq.Content, node)
 		}
-		addPair(root, "kill_blocked_sessions", seq)
+		addPair(root, "kill_blocking_sessions", seq)
 	}
 	addPair(root, "operations", operations)
 
@@ -125,7 +125,7 @@ func ignoredSessionNode(s IgnoredSession) (*yaml.Node, error) {
 	return &node, nil
 }
 
-// killedSessionNode encodes one kill_blocked_sessions entry, dropping its unset fields
+// killedSessionNode encodes one kill_blocking_sessions entry, dropping its unset fields
 // (nil session_id and empty regexps via compact; a zero after_seconds via ",omitempty"
 // on the field) so the rule round-trips through ParseManifest unchanged.
 func killedSessionNode(s KilledSession) (*yaml.Node, error) {

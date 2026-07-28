@@ -17,7 +17,7 @@ type KillEvent struct {
 	Waited time.Duration // how long it blocked the DDL before the kill
 }
 
-// killRule is one compiled kill_blocked_sessions entry: a session matcher (shared with the
+// killRule is one compiled kill_blocking_sessions entry: a session matcher (shared with the
 // ignore rules) plus the delay the blocker must persist before it is killed.
 type killRule struct {
 	match sessionRule
@@ -62,7 +62,7 @@ func compileKilledSessions(rules []ddl.KilledSession, def time.Duration) ([]kill
 	return out, nil
 }
 
-// manifestKillSource re-reads a manifest's kill_blocked_sessions from disk on demand, so a
+// manifestKillSource re-reads a manifest's kill_blocking_sessions from disk on demand, so a
 // rule added during the run (by hand or the TUI) is honored on the next poll. It is
 // mtime-gated and keeps the last good rules when the file is unreadable or mid-write —
 // the exact behavior of manifestSource for ignore rules.
@@ -99,7 +99,7 @@ func (s *manifestKillSource) Current() []killRule {
 	if err != nil {
 		return s.cur // mid-edit / invalid: keep the last good rules
 	}
-	rules, err := compileKilledSessions(m.KillBlockedSessions, s.def)
+	rules, err := compileKilledSessions(m.KillBlockingSessions, s.def)
 	if err != nil {
 		return s.cur
 	}

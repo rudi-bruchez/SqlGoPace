@@ -100,12 +100,12 @@ func AppendKilledSession(path string, s KilledSession) error {
 	if err != nil {
 		return err
 	}
-	for _, e := range m.KillBlockedSessions {
+	for _, e := range m.KillBlockingSessions {
 		if sameKilledSession(e, s) {
 			return nil // already present
 		}
 	}
-	m.KillBlockedSessions = append(m.KillBlockedSessions, s)
+	m.KillBlockingSessions = append(m.KillBlockingSessions, s)
 	data, err := MarshalManifest(m)
 	if err != nil {
 		return err
@@ -131,11 +131,11 @@ func RemoveKilledSession(path string, s KilledSession) error {
 	if err != nil {
 		return err
 	}
-	before := len(m.KillBlockedSessions)
-	m.KillBlockedSessions = slices.DeleteFunc(m.KillBlockedSessions, func(e KilledSession) bool {
+	before := len(m.KillBlockingSessions)
+	m.KillBlockingSessions = slices.DeleteFunc(m.KillBlockingSessions, func(e KilledSession) bool {
 		return sameKilledSession(e, s)
 	})
-	if len(m.KillBlockedSessions) == before {
+	if len(m.KillBlockingSessions) == before {
 		return nil // nothing matched: don't rewrite the file
 	}
 	data, err := MarshalManifest(m)

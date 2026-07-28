@@ -178,7 +178,7 @@ type Engine struct {
 	reconnectTimeout time.Duration
 	database         string                // when set, process only manifests for this database
 	liveReload       bool                  // re-read ignore_blocked_sessions from the manifest mid-run
-	killer           *BlockerKiller        // when set, kills matching blockers per kill_blocked_sessions
+	killer           *BlockerKiller        // when set, kills matching blockers per kill_blocking_sessions
 	killDefaultAfter time.Duration         // default delay for a kill rule that sets none
 	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
@@ -223,7 +223,7 @@ func WithTempdbShrinkRunner(d TempdbShrinkDriver) EngineOption {
 }
 
 // WithBlockerKiller arms the selective blocker-kill policy: the killer terminates sessions
-// blocking this run's DDL that match the manifest's kill_blocked_sessions (after each rule's
+// blocking this run's DDL that match the manifest's kill_blocking_sessions (after each rule's
 // delay). defaultAfter seeds a rule that sets no delay. The same killer must be attached to
 // the sampler (ServerSampler.SetKiller) so it is consulted on each blocking poll.
 func WithBlockerKiller(k *BlockerKiller, defaultAfter time.Duration) EngineOption {
@@ -533,13 +533,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
-	// Arm the blocker-killer for this manifest (kill_blocked_sessions), if wired. The
+	// Arm the blocker-killer for this manifest (kill_blocking_sessions), if wired. The
 	// killer is shared with the sampler; disarm it when this manifest is done so a later
 	// manifest without kill rules does not act on stale ones.
 	if e.killer != nil {
-		killSrc, kerr := e.killSource(name, manifest.KillBlockedSessions)
+		killSrc, kerr := e.killSource(name, manifest.KillBlockingSessions)
 		if kerr != nil {
-			rep.Error = "compile kill_blocked_sessions: " + kerr.Error()
+			rep.Error = "compile kill_blocking_sessions: " + kerr.Error()
 			return e.finalize(ctx, name, rep, start, false)
 		}
 		e.killer.SetSource(killSrc)
@@ -971,7 +971,7 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	recovery.Description = recoveryDescription(m, name)
 	recovery.OnFailure = ddl.OnFailureContinue
 	recovery.IgnoreBlockedSessions = ignore
-	recovery.KillBlockedSessions = e.latestKillRules(name, m)
+	recovery.KillBlockingSessions = e.latestKillRules(name, m)
 	recovery.Operations = failed
 	recName := name + ".recovery.yaml"
 	rep.Error = fmt.Sprintf("%d of %d operation(s) failed; recovery manifest: %s", len(failed), len(rep.Operations), recName)
@@ -1006,14 +1006,14 @@ func (e *Engine) latestIgnoreRules(name string, m *ddl.Manifest) []ddl.IgnoredSe
 	return m.IgnoreBlockedSessions
 }
 
-// latestKillRules returns the manifest's kill_blocked_sessions, preferring the current
+// latestKillRules returns the manifest's kill_blocking_sessions, preferring the current
 // on-disk copy in processing (reflecting any mid-run TUI append) and falling back to the
 // in-memory manifest — the kill-rule twin of latestIgnoreRules.
 func (e *Engine) latestKillRules(name string, m *ddl.Manifest) []ddl.KilledSession {
 	if latest, err := ddl.LoadManifestFile(filepath.Join(e.dirs.Processing, name)); err == nil {
-		return latest.KillBlockedSessions
+		return latest.KillBlockingSessions
 	}
-	return m.KillBlockedSessions
+	return m.KillBlockingSessions
 }
 
 // writeRecovery renders a recovery manifest to YAML and writes it.

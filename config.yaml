@@ -97,7 +97,7 @@ batch_dml:
   self_wait_timeout_minutes: 5   # max total wait while stopped under pressure before a clean stop
 
 # Selective blocker-kill policy. When enabled, sessions that block a running operation and
-# match a manifest's kill_blocked_sessions rule are KILLed once they have blocked for the
+# match a manifest's kill_blocking_sessions rule are KILLed once they have blocked for the
 # rule's delay (after_seconds; 0 = on sight). Killing is destructive, so it is OFF by
 # default; preflight WARNS (does not fail) if the login lacks ALTER ANY CONNECTION. The
 # match rules live per-manifest (hot-reloadable; the TUI's "X" key appends to them without a

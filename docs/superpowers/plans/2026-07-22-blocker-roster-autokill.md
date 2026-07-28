@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add a TUI key (`b`) that opens a roster of every session that has blocked the running DDL this run, grouped by login or host, from which the operator toggles auto-kill (`kill_blocked_sessions`) rules on the running manifest.
+**Goal:** Add a TUI key (`b`) that opens a roster of every session that has blocked the running DDL this run, grouped by login or host, from which the operator toggles auto-kill (`kill_blocking_sessions`) rules on the running manifest.
 
 **Architecture:** The roster is a grouped, actionable rendering of the existing in-memory suspension history (sessions that blocked us). Arming appends a manifest kill rule (no immediate kill); the engine hot-reloads it and the already-armed `BlockerKiller` terminates present-or-future matches. Un-arming removes the rule. The only new data captured is the blocker's host, threaded from `mssql.SelfBlock` through the suspension tracker to the TUI.
 
@@ -261,16 +261,16 @@ func TestRemoveKilledSession(t *testing.T) {
 		t.Fatalf("append: %v", err)
 	}
 	m, err := ddl.LoadManifestFile(path)
-	if err != nil || len(m.KillBlockedSessions) != 1 {
-		t.Fatalf("after append: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	if err != nil || len(m.KillBlockingSessions) != 1 {
+		t.Fatalf("after append: %d rules, err=%v", len(m.KillBlockingSessions), err)
 	}
 
 	if err := ddl.RemoveKilledSession(path, rule); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
 	m, err = ddl.LoadManifestFile(path)
-	if err != nil || len(m.KillBlockedSessions) != 0 {
-		t.Fatalf("after remove: %d rules, err=%v", len(m.KillBlockedSessions), err)
+	if err != nil || len(m.KillBlockingSessions) != 0 {
+		t.Fatalf("after remove: %d rules, err=%v", len(m.KillBlockingSessions), err)
 	}
 
 	// Removing an absent rule is a no-op (no error).
@@ -299,9 +299,9 @@ func RemoveKilledSession(path string, s KilledSession) error {
 	if err != nil {
 		return err
 	}
-	kept := make([]KilledSession, 0, len(m.KillBlockedSessions))
+	kept := make([]KilledSession, 0, len(m.KillBlockingSessions))
 	removed := false
-	for _, e := range m.KillBlockedSessions {
+	for _, e := range m.KillBlockingSessions {
 		if sameKilledSession(e, s) {
 			removed = true
 			continue
@@ -311,7 +311,7 @@ func RemoveKilledSession(path string, s KilledSession) error {
 	if !removed {
 		return nil
 	}
-	m.KillBlockedSessions = kept
+	m.KillBlockingSessions = kept
 	data, err := MarshalManifest(m)
 	if err != nil {
 		return err
@@ -488,11 +488,11 @@ Expected: FAIL — undefined `rosterGroups`, `ActionArmKillRule`, `KillerArmedMs
 In `internal/tui/model.go`, insert into the `ActionKind` const block after `ActionKillBlockerAuto`:
 
 ```go
-	// ActionArmKillRule appends a kill_blocked_sessions rule (Criterion/Value) to the running
+	// ActionArmKillRule appends a kill_blocking_sessions rule (Criterion/Value) to the running
 	// manifest without killing now: a session that later blocks the DDL and matches the rule is
 	// terminated by the armed BlockerKiller. Emitted from the blocker roster.
 	ActionArmKillRule
-	// ActionDisarmKillRule removes the matching kill_blocked_sessions rule from the running
+	// ActionDisarmKillRule removes the matching kill_blocking_sessions rule from the running
 	// manifest — the inverse of ActionArmKillRule.
 	ActionDisarmKillRule
 ```
@@ -797,7 +797,7 @@ This is a wiring task. Following the existing pattern in `main.go`, the `ignoreB
 In `cmd/sqlgopace/main.go`, after `killBlockerAuto`:
 
 ```go
-// armKillRule appends a kill_blocked_sessions rule (by login/host) to the running manifest
+// armKillRule appends a kill_blocking_sessions rule (by login/host) to the running manifest
 // without killing anyone now — a session that later blocks the DDL and matches is terminated by
 // the armed BlockerKiller. It is killBlockerAuto without the immediate KILL: the roster arms
 // recurrences, it does not act on a live session. The outcome is echoed to the console.
@@ -819,7 +819,7 @@ func armKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
 	program.Send(tui.LogMsg{Line: fmt.Sprintf("auto-kill armed by %s=%s — added to manifest", a.Criterion, a.Value)})
 }
 
-// disarmKillRule removes the matching kill_blocked_sessions rule from the running manifest — the
+// disarmKillRule removes the matching kill_blocking_sessions rule from the running manifest — the
 // inverse of armKillRule. The outcome is echoed to the console.
 func disarmKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
 	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
@@ -889,7 +889,7 @@ git commit -m "feat: wire blocker-roster arm/disarm actions and killer-armed fla
 
 - [ ] **Step 6: Manual smoke (optional, needs a server + a live blocker)**
 
-With `--tui` against a test DB and `kill_blockers` disabled in config: trigger a blocker, press `b`, confirm the roster lists the blocking login, the footer shows the "kill_blockers disabled" warning, `g` toggles login/host, `space` shows `[✓ armed]` and logs "auto-kill armed by …", `space` again clears it and logs "disarmed", and `q` returns to the dashboard. Inspect the manifest in `02.processing/` to confirm the `kill_blocked_sessions` rule was added then removed.
+With `--tui` against a test DB and `kill_blockers` disabled in config: trigger a blocker, press `b`, confirm the roster lists the blocking login, the footer shows the "kill_blockers disabled" warning, `g` toggles login/host, `space` shows `[✓ armed]` and logs "auto-kill armed by …", `space` again clears it and logs "disarmed", and `q` returns to the dashboard. Inspect the manifest in `02.processing/` to confirm the `kill_blocking_sessions` rule was added then removed.
 
 ---
 
