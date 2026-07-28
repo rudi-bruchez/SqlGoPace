@@ -718,18 +718,22 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
 
 		opRep := report.OperationReport{
-			Index:       i + 1,
-			CommandType: step.Operation.CommandType(),
-			Target:      opTarget(step.Operation),
-			SQL:         stmt, // the statement actually executed (RESUME when continuing a paused resumable)
-			Options:     optionDecisions(step.Decisions),
-			Reactions:   reactions,
-			PeakBlocked: peakBlocked,
-			Waits:       waitLines,
-			WaitTotalMS: waitTotal,
-			Shrink:      shrinkReport(shrinkResults),
-			BatchDML:    batchDMLReport(batchResult),
-			DurationMS:  e.msSince(opStart),
+			Index:          i + 1,
+			CommandType:    step.Operation.CommandType(),
+			Target:         opTarget(step.Operation),
+			SQL:            stmt, // the statement actually executed (RESUME when continuing a paused resumable)
+			Options:        optionDecisions(step.Decisions),
+			Reactions:      reactions,
+			PeakBlocked:    peakBlocked,
+			ContendedCount: contended.len(),
+			Waits:          waitLines,
+			WaitTotalMS:    waitTotal,
+			Shrink:         shrinkReport(shrinkResults),
+			BatchDML:       batchDMLReport(batchResult),
+			DurationMS:     e.msSince(opStart),
+		}
+		if opRep.ContendedCount > 0 {
+			opRep.ContendedFile = name + contendedCaptureSuffix
 		}
 		if runErr != nil {
 			opRep.Error = runErr.Error()
