@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
 func dataShrinkProfile(t *testing.T, extra string) *maint.Profile {
@@ -122,4 +124,78 @@ func TestPrintHeapAdvisory(t *testing.T) {
 	if !strings.Contains(buf.String(), "dbo.H") {
 		t.Errorf("advisory print missing table: %q", buf.String())
 	}
+}
+
+// fakePlanReader implements plan.Reader for planShrink tests.
+type fakePlanReader struct {
+	inv     []mssql.InventoryObject
+	density map[int64]float64
+	pages   map[int64]int64
+}
+
+func (f *fakePlanReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
+	return f.inv, nil
+}
+func (f *fakePlanReader) PhysicalStats(_ context.Context, objectID int64, _ int, _ *int, _ string) ([]mssql.PhysicalStats, error) {
+	return []mssql.PhysicalStats{{PartitionNumber: 1, PageCount: f.pages[objectID], AvgPageSpaceUsedPercent: f.density[objectID], RecordCount: 100}}, nil
+}
+func (f *fakePlanReader) EstimateCompression(context.Context, string, string, int, *int, string) ([]mssql.CompressionSaving, error) {
+	return nil, nil
+}
+func (f *fakePlanReader) IndexOperationalStats(context.Context, int64, int, *int) ([]mssql.OperationalStats, error) {
+	return nil, nil
+}
+func (f *fakePlanReader) StatsProperties(context.Context, int64) ([]mssql.StatProperty, error) {
+	return nil, nil
+}
+
+func TestPlanShrinkEndToEnd(t *testing.T) {
+	p := dataShrinkProfile(t, "  reorganize_below_density_percent: 65\nindex:\n  page_count_floor: 1000\n")
+	r := &fakePlanReader{
+		inv:     []mssql.InventoryObject{{Schema: "dbo", Table: "A", ObjectID: 1, IndexID: 1, IndexName: "PK_A", Type: 1, PartitionNumber: 1, SizeMB: 100}},
+		density: map[int64]float64{1: 40},
+		pages:   map[int64]int64{1: 5000},
+	}
+	nm, advisories, err := planShrink(context.Background(), r, p, "DB", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("planShrink: %v", err)
+	}
+	if nm == nil || len(nm.manifest.Operations) != 2 {
+		t.Fatalf("want reorganize+shrink manifest, got %+v", nm)
+	}
+	if len(advisories) != 0 {
+		t.Errorf("no heaps in fixture, want 0 advisories, got %+v", advisories)
+	}
+}
+
+func TestPlanShrinkPreReorganizeOff(t *testing.T) {
+	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
+	// Even with a low-density index available, pre_reorganize:false yields shrink-only
+	// and never calls AnalyzePreShrink. A reader that panics proves it is not called.
+	nm, _, err := planShrink(context.Background(), panicReader{}, p, "DB", &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("planShrink: %v", err)
+	}
+	if len(nm.manifest.Operations) != 1 {
+		t.Errorf("want shrink-only, got %d ops", len(nm.manifest.Operations))
+	}
+}
+
+// panicReader fails the test if any Reader method is called.
+type panicReader struct{}
+
+func (panicReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
+	panic("AnalyzePreShrink must not run when pre_reorganize is off")
+}
+func (panicReader) PhysicalStats(context.Context, int64, int, *int, string) ([]mssql.PhysicalStats, error) {
+	panic("unexpected")
+}
+func (panicReader) EstimateCompression(context.Context, string, string, int, *int, string) ([]mssql.CompressionSaving, error) {
+	panic("unexpected")
+}
+func (panicReader) IndexOperationalStats(context.Context, int64, int, *int) ([]mssql.OperationalStats, error) {
+	panic("unexpected")
+}
+func (panicReader) StatsProperties(context.Context, int64) ([]mssql.StatProperty, error) {
+	panic("unexpected")
 }

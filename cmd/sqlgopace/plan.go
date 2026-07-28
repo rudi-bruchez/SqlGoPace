@@ -157,14 +157,32 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 	}
 	manifests := manifestsFromPlan(pl, db)
 
+	// Pre-shrink pass (connected database only): a reorganize→shrink manifest and a
+	// heap advisory, when the profile's shrink section is enabled.
+	shrinkNM, heapAdvisories, err := planShrink(ctx, conn, profile, db, stdout)
+	if err != nil {
+		return err
+	}
+	if shrinkNM != nil {
+		manifests = append(manifests, *shrinkNM)
+	}
+
 	if *explain {
 		renderDecisions(stdout, pl)
 	}
+	printHeapAdvisory(stdout, heapAdvisories)
 	if *dryRun {
 		return renderManifests(stdout, manifests)
 	}
 	if err := writeManifests(stdout, out, manifests); err != nil {
 		return err
+	}
+	if shrinkNM != nil {
+		if path, err := writeHeapAdvisorySidecar(out, shrinkNM.filename, db, heapAdvisories); err != nil {
+			return err
+		} else if path != "" {
+			fmt.Fprintf(stdout, "wrote %s\n", path)
+		}
 	}
 	recordPlanHistory(ctx, stdout, cfg, db, pl, manifests)
 	return nil

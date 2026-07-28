@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
+	"github.com/rudi-bruchez/SqlGoPace/internal/plan"
 )
 
 // shrinkManifest assembles the dedicated shrink manifest for the connected database:
@@ -45,6 +47,23 @@ func shrinkManifest(profile *maint.Profile, db string, pre maint.PreShrinkPlan) 
 			Operations:  ops,
 		},
 	}
+}
+
+// planShrink gathers the pre-shrink density (only for an enabled data shrink with
+// pre_reorganize on), assembles the shrink manifest, and returns it with the heap
+// advisories. Returns (nil, nil, nil) when the shrink section is disabled.
+func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db string, logw io.Writer) (*namedManifest, []maint.HeapAdvisory, error) {
+	if !profile.Shrink.Enabled {
+		return nil, nil, nil
+	}
+	var pre maint.PreShrinkPlan
+	if !profile.Shrink.IsLog() && profile.Shrink.PreReorganizeEnabled() {
+		var err error
+		if pre, err = plan.AnalyzePreShrink(ctx, r, profile, logw); err != nil {
+			return nil, nil, err
+		}
+	}
+	return shrinkManifest(profile, db, pre), pre.HeapAdvisories, nil
 }
 
 // heapAdvisoryDoc is the .heaps.yaml advisory sidecar. Advisory only — SqlGoPace never
