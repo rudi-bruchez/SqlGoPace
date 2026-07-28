@@ -20,7 +20,7 @@ blocker**. Today we do not record it: the `.blocked.yaml` capture records the *v
 (their identity and query text), from which the contended table can only be *inferred*.
 
 This design records the confirmed object directly and feeds it into the next planning
-iteration, so the pre-shrink reorganize pass can prioritise the objects the shrink
+iteration, so the pre-shrink reorganize pass can prioritize the objects the shrink
 actually fought over.
 
 ### Relationship to the pre-shrink reorganize design
@@ -36,7 +36,7 @@ by page density / size **before** the run and states its own limit (§3):
 This design supplies the missing empirical signal: an object that appears in a run's
 contended-object capture **is** confirmed to have blocked the shrink — closing the
 "candidates, not confirmed" gap for heaps without ever running `page_allocations`. The
-two are complementary: the density scan proposes, the capture confirms and prioritises.
+two are complementary: the density scan proposes, the capture confirms and prioritizes.
 
 ## Scope
 
@@ -244,7 +244,7 @@ advisory rendering, not stored on the heap-measurement type. This is the one str
 touch-point on the companion pre-shrink work; it is additive (absent confirmed set →
 today's "candidate" wording).
 
-Prioritisation among confirmed objects: by `times_blocked` descending (most recurrent
+Prioritization among confirmed objects: by `times_blocked` descending (most recurrent
 first), then `first_seen`.
 
 What does not change: the density logic itself, the manifest format, `decide.go`.
@@ -266,7 +266,7 @@ advisory is the only lever. The design makes this visible rather than hiding it.
 | `sink` injection | `internal/run` (`engine.go`) | call the capture on pause/cancel/abort **if `ddl.Shrink`** | the two above |
 | `.log` pointer line | `internal/report` | one-line pointer at `INCOMPLETE` | capture count |
 | parse `.contended.yaml` + db guard | `internal/maint` (loaded in `cmd`) | load the sidecar, validate `database:` | pure (I/O upstream) |
-| augmented selection | `internal/maint` | prioritise / add / annotate per confirmed set | pure |
+| augmented selection | `internal/maint` | prioritize / add / annotate per confirmed set | pure |
 | `--confirmed` flag | `cmd/sqlgopace` | wire path → parse → selection | plumbing |
 
 ## 6. Testing

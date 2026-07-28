@@ -472,7 +472,43 @@ func TestProcessAllCapturesBlockedSessions(t *testing.T) {
 }
 
 func TestProcessAllCapturesContendedObjectsForShrinkOnly(t *testing.T) {
-	// A shrink whose sink fires a pause while we hold a Sch-M lock writes .contended.yaml.
+	// A shrink whose sink fires a pause while we hold a Sch-M lock AND are actively
+	// blocking another session writes .contended.yaml.
+	held := []mssql.LockedObject{{ObjectID: 100, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}}
+	driver := &fakeShrinkDriver{
+		results: []run.ShrinkResult{
+			{File: "MyDb_Data", Type: "data", InitialMB: 1000, FinalMB: 440, TargetMB: 440, Chunks: 4},
+		},
+		emit: []run.ReactionEvent{{Kind: "pause", Detail: "log over cap"}},
+	}
+	eng, dirs := setupShrinkEngineOpts(t, shrinkDataManifest, &fakeOpRunner{}, run.WithShrinkRunner(driver),
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(fakeBlockerReader{
+			held: held,
+			sessions: []mssql.Session{
+				{SPID: 53, BlockingSPID: 70, Login: "svc_report", Host: "BATCH01", Program: "ReportingService", ActiveQuery: "SELECT 1"},
+			},
+		}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_shrink.yaml.contended.yaml"))
+	if err != nil {
+		t.Fatalf("read contended capture file: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "MEASUREMENT") || !strings.Contains(got, "object_id: 100") {
+		t.Errorf("contended sidecar missing held object:\n%s", got)
+	}
+}
+
+func TestProcessAllSkipsContendedWhenNotBlocking(t *testing.T) {
+	// A shrink whose sink fires a pause while we hold a Sch-M lock but are NOT blocking
+	// any session (e.g. a log-pressure pause) must NOT write .contended.yaml: the sidecar's
+	// meaning is "objects we blocked others on", and recording an unblocked hold would be a
+	// false positive that gets fed back as a confirmed blocker.
 	held := []mssql.LockedObject{{ObjectID: 100, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}}
 	driver := &fakeShrinkDriver{
 		results: []run.ShrinkResult{
@@ -488,14 +524,8 @@ func TestProcessAllCapturesContendedObjectsForShrinkOnly(t *testing.T) {
 		t.Fatalf("ProcessAll() error = %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_shrink.yaml.contended.yaml"))
-	if err != nil {
-		t.Fatalf("read contended capture file: %v", err)
-	}
-	got := string(data)
-	if !strings.Contains(got, "MEASUREMENT") || !strings.Contains(got, "object_id: 100") {
-		t.Errorf("contended sidecar missing held object:\n%s", got)
-	}
+	mustNotExist(t, filepath.Join(dirs.Done, "010_shrink.yaml.contended.yaml"))
+	mustNotExist(t, filepath.Join(dirs.Failed, "010_shrink.yaml.contended.yaml"))
 }
 
 func TestProcessAllSkipsContendedForNonShrink(t *testing.T) {

@@ -345,10 +345,10 @@ guarantee; do not open a parallel execution path that would bypass this split.
 - **`.log` report + history**: `initial_size`, `final_size`, space reclaimed, total duration,
   chunk count, reactions, and the `--version` that produced the run (as everywhere else).
 
-**Contended-object capture.** When a shrink finishes `INCOMPLETE` or `FAILED` because it kept
-blocking other sessions, the engine writes `<manifest>.contended.yaml` next to the run report,
-listing the objects it held a `Sch-M` lock on while blocking others — empirically confirmed tail
-blockers. The `.log` report carries a one-line pointer to it. `sqlgopace plan --confirmed <path>`
+**Contended-object capture.** Whenever a shrink blocks other sessions while relocating an object —
+regardless of the run's final outcome — the engine writes `<manifest>.contended.yaml` next to the
+run report, listing the objects it held a `Sch-M` lock on while blocking others — empirically
+confirmed tail blockers. The `.log` report carries a one-line pointer to it. `sqlgopace plan --confirmed <path>`
 reads the sidecar back into the next pre-shrink pass, prioritizing those objects' reorganizes and
 marking matching heap advisories `CONFIRMED`. Full design in
 [`docs/superpowers/specs/2026-07-28-contended-object-capture-design.md`](../docs/superpowers/specs/2026-07-28-contended-object-capture-design.md).

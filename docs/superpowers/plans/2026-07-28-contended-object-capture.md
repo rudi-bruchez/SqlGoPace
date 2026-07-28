@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Record the object a shrink holds a `Sch-M` lock on while it blocks other sessions (the empirically confirmed tail blocker) into a machine `.contended.yaml` sidecar, and let `plan --confirmed <path>` prioritise / confirm those objects in the pre-shrink reorganize pass.
+**Goal:** Record the object a shrink holds a `Sch-M` lock on while it blocks other sessions (the empirically confirmed tail blocker) into a machine `.contended.yaml` sidecar, and let `plan --confirmed <path>` prioritize / confirm those objects in the pre-shrink reorganize pass.
 
 **Architecture:** A new `internal/mssql` read (`HeldObjectLocks`) is called from the engine's existing reaction `sink` — only for `ddl.Shrink` ops — at the instant it already captures blocked sessions (the `Sch-M` is still held there). A run-side accumulator dedups objects across reactions and writes `.contended.yaml`. On the planner side, `DecidePreShrink` gains a confirmed set that reorders/adds/annotates reorganizes and upgrades matching heap advisories to CONFIRMED; `plan` gains a `--confirmed` flag that loads and guards the sidecar.
 
@@ -1295,7 +1295,7 @@ git commit -m "docs: document plan --confirmed and the .contended.yaml sidecar"
 - §1 `HeldObjectLocks` + NULL fallback → Task 1. ✓
 - §2 accumulator, injection at the sink while lock held, shrink-only gate → Tasks 3, 4. ✓
 - §3 sidecar format (`object_id`, `database:` guard, empty→no file), `.log` pointer → Tasks 2, 3, 5. ✓
-- §4 `--confirmed` flag, db guard, shrink-enabled guard, augment (prioritise/add-despite-density/annotate), confirmed-heap advisory, stale-id skip-with-log, comment mechanism (`HeadComment`, not a field), heap render-time param → Tasks 6, 7, 8, 9. ✓
+- §4 `--confirmed` flag, db guard, shrink-enabled guard, augment (prioritize/add-despite-density/annotate), confirmed-heap advisory, stale-id skip-with-log, comment mechanism (`HeadComment`, not a field), heap render-time param → Tasks 6, 7, 8, 9. ✓
 - §5 units/boundaries → task decomposition matches the table. ✓
 - §6 tests incl. engine injection gate, round-trip, non-regression → Tasks 3, 4, 7, 8, 9. ✓
 - Non-goals (no page_allocations, no auto rebuild_heap, no .blocked.yaml read, shrink-only) → respected; nothing in the tasks violates them. ✓

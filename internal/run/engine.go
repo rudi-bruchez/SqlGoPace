@@ -610,10 +610,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			var blocked int
 			if capture {
 				blocked = e.captureBlockers(ctx, ignore, captured, name)
-				if _, isShrink := step.Operation.(ddl.Shrink); isShrink && e.session != nil {
-					e.captureContended(ctx, e.session.SPID(), contended, name, manifest.Database)
-				}
 				if blocked > 0 {
+					if _, isShrink := step.Operation.(ddl.Shrink); isShrink && e.session != nil {
+						e.captureContended(ctx, e.session.SPID(), contended, name, manifest.Database)
+					}
 					detail = fmt.Sprintf("%s; blocking %d session(s)", detail, blocked)
 				}
 			}

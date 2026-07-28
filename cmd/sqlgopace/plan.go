@@ -103,7 +103,7 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 		outDir       = fs.String("out", "", "directory to write manifests into (default: the config's to_run)")
 		dryRun       = fs.Bool("dry-run", false, "print the manifests instead of writing them")
 		explain      = fs.Bool("explain", false, "show the reasoning behind each decision")
-		confirmed    = fs.String("confirmed", "", "path to a .contended.yaml from a prior failed shrink; prioritise its objects in the pre-shrink pass")
+		confirmed    = fs.String("confirmed", "", "path to a .contended.yaml from a prior failed shrink; prioritizes its objects in the pre-shrink pass")
 	)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
