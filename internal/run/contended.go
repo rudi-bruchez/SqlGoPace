@@ -1,7 +1,10 @@
 package run
 
 import (
+	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -75,4 +78,27 @@ func renderContended(name, database string, acc *contendedCapture) []byte {
 	}
 	b.Write(body)
 	return []byte(b.String())
+}
+
+// captureContended records the objects our shrink (spid) currently holds a Sch-M lock
+// on, into acc, and flushes the sidecar. Best-effort: a nil reader or a read error is a
+// no-op. Called only for shrink operations.
+func (e *Engine) captureContended(ctx context.Context, spid int, acc *contendedCapture, name, database string) {
+	if e.blockers == nil || spid == 0 {
+		return
+	}
+	held, err := e.blockers.HeldObjectLocks(ctx, spid)
+	if err != nil {
+		return
+	}
+	now := e.now()
+	for _, o := range held {
+		acc.add(o, now)
+	}
+	if acc.len() > 0 {
+		path := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
+		if err := os.WriteFile(path, renderContended(name, database, acc), 0o644); err != nil {
+			fmt.Fprintf(e.out, "write contended capture %s: %v\n", name, err)
+		}
+	}
 }

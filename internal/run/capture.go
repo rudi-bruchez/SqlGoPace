@@ -151,6 +151,19 @@ func (e *Engine) relocateCapture(name, dir string) {
 	}
 }
 
+// relocateContended moves the .contended.yaml sidecar from processing to dir on
+// finalize, mirroring relocateCapture. No-op when none was written (non-shrink
+// operations, or a shrink that never captured a held object).
+func (e *Engine) relocateContended(name, dir string) {
+	src := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
+	if _, err := os.Stat(src); err != nil {
+		return
+	}
+	if err := os.Rename(src, filepath.Join(dir, name+contendedCaptureSuffix)); err != nil {
+		fmt.Fprintf(e.out, "relocate contended capture %s: %v\n", name, err)
+	}
+}
+
 // renderCapture builds the advisory blocked-session capture file: a commented,
 // ready-to-paste ignore_blocked_sessions block plus an observed: diagnostics block.
 // SqlGoPace never reads this file back — promoting an entry into the manifest's

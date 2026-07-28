@@ -111,10 +111,12 @@ type WaitReader interface {
 var _ WaitReader = (*mssql.Conn)(nil)
 
 // BlockerReader reads the active sessions so the engine can record which ones our
-// DDL was blocking when it reacted, for the advisory capture file. *mssql.Conn
-// satisfies it.
+// DDL was blocking when it reacted, for the advisory capture file, and the objects
+// our own session currently holds a Sch-M lock on, for the shrink contended-object
+// capture. *mssql.Conn satisfies it.
 type BlockerReader interface {
 	ActiveSessions(ctx context.Context) ([]mssql.Session, error)
+	HeldObjectLocks(ctx context.Context, spid int) ([]mssql.LockedObject, error)
 }
 
 var _ BlockerReader = (*mssql.Conn)(nil)
@@ -548,6 +550,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 
 	var failedOps []ddl.Operation
 	captured := &blockerCapture{}
+	contended := &contendedCapture{}
 	// cursor is the crash-resume watermark: the number of leading operations durably
 	// done. It is advanced and persisted after each completed operation (below), so a
 	// crash — not just a drain — resumes at the next operation instead of replaying.
@@ -607,6 +610,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			var blocked int
 			if capture {
 				blocked = e.captureBlockers(ctx, ignore, captured, name)
+				if _, isShrink := step.Operation.(ddl.Shrink); isShrink && e.session != nil {
+					e.captureContended(ctx, e.session.SPID(), contended, name, manifest.Database)
+				}
 				if blocked > 0 {
 					detail = fmt.Sprintf("%s; blocking %d session(s)", detail, blocked)
 				}
@@ -844,6 +850,7 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
 	e.relocateCapture(name, dir)
+	e.relocateContended(name, dir)
 
 	if err := report.WriteFile(filepath.Join(dir, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
@@ -917,6 +924,7 @@ func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *repor
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
 	e.relocateCapture(name, e.dirs.Failed)
+	e.relocateContended(name, e.dirs.Failed)
 
 	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
@@ -963,6 +971,7 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
 	e.relocateCapture(name, e.dirs.Failed)
+	e.relocateContended(name, e.dirs.Failed)
 
 	// Copy the manifest so recovery-specific overrides are the only differences; this
 	// carries forward every other setting (execution window, intent, …) that
