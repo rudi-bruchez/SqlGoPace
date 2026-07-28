@@ -667,6 +667,7 @@ Notes:
   add it by editing the generated manifest.
 - The reorganize selection runs a SAMPLED `sys.dm_db_index_physical_stats` scan of the
   database's indexes at plan time (heavier than the maintenance pass's LIMITED scan).
+- When `pre_reorganize: false`, the heap advisory is also skipped (it requires the SAMPLED page-density scan that the pre-reorganize pass performs).
 
 ## Compatibility matrix
 
