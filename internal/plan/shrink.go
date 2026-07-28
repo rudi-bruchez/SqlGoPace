@@ -37,7 +37,7 @@ func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, log
 			}
 		}
 	}
-	return maint.DecidePreShrink(indexes, heaps, profile), nil
+	return maint.DecidePreShrink(indexes, heaps, profile, nil), nil
 }
 
 // shrinkIndexMeasurement reads SAMPLED density for one rowstore index, aggregating
