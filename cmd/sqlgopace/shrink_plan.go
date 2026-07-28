@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 
@@ -13,6 +14,20 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
 	"github.com/rudi-bruchez/SqlGoPace/internal/plan"
 )
+
+// confirmedSetFor validates a contended doc against the connected database and returns
+// the object_id -> times_blocked map. Empty database in the doc, or a mismatch, is an
+// error — a sidecar captured against a different database would silently misattribute.
+func confirmedSetFor(doc maint.ContendedDoc, db string) (map[int64]int, error) {
+	if !strings.EqualFold(doc.Database, db) {
+		return nil, fmt.Errorf("--confirmed sidecar is for database %q, connected to %q", doc.Database, db)
+	}
+	set := make(map[int64]int, len(doc.Observed))
+	for _, o := range doc.Observed {
+		set[o.ObjectID] = o.TimesBlocked
+	}
+	return set, nil
+}
 
 // shrinkManifest assembles the dedicated shrink manifest for the connected database:
 // the density-selected reorganizes (in pre, empty when pre_reorganize is off or the
@@ -38,6 +53,12 @@ func shrinkManifest(profile *maint.Profile, db string, pre maint.PreShrinkPlan) 
 	if s.IsLog() {
 		typ = "log"
 	}
+	comments := map[int]string{}
+	for i, note := range pre.ReorganizeNotes {
+		if note != "" {
+			comments[i] = note
+		}
+	}
 	return &namedManifest{
 		filename: fmt.Sprintf("050_shrink_%s_%s.yaml", db, typ),
 		category: "shrink",
@@ -46,20 +67,24 @@ func shrinkManifest(profile *maint.Profile, db string, pre maint.PreShrinkPlan) 
 			Database:    db,
 			Operations:  ops,
 		},
+		comments: comments,
 	}
 }
 
 // planShrink gathers the pre-shrink density (only for an enabled data shrink with
 // pre_reorganize on), assembles the shrink manifest, and returns it with the heap
-// advisories. Returns (nil, nil, nil) when the shrink section is disabled.
-func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db string, logw io.Writer) (*namedManifest, []maint.HeapAdvisory, error) {
+// advisories. confirmed is the object_id -> times_blocked set from a --confirmed
+// sidecar (nil when none was given); it prioritizes and annotates matching reorganizes
+// and marks matching heap advisories CONFIRMED. Returns (nil, nil, nil) when the shrink
+// section is disabled.
+func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db string, confirmed map[int64]int, logw io.Writer) (*namedManifest, []maint.HeapAdvisory, error) {
 	if !profile.Shrink.Enabled {
 		return nil, nil, nil
 	}
 	var pre maint.PreShrinkPlan
 	if !profile.Shrink.IsLog() && profile.Shrink.PreReorganizeEnabled() {
 		var err error
-		if pre, err = plan.AnalyzePreShrink(ctx, r, profile, logw); err != nil {
+		if pre, err = plan.AnalyzePreShrink(ctx, r, profile, confirmed, logw); err != nil {
 			return nil, nil, err
 		}
 	}
@@ -80,6 +105,8 @@ type heapAdvisoryItem struct {
 	SizeMB                 int64   `yaml:"size_mb"`
 	ForwardedRecordPercent float64 `yaml:"forwarded_record_percent"`
 	PageDensityPercent     float64 `yaml:"page_density_percent"`
+	Confirmed              bool    `yaml:"confirmed,omitempty"`
+	TimesBlocked           int     `yaml:"times_blocked,omitempty"`
 }
 
 const heapAdvisoryText = "Heaps cannot be reorganized in-row (reorganize only compacts their LOB pages). " +
@@ -94,8 +121,12 @@ func printHeapAdvisory(w io.Writer, advisories []maint.HeapAdvisory) {
 	}
 	fmt.Fprintf(w, "-- heap advisory: %d heap(s) reorganize cannot help before the shrink:\n", len(advisories))
 	for _, a := range advisories {
-		fmt.Fprintf(w, "--   %s.%s  %d MB  density %.0f%%  forwarded %.0f%%\n",
+		line := fmt.Sprintf("--   %s.%s  %d MB  density %.0f%%  forwarded %.0f%%",
 			a.Schema, a.Table, a.SizeMB, a.PageDensityPercent, a.ForwardedRecordPercent)
+		if a.Confirmed {
+			line += fmt.Sprintf(" [CONFIRMED, times_blocked=%d]", a.TimesBlocked)
+		}
+		fmt.Fprintln(w, line)
 	}
 }
 
@@ -110,6 +141,7 @@ func writeHeapAdvisorySidecar(dir, shrinkFilename, db string, advisories []maint
 		doc.Heaps = append(doc.Heaps, heapAdvisoryItem{
 			Schema: a.Schema, Table: a.Table, SizeMB: a.SizeMB,
 			ForwardedRecordPercent: a.ForwardedRecordPercent, PageDensityPercent: a.PageDensityPercent,
+			Confirmed: a.Confirmed, TimesBlocked: a.TimesBlocked,
 		})
 	}
 	data, err := yaml.Marshal(doc)

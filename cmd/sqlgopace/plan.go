@@ -27,6 +27,7 @@ type namedManifest struct {
 	filename string
 	category string
 	manifest *ddl.Manifest
+	comments map[int]string // per-operation head comments (shrink manifests only); nil elsewhere
 }
 
 // manifestCategories fixes the emission order and filename label per category. The
@@ -102,6 +103,7 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 		outDir       = fs.String("out", "", "directory to write manifests into (default: the config's to_run)")
 		dryRun       = fs.Bool("dry-run", false, "print the manifests instead of writing them")
 		explain      = fs.Bool("explain", false, "show the reasoning behind each decision")
+		confirmed    = fs.String("confirmed", "", "path to a .contended.yaml from a prior failed shrink; prioritise its objects in the pre-shrink pass")
 	)
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -151,6 +153,24 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 			return err
 		}
 	}
+	var confirmedSet map[int64]int
+	if *confirmed != "" {
+		if !profile.Shrink.Enabled {
+			return errors.New("--confirmed requires shrink.enabled in the maintenance profile")
+		}
+		data, err := os.ReadFile(*confirmed)
+		if err != nil {
+			return fmt.Errorf("read --confirmed: %w", err)
+		}
+		doc, err := maint.ParseContended(data)
+		if err != nil {
+			return err
+		}
+		if confirmedSet, err = confirmedSetFor(doc, db); err != nil {
+			return err
+		}
+	}
+
 	pl, err := plan.Analyze(ctx, conn, profile, cats, db, stdout)
 	if err != nil {
 		return err
@@ -159,7 +179,7 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 
 	// Pre-shrink pass (connected database only): a reorganize→shrink manifest and a
 	// heap advisory, when the profile's shrink section is enabled.
-	shrinkNM, heapAdvisories, err := planShrink(ctx, conn, profile, db, stdout)
+	shrinkNM, heapAdvisories, err := planShrink(ctx, conn, profile, db, confirmedSet, stdout)
 	if err != nil {
 		return err
 	}
@@ -348,7 +368,7 @@ func renderManifests(w io.Writer, manifests []namedManifest) error {
 		return nil
 	}
 	for _, nm := range manifests {
-		data, err := ddl.MarshalManifest(nm.manifest)
+		data, err := ddl.MarshalManifestAnnotated(nm.manifest, nm.comments)
 		if err != nil {
 			return err
 		}
@@ -368,7 +388,7 @@ func writeManifests(w io.Writer, dir string, manifests []namedManifest) error {
 	}
 	written := make([]string, 0, len(manifests))
 	for _, nm := range manifests {
-		data, err := ddl.MarshalManifest(nm.manifest)
+		data, err := ddl.MarshalManifestAnnotated(nm.manifest, nm.comments)
 		if err != nil {
 			return err
 		}

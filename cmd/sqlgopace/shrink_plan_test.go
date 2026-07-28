@@ -87,6 +87,50 @@ func TestShrinkManifestDisabledIsNil(t *testing.T) {
 	}
 }
 
+// readFile reads path and fails the test on error.
+func readFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return string(data)
+}
+
+func TestLoadConfirmedRejectsDatabaseMismatch(t *testing.T) {
+	doc := maint.ContendedDoc{Database: "OTHER"}
+	_, err := confirmedSetFor(doc, "PRODDB")
+	if err == nil {
+		t.Fatal("expected error on database mismatch")
+	}
+}
+
+func TestConfirmedSetForBuildsMap(t *testing.T) {
+	doc := maint.ContendedDoc{Database: "PRODDB", Observed: []maint.ContendedObject{
+		{ObjectID: 100, TimesBlocked: 3}, {ObjectID: 200, TimesBlocked: 1},
+	}}
+	got, err := confirmedSetFor(doc, "PRODDB")
+	if err != nil {
+		t.Fatalf("confirmedSetFor: %v", err)
+	}
+	if got[100] != 3 || got[200] != 1 {
+		t.Errorf("map = %v", got)
+	}
+}
+
+func TestHeapAdvisorySidecarMarksConfirmed(t *testing.T) {
+	adv := []maint.HeapAdvisory{{Schema: "dbo", Table: "H", SizeMB: 500, PageDensityPercent: 40, Confirmed: true, TimesBlocked: 4}}
+	dir := t.TempDir()
+	path, err := writeHeapAdvisorySidecar(dir, "050_shrink_db_data.yaml", "PRODDB", adv)
+	if err != nil || path == "" {
+		t.Fatalf("writeHeapAdvisorySidecar: %v", err)
+	}
+	body := readFile(t, path)
+	if !strings.Contains(body, "confirmed: true") || !strings.Contains(body, "times_blocked: 4") {
+		t.Errorf("heap sidecar missing confirmation:\n%s", body)
+	}
+}
+
 func TestHeapAdvisorySidecar(t *testing.T) {
 	dir := t.TempDir()
 	advisories := []maint.HeapAdvisory{{Schema: "dbo", Table: "H", SizeMB: 3000, ForwardedRecordPercent: 12, PageDensityPercent: 55}}
@@ -156,7 +200,7 @@ func TestPlanShrinkEndToEnd(t *testing.T) {
 		density: map[int64]float64{1: 40},
 		pages:   map[int64]int64{1: 5000},
 	}
-	nm, advisories, err := planShrink(context.Background(), r, p, "DB", &bytes.Buffer{})
+	nm, advisories, err := planShrink(context.Background(), r, p, "DB", nil, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}
@@ -172,7 +216,7 @@ func TestPlanShrinkPreReorganizeOff(t *testing.T) {
 	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
 	// Even with a low-density index available, pre_reorganize:false yields shrink-only
 	// and never calls AnalyzePreShrink. A reader that panics proves it is not called.
-	nm, _, err := planShrink(context.Background(), panicReader{}, p, "DB", &bytes.Buffer{})
+	nm, _, err := planShrink(context.Background(), panicReader{}, p, "DB", nil, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}
