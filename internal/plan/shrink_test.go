@@ -15,9 +15,10 @@ import (
 // methods are unused by AnalyzePreShrink and return nil.
 type fakeShrinkReader struct {
 	inv        []mssql.InventoryObject
-	density    map[int64]float64 // objectID → avg_page_space_used_in_percent
-	pages      map[int64]int64   // objectID → page_count
-	errObjects map[int64]bool    // objectID → PhysicalStats returns an error (per-object read failure)
+	density    map[int64]float64               // objectID → avg_page_space_used_in_percent
+	pages      map[int64]int64                 // objectID → page_count
+	errObjects map[int64]bool                  // objectID → PhysicalStats returns an error (per-object read failure)
+	rows       map[int64][]mssql.PhysicalStats // objectID → explicit multi-partition rows (overrides density/pages)
 }
 
 func (f *fakeShrinkReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
@@ -26,6 +27,9 @@ func (f *fakeShrinkReader) ObjectInventory(context.Context) ([]mssql.InventoryOb
 func (f *fakeShrinkReader) PhysicalStats(_ context.Context, objectID int64, _ int, _ *int, mode string) ([]mssql.PhysicalStats, error) {
 	if f.errObjects[objectID] {
 		return nil, fmt.Errorf("sampled scan failed for object %d", objectID)
+	}
+	if rows, ok := f.rows[objectID]; ok {
+		return rows, nil
 	}
 	return []mssql.PhysicalStats{{
 		PartitionNumber: 1, PageCount: f.pages[objectID],
@@ -87,5 +91,36 @@ func TestAnalyzePreShrinkSkipsFailedObjectNotFatal(t *testing.T) {
 	}
 	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Table != "Good" {
 		t.Errorf("failed object should be skipped, survivor kept; got %+v", pl.Reorganizes)
+	}
+}
+
+// TestAnalyzePreShrinkAggregatesAcrossPartitions covers shrinkIndexMeasurement's
+// multi-partition aggregation: page counts SUM across partitions and the worst (lowest)
+// density wins. The floor and threshold are chosen so the test only passes under correct
+// aggregation: neither partition's page count alone clears the floor (only their sum
+// does), and neither the higher-density partition alone nor the average of the two would
+// clear the reorganize threshold — only the true minimum does.
+func TestAnalyzePreShrinkAggregatesAcrossPartitions(t *testing.T) {
+	p, err := maint.Parse([]byte("index:\n  page_count_floor: 4000\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 50\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "P", ObjectID: 1, IndexID: 1, IndexName: "PK_P", Type: 1, PartitionNumber: 1, SizeMB: 100},
+		},
+		rows: map[int64][]mssql.PhysicalStats{
+			1: {
+				{PartitionNumber: 1, PageCount: 3000, AvgPageSpaceUsedPercent: 80, RecordCount: 100},
+				{PartitionNumber: 2, PageCount: 2000, AvgPageSpaceUsedPercent: 40, RecordCount: 100},
+			},
+		},
+	}
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("AnalyzePreShrink: %v", err)
+	}
+	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Index != "PK_P" {
+		t.Errorf("reorganizes = %+v, want PK_P selected (summed page count 5000 >= floor 4000, worst density 40 < threshold 50)", pl.Reorganizes)
 	}
 }
