@@ -424,6 +424,15 @@ Behaviour worth knowing:
 - Reactions reuse the engine's monitoring: under blocking or log pressure the driver pauses
   between chunks (free — committed work is kept) and shrinks the next chunk smaller.
 
+**Recording confirmed blockers.** Whenever a shrink blocks other sessions while relocating an
+object — regardless of the run's final outcome — the engine writes `<manifest>.contended.yaml`
+next to the run report, listing the objects it held a `Sch-M` lock on while blocking others: the
+ones it was relocating and couldn't get past, empirically confirmed tail blockers. It is
+machine-readable, relocated to `03.done`/`04.failed` with the manifest on finalize, and the run
+report's `.log` gets a one-line pointer (`contended objects: N — see <file>`). Feed it into the
+next planning pass with `sqlgopace plan --confirmed <path>` (see below) to prioritize those
+objects.
+
 ### Shrinking tempdb: `operation: shrink_tempdb`
 
 `shrink_tempdb` is a dedicated operation for tempdb's data files — there is no `database:` field
@@ -641,6 +650,7 @@ sqlgopace --config config.yaml
 | `--out`        | Directory to write manifests into (default: the config's `to_run`).          |
 | `--dry-run`    | Print the manifests instead of writing them.                                 |
 | `--explain`    | Show the reasoning behind each decision.                                     |
+| `--confirmed`  | Path to a `.contended.yaml` written by a prior shrink run that blocked other sessions; prioritizes those empirically-confirmed blocker objects in the pre-shrink reorganize pass and marks matching heap advisories `CONFIRMED`. Requires `shrink.enabled` in the profile. |
 
 ### `shrink:` (pre-shrink reorganize + reclaim)
 

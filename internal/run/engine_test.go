@@ -113,11 +113,18 @@ func (f *fakeWaits) SessionWaits(context.Context, int) ([]mssql.SessionWait, err
 }
 
 // fakeBlockerReader returns a fixed set of active sessions for the blocked-session
-// capture.
-type fakeBlockerReader struct{ sessions []mssql.Session }
+// capture, and a fixed set of held object locks for the shrink contended-object capture.
+type fakeBlockerReader struct {
+	sessions []mssql.Session
+	held     []mssql.LockedObject
+}
 
 func (f fakeBlockerReader) ActiveSessions(context.Context) ([]mssql.Session, error) {
 	return f.sessions, nil
+}
+
+func (f fakeBlockerReader) HeldObjectLocks(context.Context, int) ([]mssql.LockedObject, error) {
+	return f.held, nil
 }
 
 type fakePreflighter struct {
@@ -462,6 +469,80 @@ func TestProcessAllCapturesBlockedSessions(t *testing.T) {
 	if strings.Contains(out, "session_id: 54") {
 		t.Errorf("capture must not include a session blocked by someone else\n%s", out)
 	}
+}
+
+func TestProcessAllCapturesContendedObjectsForShrinkOnly(t *testing.T) {
+	// A shrink whose sink fires a pause while we hold a Sch-M lock AND are actively
+	// blocking another session writes .contended.yaml.
+	held := []mssql.LockedObject{{ObjectID: 100, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}}
+	driver := &fakeShrinkDriver{
+		results: []run.ShrinkResult{
+			{File: "MyDb_Data", Type: "data", InitialMB: 1000, FinalMB: 440, TargetMB: 440, Chunks: 4},
+		},
+		emit: []run.ReactionEvent{{Kind: "pause", Detail: "log over cap"}},
+	}
+	eng, dirs := setupShrinkEngineOpts(t, shrinkDataManifest, &fakeOpRunner{}, run.WithShrinkRunner(driver),
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(fakeBlockerReader{
+			held: held,
+			sessions: []mssql.Session{
+				{SPID: 53, BlockingSPID: 70, Login: "svc_report", Host: "BATCH01", Program: "ReportingService", ActiveQuery: "SELECT 1"},
+			},
+		}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_shrink.yaml.contended.yaml"))
+	if err != nil {
+		t.Fatalf("read contended capture file: %v", err)
+	}
+	got := string(data)
+	if !strings.Contains(got, "MEASUREMENT") || !strings.Contains(got, "object_id: 100") {
+		t.Errorf("contended sidecar missing held object:\n%s", got)
+	}
+}
+
+func TestProcessAllSkipsContendedWhenNotBlocking(t *testing.T) {
+	// A shrink whose sink fires a pause while we hold a Sch-M lock but are NOT blocking
+	// any session (e.g. a log-pressure pause) must NOT write .contended.yaml: the sidecar's
+	// meaning is "objects we blocked others on", and recording an unblocked hold would be a
+	// false positive that gets fed back as a confirmed blocker.
+	held := []mssql.LockedObject{{ObjectID: 100, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}}
+	driver := &fakeShrinkDriver{
+		results: []run.ShrinkResult{
+			{File: "MyDb_Data", Type: "data", InitialMB: 1000, FinalMB: 440, TargetMB: 440, Chunks: 4},
+		},
+		emit: []run.ReactionEvent{{Kind: "pause", Detail: "log over cap"}},
+	}
+	eng, dirs := setupShrinkEngineOpts(t, shrinkDataManifest, &fakeOpRunner{}, run.WithShrinkRunner(driver),
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(fakeBlockerReader{held: held}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	mustNotExist(t, filepath.Join(dirs.Done, "010_shrink.yaml.contended.yaml"))
+	mustNotExist(t, filepath.Join(dirs.Failed, "010_shrink.yaml.contended.yaml"))
+}
+
+func TestProcessAllSkipsContendedForNonShrink(t *testing.T) {
+	// The same held-object reader + a pause on a rebuild_index op must NOT write a sidecar.
+	held := []mssql.LockedObject{{ObjectID: 100, Schema: "dbo", Table: "T", Mode: "Sch-M"}}
+	runner := &fakeOpRunner{emit: []run.ReactionEvent{
+		{Kind: "pause", Detail: "blocking other sessions"},
+	}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithBlockerReader(fakeBlockerReader{held: held}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	mustNotExist(t, filepath.Join(dirs.Done, "010_a.yaml.contended.yaml"))
+	mustNotExist(t, filepath.Join(dirs.Failed, "010_a.yaml.contended.yaml"))
 }
 
 func TestProcessAllRecordsPeakBlocked(t *testing.T) {

@@ -15,7 +15,12 @@ import (
 // so it runs only when the shrink section is enabled and the shrink is a data shrink
 // with pre_reorganize on (the caller enforces that). Per-object read failures are logged
 // and skipped, never fatal.
-func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, logw io.Writer) (maint.PreShrinkPlan, error) {
+//
+// confirmed maps an object_id observed blocking a prior shrink (from a .contended.yaml
+// sidecar) to its times_blocked count; nil when there is no capture to prioritize. A
+// confirmed id that matches no measured object (already dropped, renamed, or gone) is
+// logged and skipped rather than failing the plan.
+func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, confirmed map[int64]int, logw io.Writer) (maint.PreShrinkPlan, error) {
 	inv, err := r.ObjectInventory(ctx)
 	if err != nil {
 		return maint.PreShrinkPlan{}, fmt.Errorf("object inventory: %w", err)
@@ -37,7 +42,21 @@ func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, log
 			}
 		}
 	}
-	return maint.DecidePreShrink(indexes, heaps, profile), nil
+
+	measured := make(map[int64]bool, len(indexes)+len(heaps))
+	for _, m := range indexes {
+		measured[m.ObjectID] = true
+	}
+	for _, m := range heaps {
+		measured[m.ObjectID] = true
+	}
+	for id := range confirmed {
+		if !measured[id] {
+			fmt.Fprintf(logw, "-- confirmed object %d not found; skipping\n", id)
+		}
+	}
+
+	return maint.DecidePreShrink(indexes, heaps, profile, confirmed), nil
 }
 
 // shrinkIndexMeasurement reads SAMPLED density for one rowstore index, aggregating
@@ -61,7 +80,8 @@ func shrinkIndexMeasurement(ctx context.Context, r Reader, head mssql.InventoryO
 		}
 	}
 	return maint.ShrinkIndexMeasurement{
-		Schema: head.Schema, Table: head.Table, Index: head.IndexName,
+		ObjectID: head.ObjectID,
+		Schema:   head.Schema, Table: head.Table, Index: head.IndexName,
 		PageCount: pageCount, AvgPageSpaceUsedPercent: minDensity,
 	}, true
 }
@@ -96,7 +116,8 @@ func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, head
 		fwdPct = float64(forwarded) / float64(records) * 100
 	}
 	return maint.ShrinkHeapMeasurement{
-		Schema: head.Schema, Table: head.Table, SizeMB: sizeMB,
+		ObjectID: head.ObjectID,
+		Schema:   head.Schema, Table: head.Table, SizeMB: sizeMB,
 		ForwardedRecordPercent: fwdPct, AvgPageSpaceUsedPercent: minDensity,
 	}, true
 }

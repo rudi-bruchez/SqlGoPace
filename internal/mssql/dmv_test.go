@@ -1,9 +1,8 @@
-package mssql_test
+package mssql
 
 import (
+	"database/sql"
 	"testing"
-
-	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
 func TestSessionBlockedBy(t *testing.T) {
@@ -21,7 +20,7 @@ func TestSessionBlockedBy(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := mssql.Session{SPID: 52, BlockingSPID: tt.blockingSPID}
+			s := Session{SPID: 52, BlockingSPID: tt.blockingSPID}
 			if got := s.BlockedBy(tt.ddlSPID); got != tt.want {
 				t.Errorf("BlockedBy(%d) with BlockingSPID=%d = %v, want %v", tt.ddlSPID, tt.blockingSPID, got, tt.want)
 			}
@@ -32,13 +31,13 @@ func TestSessionBlockedBy(t *testing.T) {
 func TestFindSelfBlock(t *testing.T) {
 	// A snapshot: our DDL (119) is blocked by 104, which is running a SELECT; 134 is
 	// blocked by us (irrelevant to self-block).
-	blocker := mssql.Session{SPID: 104, Login: "SVC_OBS", Program: "app", ActiveQuery: "SELECT DL.SETTLEMENTDATE"}
-	self := mssql.Session{SPID: 119, WaitType: "LCK_M_SCH_M", WaitMS: 120162, BlockingSPID: 104}
-	victim := mssql.Session{SPID: 134, BlockingSPID: 119}
-	snapshot := []mssql.Session{blocker, self, victim}
+	blocker := Session{SPID: 104, Login: "SVC_OBS", Program: "app", ActiveQuery: "SELECT DL.SETTLEMENTDATE"}
+	self := Session{SPID: 119, WaitType: "LCK_M_SCH_M", WaitMS: 120162, BlockingSPID: 104}
+	victim := Session{SPID: 134, BlockingSPID: 119}
+	snapshot := []Session{blocker, self, victim}
 
 	t.Run("blocked with blocker in snapshot", func(t *testing.T) {
-		sb := mssql.FindSelfBlock(snapshot, 119)
+		sb := FindSelfBlock(snapshot, 119)
 		if !sb.Blocked || sb.SPID != 104 || sb.WaitType != "LCK_M_SCH_M" || sb.WaitMS != 120162 {
 			t.Fatalf("got %+v, want Blocked by 104 on LCK_M_SCH_M for 120162ms", sb)
 		}
@@ -48,7 +47,7 @@ func TestFindSelfBlock(t *testing.T) {
 	})
 
 	t.Run("blocker absent from snapshot still reports the block", func(t *testing.T) {
-		sb := mssql.FindSelfBlock([]mssql.Session{self}, 119)
+		sb := FindSelfBlock([]Session{self}, 119)
 		if !sb.Blocked || sb.SPID != 104 || sb.WaitType != "LCK_M_SCH_M" {
 			t.Fatalf("got %+v, want Blocked by 104 even without identity", sb)
 		}
@@ -58,39 +57,39 @@ func TestFindSelfBlock(t *testing.T) {
 	})
 
 	t.Run("idle-in-transaction blocker falls back to parent query", func(t *testing.T) {
-		idle := mssql.Session{SPID: 104, Login: "SVC_OBS", ActiveQuery: "", ParentQuery: "UPDATE t SET x=1"}
-		sb := mssql.FindSelfBlock([]mssql.Session{idle, self}, 119)
+		idle := Session{SPID: 104, Login: "SVC_OBS", ActiveQuery: "", ParentQuery: "UPDATE t SET x=1"}
+		sb := FindSelfBlock([]Session{idle, self}, 119)
 		if sb.Query != "UPDATE t SET x=1" {
 			t.Errorf("Query = %q, want the parent batch when there is no active statement", sb.Query)
 		}
 	})
 
 	t.Run("not blocked", func(t *testing.T) {
-		running := mssql.Session{SPID: 119, BlockingSPID: 0}
-		if sb := mssql.FindSelfBlock([]mssql.Session{running}, 119); sb.Blocked {
+		running := Session{SPID: 119, BlockingSPID: 0}
+		if sb := FindSelfBlock([]Session{running}, 119); sb.Blocked {
 			t.Errorf("got %+v, want not blocked", sb)
 		}
 	})
 
 	t.Run("our SPID unknown (0) is never blocked", func(t *testing.T) {
-		if sb := mssql.FindSelfBlock(snapshot, 0); sb.Blocked {
+		if sb := FindSelfBlock(snapshot, 0); sb.Blocked {
 			t.Errorf("got %+v, want not blocked for ddlSPID 0", sb)
 		}
 	})
 
 	t.Run("our session absent from snapshot", func(t *testing.T) {
-		if sb := mssql.FindSelfBlock([]mssql.Session{blocker, victim}, 119); sb.Blocked {
+		if sb := FindSelfBlock([]Session{blocker, victim}, 119); sb.Blocked {
 			t.Errorf("got %+v, want not blocked when our row is absent", sb)
 		}
 	})
 }
 
 func TestFindSelfBlockCapturesHost(t *testing.T) {
-	sessions := []mssql.Session{
+	sessions := []Session{
 		{SPID: 119, WaitType: "LCK_M_SCH_M", WaitMS: 5000, BlockingSPID: 104},
 		{SPID: 104, Login: "app_login", Host: "APPSRV01", Program: "SQLCMD"},
 	}
-	sb := mssql.FindSelfBlock(sessions, 119)
+	sb := FindSelfBlock(sessions, 119)
 	if !sb.Blocked || sb.SPID != 104 {
 		t.Fatalf("expected blocked by 104, got %+v", sb)
 	}
@@ -112,10 +111,26 @@ func TestLogSpaceUsedBytes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ls := mssql.LogSpace{TotalBytes: tt.totalBytes, UsedPercent: tt.usedPercent}
+			ls := LogSpace{TotalBytes: tt.totalBytes, UsedPercent: tt.usedPercent}
 			if got := ls.UsedBytes(); got != tt.want {
 				t.Errorf("UsedBytes() = %d, want %d", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestScanLockedObjectNullNameFallsBackToID(t *testing.T) {
+	// A dropped object resolves OBJECT_NAME/OBJECT_SCHEMA_NAME to NULL; keep the id.
+	got := scanLockedObject(261575970, sql.NullString{}, sql.NullString{}, "Sch-M")
+	want := LockedObject{ObjectID: 261575970, Schema: "", Table: "", Mode: "Sch-M"}
+	if got != want {
+		t.Errorf("scanLockedObject NULL name = %+v, want %+v", got, want)
+	}
+
+	got = scanLockedObject(42, sql.NullString{String: "dbo", Valid: true},
+		sql.NullString{String: "MEASUREMENT", Valid: true}, "Sch-M")
+	want = LockedObject{ObjectID: 42, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}
+	if got != want {
+		t.Errorf("scanLockedObject = %+v, want %+v", got, want)
 	}
 }

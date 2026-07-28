@@ -106,3 +106,36 @@ func TestMarshalManifestOmitsEmpty(t *testing.T) {
 		t.Errorf("output missing the operation discriminator:\n%s", out)
 	}
 }
+
+// TestMarshalManifestAnnotatedEmitsComment checks that a per-op comment is emitted as a
+// YAML head comment above the annotated operation, and that it does not break round-trip.
+func TestMarshalManifestAnnotatedEmitsComment(t *testing.T) {
+	m := &ddl.Manifest{
+		Database: "PRODDB",
+		Operations: []ddl.Operation{
+			ddl.ReorganizeIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK"},
+		},
+	}
+	out, err := ddl.MarshalManifestAnnotated(m, map[int]string{0: "confirmed blocker (times_blocked=3)"})
+	if err != nil {
+		t.Fatalf("MarshalManifestAnnotated: %v", err)
+	}
+	if !strings.Contains(string(out), "# confirmed blocker (times_blocked=3)") {
+		t.Errorf("comment not emitted:\n%s", out)
+	}
+	// The comment must not break round-trip.
+	if _, err := ddl.ParseManifest(bytes.NewReader(out)); err != nil {
+		t.Errorf("annotated manifest does not parse: %v", err)
+	}
+}
+
+// TestMarshalManifestUnannotatedUnchanged checks that MarshalManifest is a pure
+// nil-annotated call: its output must stay byte-identical to before the refactor.
+func TestMarshalManifestUnannotatedUnchanged(t *testing.T) {
+	m := &ddl.Manifest{Operations: []ddl.Operation{ddl.ReorganizeIndex{Schema: "dbo", Table: "A", Index: "IX"}}}
+	a, _ := ddl.MarshalManifest(m)
+	b, _ := ddl.MarshalManifestAnnotated(m, nil)
+	if string(a) != string(b) {
+		t.Errorf("nil-annotated output differs from MarshalManifest")
+	}
+}

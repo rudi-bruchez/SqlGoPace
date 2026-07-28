@@ -287,3 +287,55 @@ func (c *Conn) ActiveSessions(ctx context.Context) ([]Session, error) {
 	}
 	return sessions, rows.Err()
 }
+
+// LockedObject is one user object a session holds a granted Sch-M lock on — for a
+// shrink, the object it is relocating and holding other sessions up on. Schema/Table
+// are empty when the object could not be name-resolved (dropped between lock and read);
+// ObjectID always identifies it.
+type LockedObject struct {
+	ObjectID int64
+	Schema   string
+	Table    string
+	Mode     string
+}
+
+const heldObjectLocksSQL = `
+SELECT l.resource_associated_entity_id,
+       OBJECT_SCHEMA_NAME(l.resource_associated_entity_id, l.resource_database_id),
+       OBJECT_NAME(l.resource_associated_entity_id, l.resource_database_id),
+       l.request_mode
+FROM sys.dm_tran_locks l
+WHERE l.request_session_id = @spid
+  AND l.resource_type   = 'OBJECT'
+  AND l.request_status  = 'GRANT'
+  AND l.request_mode LIKE 'Sch-M%';`
+
+// scanLockedObject maps one dm_tran_locks row to a LockedObject, keeping only the
+// object_id when the name did not resolve.
+func scanLockedObject(objectID int64, schema, table sql.NullString, mode string) LockedObject {
+	return LockedObject{ObjectID: objectID, Schema: schema.String, Table: table.String, Mode: mode}
+}
+
+// HeldObjectLocks returns the user objects spid currently holds a granted Sch-M lock on.
+// Best-effort: the caller treats an error as "nothing captured this snapshot".
+func (c *Conn) HeldObjectLocks(ctx context.Context, spid int) ([]LockedObject, error) {
+	rows, err := c.pool.QueryContext(ctx, heldObjectLocksSQL, sql.Named("spid", spid))
+	if err != nil {
+		return nil, fmt.Errorf("query held object locks: %w", err)
+	}
+	defer rows.Close()
+
+	var out []LockedObject
+	for rows.Next() {
+		var (
+			objectID      int64
+			schema, table sql.NullString
+			mode          string
+		)
+		if err := rows.Scan(&objectID, &schema, &table, &mode); err != nil {
+			return nil, fmt.Errorf("scan held object lock: %w", err)
+		}
+		out = append(out, scanLockedObject(objectID, schema, table, mode))
+	}
+	return out, rows.Err()
+}

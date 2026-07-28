@@ -59,7 +59,7 @@ func TestAnalyzePreShrink(t *testing.T) {
 		density: map[int64]float64{1: 40, 2: 50},
 		pages:   map[int64]int64{1: 5000, 2: 400000},
 	}
-	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, &bytes.Buffer{})
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("AnalyzePreShrink: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestAnalyzePreShrinkSkipsFailedObjectNotFatal(t *testing.T) {
 		pages:      map[int64]int64{2: 5000},
 		errObjects: map[int64]bool{1: true}, // object 1's sampled scan errors; must be skipped, not fatal
 	}
-	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, &bytes.Buffer{})
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("a per-object read error must not be fatal, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestAnalyzePreShrinkAggregatesAcrossPartitions(t *testing.T) {
 			},
 		},
 	}
-	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, &bytes.Buffer{})
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
 	if err != nil {
 		t.Fatalf("AnalyzePreShrink: %v", err)
 	}

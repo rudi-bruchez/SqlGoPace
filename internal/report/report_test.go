@@ -66,3 +66,27 @@ func TestWriteHumanAndJSON(t *testing.T) {
 		t.Errorf("JSON round-trip mismatch (-want +got):\n%s", diff)
 	}
 }
+
+func TestReportRendersContendedPointer(t *testing.T) {
+	r := report.RunReport{
+		Manifest: "020_shrink.yaml",
+		Outcome:  "SUCCESS",
+		Operations: []report.OperationReport{{
+			Index:          1,
+			CommandType:    "shrink_data",
+			Target:         "PRODDB",
+			Outcome:        "success",
+			ContendedCount: 2,
+			ContendedFile:  "020_shrink.yaml.contended.yaml",
+		}},
+	}
+	var buf bytes.Buffer
+	if err := report.Write(&buf, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	out := buf.String()
+
+	if !strings.Contains(out, "contended objects: 2 — see 020_shrink.yaml.contended.yaml") {
+		t.Errorf("missing contended pointer line:\n%s", out)
+	}
+}

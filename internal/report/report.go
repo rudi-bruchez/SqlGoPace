@@ -65,21 +65,23 @@ type BatchDMLReport struct {
 
 // OperationReport is the outcome of one executed operation.
 type OperationReport struct {
-	Index       int                `json:"index"`
-	CommandType string             `json:"command_type"`
-	Target      string             `json:"target"`
-	SQL         string             `json:"sql"`
-	Options     []OptionDecision   `json:"options,omitempty"`
-	Reactions   []ReactionLine     `json:"reactions,omitempty"`
-	PeakBlocked int                `json:"peak_blocked,omitempty"`
-	Waits       []WaitLine         `json:"waits,omitempty"`
-	WaitTotalMS int64              `json:"wait_total_ms,omitempty"`
-	Shrink      []ShrinkFileReport `json:"shrink,omitempty"`
-	BatchDML    *BatchDMLReport    `json:"batch_dml,omitempty"`
-	Outcome     string             `json:"outcome"`
-	Detail      string             `json:"detail,omitempty"` // context for the outcome, e.g. a skip reason
-	Error       string             `json:"error,omitempty"`
-	DurationMS  int64              `json:"duration_ms"`
+	Index          int                `json:"index"`
+	CommandType    string             `json:"command_type"`
+	Target         string             `json:"target"`
+	SQL            string             `json:"sql"`
+	Options        []OptionDecision   `json:"options,omitempty"`
+	Reactions      []ReactionLine     `json:"reactions,omitempty"`
+	PeakBlocked    int                `json:"peak_blocked,omitempty"`
+	ContendedCount int                `json:"contended_count,omitempty"`
+	ContendedFile  string             `json:"contended_file,omitempty"`
+	Waits          []WaitLine         `json:"waits,omitempty"`
+	WaitTotalMS    int64              `json:"wait_total_ms,omitempty"`
+	Shrink         []ShrinkFileReport `json:"shrink,omitempty"`
+	BatchDML       *BatchDMLReport    `json:"batch_dml,omitempty"`
+	Outcome        string             `json:"outcome"`
+	Detail         string             `json:"detail,omitempty"` // context for the outcome, e.g. a skip reason
+	Error          string             `json:"error,omitempty"`
+	DurationMS     int64              `json:"duration_ms"`
 }
 
 // CheckLine is one preflight check result.
@@ -131,6 +133,9 @@ func Write(w io.Writer, r RunReport) error {
 			}
 			if op.PeakBlocked > 0 {
 				fmt.Fprintf(w, "      peak blocked: %d session(s)\n", op.PeakBlocked)
+			}
+			if op.ContendedCount > 0 {
+				fmt.Fprintf(w, "      contended objects: %d — see %s\n", op.ContendedCount, op.ContendedFile)
 			}
 			if len(op.Waits) > 0 {
 				fmt.Fprintf(w, "      waits (total %dms):\n", op.WaitTotalMS)
