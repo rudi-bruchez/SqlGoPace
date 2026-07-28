@@ -74,7 +74,7 @@ reclaims VLFs and has nothing to do with page density or heaps. For `type: log`,
 `pre_reorganize` is ignored (no reorganizes, no advisory) and the manifest carries the
 shrink op alone.
 
-Session policy (`ignore_blocked_sessions` / `kill_blocked_sessions`) is **not**
+Session policy (`ignore_blocked_sessions` / `kill_blocking_sessions`) is **not**
 generated — it is situational. The operator adds it by editing the generated manifest.
 Only `max_block_minutes` is carried through.
 
