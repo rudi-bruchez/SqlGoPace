@@ -59,3 +59,4 @@ config-local.yaml-*
 # Local git worktrees (a full second copy of the tree: doubles every grep and
 # has already misled line-number citations in specs).
 .claude/worktrees/
+local/
