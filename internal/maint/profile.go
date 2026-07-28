@@ -14,6 +14,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 )
 
 // ErrInvalidProfile is returned for a structurally valid YAML that violates a
@@ -58,6 +60,7 @@ type Profile struct {
 	Index       IndexRules       `yaml:"index"`
 	Compression CompressionRules `yaml:"compression"`
 	Heap        HeapRules        `yaml:"heap"`
+	Shrink      ShrinkRules      `yaml:"shrink"`
 	Statistics  StatisticsRules  `yaml:"statistics"`
 	CheckDB     CheckDBRules     `yaml:"checkdb"`
 	Scope       ScopeRules       `yaml:"scope"`
@@ -133,6 +136,27 @@ type HeapRules struct {
 	FreeSpaceDeviationPercent float64 `yaml:"free_space_deviation_percent"`
 	Online                    *bool   `yaml:"online"` // nil = auto (matrix)
 }
+
+// ShrinkRules drives the plan subcommand's optional pre-shrink pass: it emits a
+// reorganize→shrink manifest for the connected database and a heap advisory. The
+// section is inert unless Enabled. See docs/superpowers/specs/2026-07-28-pre-shrink-
+// reorganize-design.md.
+type ShrinkRules struct {
+	Enabled                       bool    `yaml:"enabled"`
+	Type                          string  `yaml:"type"`                             // data | log
+	Files                         string  `yaml:"files"`                            // all | logical file name
+	TargetFreeSpace               string  `yaml:"targetfreespace"`                  // percent or absolute MB
+	PreReorganize                 *bool   `yaml:"pre_reorganize"`                   // nil = true when Enabled
+	ReorganizeBelowDensityPercent float64 `yaml:"reorganize_below_density_percent"` // default 65
+	MaxBlockMinutes               int     `yaml:"max_block_minutes"`                // carried into the shrink op; 0 = omit
+}
+
+// PreReorganizeEnabled reports whether the pre-shrink reorganize pass runs. It defaults
+// to true when the shrink section is enabled, unless explicitly set to false.
+func (r ShrinkRules) PreReorganizeEnabled() bool { return r.PreReorganize == nil || *r.PreReorganize }
+
+// IsLog reports whether this is a log-file shrink (no reorganize, no heap advisory).
+func (r ShrinkRules) IsLog() bool { return strings.EqualFold(strings.TrimSpace(r.Type), "log") }
 
 // StatisticsRules drives the UPDATE STATISTICS decision (see spec §5.4).
 type StatisticsRules struct {
@@ -347,6 +371,10 @@ func (p *Profile) applyDefaults() {
 		h.FreeSpaceDeviationPercent = 30
 	}
 
+	if p.Shrink.Enabled && p.Shrink.ReorganizeBelowDensityPercent == 0 {
+		p.Shrink.ReorganizeBelowDensityPercent = 65
+	}
+
 	for idx := range p.Overrides {
 		o := &p.Overrides[idx]
 		o.Rebuild = strings.ToLower(strings.TrimSpace(o.Rebuild))
@@ -440,6 +468,26 @@ func (p *Profile) validate() error {
 		case "", CompressionNone, CompressionRow, CompressionPage:
 		default:
 			return fmt.Errorf("overrides[%d]: compression = %q, want none/row/page or empty: %w", idx, o.Compression, ErrInvalidProfile)
+		}
+	}
+
+	if p.Shrink.Enabled {
+		switch strings.ToLower(strings.TrimSpace(p.Shrink.Type)) {
+		case "data", "log":
+		default:
+			return fmt.Errorf("shrink.type = %q, want \"data\" or \"log\": %w", p.Shrink.Type, ErrInvalidProfile)
+		}
+		if strings.TrimSpace(p.Shrink.Files) == "" {
+			return fmt.Errorf("shrink.files is required (\"all\" or a logical file name): %w", ErrInvalidProfile)
+		}
+		if _, err := ddl.ParseTargetFreeSpace(p.Shrink.TargetFreeSpace); err != nil {
+			return fmt.Errorf("shrink.targetfreespace: %w", err)
+		}
+		if d := p.Shrink.ReorganizeBelowDensityPercent; d < 1 || d > 100 {
+			return fmt.Errorf("shrink.reorganize_below_density_percent must be in 1..100: %w", ErrInvalidProfile)
+		}
+		if p.Shrink.MaxBlockMinutes < 0 {
+			return fmt.Errorf("shrink.max_block_minutes must be ≥ 0: %w", ErrInvalidProfile)
 		}
 	}
 	return nil
