@@ -75,7 +75,7 @@ func (p ShrinkProgress) Percent() float64 {
 
 // TempdbProfile carries the tempdb-shrink-specific knobs into the shared chunk loop.
 // Nil for a normal (non-tempdb) shrink. When FlushCaches is set, stall escalates a
-// persistent no-progress run (Msg 5240 / Msg 845 / real no-gain) into one targeted
+// persistent no-progress run (any shrink chunk error, or a real no-gain) into one targeted
 // temp-object cache flush, guarded by flushed so it never runs more than once per run.
 type TempdbProfile struct {
 	FlushCaches bool
@@ -413,11 +413,16 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		t0 := r.clk.Now()
 		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog)
 		if err != nil {
-			// Msg 5240 (could not adjust the file's space allocation) or Msg 845 (buffer latch
-			// time-out, tempdb under severe contention): neither is a failure — try a smaller
-			// move and treat it as no-progress, so a persistent stall stops cleanly with work
-			// preserved (or, on the tempdb path, escalates to a cache flush).
-			if !mssql.IsFileAllocationError(err) && !mssql.IsBufferLatchTimeout(err) {
+			// A DBCC SHRINKFILE chunk error almost never means the operation is broken — it
+			// means the shrink could not move a page right now (Msg 3140 "could not adjust the
+			// space allocation", Msg 845 buffer-latch time-out, a WAIT_AT_LOW_PRIORITY timeout,
+			// a transient contention error, …). We decide success by progress, not by matching a
+			// specific message number: treat any such error as a no-progress event — a smaller
+			// step, then stall's bounded budget (MaxNoProgress / SelfWaitTimeout) stops cleanly
+			// with work preserved (or, on the tempdb path, escalates to a cache flush). The last
+			// error is carried into the reason so it is never masked. Only our own cancellation
+			// is fatal.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return result, err
 			}
 			step = clampStep(step/2, r.tuning.MinStepMB, maxStep)
@@ -426,7 +431,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
-				result.Reason = "shrink could not adjust the file allocation (work preserved)"
+				result.Reason = fmt.Sprintf("no further progress: %v (work preserved)", err)
 				return result, nil
 			}
 			continue
@@ -706,8 +711,9 @@ func (r *ShrinkRunner) pumpChunkProgress(ctx context.Context, base ShrinkProgres
 	}
 }
 
-// stall records a no-progress chunk (a real no-gain, a Msg 5240 that could not adjust the
-// file, or a Msg 845 buffer latch time-out) and decides whether to give up. On the tempdb
+// stall records a no-progress chunk (a real no-gain, or any DBCC error that left the file
+// unmoved — "could not adjust the space allocation", a buffer-latch time-out, …) and
+// decides whether to give up. On the tempdb
 // path (prof != nil && prof.FlushCaches), once the stall persists to NoProgressBeforeFlush
 // it flushes the temp-object cache exactly once (the flushed guard) and gives the loop a
 // fresh no-progress budget rather than counting straight through to a give-up. Otherwise it
