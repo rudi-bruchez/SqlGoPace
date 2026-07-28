@@ -14,11 +14,22 @@ import (
 // blocks are omitted, so the output stays clean and round-trips through
 // ParseManifest unchanged.
 func MarshalManifest(m *Manifest) ([]byte, error) {
+	return MarshalManifestAnnotated(m, nil)
+}
+
+// MarshalManifestAnnotated renders the manifest exactly as MarshalManifest does, but
+// additionally sets opComments[i] as a YAML head comment (a "# ..." line) above operation
+// i when the comment is non-empty. Comments are ignored by ParseManifest, so annotation
+// never affects round-trip.
+func MarshalManifestAnnotated(m *Manifest, opComments map[int]string) ([]byte, error) {
 	operations := &yaml.Node{Kind: yaml.SequenceNode}
 	for i, op := range m.Operations {
 		node, err := operationNode(op)
 		if err != nil {
 			return nil, fmt.Errorf("operation %d (%s): %w", i, op.CommandType(), err)
+		}
+		if c := opComments[i]; c != "" {
+			node.HeadComment = c
 		}
 		operations.Content = append(operations.Content, node)
 	}
