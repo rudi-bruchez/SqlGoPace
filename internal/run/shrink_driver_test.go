@@ -23,11 +23,11 @@ type fakeServer struct {
 	sizeMB   int
 	usedMB   int
 
-	truncateToMB  *int // size after a TRUNCATEONLY pass, if set
-	noProgress    bool // chunk moves never change the size (simulate 49516 / data at end)
-	floorMB       int  // a chunk cannot shrink below this (also the active-log floor)
-	blockTruncate bool // model a long-running TRUNCATEONLY: block until the context is canceled
-	allocError    bool // every page-moving chunk returns Msg 5240 (could not adjust allocation)
+	truncateToMB  *int  // size after a TRUNCATEONLY pass, if set
+	noProgress    bool  // chunk moves never change the size (simulate 49516 / data at end)
+	floorMB       int   // a chunk cannot shrink below this (also the active-log floor)
+	blockTruncate bool  // model a long-running TRUNCATEONLY: block until the context is canceled
+	chunkErr      error // if set, every page-moving chunk returns this error (a shrink that cannot move a page)
 
 	// chunkErrs scripts transient chunk errors (e.g. Msg 845): each page-moving chunk exec
 	// pops and returns the front error instead of its normal behavior, until the queue is
@@ -72,8 +72,8 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 			s.chunkErrs = s.chunkErrs[1:]
 			return err
 		}
-		if s.allocError {
-			return mssqldb.Error{Number: 5240, Message: "Could not adjust the space allocation for file 'Data'."}
+		if s.chunkErr != nil {
+			return s.chunkErr
 		}
 		if s.noProgress {
 			return nil
@@ -405,7 +405,10 @@ func TestShrinkDataNoProgressStops(t *testing.T) {
 func TestShrinkAbsorbsAllocationError(t *testing.T) {
 	s := &fakeServer{
 		fileType: mssql.FileTypeRows, name: "Data",
-		sizeMB: 1000, usedMB: 400, floorMB: 400, allocError: true, // every chunk returns Msg 5240
+		sizeMB: 1000, usedMB: 400, floorMB: 400,
+		// Msg 3140 is the real "could not adjust the space allocation" error a shrink raises
+		// on a page it cannot move (not Msg 5240, which is a different message).
+		chunkErr: mssqldb.Error{Number: 3140, Message: "Could not adjust the space allocation for file 'Data'."},
 	}
 	clk := NewManualClock(time.Unix(0, 0))
 	r := newTestRunner(s, clk)
@@ -413,16 +416,38 @@ func TestShrinkAbsorbsAllocationError(t *testing.T) {
 	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final 440
 	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
 	if err != nil {
-		t.Fatalf("Msg 5240 must not fail the run, got err = %v", err)
+		t.Fatalf("Msg 3140 must not fail the run, got err = %v", err)
 	}
 	if len(res) != 1 || res[0].Reason == "" {
 		t.Fatalf("got %+v, want a clean stop with a reason (work preserved)", res)
 	}
 	if !strings.Contains(res[0].Reason, "adjust") {
-		t.Errorf("Reason = %q, want it to mention the allocation could not be adjusted", res[0].Reason)
+		t.Errorf("Reason = %q, want it to carry the underlying error text", res[0].Reason)
 	}
 	if res[0].FinalMB != 1000 { // nothing moved, but the file size is honestly reported
 		t.Errorf("FinalMB = %d, want the unchanged 1000", res[0].FinalMB)
+	}
+}
+
+// TestShrinkAbsorbsUnknownChunkError proves the driver decides by progress, not by matching
+// a specific message number: an arbitrary, unrecognized DBCC error is absorbed as a
+// no-progress event (bounded stall, work preserved) with its text carried into the reason,
+// never a hard failure.
+func TestShrinkAbsorbsUnknownChunkError(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErr: mssqldb.Error{Number: 999999, Message: "some brand-new shrink error"},
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("an unrecognized chunk error must not fail the run, got err = %v", err)
+	}
+	if len(res) != 1 || !strings.Contains(res[0].Reason, "brand-new shrink error") {
+		t.Fatalf("got %+v, want a clean stop whose reason carries the unknown error", res)
 	}
 }
 
@@ -820,8 +845,8 @@ func TestIsShrinkOpCoversBoth(t *testing.T) {
 
 // TestTempdb845RetriesWithoutFailing scripts a single Msg 845 (buffer latch time-out) on
 // the first chunk, then lets subsequent chunks succeed normally. The chunk loop must treat
-// it as a non-fatal, retryable no-progress event (same path as Msg 5240) and still converge
-// to the target — with FlushCaches false, proving 845 alone never triggers the flush.
+// it as a non-fatal, retryable no-progress event (the same path any chunk error takes) and
+// still converge to the target — with FlushCaches false, proving 845 alone never triggers the flush.
 func TestTempdb845RetriesWithoutFailing(t *testing.T) {
 	s := &fakeServer{
 		fileType: mssql.FileTypeRows, name: "tempdev",
