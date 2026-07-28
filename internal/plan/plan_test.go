@@ -141,6 +141,42 @@ func TestAnalyze(t *testing.T) {
 	}
 }
 
+// TestShrinkMeasurementsCarryObjectID exercises shrinkIndexMeasurement and
+// shrinkHeapMeasurement directly (unexported, so this lives in the internal
+// package plan test) and asserts the built measurement carries the inventory
+// head's ObjectID, so a later pass can join the confirmed-blocker set by
+// object id.
+func TestShrinkMeasurementsCarryObjectID(t *testing.T) {
+	r := &fakeReader{
+		physical: map[string][]mssql.PhysicalStats{
+			"10:1:SAMPLED": {{PartitionNumber: 1, PageCount: 5000, AvgPageSpaceUsedPercent: 40, RecordCount: 100}},
+			"20:0:SAMPLED": {{PartitionNumber: 1, PageCount: 100, AvgPageSpaceUsedPercent: 50, RecordCount: 100, ForwardedRecordCount: 10}},
+		},
+	}
+	p, err := maint.Parse([]byte("heap:\n  min_size_mb: 1\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+
+	indexHead := mssql.InventoryObject{Schema: "dbo", Table: "ORDERS", ObjectID: 10, IndexID: 1, IndexName: "PK_ORDERS", Type: 1}
+	im, ok := shrinkIndexMeasurement(context.Background(), r, indexHead, io.Discard)
+	if !ok {
+		t.Fatalf("shrinkIndexMeasurement() ok = false, want true")
+	}
+	if im.ObjectID != 10 {
+		t.Errorf("index measurement ObjectID = %d, want 10 (the inventory head's object id)", im.ObjectID)
+	}
+
+	heapHead := mssql.InventoryObject{Schema: "dbo", Table: "STAGING", ObjectID: 20, IndexID: 0, SizeMB: 100}
+	hm, ok := shrinkHeapMeasurement(context.Background(), r, p, heapHead, io.Discard)
+	if !ok {
+		t.Fatalf("shrinkHeapMeasurement() ok = false, want true")
+	}
+	if hm.ObjectID != 20 {
+		t.Errorf("heap measurement ObjectID = %d, want 20 (the inventory head's object id)", hm.ObjectID)
+	}
+}
+
 func TestParseCategories(t *testing.T) {
 	if _, err := ParseCategories("index, heaps , checkdb"); err != nil {
 		t.Errorf("ParseCategories(valid) error = %v", err)

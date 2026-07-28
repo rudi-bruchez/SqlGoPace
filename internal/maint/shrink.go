@@ -5,6 +5,7 @@ import "github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 // ShrinkIndexMeasurement is one rowstore index's page density for the pre-shrink
 // reorganize decision, aggregated across the index's partitions.
 type ShrinkIndexMeasurement struct {
+	ObjectID                int64
 	Schema, Table, Index    string
 	PageCount               int64
 	AvgPageSpaceUsedPercent float64 // worst (lowest) density across the index's partitions
@@ -12,6 +13,7 @@ type ShrinkIndexMeasurement struct {
 
 // ShrinkHeapMeasurement is one heap's density for the pre-shrink advisory.
 type ShrinkHeapMeasurement struct {
+	ObjectID                int64
 	Schema, Table           string
 	SizeMB                  int64
 	ForwardedRecordPercent  float64

@@ -61,7 +61,8 @@ func shrinkIndexMeasurement(ctx context.Context, r Reader, head mssql.InventoryO
 		}
 	}
 	return maint.ShrinkIndexMeasurement{
-		Schema: head.Schema, Table: head.Table, Index: head.IndexName,
+		ObjectID: head.ObjectID,
+		Schema:   head.Schema, Table: head.Table, Index: head.IndexName,
 		PageCount: pageCount, AvgPageSpaceUsedPercent: minDensity,
 	}, true
 }
@@ -96,7 +97,8 @@ func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, head
 		fwdPct = float64(forwarded) / float64(records) * 100
 	}
 	return maint.ShrinkHeapMeasurement{
-		Schema: head.Schema, Table: head.Table, SizeMB: sizeMB,
+		ObjectID: head.ObjectID,
+		Schema:   head.Schema, Table: head.Table, SizeMB: sizeMB,
 		ForwardedRecordPercent: fwdPct, AvgPageSpaceUsedPercent: minDensity,
 	}, true
 }
