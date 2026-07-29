@@ -76,6 +76,42 @@ func TestContendedCaptureDedupsAndCounts(t *testing.T) {
 	}
 }
 
+func TestContendedAddTailFreshEntry(t *testing.T) {
+	var acc contendedCapture
+	acc.addTail(TailFinding{ObjectID: 9, Schema: "dbo", Table: "Big", IndexID: 1, PageFromEnd: 4}, "t0")
+
+	doc := acc.doc("DB")
+	if len(doc.Observed) != 1 {
+		t.Fatalf("observed = %d, want 1", len(doc.Observed))
+	}
+	o := doc.Observed[0]
+	if o.ConfirmedBy != "tail_position" || o.IndexID != 1 || o.PageFromEnd != 4 || o.TimesBlocked != 0 {
+		t.Errorf("tail entry wrong: %+v", o)
+	}
+}
+
+func TestContendedLockThenTailMerges(t *testing.T) {
+	var acc contendedCapture
+	acc.add(mssql.LockedObject{ObjectID: 9, Schema: "dbo", Table: "Big", Mode: "Sch-M"}, "t0")
+	acc.add(mssql.LockedObject{ObjectID: 9, Schema: "dbo", Table: "Big", Mode: "Sch-M"}, "t1")
+	acc.addTail(TailFinding{ObjectID: 9, Schema: "dbo", Table: "Big", IndexID: 1, PageFromEnd: 2}, "t2")
+
+	doc := acc.doc("DB")
+	if len(doc.Observed) != 1 {
+		t.Fatalf("observed = %d, want 1 (merge)", len(doc.Observed))
+	}
+	o := doc.Observed[0]
+	if o.ConfirmedBy != "tail_position" {
+		t.Errorf("merged entry must upgrade to tail_position, got %q", o.ConfirmedBy)
+	}
+	if o.TimesBlocked != 2 || o.LockMode != "Sch-M" || o.FirstSeen != "t0" {
+		t.Errorf("merge must preserve lock stats: %+v", o)
+	}
+	if o.PageFromEnd != 2 || o.IndexID != 1 {
+		t.Errorf("merge must fill tail fields: %+v", o)
+	}
+}
+
 func TestRenderContendedRoundTrips(t *testing.T) {
 	var acc contendedCapture
 	acc.add(mssql.LockedObject{ObjectID: 261575970, Schema: "dbo", Table: "MEASUREMENT", Mode: "Sch-M"}, "2026-07-28T11:10:09Z")

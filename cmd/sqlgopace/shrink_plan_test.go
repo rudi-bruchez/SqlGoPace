@@ -50,6 +50,22 @@ func TestShrinkManifestReorganizesPrecedeShrink(t *testing.T) {
 	}
 }
 
+func TestShrinkManifestCarriesIdentifyTailObject(t *testing.T) {
+	p := dataShrinkProfile(t, "  identify_tail_object: true\n")
+	nm := shrinkManifest(p, "DB", maint.PreShrinkPlan{})
+	if nm == nil {
+		t.Fatal("shrinkManifest returned nil")
+	}
+	ops := nm.manifest.Operations
+	sh, ok := ops[len(ops)-1].(ddl.Shrink) // the shrink is the last op (after any reorganizes)
+	if !ok {
+		t.Fatalf("last op = %T, want ddl.Shrink", ops[len(ops)-1])
+	}
+	if !sh.IdentifyTailObject {
+		t.Error("identify_tail_object should be true on the generated shrink op")
+	}
+}
+
 func TestShrinkManifestNoPreReorganizeIsShrinkOnly(t *testing.T) {
 	p := dataShrinkProfile(t, "")
 	// Caller passes an empty PreShrinkPlan when pre_reorganize is off.
@@ -113,7 +129,7 @@ func TestConfirmedSetForBuildsMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("confirmedSetFor: %v", err)
 	}
-	if got[100] != 3 || got[200] != 1 {
+	if got[100].TimesBlocked != 3 || got[200].TimesBlocked != 1 {
 		t.Errorf("map = %v", got)
 	}
 }
@@ -235,7 +251,7 @@ func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
 		t.Fatalf("profile: %v", err)
 	}
 	var logbuf bytes.Buffer
-	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", map[int64]maint.Confirmation{1: {TimesBlocked: 2}}, &logbuf)
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}
@@ -249,7 +265,7 @@ func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
 func TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns(t *testing.T) {
 	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
 	var logbuf bytes.Buffer
-	_, _, err := planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	_, _, err := planShrink(context.Background(), panicReader{}, p, "DB", map[int64]maint.Confirmation{1: {TimesBlocked: 2}}, &logbuf)
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}

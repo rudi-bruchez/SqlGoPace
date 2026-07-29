@@ -153,7 +153,7 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 			return err
 		}
 	}
-	var confirmedSet map[int64]int
+	var confirmedSet map[int64]maint.Confirmation
 	if *confirmed != "" {
 		if !profile.Shrink.Enabled {
 			return errors.New("--confirmed requires shrink.enabled in the maintenance profile")

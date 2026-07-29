@@ -32,3 +32,43 @@ func TestParseContendedRejectsUnknownField(t *testing.T) {
 		t.Fatal("expected error on unknown field")
 	}
 }
+
+func TestParseContendedRoundTripsNewFields(t *testing.T) {
+	in := []byte(`database: MyDB
+observed:
+    - object_id: 42
+      schema: dbo
+      table: Big
+      confirmed_by: tail_position
+      index_id: 1
+      page_from_end: 3
+`)
+	doc, err := ParseContended(in)
+	if err != nil {
+		t.Fatalf("ParseContended: %v", err)
+	}
+	if len(doc.Observed) != 1 {
+		t.Fatalf("observed = %d, want 1", len(doc.Observed))
+	}
+	o := doc.Observed[0]
+	if o.ConfirmedBy != "tail_position" || o.IndexID != 1 || o.PageFromEnd != 3 {
+		t.Errorf("new fields not decoded: %+v", o)
+	}
+}
+
+func TestParseContendedAcceptsLegacySidecar(t *testing.T) {
+	// A sidecar written before this change has none of the new fields.
+	in := []byte(`database: MyDB
+observed:
+    - object_id: 7
+      schema: dbo
+      table: Old
+      lock_mode: Sch-M
+      times_blocked: 2
+      first_seen: t0
+      last_seen: t1
+`)
+	if _, err := ParseContended(in); err != nil {
+		t.Fatalf("legacy sidecar must still parse: %v", err)
+	}
+}

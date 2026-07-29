@@ -89,6 +89,16 @@ const (
 	reclaimMediumCeilingMB = 50 * 1024 // 5–50 GB
 )
 
+// Tail-object walk bounds (see the tail-object design spec §1). The walk skips the
+// file's trailing unallocated pages until it reaches the last allocated page; that run
+// can never exceed the file's total free-page count, so the cap is derived from free
+// space, with an absolute backstop for a mostly-free file whose last allocated page sits
+// near the front.
+const (
+	tailWalkMargin = 512    // extra pages absorbing concurrent allocation churn
+	tailWalkAbsCap = 262144 // ~2 GB at 8 KB/page: hard ceiling on the backward loop
+)
+
 // Wait thresholds that gate the step adjustment (design §7.2).
 const (
 	writeLogReduceMs      = 10 // WRITELOG avg above this → I/O is the bottleneck
@@ -171,4 +181,15 @@ func NextTargetMB(current, step, final int) int {
 		return final
 	}
 	return next
+}
+
+// tailWalkPages returns how many pages back the tail-object walk may scan for a data file
+// with freeMB megabytes free: min(free pages + margin, absolute cap), floored at the
+// margin so a full/near-full file still gets a small look-back window.
+func tailWalkPages(freeMB int) int {
+	pages := freeMB*128 + tailWalkMargin
+	if pages < tailWalkMargin {
+		pages = tailWalkMargin
+	}
+	return min(pages, tailWalkAbsCap)
 }

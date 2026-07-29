@@ -149,6 +149,7 @@ type ShrinkRules struct {
 	PreReorganize                 *bool   `yaml:"pre_reorganize"`                   // nil = true when Enabled
 	ReorganizeBelowDensityPercent float64 `yaml:"reorganize_below_density_percent"` // default 65
 	MaxBlockMinutes               int     `yaml:"max_block_minutes"`                // carried into the shrink op; 0 = omit
+	IdentifyTailObject            bool    `yaml:"identify_tail_object"`             // set identify_tail_object on the generated shrink op
 }
 
 // PreReorganizeEnabled reports whether the pre-shrink reorganize pass runs. It defaults

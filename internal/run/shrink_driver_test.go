@@ -41,6 +41,10 @@ type fakeServer struct {
 
 	percentComplete float64 // dm_exec_requests percent_complete for the running chunk (0 = no active request)
 
+	tail      mssql.TailObject // scripted FindTailObject result
+	tailFound bool
+	tailCalls int
+
 	execLog  []string
 	killed   bool
 	reuseIdx int
@@ -124,6 +128,11 @@ func (s *fakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, e
 		return mssql.Progress{}, false, nil
 	}
 	return mssql.Progress{PercentComplete: s.percentComplete, Command: "DbccFilesCompact"}, true, nil
+}
+
+func (s *fakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObject, bool, error) {
+	s.tailCalls++
+	return s.tail, s.tailFound, nil
 }
 
 // noPressureSampler never reports blocking or log pressure.
@@ -588,7 +597,7 @@ func TestTempdbFlushesOnceOnPersistentStall(t *testing.T) {
 	prof := &TempdbProfile{FlushCaches: true, flushed: &flushed}
 
 	f := mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 500}
-	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof)
+	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof, nil)
 	if err != nil {
 		t.Fatalf("chunkLoop() error = %v", err)
 	}
@@ -692,6 +701,10 @@ func (s *tempdbFakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.Sessi
 }
 func (s *tempdbFakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {
 	return mssql.Progress{}, false, nil
+}
+
+func (s *tempdbFakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObject, bool, error) {
+	return mssql.TailObject{}, false, nil
 }
 
 // newTestTempdbRunner wires a ShrinkRunner over a tempdbFakeServer, mirroring
@@ -858,7 +871,7 @@ func TestTempdb845RetriesWithoutFailing(t *testing.T) {
 	prof := &TempdbProfile{flushed: new(bool)} // FlushCaches false: 845 alone must not flush
 
 	f := mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 500}
-	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof)
+	res, err := r.chunkLoop(context.Background(), f, 1000, 500, ddl.ResolvedOptions{}, nil, discard, prof, nil)
 	if err != nil {
 		t.Fatalf("845 must not be fatal, got err = %v", err)
 	}

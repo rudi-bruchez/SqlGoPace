@@ -1,6 +1,7 @@
 package maint_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -104,7 +105,7 @@ func TestDecidePreShrinkConfirmedReordersToHead(t *testing.T) {
 		{ObjectID: 2, Schema: "dbo", Table: "B", Index: "IXB", PageCount: 5000, AvgPageSpaceUsedPercent: 40},
 	}
 	p := profileWithShrink(70, 1000)
-	pl := maint.DecidePreShrink(idx, nil, p, map[int64]int{2: 3}) // B confirmed
+	pl := maint.DecidePreShrink(idx, nil, p, map[int64]maint.Confirmation{2: {TimesBlocked: 3}}) // B confirmed
 	if pl.Reorganizes[0].Table != "B" {
 		t.Errorf("confirmed B not first: %+v", pl.Reorganizes)
 	}
@@ -119,7 +120,7 @@ func TestDecidePreShrinkConfirmedDenseAddedDespiteDensity(t *testing.T) {
 		{ObjectID: 3, Schema: "dbo", Table: "C", Index: "IXC", PageCount: 5000, AvgPageSpaceUsedPercent: 85},
 	}
 	p := profileWithShrink(70, 1000)
-	pl := maint.DecidePreShrink(idx, nil, p, map[int64]int{3: 1})
+	pl := maint.DecidePreShrink(idx, nil, p, map[int64]maint.Confirmation{3: {TimesBlocked: 1}})
 	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Table != "C" {
 		t.Fatalf("dense-confirmed not added: %+v", pl.Reorganizes)
 	}
@@ -131,7 +132,7 @@ func TestDecidePreShrinkConfirmedDenseAddedDespiteDensity(t *testing.T) {
 func TestDecidePreShrinkConfirmedHeapMarked(t *testing.T) {
 	heaps := []maint.ShrinkHeapMeasurement{{ObjectID: 9, Schema: "dbo", Table: "H", SizeMB: 500, AvgPageSpaceUsedPercent: 40}}
 	p := profileWithShrink(70, 1000) // heap.min_size_mb small enough in the helper
-	pl := maint.DecidePreShrink(nil, heaps, p, map[int64]int{9: 4})
+	pl := maint.DecidePreShrink(nil, heaps, p, map[int64]maint.Confirmation{9: {TimesBlocked: 4}})
 	if len(pl.HeapAdvisories) != 1 || !pl.HeapAdvisories[0].Confirmed || pl.HeapAdvisories[0].TimesBlocked != 4 {
 		t.Errorf("heap not marked confirmed: %+v", pl.HeapAdvisories)
 	}
@@ -149,13 +150,40 @@ func TestDecidePreShrinkConfirmedDenseHeapAddedDespiteDensity(t *testing.T) {
 		{ObjectID: 9, Schema: "dbo", Table: "H", SizeMB: 500, AvgPageSpaceUsedPercent: 80},  // dense, confirmed
 		{ObjectID: 10, Schema: "dbo", Table: "D", SizeMB: 500, AvgPageSpaceUsedPercent: 80}, // dense, not confirmed
 	}
-	pl := maint.DecidePreShrink(nil, heaps, p, map[int64]int{9: 2})
+	pl := maint.DecidePreShrink(nil, heaps, p, map[int64]maint.Confirmation{9: {TimesBlocked: 2}})
 	if len(pl.HeapAdvisories) != 1 {
 		t.Fatalf("advisories = %+v, want exactly one (confirmed dense heap kept, unconfirmed dense heap skipped)", pl.HeapAdvisories)
 	}
 	a := pl.HeapAdvisories[0]
 	if a.Table != "H" || !a.Confirmed || a.TimesBlocked != 2 {
 		t.Errorf("advisory = %+v, want confirmed dbo.H times_blocked=2", a)
+	}
+}
+
+func TestDecidePreShrinkTailFirst(t *testing.T) {
+	p := &maint.Profile{}
+	p.Shrink.ReorganizeBelowDensityPercent = 70
+	p.Index.PageCountFloor = 100
+
+	indexes := []maint.ShrinkIndexMeasurement{
+		{ObjectID: 1, Schema: "dbo", Table: "LockOnly", Index: "IX1", PageCount: 1000, AvgPageSpaceUsedPercent: 90},
+		{ObjectID: 2, Schema: "dbo", Table: "TailOnly", Index: "IX2", PageCount: 1000, AvgPageSpaceUsedPercent: 90},
+	}
+	confirmed := map[int64]maint.Confirmation{
+		1: {TimesBlocked: 5},                          // lock-confirmed, dense
+		2: {ByTail: true, IndexID: 2, PageFromEnd: 3}, // tail-confirmed, dense
+	}
+
+	pl := maint.DecidePreShrink(indexes, nil, p, confirmed)
+
+	if len(pl.Reorganizes) != 2 {
+		t.Fatalf("reorganizes = %d, want 2", len(pl.Reorganizes))
+	}
+	if pl.Reorganizes[0].Table != "TailOnly" {
+		t.Errorf("tail-confirmed object must lead; got %q first", pl.Reorganizes[0].Table)
+	}
+	if !strings.Contains(pl.ReorganizeNotes[0], "tail-position") {
+		t.Errorf("tail note = %q, want it to mention tail-position", pl.ReorganizeNotes[0])
 	}
 }
 

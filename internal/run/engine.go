@@ -598,6 +598,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			reactionMu  sync.Mutex
 		)
 		sink := func(ev ReactionEvent) {
+			if ev.Tail != nil {
+				e.captureTail(contended, name, manifest.Database, *ev.Tail)
+			}
 			detail := ev.Detail
 			if isInterruption(ev.Kind) {
 				if pct, ok := e.operationPercent(ctx); ok {
@@ -853,8 +856,7 @@ func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunRepor
 	} else if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
-	e.relocateCapture(name, dir)
-	e.relocateContended(name, dir)
+	e.relocateCaptures(name, dir)
 
 	if err := report.WriteFile(filepath.Join(dir, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
@@ -927,8 +929,7 @@ func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *repor
 	if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
-	e.relocateCapture(name, e.dirs.Failed)
-	e.relocateContended(name, e.dirs.Failed)
+	e.relocateCaptures(name, e.dirs.Failed)
 
 	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
 		fmt.Fprintf(e.out, "write log %s: %v\n", name, err)
@@ -974,8 +975,7 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	if err := e.queue.Fail(name); err != nil {
 		fmt.Fprintf(e.out, "fail %s: %v\n", name, err)
 	}
-	e.relocateCapture(name, e.dirs.Failed)
-	e.relocateContended(name, e.dirs.Failed)
+	e.relocateCaptures(name, e.dirs.Failed)
 
 	// Copy the manifest so recovery-specific overrides are the only differences; this
 	// carries forward every other setting (execution window, intent, …) that

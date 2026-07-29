@@ -435,12 +435,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		stepSink = fwd.step
 	}
 	shrinkRunner := run.NewShrinkRunner(conn, conn, sampler, run.System, run.ShrinkRunnerConfig{
-		Tuning:          shrinkTuning(cfg.Shrink),
-		PollInterval:    cfg.Monitoring.BlockingPoll(),
-		LogPollInterval: cfg.Monitoring.LogPoll(),
-		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
-		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
-		KillGrace:       cfg.Monitoring.KillGrace(),
+		Tuning:            shrinkTuning(cfg.Shrink),
+		PollInterval:      cfg.Monitoring.BlockingPoll(),
+		LogPollInterval:   cfg.Monitoring.LogPoll(),
+		BlockingTimeout:   cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout:   cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:         cfg.Monitoring.KillGrace(),
+		SQLMajorVersion:   info.MajorVersion,
 	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	// shrink_tempdb always executes over a connection whose database context is
 	// tempdb, regardless of which database this engine otherwise targets. Blocking()/
@@ -455,12 +456,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	}
 	tempdbSampler := run.NewServerSampler(conn, tempdbConn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
-		Tuning:          shrinkTuning(cfg.Shrink),
-		PollInterval:    cfg.Monitoring.BlockingPoll(),
-		LogPollInterval: cfg.Monitoring.LogPoll(),
-		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
-		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
-		KillGrace:       cfg.Monitoring.KillGrace(),
+		Tuning:            shrinkTuning(cfg.Shrink),
+		PollInterval:      cfg.Monitoring.BlockingPoll(),
+		LogPollInterval:   cfg.Monitoring.LogPoll(),
+		BlockingTimeout:   cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout:   cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:         cfg.Monitoring.KillGrace(),
+		SQLMajorVersion:   info.MajorVersion,
 	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
 		Tuning:          batchTuning(cfg.BatchDML),

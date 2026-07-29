@@ -886,11 +886,12 @@ func (o CheckDB) Validate() error {
 // Like check_db it is file/database-scoped, so its Target carries the file name in
 // Name and never a schema.table (see ObjectRef and the check_db target convention).
 type Shrink struct {
-	Type            string          `yaml:"type"`                // "data" | "log"
-	Files           string          `yaml:"files"`               // "all" | logical file name; defaults to "all"
-	EmptyFile       bool            `yaml:"emptyfile,omitempty"` // reserved for Phase 2; must be false in v1
-	TargetFreeSpace string          `yaml:"targetfreespace"`     // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
-	Options         OptionOverrides `yaml:"options"`             // only WaitAtLowPriority is relevant
+	Type               string          `yaml:"type"`                        // "data" | "log"
+	Files              string          `yaml:"files"`                       // "all" | logical file name; defaults to "all"
+	EmptyFile          bool            `yaml:"emptyfile,omitempty"`         // reserved for Phase 2; must be false in v1
+	TargetFreeSpace    string          `yaml:"targetfreespace"`             // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
+	Options            OptionOverrides `yaml:"options"`                     // only WaitAtLowPriority is relevant
+	IdentifyTailObject bool            `yaml:"identify_tail_object,omitempty"` // run the tail-object walk at shrink start
 }
 
 // FilesOrAll returns the configured logical file name, defaulting to "all".
