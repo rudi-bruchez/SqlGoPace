@@ -52,6 +52,7 @@ func shrinkManifest(profile *maint.Profile, db string, pre maint.PreShrinkPlan) 
 		mb := s.MaxBlockMinutes
 		shrink.Options.MaxBlockMinutes = &mb
 	}
+	shrink.IdentifyTailObject = s.IdentifyTailObject
 	ops = append(ops, shrink)
 
 	typ := "data"

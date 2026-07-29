@@ -50,6 +50,22 @@ func TestShrinkManifestReorganizesPrecedeShrink(t *testing.T) {
 	}
 }
 
+func TestShrinkManifestCarriesIdentifyTailObject(t *testing.T) {
+	p := dataShrinkProfile(t, "  identify_tail_object: true\n")
+	nm := shrinkManifest(p, "DB", maint.PreShrinkPlan{})
+	if nm == nil {
+		t.Fatal("shrinkManifest returned nil")
+	}
+	ops := nm.manifest.Operations
+	sh, ok := ops[len(ops)-1].(ddl.Shrink) // the shrink is the last op (after any reorganizes)
+	if !ok {
+		t.Fatalf("last op = %T, want ddl.Shrink", ops[len(ops)-1])
+	}
+	if !sh.IdentifyTailObject {
+		t.Error("identify_tail_object should be true on the generated shrink op")
+	}
+}
+
 func TestShrinkManifestNoPreReorganizeIsShrinkOnly(t *testing.T) {
 	p := dataShrinkProfile(t, "")
 	// Caller passes an empty PreShrinkPlan when pre_reorganize is off.
