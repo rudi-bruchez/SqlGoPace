@@ -43,6 +43,7 @@ to (mass purge, table drops, scope reduction) and does everything it can to keep
   files: all            # "all" (every file of that type) | logical name of one file
   emptyfile: false      # reserved for Phase 2; must be false (or absent) in v1
   targetfreespace: 10%  # TARGET free space in the final file: "10%" or "100MB"
+  identify_tail_object: false  # optional; run the tail-object walk at shrink start (§8.6)
   options:
     wait_at_low_priority: true   # 2022+ only (gated by the matrix); auto when absent
 ```
@@ -60,6 +61,9 @@ Fields:
 - **`options.wait_at_low_priority`**: an "auto" `*bool` (like the other options).
   `nil` ⇒ decided by the matrix (ON on 2022+). `ABORT_AFTER_WAIT` stays `SELF` unless
   `Policy.AllowAbortBlockers` is enabled globally (reuses the existing field).
+- **`identify_tail_object`** (plain `bool`, default `false`): opt into a proactive
+  tail-object walk at shrink start (§8.6). The reactive walk at give-up runs regardless of
+  this flag. Data shrinks only; requires SQL Server 2019+.
 
 **No `maxdop`**: `DBCC SHRINKFILE` takes no MAXDOP option. Any `maxdop` key under a shrink
 is ignored (or rejected at validation).
@@ -336,6 +340,42 @@ issues `KILL <spid>` **on the pool**, never on `exec`. The shrink driver **must*
 the `Executor` interface (`ExecDDL` on `exec`, `Kill` via the pool) to inherit that
 guarantee; do not open a parallel execution path that would bypass this split.
 
+### 8.6 Tail-object identification
+
+`DBCC SHRINKFILE` relocates the highest allocated pages toward the front of the file, so the
+object owning the **last allocated page** is the binding constraint: it decides how far the
+file can shrink and what the move contends on. When it can't be moved cheaply (a heap, a LOB
+allocation, a page pinned by another session), the shrink stalls short of target — often with
+**no blocking victim** for the `Sch-M`-lock capture (§8.3) to record.
+
+`FindTailObject` (`internal/mssql`) closes that gap: a bounded backward walk over
+`sys.dm_db_page_info` from the file's last page down to the first page owning a user object
+(§13). The look-back is capped at the file's free-page count plus a margin, with an absolute
+backstop, so a mostly-free file can't drive an unbounded scan; free/allocation-bitmap pages
+(`object_id IS NULL`) are skipped. It takes only brief page latches, never transaction locks.
+
+Two triggers, one helper (`ShrinkRunner.maybeCaptureTail`):
+
+- **Reactive (always on):** runs once when `chunkLoop` gives up ("no further progress")
+  for a data file — the definitive "couldn't get past the tail" moment. Not run on a graceful
+  stop / `ErrStopped` (that resumes later, it isn't a give-up).
+- **Proactive (`identify_tail_object: true`):** runs once at `chunkLoop` entry, **after**
+  `TRUNCATEONLY` (so the free-page bound reflects the post-truncate size and the last
+  allocated page is the real one).
+
+Gating: SQL Server **2019+** only (`sys.dm_db_page_info`); below that the driver emits one
+`warn` per operation and skips. `sys.dm_db_page_info` needs only `VIEW DATABASE STATE`
+(`VIEW DATABASE PERFORMANCE STATE` on 2022+), already covered by the `VIEW SERVER STATE`
+the monitoring requires — **no `DBCC PAGE`** (it would need `sysadmin`). Tempdb (`prof != nil`
+in the shared `chunkLoop`) and log shrinks never walk.
+
+A found tail object is emitted as a `ReactionEvent{Tail: *TailFinding}`; the engine sink
+records it into the same `<manifest>.contended.yaml` accumulator as the lock capture, tagged
+`confirmed_by: tail_position` (with `index_id` and `page_from_end`). If the same object was
+also lock-captured, the entry is upgraded to `tail_position` while its lock stats are
+preserved. `plan --confirmed` promotes tail-position blockers ahead of lock-confirmed ones
+(and, among tail entries, the one closest to the file end first).
+
 ## 9. Progress, reporting, TUI
 
 - **Deterministic progress** (an advantage of chunking, unlike the fluctuating
@@ -470,6 +510,26 @@ FROM sys.dm_db_log_space_usage;
 ```sql
 SELECT name, recovery_model_desc, log_reuse_wait_desc
 FROM sys.databases WHERE name = DB_NAME();
+```
+
+### Tail object of a data file (§8.6; SQL Server 2019+)
+Walk backward from the last page of a data file to the first page owning a user object —
+the object `DBCC SHRINKFILE` must relocate past. `FindTailObject` bounds the loop by the
+file's free-page count (with an absolute backstop); the illustrative shape:
+```sql
+DECLARE @file_id int = 1, @page_id int;
+SELECT @page_id = CAST(size AS int) - 1 FROM sys.database_files WHERE file_id = @file_id;
+WHILE @page_id >= 0
+BEGIN
+    IF (SELECT object_id FROM sys.dm_db_page_info(DB_ID(), @file_id, @page_id, 'LIMITED')) IS NOT NULL
+    BEGIN
+        SELECT OBJECT_SCHEMA_NAME(object_id) AS [schema], OBJECT_NAME(object_id) AS [object],
+               index_id, object_id
+        FROM sys.dm_db_page_info(DB_ID(), @file_id, @page_id, 'LIMITED');
+        BREAK;
+    END
+    SET @page_id -= 1;
+END
 ```
 
 ### Native progress (diagnostic; we prefer per-chunk progress, §9)

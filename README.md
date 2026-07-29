@@ -385,6 +385,7 @@ is re-entrant — re-running toward the same target resumes where it left off.
   type: data            # "data" | "log"
   files: all            # "all" (every file of the type) | a logical file name
   targetfreespace: 10%  # free space wanted in the final file: "N%" or "N MB"
+  identify_tail_object: true   # optional; name the tail object up front (2019+)
   options:
     wait_at_low_priority: true   # 2022+ only (matrix-gated); auto if omitted
 
@@ -407,6 +408,11 @@ is re-entrant — re-running toward the same target resumes where it left off.
 - **`options.wait_at_low_priority`**: auto by default. On SQL Server 2022+ it is injected for
   data shrinks so the schema-modify lock waits at low priority instead of blocking queries.
   It does not apply to log files. `DBCC SHRINKFILE` takes no `MAXDOP`.
+- **`identify_tail_object`** (default off): when `true`, run the tail-object walk once at the
+  start of each data-file shrink — after the `TRUNCATEONLY` pass — to name the object owning
+  the file's last allocated page, the one `DBCC SHRINKFILE` must relocate past. It is recorded
+  like a confirmed blocker (see below). Requires SQL Server 2019+ (`sys.dm_db_page_info`); on
+  older versions it logs a warning and is skipped. Ignored for log shrinks.
 
 Behaviour worth knowing:
 
@@ -424,14 +430,25 @@ Behaviour worth knowing:
 - Reactions reuse the engine's monitoring: under blocking or log pressure the driver pauses
   between chunks (free — committed work is kept) and shrinks the next chunk smaller.
 
-**Recording confirmed blockers.** Whenever a shrink blocks other sessions while relocating an
-object — regardless of the run's final outcome — the engine writes `<manifest>.contended.yaml`
-next to the run report, listing the objects it held a `Sch-M` lock on while blocking others: the
-ones it was relocating and couldn't get past, empirically confirmed tail blockers. It is
-machine-readable, relocated to `03.done`/`04.failed` with the manifest on finalize, and the run
-report's `.log` gets a one-line pointer (`contended objects: N — see <file>`). Feed it into the
-next planning pass with `sqlgopace plan --confirmed <path>` (see below) to prioritize those
-objects.
+**Recording confirmed blockers.** A shrink records the objects it couldn't get past into
+`<manifest>.contended.yaml` next to the run report, by two complementary means, each tagged with
+a `confirmed_by`:
+
+- `confirmed_by: lock` — whenever the shrink blocks other sessions while relocating an object
+  (regardless of the run's final outcome), the object it held a `Sch-M` lock on is recorded: an
+  empirically confirmed tail blocker.
+- `confirmed_by: tail_position` — the **tail-object walk** names the object owning the file's
+  last allocated page directly, without needing to block anyone. It runs automatically when a
+  data shrink gives up short of target ("no further progress"), and — with `identify_tail_object:
+  true` — once at the start of each data shrink. Requires SQL Server 2019+; skipped (with a
+  warning) below that, and for log/tempdb shrinks. This closes the common case of a shrink that
+  stalls with no blocking victim (data pinned at the file end, a `WAIT_AT_LOW_PRIORITY` timeout).
+
+The sidecar is machine-readable, relocated to `03.done`/`04.failed` with the manifest on
+finalize, and the run report's `.log` gets a one-line pointer (`contended objects: N — see
+<file>`). Feed it into the next planning pass with `sqlgopace plan --confirmed <path>` (see
+below); tail-position blockers are promoted ahead of lock-confirmed ones (they are the
+definitive constraint on how far the file can shrink).
 
 ### Shrinking tempdb: `operation: shrink_tempdb`
 
@@ -650,7 +667,7 @@ sqlgopace --config config.yaml
 | `--out`        | Directory to write manifests into (default: the config's `to_run`).          |
 | `--dry-run`    | Print the manifests instead of writing them.                                 |
 | `--explain`    | Show the reasoning behind each decision.                                     |
-| `--confirmed`  | Path to a `.contended.yaml` written by a prior shrink run that blocked other sessions; prioritizes those empirically-confirmed blocker objects in the pre-shrink reorganize pass and marks matching heap advisories `CONFIRMED`. Requires `shrink.enabled` in the profile. |
+| `--confirmed`  | Path to a `.contended.yaml` written by a prior shrink run (objects it blocked on, or the tail object it couldn't get past); prioritizes those confirmed blocker objects in the pre-shrink reorganize pass — tail-position blockers first — and marks matching heap advisories `CONFIRMED`. Requires `shrink.enabled` in the profile. |
 
 ### `shrink:` (pre-shrink reorganize + reclaim)
 
@@ -669,6 +686,7 @@ shrink:
   pre_reorganize: true   # false = emit the shrink op alone (default true)
   reorganize_below_density_percent: 65  # reorganize rowstore indexes below this SAMPLED page density
   max_block_minutes: 10  # optional; carried into the shrink op's options
+  identify_tail_object: true  # optional; sets identify_tail_object on the generated shrink op (2019+)
 ```
 
 Notes:
