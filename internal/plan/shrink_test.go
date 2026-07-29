@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
@@ -122,5 +123,129 @@ func TestAnalyzePreShrinkAggregatesAcrossPartitions(t *testing.T) {
 	}
 	if len(pl.Reorganizes) != 1 || pl.Reorganizes[0].Index != "PK_P" {
 		t.Errorf("reorganizes = %+v, want PK_P selected (summed page count 5000 >= floor 4000, worst density 40 < threshold 50)", pl.Reorganizes)
+	}
+}
+
+// TestAnalyzePreShrinkIndexIgnoresEmptyPartitionDensity covers FIX 1: an empty
+// partition (page_count=0) reports density 0 (ISNULL-mapped), which must not drag
+// the index's worst-density down and force a spurious reorganize of an otherwise
+// dense index. Only partitions with page_count > 0 should count toward the
+// minimum. Density 80 is well above the 50 threshold, so with the empty partition
+// correctly ignored the index must NOT be reorganized.
+func TestAnalyzePreShrinkIndexIgnoresEmptyPartitionDensity(t *testing.T) {
+	p, err := maint.Parse([]byte("index:\n  page_count_floor: 1000\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 50\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "P", ObjectID: 1, IndexID: 1, IndexName: "PK_P", Type: 1, PartitionNumber: 1, SizeMB: 100},
+		},
+		rows: map[int64][]mssql.PhysicalStats{
+			1: {
+				{PartitionNumber: 1, PageCount: 5000, AvgPageSpaceUsedPercent: 80, RecordCount: 100},
+				{PartitionNumber: 2, PageCount: 0, AvgPageSpaceUsedPercent: 0, RecordCount: 0}, // empty partition
+			},
+		},
+	}
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("AnalyzePreShrink: %v", err)
+	}
+	if len(pl.Reorganizes) != 0 {
+		t.Errorf("reorganizes = %+v, want none: empty partition's density=0 must not drag down the true 80%% density", pl.Reorganizes)
+	}
+}
+
+// TestAnalyzePreShrinkHeapIgnoresEmptyPartitionDensity is the heap analogue of the
+// above: an empty partition's density=0 must not force a spuriously dense-below-
+// threshold heap advisory.
+func TestAnalyzePreShrinkHeapIgnoresEmptyPartitionDensity(t *testing.T) {
+	p, err := maint.Parse([]byte("heap:\n  min_size_mb: 10\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 50\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "H", ObjectID: 2, IndexID: 0, IndexName: "", Type: 0, PartitionNumber: 1, SizeMB: 3000},
+		},
+		rows: map[int64][]mssql.PhysicalStats{
+			2: {
+				{PartitionNumber: 1, PageCount: 5000, AvgPageSpaceUsedPercent: 80, RecordCount: 100},
+				{PartitionNumber: 2, PageCount: 0, AvgPageSpaceUsedPercent: 0, RecordCount: 0}, // empty partition
+			},
+		},
+	}
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("AnalyzePreShrink: %v", err)
+	}
+	if len(pl.HeapAdvisories) != 0 {
+		t.Errorf("advisories = %+v, want none: empty partition's density=0 must not drag down the true 80%% density", pl.HeapAdvisories)
+	}
+}
+
+// TestAnalyzePreShrinkHeapSizeSumsAcrossPartitions covers FIX 5: a heap's SizeMB in
+// InventoryObject is per-PARTITION, not per-object, so shrinkHeapMeasurement must
+// sum SizeMB across the whole partition group before applying the min_size_mb
+// pre-filter. Each partition is below min_size_mb alone but their sum clears it.
+func TestAnalyzePreShrinkHeapSizeSumsAcrossPartitions(t *testing.T) {
+	p, err := maint.Parse([]byte("heap:\n  min_size_mb: 10\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 65\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "H", ObjectID: 2, IndexID: 0, IndexName: "", Type: 0, PartitionNumber: 1, SizeMB: 6},
+			{Schema: "dbo", Table: "H", ObjectID: 2, IndexID: 0, IndexName: "", Type: 0, PartitionNumber: 2, SizeMB: 6},
+		},
+		rows: map[int64][]mssql.PhysicalStats{
+			2: {
+				{PartitionNumber: 1, PageCount: 1000, AvgPageSpaceUsedPercent: 40, RecordCount: 100},
+				{PartitionNumber: 2, PageCount: 1000, AvgPageSpaceUsedPercent: 40, RecordCount: 100},
+			},
+		},
+	}
+	pl, err := plan.AnalyzePreShrink(context.Background(), r, p, nil, &bytes.Buffer{})
+	if err != nil {
+		t.Fatalf("AnalyzePreShrink: %v", err)
+	}
+	if len(pl.HeapAdvisories) != 1 {
+		t.Fatalf("advisories = %+v, want one: partitions (6+6=12 MB) sum above min_size_mb 10, though each alone is below", pl.HeapAdvisories)
+	}
+	if pl.HeapAdvisories[0].SizeMB != 12 {
+		t.Errorf("SizeMB = %d, want 12 (summed across partitions)", pl.HeapAdvisories[0].SizeMB)
+	}
+}
+
+// TestAnalyzePreShrinkNotFoundOnlyForGenuinelyMissing covers FIX 4: "confirmed
+// object not found" must mean genuinely absent from the database (dropped/renamed),
+// not merely filtered out by a downstream rule (e.g. a heap below min_size_mb). id 2
+// is present in the raw inventory but filtered out by the heap size floor, so it
+// must NOT be logged "not found"; id 99 is absent from the inventory entirely and
+// must be logged.
+func TestAnalyzePreShrinkNotFoundOnlyForGenuinelyMissing(t *testing.T) {
+	p, err := maint.Parse([]byte("heap:\n  min_size_mb: 1000\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	r := &fakeShrinkReader{
+		inv: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "H", ObjectID: 2, IndexID: 0, IndexName: "", Type: 0, PartitionNumber: 1, SizeMB: 5}, // below min_size_mb 1000
+		},
+		density: map[int64]float64{2: 40},
+		pages:   map[int64]int64{2: 100},
+	}
+	var logbuf bytes.Buffer
+	_, err = plan.AnalyzePreShrink(context.Background(), r, p, map[int64]int{2: 1, 99: 1}, &logbuf)
+	if err != nil {
+		t.Fatalf("AnalyzePreShrink: %v", err)
+	}
+	log := logbuf.String()
+	if strings.Contains(log, "confirmed object 2 not found") {
+		t.Errorf("object 2 is present in inventory (just filtered by size); must not be logged not-found:\n%s", log)
+	}
+	if !strings.Contains(log, "confirmed object 99 not found") {
+		t.Errorf("object 99 is absent from the inventory entirely; must be logged not-found:\n%s", log)
 	}
 }

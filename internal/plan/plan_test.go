@@ -168,7 +168,7 @@ func TestShrinkMeasurementsCarryObjectID(t *testing.T) {
 	}
 
 	heapHead := mssql.InventoryObject{Schema: "dbo", Table: "STAGING", ObjectID: 20, IndexID: 0, SizeMB: 100}
-	hm, ok := shrinkHeapMeasurement(context.Background(), r, p, heapHead, io.Discard)
+	hm, ok := shrinkHeapMeasurement(context.Background(), r, p, []mssql.InventoryObject{heapHead}, io.Discard)
 	if !ok {
 		t.Fatalf("shrinkHeapMeasurement() ok = false, want true")
 	}

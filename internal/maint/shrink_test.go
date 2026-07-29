@@ -137,6 +137,28 @@ func TestDecidePreShrinkConfirmedHeapMarked(t *testing.T) {
 	}
 }
 
+// TestDecidePreShrinkConfirmedDenseHeapAddedDespiteDensity covers FIX 2: a
+// confirmed heap must be surfaced regardless of density (mirroring the index
+// path's "added despite density" behavior), because losing the empirical signal
+// means an actual observed blocker never gets marked CONFIRMED. Density 80 is
+// above the 70 threshold, so an unconfirmed heap at the same density must still be
+// skipped.
+func TestDecidePreShrinkConfirmedDenseHeapAddedDespiteDensity(t *testing.T) {
+	p := profileWithShrink(70, 1000) // heap.min_size_mb small enough in the helper
+	heaps := []maint.ShrinkHeapMeasurement{
+		{ObjectID: 9, Schema: "dbo", Table: "H", SizeMB: 500, AvgPageSpaceUsedPercent: 80},  // dense, confirmed
+		{ObjectID: 10, Schema: "dbo", Table: "D", SizeMB: 500, AvgPageSpaceUsedPercent: 80}, // dense, not confirmed
+	}
+	pl := maint.DecidePreShrink(nil, heaps, p, map[int64]int{9: 2})
+	if len(pl.HeapAdvisories) != 1 {
+		t.Fatalf("advisories = %+v, want exactly one (confirmed dense heap kept, unconfirmed dense heap skipped)", pl.HeapAdvisories)
+	}
+	a := pl.HeapAdvisories[0]
+	if a.Table != "H" || !a.Confirmed || a.TimesBlocked != 2 {
+		t.Errorf("advisory = %+v, want confirmed dbo.H times_blocked=2", a)
+	}
+}
+
 func TestDecidePreShrinkDensityBoundary(t *testing.T) {
 	p := shrinkProfile(t) // threshold 65
 	indexes := []maint.ShrinkIndexMeasurement{

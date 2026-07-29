@@ -95,7 +95,12 @@ func (e *Engine) captureContended(ctx context.Context, spid int, acc *contendedC
 	for _, o := range held {
 		acc.add(o, now)
 	}
-	if acc.len() > 0 {
+	// Only write when this snapshot captured something: a snapshot with no held
+	// locks (e.g. a stall pause after the lock released) must not rewrite the
+	// sidecar with identical content. When held is non-empty the file legitimately
+	// changes (times_blocked/last_seen advance), so this is not a dedup — it only
+	// skips the write when nothing was captured this snapshot.
+	if len(held) > 0 {
 		path := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
 		if err := os.WriteFile(path, renderContended(name, database, acc), 0o644); err != nil {
 			fmt.Fprintf(e.out, "write contended capture %s: %v\n", name, err)

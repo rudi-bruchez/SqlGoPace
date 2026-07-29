@@ -87,6 +87,8 @@ func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db s
 		if pre, err = plan.AnalyzePreShrink(ctx, r, profile, confirmed, logw); err != nil {
 			return nil, nil, err
 		}
+	} else if len(confirmed) > 0 {
+		fmt.Fprintln(logw, "-- warning: --confirmed has no effect for a log shrink or pre_reorganize:false; ignored")
 	}
 	return shrinkManifest(profile, db, pre), pre.HeapAdvisories, nil
 }
