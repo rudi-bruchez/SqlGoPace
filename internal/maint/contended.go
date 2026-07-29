@@ -13,10 +13,16 @@ type ContendedObject struct {
 	ObjectID     int64  `yaml:"object_id"`
 	Schema       string `yaml:"schema"`
 	Table        string `yaml:"table"`
-	LockMode     string `yaml:"lock_mode"`
-	TimesBlocked int    `yaml:"times_blocked"`
-	FirstSeen    string `yaml:"first_seen"`
-	LastSeen     string `yaml:"last_seen"`
+	LockMode     string `yaml:"lock_mode,omitempty"`
+	TimesBlocked int    `yaml:"times_blocked,omitempty"`
+	FirstSeen    string `yaml:"first_seen,omitempty"`
+	LastSeen     string `yaml:"last_seen,omitempty"`
+	// Tail-position capture (see the tail-object design spec). ConfirmedBy is "lock" for a
+	// lock-held blocker or "tail_position" for one found by the backward page walk; empty is
+	// a legacy sidecar, read as "lock". IndexID/PageFromEnd are set only for tail entries.
+	IndexID     int    `yaml:"index_id,omitempty"`
+	ConfirmedBy string `yaml:"confirmed_by,omitempty"`
+	PageFromEnd int    `yaml:"page_from_end,omitempty"`
 }
 
 // ContendedDoc is the machine body of a .contended.yaml sidecar.
