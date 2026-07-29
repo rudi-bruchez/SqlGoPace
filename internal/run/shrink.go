@@ -23,6 +23,9 @@ type ShrinkReader interface {
 	// Progress reads the running statement's percent_complete from dm_exec_requests, which
 	// SQL Server populates for DBCC SHRINKFILE — the server's own view of the current chunk.
 	Progress(ctx context.Context, spid int) (mssql.Progress, bool, error)
+	// FindTailObject names the user object owning the file's last allocated page (the tail the
+	// shrink cannot relocate past). SQL 2019+ only — the driver gates on SQLMajorVersion.
+	FindTailObject(ctx context.Context, fileID, maxPagesBack int) (mssql.TailObject, bool, error)
 }
 
 var _ ShrinkReader = (*mssql.Conn)(nil)
@@ -82,6 +85,14 @@ type TempdbProfile struct {
 	flushed     *bool // once-per-run guard, shared across a RunTempdb's files
 }
 
+// tailProbe carries the per-operation tail-object walk state into the shared chunk loop.
+// Nil on the tempdb path (tempdb shrinks never walk). proactive runs a walk at loop entry;
+// warned is the once-per-operation <2019 warning guard.
+type tailProbe struct {
+	proactive bool
+	warned    *bool
+}
+
 // ShrinkResult is the outcome of shrinking one file, for the run report.
 type ShrinkResult struct {
 	File      string
@@ -104,6 +115,8 @@ type ShrinkRunnerConfig struct {
 	BlockingTimeout time.Duration
 	LogDrainTimeout time.Duration
 	KillGrace       time.Duration
+	// SQLMajorVersion gates the tail-object walk: it needs sys.dm_db_page_info, SQL 2019+ only.
+	SQLMajorVersion int
 }
 
 // ShrinkRunner drives DBCC SHRINKFILE: it estimates and gates, runs a free
@@ -124,6 +137,7 @@ type ShrinkRunner struct {
 	blockTO  time.Duration
 	logDrain time.Duration
 	killGr   time.Duration
+	major    int // SQL Server major version; gates the tail-object walk (2019+ only)
 
 	progress func(ShrinkProgress)
 	wait     func(ctx context.Context, d time.Duration) error
@@ -174,6 +188,7 @@ func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Cl
 		blockTO:  cfg.BlockingTimeout,
 		logDrain: cfg.LogDrainTimeout,
 		killGr:   cfg.KillGrace,
+		major:    cfg.SQLMajorVersion,
 		wait:     sleep,
 	}
 	for _, o := range opts {
@@ -192,6 +207,11 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 	}
 	isLog := strings.EqualFold(strings.TrimSpace(op.Type), "log")
 
+	// One warning guard per operation: below SQL 2019 the driver warns about the skipped
+	// tail-object walk exactly once, however many files this operation shrinks.
+	warned := new(bool)
+	tp := &tailProbe{proactive: op.IdentifyTailObject, warned: warned}
+
 	results := make([]ShrinkResult, 0, len(files))
 	for _, f := range files {
 		// Graceful stop: a running file's chunk loop stops itself between chunks (below);
@@ -206,7 +226,7 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 		if isLog {
 			result, ferr = r.shrinkLog(ctx, op, res, f, sink)
 		} else {
-			result, ferr = r.shrinkData(ctx, op, res, ignore, f, sink)
+			result, ferr = r.shrinkData(ctx, op, res, ignore, f, sink, tp)
 		}
 		if ferr != nil {
 			// On a graceful stop the partial file result is still worth recording.
@@ -294,7 +314,7 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 			results = append(results, ShrinkResult{File: f.Name, Type: "data", InitialMB: size, TargetMB: final, FinalMB: size, NoOp: true, Reason: "already at or below target"})
 			continue
 		}
-		res2, cerr := r.chunkLoop(ctx, f, size, final, res, ignore, sink, prof)
+		res2, cerr := r.chunkLoop(ctx, f, size, final, res, ignore, sink, prof, nil)
 		if cerr != nil {
 			if errors.Is(cerr, ErrStopped) {
 				results = append(results, res2)
@@ -323,7 +343,7 @@ func warnIfUnbalanced(results []ShrinkResult, sink ReactionSink) {
 
 // shrinkData runs the data-file algorithm (design §7.1): no-op gating, a free
 // TRUNCATEONLY pass, then the chunk loop.
-func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, f mssql.FileSpace, sink ReactionSink) (ShrinkResult, error) {
+func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.ResolvedOptions, ignore IgnoreSource, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) (ShrinkResult, error) {
 	spec, err := ddl.ParseTargetFreeSpace(op.TargetFreeSpace)
 	if err != nil {
 		return ShrinkResult{}, err // already validated at parse time; defensive
@@ -370,14 +390,20 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	}
 
 	// Phase B — chunked page-moving shrink.
-	return r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil)
+	return r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil, tp)
 }
 
 // chunkLoop runs the page-moving chunk loop for one already-truncated file, from start
 // down to final MB. It is shared by shrinkData (prof == nil, a normal shrink) and
 // RunTempdb (prof carries tempdb-specific escalation knobs — see stall).
-func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, final int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, prof *TempdbProfile) (ShrinkResult, error) {
+func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, final int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, prof *TempdbProfile, tp *tailProbe) (ShrinkResult, error) {
 	result := ShrinkResult{File: f.Name, Type: "data", InitialMB: f.SizeMB, TargetMB: final, FinalMB: start}
+
+	// Proactive tail-object walk: run once at loop entry when the operation asked for it
+	// (op.IdentifyTailObject), before any chunk executes.
+	if tp != nil && tp.proactive {
+		r.maybeCaptureTail(ctx, f, sink, tp.warned)
+	}
 
 	maxStep := effectiveMaxStepMB(start, r.tuning) // per-file step ceiling, fixed for this file
 	step := InitialStepMB(start-final, start, r.tuning)
@@ -432,6 +458,9 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			} else if stop {
 				result.FinalMB = current
 				result.Reason = fmt.Sprintf("no further progress: %v (work preserved)", err)
+				if tp != nil {
+					r.maybeCaptureTail(ctx, f, sink, tp.warned)
+				}
 				return result, nil
 			}
 			continue
@@ -474,6 +503,9 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			} else if stop {
 				result.FinalMB = current
 				result.Reason = "no further progress (work preserved)"
+				if tp != nil {
+					r.maybeCaptureTail(ctx, f, sink, tp.warned)
+				}
 				return result, nil
 			}
 			continue
@@ -751,6 +783,33 @@ func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, 
 func (r *ShrinkRunner) flushTempdbCaches(ctx context.Context, sink ReactionSink) error {
 	sink(ReactionEvent{Kind: "pause", Detail: "tempdb stall: flushing temp-object cache (CHECKPOINT + FREESYSTEMCACHE)"})
 	return r.exec.ExecDDL(ctx, "CHECKPOINT;\nDBCC FREESYSTEMCACHE ('Temporary Tables & Table Variables') WITH NO_INFOMSGS;")
+}
+
+// maybeCaptureTail runs the tail-object walk for one data file and emits the result through
+// the sink for the engine to record. Below SQL 2019 it emits one warning per operation (via
+// the warned guard) and does not walk. On a hit it emits an info event carrying the finding;
+// not-found or a read error records nothing (a warning, on error).
+func (r *ShrinkRunner) maybeCaptureTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, warned *bool) {
+	if r.major < 15 {
+		if warned != nil && !*warned {
+			*warned = true
+			sink(ReactionEvent{Kind: "warn", Detail: "tail-object identification needs SQL Server 2019+ (sys.dm_db_page_info); skipped"})
+		}
+		return
+	}
+	o, found, err := r.reader.FindTailObject(ctx, f.FileID, tailWalkPages(f.FreeMB))
+	if err != nil {
+		sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("tail-object walk failed on %q: %v", f.Name, err)})
+		return
+	}
+	if !found {
+		return
+	}
+	sink(ReactionEvent{
+		Kind:   "info",
+		Detail: fmt.Sprintf("tail object %s.%s (index_id=%d, %d pages from end) on %q", o.Schema, o.Table, o.IndexID, o.PageFromEnd, f.Name),
+		Tail:   &TailFinding{ObjectID: o.ObjectID, Schema: o.Schema, Table: o.Table, IndexID: o.IndexID, PageFromEnd: o.PageFromEnd},
+	})
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait
