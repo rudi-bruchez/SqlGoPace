@@ -598,6 +598,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			reactionMu  sync.Mutex
 		)
 		sink := func(ev ReactionEvent) {
+			if ev.Tail != nil {
+				e.captureTail(contended, name, manifest.Database, *ev.Tail)
+			}
 			detail := ev.Detail
 			if isInterruption(ev.Kind) {
 				if pct, ok := e.operationPercent(ctx); ok {

@@ -17,10 +17,13 @@ import (
 const contendedCaptureSuffix = ".contended.yaml"
 
 type capturedObject struct {
-	obj       mssql.LockedObject
-	firstSeen string
-	lastSeen  string
-	count     int
+	obj         mssql.LockedObject
+	firstSeen   string
+	lastSeen    string
+	count       int
+	byTail      bool // upgraded by a tail-object walk
+	indexID     int
+	pageFromEnd int
 }
 
 // contendedCapture accumulates the distinct objects a shrink held a Sch-M lock on across
@@ -46,15 +49,38 @@ func (c *contendedCapture) add(o mssql.LockedObject, now string) {
 
 func (c *contendedCapture) len() int { return len(c.order) }
 
+// addTail records a tail-position blocker. On an existing key (the object was also
+// lock-captured) it upgrades the entry to tail_position and fills the tail fields while
+// preserving the lock stats; a fresh key creates a tail-only entry (no lock stats).
+func (c *contendedCapture) addTail(f TailFinding, now string) {
+	if c.byID == nil {
+		c.byID = make(map[int64]*capturedObject)
+	}
+	e, ok := c.byID[f.ObjectID]
+	if !ok {
+		e = &capturedObject{obj: mssql.LockedObject{ObjectID: f.ObjectID, Schema: f.Schema, Table: f.Table}}
+		c.byID[f.ObjectID] = e
+		c.order = append(c.order, f.ObjectID)
+	}
+	e.byTail = true
+	e.indexID = f.IndexID
+	e.pageFromEnd = f.PageFromEnd
+}
+
 // doc builds the machine document in first-seen order.
 func (c *contendedCapture) doc(database string) maint.ContendedDoc {
 	doc := maint.ContendedDoc{Database: database}
 	for _, id := range c.order {
 		e := c.byID[id]
+		confirmedBy := "lock"
+		if e.byTail {
+			confirmedBy = "tail_position"
+		}
 		doc.Observed = append(doc.Observed, maint.ContendedObject{
 			ObjectID: e.obj.ObjectID, Schema: e.obj.Schema, Table: e.obj.Table,
 			LockMode: e.obj.Mode, TimesBlocked: e.count,
 			FirstSeen: e.firstSeen, LastSeen: e.lastSeen,
+			IndexID: e.indexID, ConfirmedBy: confirmedBy, PageFromEnd: e.pageFromEnd,
 		})
 	}
 	return doc
@@ -101,9 +127,21 @@ func (e *Engine) captureContended(ctx context.Context, spid int, acc *contendedC
 	// changes (times_blocked/last_seen advance), so this is not a dedup — it only
 	// skips the write when nothing was captured this snapshot.
 	if len(held) > 0 {
-		path := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
-		if err := os.WriteFile(path, renderContended(name, database, acc), 0o644); err != nil {
-			fmt.Fprintf(e.out, "write contended capture %s: %v\n", name, err)
-		}
+		e.writeContended(name, database, acc)
 	}
+}
+
+// writeContended flushes the accumulator to the sidecar next to the manifest.
+func (e *Engine) writeContended(name, database string, acc *contendedCapture) {
+	path := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
+	if err := os.WriteFile(path, renderContended(name, database, acc), 0o644); err != nil {
+		fmt.Fprintf(e.out, "write contended capture %s: %v\n", name, err)
+	}
+}
+
+// captureTail records a tail-position blocker the shrink driver found (via a ReactionEvent)
+// and flushes the sidecar. Best-effort; called only for shrink operations.
+func (e *Engine) captureTail(acc *contendedCapture, name, database string, f TailFinding) {
+	acc.addTail(f, e.now())
+	e.writeContended(name, database, acc)
 }

@@ -51,6 +51,17 @@ func reuseWaitSuffix(reuseWait string) string {
 type ReactionEvent struct {
 	Kind   string // "pause" | "resume" | "cancel" | "kill"
 	Detail string
+	Tail   *TailFinding // non-nil only on a "tail object found" info event
+}
+
+// TailFinding is a tail object the shrink driver found and passes to the engine sink to
+// record (kept in package run so ReactionEvent stays decoupled from internal/mssql).
+type TailFinding struct {
+	ObjectID    int64
+	Schema      string
+	Table       string
+	IndexID     int
+	PageFromEnd int
 }
 
 // ReactionSink receives reaction events as they happen.
