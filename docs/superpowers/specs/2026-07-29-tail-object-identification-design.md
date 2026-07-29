@@ -156,39 +156,69 @@ shrinking, so it passes `f.FileID` directly — no name→id lookup.
 
 ### 2. The driver — `internal/run/shrink.go`
 
+The capture must follow the **existing lock-capture wiring**: the lock capture is *not*
+done inside `ShrinkRunner`; the runner emits `ReactionEvent`s through the per-operation
+`sink`, and the engine's sink closure (`engine.go`, which owns the `*contendedCapture`
+accumulator and writes the sidecar) does the recording. The tail capture uses the same
+channel.
+
 `ShrinkReader` gains:
 
 ```go
 FindTailObject(ctx context.Context, fileID, maxPagesBack int) (mssql.TailObject, bool, error)
 ```
 
-A shared helper records the tail object into the capture accumulator and flushes the
-sidecar:
+`ReactionEvent` (`internal/run/reaction.go`) gains one optional field carrying a found
+tail object, so the engine sink can recognise and record it without coupling the event to
+`internal/mssql`:
 
 ```go
-func (r *ShrinkRunner) captureTailObject(ctx context.Context, f mssql.FileSpace,
-    acc *contendedCapture, name, database string, sink ReactionSink)
+type TailFinding struct {
+    ObjectID     int64
+    Schema, Table string
+    IndexID      int
+    PageFromEnd  int
+}
+// in ReactionEvent:
+Tail *TailFinding // non-nil only on a "tail object found" info event
 ```
 
-It is a no-op when the target major version is < 15 (warn once) or when the walk finds
-nothing. Call sites:
+The runner does the **read** (it holds the `ShrinkReader`, the file, and knows the
+give-up/entry moments); the engine does the **record**. A runner helper:
 
-- `chunkLoop` give-up (both no-gain and DBCC-error stall paths that return `stop=true`):
-  reactive capture. `chunkLoop` is shared with `RunTempdb` (`prof != nil`), so both
-  captures are gated on `prof == nil` — a tempdb shrink never walks (non-goal).
-- `chunkLoop` entry, after TRUNCATEONLY, when `identify_tail_object` is set: proactive
-  capture.
+```go
+func (r *ShrinkRunner) maybeCaptureTail(ctx context.Context, f mssql.FileSpace,
+    sink ReactionSink, warned *bool)
+```
 
-The runner needs the detected major version and the `identify_tail_object` flag; both are
-threaded through `ShrinkRunnerConfig` / the op, alongside the existing wiring. The
-accumulator (`*contendedCapture`) is already created per shrink for the lock capture; the
-tail capture reuses it so both kinds land in one sidecar.
+gates on the detected major version (`r.major`, new `ShrinkRunnerConfig.SQLMajorVersion`);
+on < 15 it emits one `Kind:"warn"` event via the `warned *bool` guard and returns; on ≥ 15
+it computes `maxPagesBack` from `f.FreeMB` (§1), calls `FindTailObject`, and on a hit emits
+`ReactionEvent{Kind:"info", Detail:"tail object …", Tail:&TailFinding{…}}`. Not-found /
+read-error records nothing.
+
+Call sites, all gated on a normal data shrink (`prof == nil` — `chunkLoop` is shared with
+`RunTempdb`, whose tempdb shrink never walks):
+
+- **Reactive** — at each `chunkLoop` give-up (the two `stop=true` returns from `stall`,
+  both no-gain and DBCC-error), call `maybeCaptureTail`.
+- **Proactive** — at `chunkLoop` entry, before the loop, when `identify_tail_object` is
+  set on the op.
+
+`chunkLoop`/`shrinkData` gain a `*tailProbe{proactive bool; warned *bool}` param (nil on
+the tempdb path). The `warned` guard is created once per operation in `Run`, so a
+multi-file data shrink on < 2019 warns once. The engine sink gains one branch: on
+`ev.Tail != nil`, call a new `Engine.captureTail(contended, name, database, *ev.Tail)`
+that records into the same accumulator and writes the sidecar.
 
 ### 3. The sidecar — `internal/run/contended.go` + `internal/maint/contended.go`
 
-`contendedCapture` gains a parallel `addTail(o mssql.TailObject, now string)`, keyed by
-object_id like the lock path. **Merge semantics** when the key already exists — i.e. the
-same object was lock-captured mid-run and then tail-captured at give-up:
+`contendedCapture` gains a parallel `addTail(f TailFinding, now string)`, keyed by
+object_id like the lock path (and `capturedObject` gains `byTail bool`, `indexID int`,
+`pageFromEnd int`). `Engine.captureContended` and the new `Engine.captureTail` share an
+extracted `writeContended(name, database, acc)` sidecar-write helper. **Merge semantics**
+when the key already exists — i.e. the same object was lock-captured mid-run and then
+tail-captured at give-up:
 
 - The entry is **upgraded** to `confirmed_by: tail_position` and its `index_id` /
   `page_from_end` are filled from the walk.
