@@ -139,29 +139,24 @@ func (e *Engine) flushCapture(name string, acc *blockerCapture) {
 	}
 }
 
-// relocateCapture moves the capture from processing to dir (next to the run report)
-// once a manifest reaches a terminal directory. No-op when none was written.
-func (e *Engine) relocateCapture(name, dir string) {
-	src := filepath.Join(e.dirs.Processing, name+blockedCaptureSuffix)
+// relocateSidecar moves a capture sidecar (identified by suffix) from processing to
+// dir (next to the run report) once a manifest reaches a terminal directory. No-op
+// when none was written. label names the sidecar in any error message.
+func (e *Engine) relocateSidecar(name, dir, suffix, label string) {
+	src := filepath.Join(e.dirs.Processing, name+suffix)
 	if _, err := os.Stat(src); err != nil {
 		return
 	}
-	if err := os.Rename(src, filepath.Join(dir, name+blockedCaptureSuffix)); err != nil {
-		fmt.Fprintf(e.out, "relocate blocked-session capture %s: %v\n", name, err)
+	if err := os.Rename(src, filepath.Join(dir, name+suffix)); err != nil {
+		fmt.Fprintf(e.out, "relocate %s %s: %v\n", label, name, err)
 	}
 }
 
-// relocateContended moves the .contended.yaml sidecar from processing to dir on
-// finalize, mirroring relocateCapture. No-op when none was written (non-shrink
-// operations, or a shrink that never captured a held object).
-func (e *Engine) relocateContended(name, dir string) {
-	src := filepath.Join(e.dirs.Processing, name+contendedCaptureSuffix)
-	if _, err := os.Stat(src); err != nil {
-		return
-	}
-	if err := os.Rename(src, filepath.Join(dir, name+contendedCaptureSuffix)); err != nil {
-		fmt.Fprintf(e.out, "relocate contended capture %s: %v\n", name, err)
-	}
+// relocateCaptures moves both advisory sidecars — the blocked-session capture and the
+// .contended.yaml — from processing to dir on finalize. Each is a no-op when absent.
+func (e *Engine) relocateCaptures(name, dir string) {
+	e.relocateSidecar(name, dir, blockedCaptureSuffix, "blocked-session capture")
+	e.relocateSidecar(name, dir, contendedCaptureSuffix, "contended capture")
 }
 
 // renderCapture builds the advisory blocked-session capture file: a commented,

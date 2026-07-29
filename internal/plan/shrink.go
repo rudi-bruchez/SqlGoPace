@@ -71,17 +71,13 @@ func shrinkIndexMeasurement(ctx context.Context, r Reader, head mssql.InventoryO
 		return maint.ShrinkIndexMeasurement{}, false
 	}
 	var pageCount int64
-	minDensity := 100.0
 	for _, s := range ps {
 		pageCount += s.PageCount
-		if s.PageCount > 0 && s.AvgPageSpaceUsedPercent < minDensity {
-			minDensity = s.AvgPageSpaceUsedPercent
-		}
 	}
 	return maint.ShrinkIndexMeasurement{
 		ObjectID: head.ObjectID,
 		Schema:   head.Schema, Table: head.Table, Index: head.IndexName,
-		PageCount: pageCount, AvgPageSpaceUsedPercent: minDensity,
+		PageCount: pageCount, AvgPageSpaceUsedPercent: worstDensity(ps),
 	}, true
 }
 
@@ -108,13 +104,9 @@ func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, g []
 		return maint.ShrinkHeapMeasurement{}, false
 	}
 	var forwarded, records int64
-	minDensity := 100.0
 	for _, s := range ps {
 		forwarded += s.ForwardedRecordCount
 		records += s.RecordCount
-		if s.PageCount > 0 && s.AvgPageSpaceUsedPercent < minDensity {
-			minDensity = s.AvgPageSpaceUsedPercent
-		}
 	}
 	fwdPct := 0.0
 	if records > 0 {
@@ -123,6 +115,20 @@ func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, g []
 	return maint.ShrinkHeapMeasurement{
 		ObjectID: head.ObjectID,
 		Schema:   head.Schema, Table: head.Table, SizeMB: sizeMB,
-		ForwardedRecordPercent: fwdPct, AvgPageSpaceUsedPercent: minDensity,
+		ForwardedRecordPercent: fwdPct, AvgPageSpaceUsedPercent: worstDensity(ps),
 	}, true
+}
+
+// worstDensity is the lowest SAMPLED page density across an object's partitions,
+// ignoring empty partitions (PageCount 0, whose density reads 0 and would falsely
+// dominate). 100 when every partition is empty. Shared by the index and heap
+// measurements, which select on the worst-packed partition.
+func worstDensity(ps []mssql.PhysicalStats) float64 {
+	d := 100.0
+	for _, s := range ps {
+		if s.PageCount > 0 {
+			d = min(d, s.AvgPageSpaceUsedPercent)
+		}
+	}
+	return d
 }
