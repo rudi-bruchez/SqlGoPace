@@ -389,7 +389,10 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		return result, nil // truncate-only was enough
 	}
 
-	// Phase B — chunked page-moving shrink.
+	// Phase B — chunked page-moving shrink. The proactive tail-object walk (if requested)
+	// runs at chunkLoop's entry, so its look-back cap (tailWalkPages) should reflect the free
+	// space actually left after TRUNCATEONLY, not f's pre-truncate snapshot.
+	f.FreeMB = size - f.UsedMB
 	return r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil, tp)
 }
 
