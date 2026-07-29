@@ -12,7 +12,7 @@ internal structures (work tables, sort/hash spills, version store) pin pages at 
 refuse to move, and every data file must be shrunk to the same size or the round-robin allocation
 skews. A restart rebuilds tempdb clean from its configured sizes — but that means downtime.
 
-The observed incident (`staging/platform/2026.07.27.tempdb/`): on a SQL Server 2019 staging
+The observed incident (staging tempdb, 2026-07-27): on a SQL Server 2019 staging
 instance, tempdb grew to 400 GB and filled the disk. A `DBCC SHRINKFILE` sat at 99.99 % for ~14
 minutes, blocked behind a **live application query** spilling a large sort into tempdb. The shrink
 also reported `Page X could not be moved because it is a work table page`, and the reference
