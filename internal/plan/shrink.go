@@ -17,10 +17,10 @@ import (
 // and skipped, never fatal.
 //
 // confirmed maps an object_id observed blocking a prior shrink (from a .contended.yaml
-// sidecar) to its times_blocked count; nil when there is no capture to prioritize. A
-// confirmed id that matches no measured object (already dropped, renamed, or gone) is
-// logged and skipped rather than failing the plan.
-func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, confirmed map[int64]int, logw io.Writer) (maint.PreShrinkPlan, error) {
+// sidecar) to its Confirmation; nil when there is no capture to prioritize. A confirmed
+// id that matches no measured object (already dropped, renamed, or gone) is logged and
+// skipped rather than failing the plan.
+func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, confirmed map[int64]maint.Confirmation, logw io.Writer) (maint.PreShrinkPlan, error) {
 	inv, err := r.ObjectInventory(ctx)
 	if err != nil {
 		return maint.PreShrinkPlan{}, fmt.Errorf("object inventory: %w", err)

@@ -237,7 +237,7 @@ func TestAnalyzePreShrinkNotFoundOnlyForGenuinelyMissing(t *testing.T) {
 		pages:   map[int64]int64{2: 100},
 	}
 	var logbuf bytes.Buffer
-	_, err = plan.AnalyzePreShrink(context.Background(), r, p, map[int64]int{2: 1, 99: 1}, &logbuf)
+	_, err = plan.AnalyzePreShrink(context.Background(), r, p, map[int64]maint.Confirmation{2: {TimesBlocked: 1}, 99: {TimesBlocked: 1}}, &logbuf)
 	if err != nil {
 		t.Fatalf("AnalyzePreShrink: %v", err)
 	}

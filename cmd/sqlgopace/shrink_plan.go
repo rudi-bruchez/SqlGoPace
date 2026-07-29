@@ -16,15 +16,20 @@ import (
 )
 
 // confirmedSetFor validates a contended doc against the connected database and returns
-// the object_id -> times_blocked map. Empty database in the doc, or a mismatch, is an
+// the object_id -> Confirmation map. Empty database in the doc, or a mismatch, is an
 // error — a sidecar captured against a different database would silently misattribute.
-func confirmedSetFor(doc maint.ContendedDoc, db string) (map[int64]int, error) {
+func confirmedSetFor(doc maint.ContendedDoc, db string) (map[int64]maint.Confirmation, error) {
 	if !strings.EqualFold(doc.Database, db) {
 		return nil, fmt.Errorf("--confirmed sidecar is for database %q, connected to %q", doc.Database, db)
 	}
-	set := make(map[int64]int, len(doc.Observed))
+	set := make(map[int64]maint.Confirmation, len(doc.Observed))
 	for _, o := range doc.Observed {
-		set[o.ObjectID] = o.TimesBlocked
+		set[o.ObjectID] = maint.Confirmation{
+			TimesBlocked: o.TimesBlocked,
+			ByTail:       o.ConfirmedBy == "tail_position",
+			IndexID:      o.IndexID,
+			PageFromEnd:  o.PageFromEnd,
+		}
 	}
 	return set, nil
 }
@@ -73,11 +78,11 @@ func shrinkManifest(profile *maint.Profile, db string, pre maint.PreShrinkPlan) 
 
 // planShrink gathers the pre-shrink density (only for an enabled data shrink with
 // pre_reorganize on), assembles the shrink manifest, and returns it with the heap
-// advisories. confirmed is the object_id -> times_blocked set from a --confirmed
+// advisories. confirmed is the object_id -> Confirmation set from a --confirmed
 // sidecar (nil when none was given); it prioritizes and annotates matching reorganizes
 // and marks matching heap advisories CONFIRMED. Returns (nil, nil, nil) when the shrink
 // section is disabled.
-func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db string, confirmed map[int64]int, logw io.Writer) (*namedManifest, []maint.HeapAdvisory, error) {
+func planShrink(ctx context.Context, r plan.Reader, profile *maint.Profile, db string, confirmed map[int64]maint.Confirmation, logw io.Writer) (*namedManifest, []maint.HeapAdvisory, error) {
 	if !profile.Shrink.Enabled {
 		return nil, nil, nil
 	}

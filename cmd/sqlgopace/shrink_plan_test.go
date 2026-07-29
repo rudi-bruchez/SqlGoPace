@@ -113,7 +113,7 @@ func TestConfirmedSetForBuildsMap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("confirmedSetFor: %v", err)
 	}
-	if got[100] != 3 || got[200] != 1 {
+	if got[100].TimesBlocked != 3 || got[200].TimesBlocked != 1 {
 		t.Errorf("map = %v", got)
 	}
 }
@@ -235,7 +235,7 @@ func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
 		t.Fatalf("profile: %v", err)
 	}
 	var logbuf bytes.Buffer
-	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", map[int64]maint.Confirmation{1: {TimesBlocked: 2}}, &logbuf)
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
 func TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns(t *testing.T) {
 	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
 	var logbuf bytes.Buffer
-	_, _, err := planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	_, _, err := planShrink(context.Background(), panicReader{}, p, "DB", map[int64]maint.Confirmation{1: {TimesBlocked: 2}}, &logbuf)
 	if err != nil {
 		t.Fatalf("planShrink: %v", err)
 	}
