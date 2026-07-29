@@ -225,6 +225,57 @@ func TestPlanShrinkPreReorganizeOff(t *testing.T) {
 	}
 }
 
+// TestPlanShrinkConfirmedIgnoredForLogShrinkWarns covers FIX 3: a non-empty
+// --confirmed set is silently discarded when the pass won't run AnalyzePreShrink
+// (a log shrink, or pre_reorganize:false). planShrink must warn to logw so the
+// operator knows the sidecar had no effect, rather than the set vanishing quietly.
+func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
+	p, err := maint.Parse([]byte("shrink:\n  enabled: true\n  type: log\n  files: all\n  targetfreespace: 10%\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	var logbuf bytes.Buffer
+	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	if err != nil {
+		t.Fatalf("planShrink: %v", err)
+	}
+	if !strings.Contains(logbuf.String(), "warning") || !strings.Contains(logbuf.String(), "--confirmed") {
+		t.Errorf("log = %q, want a warning that --confirmed has no effect", logbuf.String())
+	}
+}
+
+// TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns is the pre_reorganize:false
+// analogue of the above.
+func TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns(t *testing.T) {
+	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
+	var logbuf bytes.Buffer
+	_, _, err := planShrink(context.Background(), panicReader{}, p, "DB", map[int64]int{1: 2}, &logbuf)
+	if err != nil {
+		t.Fatalf("planShrink: %v", err)
+	}
+	if !strings.Contains(logbuf.String(), "warning") || !strings.Contains(logbuf.String(), "--confirmed") {
+		t.Errorf("log = %q, want a warning that --confirmed has no effect", logbuf.String())
+	}
+}
+
+// TestPlanShrinkConfirmedEmptyNoWarning ensures the warning is only emitted when a
+// confirmed set was actually supplied — an empty/nil set is the normal case (no
+// sidecar given) and must not print anything.
+func TestPlanShrinkConfirmedEmptyNoWarning(t *testing.T) {
+	p, err := maint.Parse([]byte("shrink:\n  enabled: true\n  type: log\n  files: all\n  targetfreespace: 10%\n"))
+	if err != nil {
+		t.Fatalf("profile: %v", err)
+	}
+	var logbuf bytes.Buffer
+	_, _, err = planShrink(context.Background(), panicReader{}, p, "DB", nil, &logbuf)
+	if err != nil {
+		t.Fatalf("planShrink: %v", err)
+	}
+	if strings.Contains(logbuf.String(), "warning") {
+		t.Errorf("log = %q, want no warning when confirmed is empty", logbuf.String())
+	}
+}
+
 // panicReader fails the test if any Reader method is called.
 type panicReader struct{}
 

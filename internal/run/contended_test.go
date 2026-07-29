@@ -1,12 +1,60 @@
 package run
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/maint"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
+
+// fakeHeldLocksReader returns a fixed set of held object locks for
+// captureContended; the ActiveSessions half of BlockerReader is unused here.
+type fakeHeldLocksReader struct{ held []mssql.LockedObject }
+
+func (f fakeHeldLocksReader) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	return nil, nil
+}
+func (f fakeHeldLocksReader) HeldObjectLocks(context.Context, int) ([]mssql.LockedObject, error) {
+	return f.held, nil
+}
+
+// TestCaptureContendedSkipsWriteWhenHeldEmpty covers FIX 6: a snapshot where the
+// shrink holds NO Sch-M lock (e.g. a stall pause after the lock released) must not
+// rewrite the sidecar. Once an object has been captured, an empty-held snapshot
+// must leave the existing file alone rather than rewriting the identical content —
+// the earlier "acc.len() > 0" guard rewrote on every call once anything had ever
+// been captured.
+func TestCaptureContendedSkipsWriteWhenHeldEmpty(t *testing.T) {
+	dir := t.TempDir()
+	e := &Engine{dirs: Dirs{Processing: dir}, clk: System}
+	var acc contendedCapture
+
+	// First snapshot: the shrink holds a lock. The sidecar must be written.
+	e.blockers = fakeHeldLocksReader{held: []mssql.LockedObject{
+		{ObjectID: 1, Schema: "dbo", Table: "T", Mode: "Sch-M"},
+	}}
+	e.captureContended(context.Background(), 42, &acc, "020_shrink", "DB")
+	path := filepath.Join(dir, "020_shrink"+contendedCaptureSuffix)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected sidecar written on a non-empty held snapshot: %v", err)
+	}
+
+	// Remove the file, then take an EMPTY-held snapshot: must NOT rewrite it.
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+	e.blockers = fakeHeldLocksReader{held: nil}
+	e.captureContended(context.Background(), 42, &acc, "020_shrink", "DB")
+	if _, err := os.Stat(path); err == nil {
+		t.Errorf("sidecar was rewritten on an empty held snapshot")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat: %v", err)
+	}
+}
 
 func TestContendedCaptureDedupsAndCounts(t *testing.T) {
 	var acc contendedCapture

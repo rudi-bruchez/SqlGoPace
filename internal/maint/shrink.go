@@ -104,10 +104,13 @@ func DecidePreShrink(indexes []ShrinkIndexMeasurement, heaps []ShrinkHeapMeasure
 		if ov, _ := p.OverrideFor(m.Schema, m.Table); ov.Skip {
 			continue
 		}
-		if m.SizeMB < p.Heap.MinSizeMB || m.AvgPageSpaceUsedPercent >= threshold {
+		if m.SizeMB < p.Heap.MinSizeMB {
 			continue
 		}
 		tb, isConfirmed := confirmed[m.ObjectID]
+		if m.AvgPageSpaceUsedPercent >= threshold && !isConfirmed {
+			continue // dense and not confirmed → not actionable
+		}
 		pl.HeapAdvisories = append(pl.HeapAdvisories, HeapAdvisory{
 			Schema: m.Schema, Table: m.Table, SizeMB: m.SizeMB,
 			ForwardedRecordPercent: m.ForwardedRecordPercent, PageDensityPercent: m.AvgPageSpaceUsedPercent,

@@ -27,13 +27,19 @@ func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, con
 	}
 	groups, _ := groupInventory(inv)
 
+	// seen records every object_id the scan observed, before any filter (min size,
+	// page-count floor, density) drops it — so "not found" below means genuinely
+	// absent from the database, not merely filtered out.
+	seen := make(map[int64]bool, len(groups))
+
 	var indexes []maint.ShrinkIndexMeasurement
 	var heaps []maint.ShrinkHeapMeasurement
 	for _, g := range groups {
 		head := g[0]
+		seen[head.ObjectID] = true
 		switch {
 		case head.IsHeap():
-			if m, ok := shrinkHeapMeasurement(ctx, r, profile, head, logw); ok {
+			if m, ok := shrinkHeapMeasurement(ctx, r, profile, g, logw); ok {
 				heaps = append(heaps, m)
 			}
 		case head.Type == 1 || head.Type == 2: // rowstore clustered / nonclustered
@@ -43,15 +49,8 @@ func AnalyzePreShrink(ctx context.Context, r Reader, profile *maint.Profile, con
 		}
 	}
 
-	measured := make(map[int64]bool, len(indexes)+len(heaps))
-	for _, m := range indexes {
-		measured[m.ObjectID] = true
-	}
-	for _, m := range heaps {
-		measured[m.ObjectID] = true
-	}
 	for id := range confirmed {
-		if !measured[id] {
+		if !seen[id] {
 			fmt.Fprintf(logw, "-- confirmed object %d not found; skipping\n", id)
 		}
 	}
@@ -75,7 +74,7 @@ func shrinkIndexMeasurement(ctx context.Context, r Reader, head mssql.InventoryO
 	minDensity := 100.0
 	for _, s := range ps {
 		pageCount += s.PageCount
-		if s.AvgPageSpaceUsedPercent < minDensity {
+		if s.PageCount > 0 && s.AvgPageSpaceUsedPercent < minDensity {
 			minDensity = s.AvgPageSpaceUsedPercent
 		}
 	}
@@ -87,10 +86,16 @@ func shrinkIndexMeasurement(ctx context.Context, r Reader, head mssql.InventoryO
 }
 
 // shrinkHeapMeasurement reads SAMPLED density + forwarded records for one heap, after a
-// cheap min-size pre-filter. ok is false when the heap is below the min size, the scan
-// fails, or it returns no rows.
-func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, head mssql.InventoryObject, logw io.Writer) (maint.ShrinkHeapMeasurement, bool) {
-	sizeMB := int64(head.SizeMB)
+// cheap min-size pre-filter. g is the heap's whole partition group: InventoryObject.SizeMB
+// is per-partition, so the pre-filter and the returned SizeMB sum it across g rather than
+// reading only g[0]'s (which would undercount a multi-partition heap). ok is false when
+// the heap is below the min size, the scan fails, or it returns no rows.
+func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, g []mssql.InventoryObject, logw io.Writer) (maint.ShrinkHeapMeasurement, bool) {
+	head := g[0]
+	var sizeMB int64
+	for _, o := range g {
+		sizeMB += int64(o.SizeMB)
+	}
 	if sizeMB < p.Heap.MinSizeMB {
 		return maint.ShrinkHeapMeasurement{}, false
 	}
@@ -107,7 +112,7 @@ func shrinkHeapMeasurement(ctx context.Context, r Reader, p *maint.Profile, head
 	for _, s := range ps {
 		forwarded += s.ForwardedRecordCount
 		records += s.RecordCount
-		if s.AvgPageSpaceUsedPercent < minDensity {
+		if s.PageCount > 0 && s.AvgPageSpaceUsedPercent < minDensity {
 			minDensity = s.AvgPageSpaceUsedPercent
 		}
 	}
