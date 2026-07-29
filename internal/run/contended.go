@@ -87,9 +87,11 @@ func (c *contendedCapture) doc(database string) maint.ContendedDoc {
 }
 
 const contendedHeader = `# Contended-object capture for %s
-# Objects this shrink held a Sch-M lock on while blocking other sessions —
-# i.e. the objects it was relocating and could not get past. These are
-# EMPIRICALLY CONFIRMED tail blockers (partial: the shrink stops at the first).
+# Objects this shrink could not get past, by two confirmation kinds:
+#   confirmed_by: lock          — held a Sch-M lock on the object while blocking other
+#                                 sessions (empirical, partial: the shrink stops at the first).
+#   confirmed_by: tail_position — owns the file's last allocated page (the tail the shrink
+#                                 must relocate past), found by the backward page walk.
 # Feed this to the planner:  sqlgopace plan --confirmed <this file>
 `
 
