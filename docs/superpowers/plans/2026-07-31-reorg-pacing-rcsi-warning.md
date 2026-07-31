@@ -29,7 +29,8 @@
 - `internal/run/executor_test.go` — **modify.** Update the 7 existing `runLoop(...)` calls; add paced `runLoop` tests and `reissueFor` tests.
 - `internal/run/reorg_rcsi.go` — **create.** The pure `reorgRCSIWarning` decision helper.
 - `internal/run/reorg_rcsi_test.go` — **create.** Unit tests for the helper.
-- `internal/run/engine.go` — **modify.** Add `rcsi bool` field + `WithRCSI` option; emit the warning through the per-step `sink` in `processOne`; update the stale `ReactionEvent.Kind` doc-comment.
+- `internal/run/engine.go` — **modify.** Add `rcsi bool` field + `WithRCSI` option; emit the warning through the per-step `sink` in `processOne` (only when the op will run — inside the `prepErr == nil` branch).
+- `internal/run/reaction.go` / `internal/report/report.go` — **modify.** Refresh the stale `ReactionEvent.Kind` and `ReactionLine` doc-comments to include `warn`/`info`/`abort`.
 - `internal/run/engine_test.go` — **modify.** Add an engine-level test asserting the warning reaches the `.log` for a reorg with RCSI off (and not with RCSI on).
 - `cmd/sqlgopace/main.go` — **modify.** Pass `run.WithRCSI(info.RCSIEnabled)` next to `run.WithADR(...)`.
 - `internal/mssql/conn.go` — **modify.** Add `SET IMPLICIT_TRANSACTIONS OFF;` to `harden()`.
@@ -204,8 +205,10 @@ Add to `internal/run/executor_test.go`:
 
 ```go
 func TestRunLoopPacedLoopsUnbounded(t *testing.T) {
-	// Many cancels then complete: the paced loop keeps re-issuing without ever
-	// returning ErrCancelled (so Run's MaxRetries can never fire for a reorg).
+	// Many cancels then complete: the paced loop keeps re-issuing and never returns
+	// ErrCancelled. Run only retries (and counts toward MaxRetries) when runOnce returns
+	// ErrCancelled, so this runLoop-level property is exactly what makes a paced reorg
+	// immune to MaxRetries.
 	s := &stmtRun{
 		actions: []Action{Cancel, Cancel, Cancel, Continue},
 		errs:    []error{nil, nil, nil, nil},
@@ -274,12 +277,24 @@ func TestReissueForOnlyReorganize(t *testing.T) {
 
 Note: `executor_test.go` already imports `errors`, `strings`, and the `ddl` package — no import changes needed.
 
-- [ ] **Step 9: Run the full run-package test suite**
+- [ ] **Step 9 (optional): Run-level MaxRetries contract test**
+
+`TestRunLoopPacedLoopsUnbounded` proves the paced path never returns `ErrCancelled` at
+the `runLoop` layer, which is what makes it immune to `Run`'s `MaxRetries`. A direct
+`MonitoredRunner.Run` test would lock that contract one layer up, but there is **no
+existing `Executor`/`Sampler` fake for the OpRunner path** (the `runLoop` tests use the
+pure `stmtRun` harness precisely to avoid it), so this requires new fakes: an `Executor`
+whose `ExecDDL` blocks until its context is canceled, and a `Sampler` that reports
+sustained `BlockingOthers` so `supervise` decides `Cancel` repeatedly. Add it only if you
+judge the extra coverage worth the fake infrastructure; otherwise the `runLoop`-level
+proof plus the architectural guarantee is sufficient. Skip with no loss of correctness.
+
+- [ ] **Step 10: Run the full run-package test suite**
 
 Run: `go test -race ./internal/run/`
 Expected: PASS. Then `go build ./...` and `make vet` — both green.
 
-- [ ] **Step 10: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 git add internal/run/monitored_runner.go internal/run/executor_test.go
@@ -504,20 +519,27 @@ func WithRCSI(rcsi bool) EngineOption { return func(e *Engine) { e.rcsi = rcsi }
 
 - [ ] **Step 4: Emit the warning in `processOne`**
 
-In `internal/run/engine.go`, immediately after the per-step `sink := func(ev ReactionEvent) {...}` block closes (line 633, before `waitsBefore := e.snapshotWaits(ctx)` at line 634), insert:
+In `internal/run/engine.go`, emit the warning **only when the operation will actually
+run** — i.e. after resumable-conflict handling, inside the `prepErr == nil` branch, at
+the top of the `else {` block just before `switch op := step.Operation.(type) {` (line
+677). This avoids warning about a reorg that `prepErr` prevents from running. Insert as
+the first statement of that `else` block:
 
 ```go
-			// Advisory: a reorganize_index against an RCSI-off database blocks readers on
-			// its page locks. Emitted through the sink so it lands in the run's .log and TUI.
-			// manifest.Database is empty for a no-database manifest, which runs on the
-			// engine's connected database (e.database).
-			db := manifest.Database
-			if db == "" {
-				db = e.database
-			}
-			if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
-				sink(ReactionEvent{Kind: "warn", Detail: msg})
-			}
+			} else {
+				// Advisory: a reorganize_index against an RCSI-off database blocks readers on
+				// its page locks. Emitted through the sink so it lands in the run's .log and TUI.
+				// manifest.Database is empty for a no-database manifest, which runs on the
+				// engine's connected database (e.database). The helper self-gates to reorg only.
+				db := manifest.Database
+				if db == "" {
+					db = e.database
+				}
+				if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
+					sink(ReactionEvent{Kind: "warn", Detail: msg})
+				}
+				switch op := step.Operation.(type) {
+				// ... existing Shrink / ShrinkTempdb / BatchDML / default branches, unchanged ...
 ```
 
 - [ ] **Step 5: Run the engine tests to verify they pass**
@@ -533,12 +555,20 @@ In `cmd/sqlgopace/main.go`, in the `opts := []run.EngineOption{...}` list (the `
 		run.WithRCSI(info.RCSIEnabled),
 ```
 
-- [ ] **Step 7: Update the stale `ReactionEvent.Kind` doc-comment**
+- [ ] **Step 7: Update the two stale kind doc-comments**
 
-In `internal/run/reaction.go`, the `ReactionEvent.Kind` field comment currently reads `// "pause" | "resume" | "cancel" | "kill"`. Update it to include the kinds already used in production plus this warning:
+(a) In `internal/run/reaction.go`, the `ReactionEvent.Kind` field comment currently reads `// "pause" | "resume" | "cancel" | "kill"`. Update it:
 
 ```go
 	Kind   string // "pause" | "resume" | "cancel" | "kill" | "abort" | "warn" | "info"
+```
+
+(b) In `internal/report/report.go` (line 25), the `ReactionLine` doc-comment reads `// ReactionLine records one reaction taken while an operation ran (a pause,` / `// resume, cancel, or fallback kill), so the log shows how pressure was handled.`. Since `warn`/`info` events are recorded here too, update it:
+
+```go
+// ReactionLine records one reaction taken while an operation ran (pause, resume,
+// cancel, fallback kill, abort, or an advisory warn/info), so the log shows how
+// pressure was handled.
 ```
 
 - [ ] **Step 8: Build, vet, and run the full run-package suite**
@@ -549,7 +579,7 @@ Expected: all green.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add internal/run/engine.go internal/run/engine_test.go internal/run/reaction.go cmd/sqlgopace/main.go
+git add internal/run/engine.go internal/run/engine_test.go internal/run/reaction.go internal/report/report.go cmd/sqlgopace/main.go
 git commit -m "$(cat <<'EOF'
 feat(run): warn before a reorganize_index when RCSI is off
 
@@ -634,7 +664,12 @@ Set `internal/version/VERSION` to:
 
 - [ ] **Step 2: Correct and extend `docs/REORGANIZE.md`**
 
-In `docs/REORGANIZE.md`, under "How SqlGoPace generates REORGANIZE today", replace the sentence that floats a ShrinkRunner-style follow-up driver ("turning it into a paced, cancel-and-reissue driver is the natural follow-up, and would reuse the shrink driver's shape") with the shipped decision, and add the RCSI warning and hardening. Suggested replacement paragraph:
+First grep the file for leftover follow-up-driver language so none survives:
+`grep -niE "follow-up|shrinkrunner|shrink driver's shape" docs/REORGANIZE.md`. Then, under
+"How SqlGoPace generates REORGANIZE today", replace the sentence that floats a
+ShrinkRunner-style follow-up driver ("turning it into a paced, cancel-and-reissue driver
+is the natural follow-up, and would reuse the shrink driver's shape") with the shipped
+decision, and add the RCSI warning and hardening. Suggested replacement paragraph:
 
 ```markdown
 As of 0.12.0, SqlGoPace paces a reorganize_index directly in `MonitoredRunner`'s
@@ -647,15 +682,26 @@ on the page locks). The execution connection is also hardened with
 `SET IMPLICIT_TRANSACTIONS OFF` so a reorg releases its locks incrementally.
 ```
 
-- [ ] **Step 3: Verify the build embeds the new version**
+- [ ] **Step 3: Add a one-line README note if there is a natural home**
+
+`README.md` documents reorganize under the `shrink:` / maintenance sections (e.g. lines
+~429, ~452, ~681) and describes the reaction hierarchy elsewhere. Grep for the reaction
+hierarchy / maintenance-reaction description
+(`grep -niE "wait_at_low_priority|resumable|reaction|blocking" README.md`); if there is a
+section describing how operations react under blocking, add one line noting that a
+`reorganize_index` paces by cancel-and-reissue (it cannot use `WAIT_AT_LOW_PRIORITY`/
+`RESUMABLE`) and warns when RCSI is off. If there is no natural home, skip — the spec
+made this conditional; do not force a note where it does not fit.
+
+- [ ] **Step 4: Verify the build embeds the new version**
 
 Run: `go build ./... && go test ./internal/version/`
 Expected: green.
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add internal/version/VERSION docs/REORGANIZE.md
+git add internal/version/VERSION docs/REORGANIZE.md README.md
 git commit -m "$(cat <<'EOF'
 docs(reorganize): document paced yielding + RCSI warning; bump to 0.12.0
 
@@ -668,6 +714,11 @@ EOF
 ```
 
 ---
+
+## Execution notes
+
+- **Branch first.** These commits land per task; start from a feature branch (e.g. `feat/reorg-pacing`), not `main`.
+- **Commit only with approval.** The per-task `git commit` steps are the intended granularity, but committing/pushing happens only when the user asks (project policy overrides the plan's convention). If commits are deferred, still complete each task's red→green cycle so the working tree stays test-green between tasks.
 
 ## Final verification
 
