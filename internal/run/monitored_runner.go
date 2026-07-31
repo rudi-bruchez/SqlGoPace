@@ -76,6 +76,22 @@ func (r *MonitoredRunner) Run(ctx context.Context, op ddl.Operation, sql string,
 	}
 }
 
+// reissueFor returns the paced re-issue closure for op, or nil when op is not paced.
+// Only reorganize_index is paced: its re-issue resumes from SQL Server's persisted
+// progress, so the uncapped loop converges. The closure narrates the re-issue and
+// returns the original SQL, mirroring how resumeSQL narrates a Pause resume. check_db
+// and update_statistics — the other cancel-safe ops — are intentionally not paced:
+// their re-issue restarts from scratch, so bounded retry (fail-fast) is correct.
+func reissueFor(op ddl.Operation, sql string, sink ReactionSink) func() (string, error) {
+	if _, ok := op.(ddl.ReorganizeIndex); !ok {
+		return nil
+	}
+	return func() (string, error) {
+		sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared — re-issuing REORGANIZE"})
+		return sql, nil
+	}
+}
+
 // runOnce executes the operation under monitoring, pausing and resuming a
 // resumable operation under pressure until it completes. It returns ErrCancelled
 // when a non-resumable operation is canceled under pressure, so Run retries it.
@@ -88,6 +104,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 			sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared"})
 			return ddl.ResumableControlSQL(op, "RESUME")
 		},
+		reissueFor(op, sql, sink),
 	)
 }
 
@@ -104,16 +121,32 @@ func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, 
 
 // runLoop drives the pause/resume state machine for one operation. It runs the
 // current statement; on Pause it waits for relief and resumes (running the RESUME
-// statement next); on Cancel it reports ErrCancelled; otherwise it returns the
-// statement's terminal result. The function arguments isolate the loop logic from
-// the live execution and timing so it can be tested deterministically.
-func runLoop(sql string, runStatement func(string) (Action, error), waitForRelief func() error, resumeSQL func() (string, error)) error {
+// statement next); on Cancel it either paces (when reissue != nil: wait for relief,
+// re-issue the same statement — used for reorganize_index, which resumes from
+// persisted progress) or reports ErrCancelled (bounded-retry path). The function
+// arguments isolate the loop logic from live execution and timing so it can be
+// tested deterministically.
+func runLoop(sql string, runStatement func(string) (Action, error), waitForRelief func() error, resumeSQL func() (string, error), reissue func() (string, error)) error {
 	stmt := sql
 	for {
 		action, err := runStatement(stmt)
 		switch action {
 		case Cancel:
-			return ErrCancelled
+			if reissue == nil {
+				return ErrCancelled
+			}
+			// Paced (reorganize_index): the cancel is a clean incremental stop, so wait for
+			// relief and re-issue the same REORGANIZE (SQL Server continues from persisted
+			// progress). Uncapped — this never returns ErrCancelled, so Run's MaxRetries
+			// never applies; the loop is bounded only by graceful stop and log-drain timeout.
+			if err := waitForRelief(); err != nil {
+				return err
+			}
+			next, err := reissue()
+			if err != nil {
+				return err
+			}
+			stmt = next
 		case Stop:
 			// Graceful stop: the statement was paused (runStatement stopped it, preserving
 			// the resumable's work). Return without resuming; the next run continues it.

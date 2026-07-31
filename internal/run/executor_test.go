@@ -239,6 +239,7 @@ type stmtRun struct {
 	errs      []error
 	relief    int
 	reliefErr error
+	reissued  int
 }
 
 func (s *stmtRun) runStatement(stmt string) (Action, error) {
@@ -255,9 +256,13 @@ func (s *stmtRun) waitForRelief() error { s.relief++; return s.reliefErr }
 
 func (s *stmtRun) resumeSQL() (string, error) { return "ALTER INDEX [IX] ON [dbo].[T] RESUME;", nil }
 
+// reissued counts paced re-issues; reissueSQL is the paced closure passed to runLoop
+// (returns the original statement, mirroring how a reorg resumes from persisted progress).
+func (s *stmtRun) reissueSQL() (string, error) { s.reissued++; return "REORGANIZE", nil }
+
 func TestRunLoopCompletes(t *testing.T) {
 	s := &stmtRun{actions: []Action{Continue}, errs: []error{nil}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); err != nil {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); err != nil {
 		t.Fatalf("runLoop() = %v, want nil", err)
 	}
 	if len(s.ran) != 1 || s.ran[0] != "REBUILD" {
@@ -268,14 +273,14 @@ func TestRunLoopCompletes(t *testing.T) {
 func TestRunLoopReturnsStatementError(t *testing.T) {
 	boom := errors.New("real failure")
 	s := &stmtRun{actions: []Action{Continue}, errs: []error{boom}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, boom) {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); !errors.Is(err, boom) {
 		t.Errorf("runLoop() = %v, want %v", err, boom)
 	}
 }
 
 func TestRunLoopCancelIsRetryable(t *testing.T) {
 	s := &stmtRun{actions: []Action{Cancel}, errs: []error{nil}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, ErrCancelled) {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); !errors.Is(err, ErrCancelled) {
 		t.Errorf("runLoop() = %v, want ErrCancelled", err)
 	}
 	if s.relief != 0 {
@@ -286,7 +291,7 @@ func TestRunLoopCancelIsRetryable(t *testing.T) {
 func TestRunLoopStopReturnsErrStopped(t *testing.T) {
 	// A graceful stop pauses the statement and returns without resuming.
 	s := &stmtRun{actions: []Action{Stop}, errs: []error{nil}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, ErrStopped) {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); !errors.Is(err, ErrStopped) {
 		t.Errorf("runLoop() = %v, want ErrStopped", err)
 	}
 	if s.relief != 0 {
@@ -297,7 +302,7 @@ func TestRunLoopStopReturnsErrStopped(t *testing.T) {
 func TestRunLoopPauseThenResumeToCompletion(t *testing.T) {
 	// First statement pauses, second (the RESUME) completes.
 	s := &stmtRun{actions: []Action{Pause, Continue}, errs: []error{nil, nil}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); err != nil {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); err != nil {
 		t.Fatalf("runLoop() = %v, want nil", err)
 	}
 	if len(s.ran) != 2 {
@@ -314,7 +319,7 @@ func TestRunLoopPauseThenResumeToCompletion(t *testing.T) {
 func TestRunLoopPausesRepeatedly(t *testing.T) {
 	// Pause, resume, pause again, then complete.
 	s := &stmtRun{actions: []Action{Pause, Pause, Continue}, errs: []error{nil, nil, nil}}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); err != nil {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); err != nil {
 		t.Fatalf("runLoop() = %v, want nil", err)
 	}
 	if s.relief != 2 {
@@ -325,8 +330,96 @@ func TestRunLoopPausesRepeatedly(t *testing.T) {
 func TestRunLoopReliefErrorPropagates(t *testing.T) {
 	boom := errors.New("ctx canceled while waiting")
 	s := &stmtRun{actions: []Action{Pause}, errs: []error{nil}, reliefErr: boom}
-	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL); !errors.Is(err, boom) {
+	if err := runLoop("REBUILD", s.runStatement, s.waitForRelief, s.resumeSQL, nil); !errors.Is(err, boom) {
 		t.Errorf("runLoop() = %v, want %v", err, boom)
+	}
+}
+
+func TestRunLoopPacedReissuesUntilComplete(t *testing.T) {
+	// Cancel under pressure, then complete: the paced branch waits for relief and
+	// re-issues the SAME statement (not a RESUME).
+	s := &stmtRun{actions: []Action{Cancel, Continue}, errs: []error{nil, nil}}
+	if err := runLoop("REORGANIZE", s.runStatement, s.waitForRelief, s.resumeSQL, s.reissueSQL); err != nil {
+		t.Fatalf("runLoop() = %v, want nil", err)
+	}
+	if len(s.ran) != 2 || s.ran[0] != "REORGANIZE" || s.ran[1] != "REORGANIZE" {
+		t.Errorf("ran = %v, want [REORGANIZE REORGANIZE] (re-issue the original, not a RESUME)", s.ran)
+	}
+	if s.relief != 1 {
+		t.Errorf("waitForRelief called %d times, want 1", s.relief)
+	}
+	if s.reissued != 1 {
+		t.Errorf("reissue called %d times, want 1", s.reissued)
+	}
+}
+
+func TestRunLoopPacedLoopsUnbounded(t *testing.T) {
+	// Many cancels then complete: the paced loop keeps re-issuing and never returns
+	// ErrCancelled. Run only retries (and counts toward MaxRetries) when runOnce returns
+	// ErrCancelled, so this runLoop-level property is exactly what makes a paced reorg
+	// immune to MaxRetries.
+	s := &stmtRun{
+		actions: []Action{Cancel, Cancel, Cancel, Continue},
+		errs:    []error{nil, nil, nil, nil},
+	}
+	if err := runLoop("REORGANIZE", s.runStatement, s.waitForRelief, s.resumeSQL, s.reissueSQL); err != nil {
+		t.Fatalf("runLoop() = %v, want nil (unbounded re-issue, never ErrCancelled)", err)
+	}
+	if s.relief != 3 || s.reissued != 3 {
+		t.Errorf("relief=%d reissued=%d, want 3 and 3", s.relief, s.reissued)
+	}
+}
+
+func TestRunLoopPacedReliefErrorPropagates(t *testing.T) {
+	// If relief cannot be reached (e.g. log-drain timeout), the paced branch returns
+	// that error instead of looping forever.
+	boom := errors.New("log did not drain")
+	s := &stmtRun{actions: []Action{Cancel}, errs: []error{nil}, reliefErr: boom}
+	if err := runLoop("REORGANIZE", s.runStatement, s.waitForRelief, s.resumeSQL, s.reissueSQL); !errors.Is(err, boom) {
+		t.Errorf("runLoop() = %v, want %v", err, boom)
+	}
+	if s.reissued != 0 {
+		t.Errorf("reissue called %d times, want 0 (relief failed first)", s.reissued)
+	}
+}
+
+func TestRunLoopPacedStopWins(t *testing.T) {
+	// A graceful stop after a paced re-issue ends the loop with ErrStopped.
+	s := &stmtRun{actions: []Action{Cancel, Stop}, errs: []error{nil, nil}}
+	if err := runLoop("REORGANIZE", s.runStatement, s.waitForRelief, s.resumeSQL, s.reissueSQL); !errors.Is(err, ErrStopped) {
+		t.Errorf("runLoop() = %v, want ErrStopped", err)
+	}
+	if s.reissued != 1 {
+		t.Errorf("reissue called %d times, want 1", s.reissued)
+	}
+}
+
+func TestReissueForOnlyReorganize(t *testing.T) {
+	var events []ReactionEvent
+	sink := func(ev ReactionEvent) { events = append(events, ev) }
+
+	// reorganize_index → non-nil closure that narrates and returns the original SQL.
+	f := reissueFor(ddl.ReorganizeIndex{Schema: "dbo", Table: "T", Index: "IX"}, "REORG SQL", sink)
+	if f == nil {
+		t.Fatal("reissueFor(ReorganizeIndex) = nil, want non-nil")
+	}
+	got, err := f()
+	if err != nil || got != "REORG SQL" {
+		t.Errorf("reissue() = (%q, %v), want (\"REORG SQL\", nil)", got, err)
+	}
+	if len(events) != 1 || events[0].Kind != "resume" || !strings.Contains(events[0].Detail, "re-issuing REORGANIZE") {
+		t.Errorf("emitted %+v, want one resume event mentioning re-issuing REORGANIZE", events)
+	}
+
+	// Other cancel-safe ops and a non-cancel-safe op → nil (not paced).
+	for _, op := range []ddl.Operation{
+		ddl.CheckDB{Database: "DB"},
+		ddl.UpdateStatistics{Schema: "dbo", Table: "T"},
+		ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"},
+	} {
+		if reissueFor(op, "SQL", sink) != nil {
+			t.Errorf("reissueFor(%T) != nil, want nil (only reorganize_index is paced)", op)
+		}
 	}
 }
 
