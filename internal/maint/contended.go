@@ -18,11 +18,16 @@ type ContendedObject struct {
 	FirstSeen    string `yaml:"first_seen,omitempty"`
 	LastSeen     string `yaml:"last_seen,omitempty"`
 	// Tail-position capture (see the tail-object design spec). ConfirmedBy is "lock" for a
-	// lock-held blocker or "tail_position" for one found by the backward page walk; empty is
+	// lock-held blocker, "tail_position" for one found by the backward page walk, or
+	// "transient_maintenance" for one pinned by a concurrent maintenance op; empty is
 	// a legacy sidecar, read as "lock". IndexID/PageFromEnd are set only for tail entries.
 	IndexID     int    `yaml:"index_id,omitempty"`
 	ConfirmedBy string `yaml:"confirmed_by,omitempty"`
 	PageFromEnd int    `yaml:"page_from_end,omitempty"`
+	// Transient-maintenance capture: the concurrent op that pinned the tail at capture time.
+	// Set only when ConfirmedBy == "transient_maintenance"; empty otherwise.
+	BlockedByCommand string `yaml:"blocked_by_command,omitempty"`
+	BlockedBySPID    int    `yaml:"blocked_by_spid,omitempty"`
 }
 
 // ContendedDoc is the machine body of a .contended.yaml sidecar.

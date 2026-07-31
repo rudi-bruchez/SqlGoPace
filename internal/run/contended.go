@@ -22,6 +22,9 @@ type capturedObject struct {
 	lastSeen    string
 	count       int
 	byTail      bool // upgraded by a tail-object walk
+	transient   bool
+	blockedByCommand string
+	blockedBySPID    int
 	indexID     int
 	pageFromEnd int
 }
@@ -69,6 +72,11 @@ func (c *contendedCapture) addTail(f TailFinding, now string) {
 	e.byTail = true
 	e.indexID = f.IndexID
 	e.pageFromEnd = f.PageFromEnd
+	if f.Transient {
+		e.transient = true
+		e.blockedByCommand = f.BlockedByCommand
+		e.blockedBySPID = f.BlockedBySPID
+	}
 }
 
 // doc builds the machine document in first-seen order.
@@ -77,7 +85,10 @@ func (c *contendedCapture) doc(database string) maint.ContendedDoc {
 	for _, id := range c.order {
 		e := c.byID[id]
 		confirmedBy := "lock"
-		if e.byTail {
+		switch {
+		case e.transient:
+			confirmedBy = "transient_maintenance"
+		case e.byTail:
 			confirmedBy = "tail_position"
 		}
 		doc.Observed = append(doc.Observed, maint.ContendedObject{
@@ -85,17 +96,21 @@ func (c *contendedCapture) doc(database string) maint.ContendedDoc {
 			LockMode: e.obj.Mode, TimesBlocked: e.count,
 			FirstSeen: e.firstSeen, LastSeen: e.lastSeen,
 			IndexID: e.indexID, ConfirmedBy: confirmedBy, PageFromEnd: e.pageFromEnd,
+			BlockedByCommand: e.blockedByCommand, BlockedBySPID: e.blockedBySPID,
 		})
 	}
 	return doc
 }
 
 const contendedHeader = `# Contended-object capture for %s
-# Objects this shrink could not get past, by two confirmation kinds:
+# Objects this shrink could not get past, by three confirmation kinds:
 #   confirmed_by: lock          — held a Sch-M lock on the object while blocking other
 #                                 sessions (empirical, partial: the shrink stops at the first).
 #   confirmed_by: tail_position — owns the file's last allocated page (the tail the shrink
 #                                 must relocate past), found by the backward page walk.
+#   confirmed_by: transient_maintenance — the tail was pinned by a concurrent maintenance op
+#                                 (e.g. ALTER INDEX) at capture time. Informational only —
+#                                 NOT fed to a pre-shrink reorganize.
 # Feed this to the planner:  sqlgopace plan --confirmed <this file>
 `
 

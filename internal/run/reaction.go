@@ -62,6 +62,11 @@ type TailFinding struct {
 	Table       string
 	IndexID     int
 	PageFromEnd int
+	// Transient marks a tail found while a concurrent maintenance operation blocked the
+	// shrink: recorded as confirmed_by=transient_maintenance, never a structural blocker.
+	Transient        bool
+	BlockedByCommand string // the blocker's command verb (e.g. "ALTER INDEX"), when Transient
+	BlockedBySPID    int    // the blocker's session id, when Transient
 }
 
 // ReactionSink receives reaction events as they happen.
