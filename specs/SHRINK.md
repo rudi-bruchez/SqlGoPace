@@ -390,13 +390,17 @@ reaction: the same yielding it already does for any self-wait (§8.2) or no-prog
 (§8.3) applies — bounded backoff, then a clean stop with work preserved and the manifest
 re-queued. It never waits indefinitely on the blocker, and it never `KILL`s it.
 
-What changes is recognition and reporting. Once the shrink has stalled (`noProgress >= 2`),
-`probeMaintBlock` takes one `ActiveSessions` snapshot and runs it through `FindSelfBlock` (our
-own SPID's direct blocker) and `IsMaintenanceCommand` (an allow-list of `ALTER INDEX`/`DBCC`
-verbs read off `sys.dm_exec_requests.command`). Both need only `VIEW SERVER STATE` — already
-required for monitoring — so the recognition works below SQL 2019 too, unlike the page-walk in
-§8.6. On a match it emits one `warn` per operation naming the verb, the blocking session, and
-the elapsed wait (e.g. "shrink of ... blocked by a concurrent maintenance operation — ALTER
+What changes is recognition and reporting. The self-block is only observable **while a chunk is
+executing** — that is the one moment the shrink's session appears in `sys.dm_exec_requests` with
+a `blocking_session_id`; between chunks it holds no lock request and is invisible. So a
+`pumpSelfBlock` sampler runs in-flight during each `runChunk` (alongside the progress pump),
+takes an `ActiveSessions` snapshot and runs it through `FindSelfBlock` (our own SPID's direct
+blocker) and `IsMaintenanceCommand` (an allow-list of `ALTER INDEX`/`DBCC` verbs read off
+`sys.dm_exec_requests.command`), and hands the first maintenance-block observation back to the
+chunk loop. Both reads need only `VIEW SERVER STATE` — already required for monitoring — so the
+recognition works below SQL 2019 too, unlike the page-walk in §8.6. Once the shrink has stalled,
+that stashed observation is promoted (`applyMaintBlock`): it emits one `warn` per operation
+naming the verb, the blocking session, and the elapsed wait (e.g. "shrink of ... blocked by a concurrent maintenance operation — ALTER
 INDEX on session 62 (waiting 2m31s). Transient; SqlGoPace is yielding, not forcing. Re-run
 after maintenance completes."), through the same `ReactionSink` that feeds the `.log` and the
 TUI, and a give-up while blocked states the same in its stop reason.
