@@ -292,6 +292,26 @@ func TestPlanShrinkConfirmedEmptyNoWarning(t *testing.T) {
 	}
 }
 
+func TestConfirmedSetForSkipsTransientMaintenance(t *testing.T) {
+	doc := maint.ContendedDoc{
+		Database: "DB",
+		Observed: []maint.ContendedObject{
+			{ObjectID: 1, ConfirmedBy: "tail_position", IndexID: 1, PageFromEnd: 2},
+			{ObjectID: 2, ConfirmedBy: "transient_maintenance", BlockedByCommand: "ALTER INDEX", BlockedBySPID: 104},
+		},
+	}
+	set, err := confirmedSetFor(doc, "DB")
+	if err != nil {
+		t.Fatalf("confirmedSetFor: %v", err)
+	}
+	if _, ok := set[2]; ok {
+		t.Error("transient_maintenance entry must not become a Confirmation")
+	}
+	if c, ok := set[1]; !ok || !c.ByTail {
+		t.Errorf("tail_position sibling must survive: %+v (ok=%v)", c, ok)
+	}
+}
+
 // panicReader fails the test if any Reader method is called.
 type panicReader struct{}
 
