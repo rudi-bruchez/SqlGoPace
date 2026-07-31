@@ -448,6 +448,10 @@ a `confirmed_by`:
   `identify_tail_object`. Never runs for log or tempdb shrinks. This closes the common case of a
   shrink that stalls with no blocking victim (data pinned at the file end, a
   `WAIT_AT_LOW_PRIORITY` timeout).
+- `confirmed_by: transient_maintenance` — a shrink blocked by a concurrent `ALTER INDEX`
+  rebuild/reorganize or `DBCC` operation is reported as transient (a clear `.log`/TUI warning
+  naming the operation and blocking session) rather than as a structural blocker, and — on a
+  give-up — recorded under this tag instead of `tail_position`; `plan --confirmed` ignores it.
 
 The sidecar is machine-readable, relocated to `03.done`/`04.failed` with the manifest on
 finalize, and the run report's `.log` gets a one-line pointer (`contended objects: N — see
