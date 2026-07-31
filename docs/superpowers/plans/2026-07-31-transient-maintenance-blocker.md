@@ -256,6 +256,7 @@ In `internal/maint/contended.go`, after `PageFromEnd`:
 	ConfirmedBy      string `yaml:"confirmed_by,omitempty"`
 	PageFromEnd      int    `yaml:"page_from_end,omitempty"`
 	// Transient-maintenance capture: the concurrent op that pinned the tail at capture time.
+	// Set only when ConfirmedBy == "transient_maintenance"; empty otherwise.
 	BlockedByCommand string `yaml:"blocked_by_command,omitempty"`
 	BlockedBySPID    int    `yaml:"blocked_by_spid,omitempty"`
 ```
@@ -288,7 +289,11 @@ In `addTail`, after setting `e.byTail`/`e.indexID`/`e.pageFromEnd`, carry the tr
 	}
 ```
 
-In `doc`, choose `confirmedBy` and emit the fields:
+In `doc`, choose `confirmedBy` and emit the fields. **`transient` deliberately takes
+precedence over `byTail` and `lock`**: if a concurrent maintenance op was found blocking the
+shrink on this object, the transient explanation is the salient one and the entry must not
+drive `plan --confirmed`, regardless of any lock/tail evidence also captured for it. The
+retained `times_blocked`/`page_from_end` fields stay in the sidecar as an audit trail.
 
 ```go
 		confirmedBy := "lock"
@@ -675,12 +680,49 @@ In the no-gain branch, right after `stall(...)`:
 
 Note: `probeMaintBlock` runs even when `stop` is true — that is fine (it early-returns because `tp.maintBlock` was set on the prior iteration at `noProgress == 2`, or sets it now for the give-up). Task 5 consumes `tp.maintBlock` in the give-up reason and record.
 
-- [ ] **Step 8: Run the tests**
+- [ ] **Step 8: Add a guard-independence test**
 
-Run: `go test -race ./internal/run -run 'TestMaintBlock|Shrink|Tail'`
-Expected: PASS — `TestMaintBlockWarnsOnceUnderMaintenance` and `TestMaintBlockIgnoresApplicationBlocker` pass; all existing shrink/tail tests still pass (they script `sessions: nil`, so `probeMaintBlock` is a silent no-op).
+Prove the two once-per-operation warnings are independent (the 2019+ tail warning via
+`tp.warned`, the maintenance warning via `tp.maintWarned`): a proactive walk below 2019 that
+is ALSO maintenance-blocked must emit BOTH warnings. Add to `shrink_maintblock_test.go`:
 
-- [ ] **Step 9: Commit**
+```go
+// TestTailAndMaintWarningsAreIndependent: below 2019 with IdentifyTailObject set AND a
+// concurrent maintenance block, both once-per-operation warnings fire (separate guards).
+func TestTailAndMaintWarningsAreIndependent(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true,
+		sessions: blockedByMaint("ALTER INDEX"),
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.major = 13 // below 2019: the proactive walk warns about the missing DMV
+
+	var tailWarn, maintWarn bool
+	sink := func(e ReactionEvent) {
+		if e.Kind == "warn" && strings.Contains(e.Detail, "2019") {
+			tailWarn = true
+		}
+		if e.Kind == "warn" && strings.Contains(e.Detail, "concurrent maintenance") {
+			maintWarn = true
+		}
+	}
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%", IdentifyTailObject: true}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !tailWarn || !maintWarn {
+		t.Errorf("both warnings must fire independently: tailWarn=%v maintWarn=%v", tailWarn, maintWarn)
+	}
+}
+```
+
+- [ ] **Step 9: Run the tests**
+
+Run: `go test -race ./internal/run -run 'TestMaintBlock|TestTailAndMaint|Shrink|Tail'`
+Expected: PASS — the three new tests pass; all existing shrink/tail tests still pass (they script `sessions: nil`, so `probeMaintBlock` is a silent no-op).
+
+- [ ] **Step 10: Commit**
 
 ```bash
 git add internal/run/shrink.go internal/run/shrink_driver_test.go internal/run/shrink_maintblock_test.go
@@ -723,6 +765,9 @@ func TestMaintBlockRecordsTransientTail(t *testing.T) {
 	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink)
 	if err != nil {
 		t.Fatalf("Run() error = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason == "" {
+		t.Fatalf("got %+v, want a give-up result with a reason", res)
 	}
 	tf := wantTail(events)
 	if tf == nil || !tf.Transient {
@@ -881,7 +926,9 @@ git commit -m "feat(shrink): record give-up tail as transient_maintenance and na
 
 - [ ] **Step 1: Add the SHRINK.md subsection**
 
-In `specs/SHRINK.md`, add a subsection describing the behavior. Content to include (write in the doc's existing prose style, English):
+Locate the insertion point: `grep -n "tail_position\|contended\|tail object" specs/SHRINK.md` and add
+the new subsection near the existing tail-object / contended-capture material. Write it in the
+doc's existing prose style, English. Content to include:
 
 - A shrink blocked by a concurrent `ALTER INDEX` / `DBCC` (rebuild, reorganize, indexdefrag, another shrink) yields as usual — bounded backoff, stop with work preserved, re-queue — and does **not** wait indefinitely or kill the blocker.
 - It recognizes the blocker via `ActiveSessions` + `FindSelfBlock` + `IsMaintenanceCommand` (needs only `VIEW SERVER STATE`, so it works below SQL 2019 too) and emits a clear `.log`/TUI warning naming the operation verb, the blocker session, and the wait, with the recommended action (re-run after maintenance).
@@ -889,7 +936,10 @@ In `specs/SHRINK.md`, add a subsection describing the behavior. Content to inclu
 
 - [ ] **Step 2: Add the README line**
 
-In `README.md`, under the shrink / contended-capture documentation, add one line: a shrink blocked by concurrent index maintenance is reported as transient (clear log/TUI message) and recorded as `transient_maintenance`, which `plan --confirmed` ignores.
+Locate the section: `grep -n "confirmed_by\|contended\|tail object\|--confirmed" README.md` and add
+one line under the shrink / contended-capture documentation: a shrink blocked by concurrent
+index maintenance is reported as transient (clear log/TUI message) and recorded as
+`transient_maintenance`, which `plan --confirmed` ignores.
 
 - [ ] **Step 3: Bump the version**
 
