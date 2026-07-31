@@ -119,12 +119,15 @@ type TailObject struct {
 // tailObjectSQL walks backward from the last page of @file_id, skipping pages with no user
 // object (free/unallocated pages and allocation-bitmap pages return NULL object_id), and
 // returns the first page owned by a user object. The size read and the walk are one batch,
-// so the file size is consistent for the walk. A dropped object resolves to NULL names
-// (recorded as object_id with empty schema/table). Requires SQL Server 2019+.
+// so the file size is consistent for the walk. Each page is read from sys.dm_db_page_info
+// exactly once — object_id and index_id are captured into variables and the result row is
+// built from them, so a concurrent deallocation cannot make the returned object_id NULL
+// between two reads. Names are resolved from the captured @obj and may be NULL if the object
+// is dropped in the meantime (recorded as object_id with empty schema/table). SQL 2019+.
 const tailObjectSQL = `
 SET NOCOUNT ON;
 DECLARE @file_id int = @fid, @max_back int = @maxback;
-DECLARE @last_page_id int, @page_id int, @floor int;
+DECLARE @last_page_id int, @page_id int, @floor int, @obj int, @idx int;
 SELECT @last_page_id = CAST(size AS int) - 1 FROM sys.database_files WHERE file_id = @file_id;
 IF @last_page_id IS NULL OR @last_page_id < 0 RETURN;
 SET @page_id = @last_page_id;
@@ -132,17 +135,15 @@ SET @floor = @last_page_id - @max_back;
 IF @floor < 0 SET @floor = 0;
 WHILE @page_id >= @floor
 BEGIN
-    DECLARE @obj int;
-    SELECT @obj = object_id FROM sys.dm_db_page_info(DB_ID(), @file_id, @page_id, 'LIMITED');
+    SELECT @obj = object_id, @idx = index_id
+    FROM sys.dm_db_page_info(DB_ID(), @file_id, @page_id, 'LIMITED');
     IF @obj IS NOT NULL
     BEGIN
-        SELECT
-            pi.object_id                        AS object_id,
-            OBJECT_SCHEMA_NAME(pi.object_id)    AS schema_name,
-            OBJECT_NAME(pi.object_id)           AS object_name,
-            pi.index_id                         AS index_id,
-            @last_page_id - @page_id            AS page_from_end
-        FROM sys.dm_db_page_info(DB_ID(), @file_id, @page_id, 'LIMITED') AS pi;
+        SELECT @obj                          AS object_id,
+               OBJECT_SCHEMA_NAME(@obj)      AS schema_name,
+               OBJECT_NAME(@obj)             AS object_name,
+               @idx                          AS index_id,
+               @last_page_id - @page_id      AS page_from_end;
         RETURN;
     END
     SET @page_id -= 1;

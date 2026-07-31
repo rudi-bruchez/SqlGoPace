@@ -87,10 +87,12 @@ type TempdbProfile struct {
 
 // tailProbe carries the per-operation tail-object walk state into the shared chunk loop.
 // Nil on the tempdb path (tempdb shrinks never walk). proactive runs a walk at loop entry;
-// warned is the once-per-operation <2019 warning guard.
+// warned is the once-per-operation <2019 warning guard; finding holds the proactive walk's
+// result, recorded into the sidecar only if the shrink then misses target (see shrinkData).
 type tailProbe struct {
 	proactive bool
 	warned    *bool
+	finding   *TailFinding
 }
 
 // ShrinkResult is the outcome of shrinking one file, for the run report.
@@ -393,7 +395,16 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// runs at chunkLoop's entry, so its look-back cap (tailWalkPages) should reflect the free
 	// space actually left after TRUNCATEONLY, not f's pre-truncate snapshot.
 	f.FreeMB = size - f.UsedMB
-	return r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil, tp)
+	out, err := r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil, tp)
+
+	// #1: a proactively-identified tail is a *confirmed* blocker only when the shrink missed
+	// target — a graceful stop or a log-drain stop (a give-up already recorded it in the loop).
+	// On full success (FinalMB <= TargetMB) it was relocated fine, so recording it would leave a
+	// false blocker in the sidecar and mislead `plan --confirmed`; drop it.
+	if tp != nil && tp.finding != nil && out.FinalMB > out.TargetMB {
+		r.emitTail(sink, tp.finding, f.Name, true)
+	}
+	return out, err
 }
 
 // chunkLoop runs the page-moving chunk loop for one already-truncated file, from start
@@ -403,9 +414,18 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 	result := ShrinkResult{File: f.Name, Type: "data", InitialMB: f.SizeMB, TargetMB: final, FinalMB: start}
 
 	// Proactive tail-object walk: run once at loop entry when the operation asked for it
-	// (op.IdentifyTailObject), before any chunk executes.
-	if tp != nil && tp.proactive {
-		r.maybeCaptureTail(ctx, f, sink, tp.warned)
+	// (op.IdentifyTailObject), before any chunk executes. It is logged now but only *recorded*
+	// as a confirmed blocker if the shrink later misses target (#1, handled in shrinkData) —
+	// a tail object a successful shrink relocates was never a blocker. warn=true: the operator
+	// opted in, so tell them if the server is too old.
+	if tp != nil {
+		tp.finding = nil // per-file reset: tp is shared across a files:all run
+		if tp.proactive {
+			if tf := r.walkTail(ctx, f, sink, tp.warned, true); tf != nil {
+				r.emitTail(sink, tf, f.Name, false)
+				tp.finding = tf
+			}
+		}
 	}
 
 	maxStep := effectiveMaxStepMB(start, r.tuning) // per-file step ceiling, fixed for this file
@@ -461,9 +481,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			} else if stop {
 				result.FinalMB = current
 				result.Reason = fmt.Sprintf("no further progress: %v (work preserved)", err)
-				if tp != nil {
-					r.maybeCaptureTail(ctx, f, sink, tp.warned)
-				}
+				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
 			continue
@@ -506,9 +524,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			} else if stop {
 				result.FinalMB = current
 				result.Reason = "no further progress (work preserved)"
-				if tp != nil {
-					r.maybeCaptureTail(ctx, f, sink, tp.warned)
-				}
+				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
 			continue
@@ -788,31 +804,57 @@ func (r *ShrinkRunner) flushTempdbCaches(ctx context.Context, sink ReactionSink)
 	return r.exec.ExecDDL(ctx, "CHECKPOINT;\nDBCC FREESYSTEMCACHE ('Temporary Tables & Table Variables') WITH NO_INFOMSGS;")
 }
 
-// maybeCaptureTail runs the tail-object walk for one data file and emits the result through
-// the sink for the engine to record. Below SQL 2019 it emits one warning per operation (via
-// the warned guard) and does not walk. On a hit it emits an info event carrying the finding;
-// not-found or a read error records nothing (a warning, on error).
-func (r *ShrinkRunner) maybeCaptureTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, warned *bool) {
+// walkTail runs the tail-object walk for one data file, gated on version, and returns the
+// finding (nil when unavailable or nothing is found). It emits the "needs 2019+" warning only
+// when warn is true — i.e. for the proactive walk the operator explicitly opted into. The
+// always-on reactive give-up walk passes warn=false, so a run that never asked for the feature
+// is not nagged on old servers. A read error is surfaced as a warning regardless.
+func (r *ShrinkRunner) walkTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, warned *bool, warn bool) *TailFinding {
 	if r.major < 15 {
-		if warned != nil && !*warned {
+		if warn && warned != nil && !*warned {
 			*warned = true
 			sink(ReactionEvent{Kind: "warn", Detail: "tail-object identification needs SQL Server 2019+ (sys.dm_db_page_info); skipped"})
 		}
-		return
+		return nil
 	}
 	o, found, err := r.reader.FindTailObject(ctx, f.FileID, tailWalkPages(f.FreeMB))
 	if err != nil {
 		sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("tail-object walk failed on %q: %v", f.Name, err)})
-		return
+		return nil
 	}
 	if !found {
+		return nil
+	}
+	return &TailFinding{ObjectID: o.ObjectID, Schema: o.Schema, Table: o.Table, IndexID: o.IndexID, PageFromEnd: o.PageFromEnd}
+}
+
+// emitTail logs a tail finding to the console/report. When record is true the finding is
+// attached to the event so the engine records it into the .contended.yaml sidecar as a
+// confirmed blocker; when false it is a diagnostic line only — used for the proactive walk,
+// whose finding is confirmed (recorded) only if the shrink later misses target.
+func (r *ShrinkRunner) emitTail(sink ReactionSink, f *TailFinding, fileName string, record bool) {
+	ev := ReactionEvent{
+		Kind:   "info",
+		Detail: fmt.Sprintf("tail object %s.%s (index_id=%d, %d pages from end) on %q", f.Schema, f.Table, f.IndexID, f.PageFromEnd, fileName),
+	}
+	if record {
+		ev.Tail = f
+	}
+	sink(ev)
+}
+
+// captureGiveUpTail records the tail object when a data shrink gives up ("no further
+// progress") — the always-on reactive walk. It walks fresh and records only when the
+// proactive walk did not already stash a finding (which shrinkData records post-loop for a
+// missed target); this keeps the give-up path to a single read. warn=false: a run that never
+// opted in must not be nagged about a pre-2019 server just for stalling.
+func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) {
+	if tp == nil || tp.finding != nil {
 		return
 	}
-	sink(ReactionEvent{
-		Kind:   "info",
-		Detail: fmt.Sprintf("tail object %s.%s (index_id=%d, %d pages from end) on %q", o.Schema, o.Table, o.IndexID, o.PageFromEnd, f.Name),
-		Tail:   &TailFinding{ObjectID: o.ObjectID, Schema: o.Schema, Table: o.Table, IndexID: o.IndexID, PageFromEnd: o.PageFromEnd},
-	})
+	if tf := r.walkTail(ctx, f, sink, tp.warned, false); tf != nil {
+		r.emitTail(sink, tf, f.Name, true)
+	}
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait

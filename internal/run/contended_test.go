@@ -88,6 +88,10 @@ func TestContendedAddTailFreshEntry(t *testing.T) {
 	if o.ConfirmedBy != "tail_position" || o.IndexID != 1 || o.PageFromEnd != 4 || o.TimesBlocked != 0 {
 		t.Errorf("tail entry wrong: %+v", o)
 	}
+	// #3: a tail-only entry records when it was observed (first_seen/last_seen), not blank.
+	if o.FirstSeen != "t0" || o.LastSeen != "t0" {
+		t.Errorf("tail entry timestamps = (%q, %q), want both t0", o.FirstSeen, o.LastSeen)
+	}
 }
 
 func TestContendedLockThenTailMerges(t *testing.T) {

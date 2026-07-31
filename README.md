@@ -410,9 +410,10 @@ is re-entrant — re-running toward the same target resumes where it left off.
   It does not apply to log files. `DBCC SHRINKFILE` takes no `MAXDOP`.
 - **`identify_tail_object`** (default off): when `true`, run the tail-object walk once at the
   start of each data-file shrink — after the `TRUNCATEONLY` pass — to name the object owning
-  the file's last allocated page, the one `DBCC SHRINKFILE` must relocate past. It is recorded
-  like a confirmed blocker (see below). Requires SQL Server 2019+ (`sys.dm_db_page_info`); on
-  older versions it logs a warning and is skipped. Ignored for log shrinks.
+  the file's last allocated page, the one `DBCC SHRINKFILE` must relocate past. The object is
+  logged for early visibility, but only recorded as a confirmed blocker (see below) if that
+  shrink then fails to reach target. Requires SQL Server 2019+ (`sys.dm_db_page_info`); on older
+  versions it logs a warning and is skipped. Ignored for log shrinks.
 
 Behaviour worth knowing:
 
@@ -440,9 +441,13 @@ a `confirmed_by`:
 - `confirmed_by: tail_position` — the **tail-object walk** names the object owning the file's
   last allocated page directly, without needing to block anyone. It runs automatically when a
   data shrink gives up short of target ("no further progress"), and — with `identify_tail_object:
-  true` — once at the start of each data shrink. Requires SQL Server 2019+; skipped (with a
-  warning) below that, and for log/tempdb shrinks. This closes the common case of a shrink that
-  stalls with no blocking victim (data pinned at the file end, a `WAIT_AT_LOW_PRIORITY` timeout).
+  true` — once at the start of each data shrink (logged for visibility, but only *recorded* as a
+  blocker if that shrink then fails to reach target: a tail object a successful shrink relocated
+  was never a blocker). Requires SQL Server 2019+; below that it is skipped — silently for the
+  automatic give-up walk, with a one-line warning only when you explicitly set
+  `identify_tail_object`. Never runs for log or tempdb shrinks. This closes the common case of a
+  shrink that stalls with no blocking victim (data pinned at the file end, a
+  `WAIT_AT_LOW_PRIORITY` timeout).
 
 The sidecar is machine-readable, relocated to `03.done`/`04.failed` with the manifest on
 finalize, and the run report's `.log` gets a one-line pointer (`contended objects: N — see

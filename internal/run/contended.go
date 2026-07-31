@@ -58,10 +58,14 @@ func (c *contendedCapture) addTail(f TailFinding, now string) {
 	}
 	e, ok := c.byID[f.ObjectID]
 	if !ok {
-		e = &capturedObject{obj: mssql.LockedObject{ObjectID: f.ObjectID, Schema: f.Schema, Table: f.Table}}
+		e = &capturedObject{obj: mssql.LockedObject{ObjectID: f.ObjectID, Schema: f.Schema, Table: f.Table}, firstSeen: now}
 		c.byID[f.ObjectID] = e
 		c.order = append(c.order, f.ObjectID)
 	}
+	// A tail object was observed (walked) now — record it like the lock path does, without
+	// counting it as a block (count is left untouched; times_blocked stays 0 for a tail-only
+	// entry, and a merged lock+tail entry keeps its real block count).
+	e.lastSeen = now
 	e.byTail = true
 	e.indexID = f.IndexID
 	e.pageFromEnd = f.PageFromEnd

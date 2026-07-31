@@ -354,27 +354,32 @@ allocation, a page pinned by another session), the shrink stalls short of target
 backstop, so a mostly-free file can't drive an unbounded scan; free/allocation-bitmap pages
 (`object_id IS NULL`) are skipped. It takes only brief page latches, never transaction locks.
 
-Two triggers, one helper (`ShrinkRunner.maybeCaptureTail`):
+Two triggers (`ShrinkRunner.walkTail` finds; `emitTail` logs and, optionally, records):
 
-- **Reactive (always on):** runs once when `chunkLoop` gives up ("no further progress")
-  for a data file — the definitive "couldn't get past the tail" moment. Not run on a graceful
-  stop / `ErrStopped` (that resumes later, it isn't a give-up).
+- **Reactive (always on):** `captureGiveUpTail` runs once when `chunkLoop` gives up ("no
+  further progress") for a data file — the definitive "couldn't get past the tail" moment — and
+  records the result. Not run on a graceful stop / `ErrStopped` (that resumes later).
 - **Proactive (`identify_tail_object: true`):** runs once at `chunkLoop` entry, **after**
   `TRUNCATEONLY` (so the free-page bound reflects the post-truncate size and the last
-  allocated page is the real one).
+  allocated page is the real one). Its finding is **logged, then stashed** on the `tailProbe`
+  and *recorded* only if the shrink later misses target (`shrinkData` checks `FinalMB > TargetMB`
+  after `chunkLoop`) — a tail object a successful shrink relocated was never a blocker, so
+  recording it would plant a false `tail_position` entry that misleads `plan --confirmed`. When
+  proactive has already stashed a finding, the give-up path reuses it rather than walking again.
 
-Gating: SQL Server **2019+** only (`sys.dm_db_page_info`); below that the driver emits one
-`warn` per operation and skips. `sys.dm_db_page_info` needs only `VIEW DATABASE STATE`
-(`VIEW DATABASE PERFORMANCE STATE` on 2022+), already covered by the `VIEW SERVER STATE`
-the monitoring requires — **no `DBCC PAGE`** (it would need `sysadmin`). Tempdb (`prof != nil`
-in the shared `chunkLoop`) and log shrinks never walk.
+Gating: SQL Server **2019+** only (`sys.dm_db_page_info`); below that the walk is skipped —
+**silently** for the always-on reactive path (a run that never opted in is not nagged), and with
+**one `warn` per operation** only for the proactive (opt-in) path. `sys.dm_db_page_info` needs
+only `VIEW DATABASE STATE` (`VIEW DATABASE PERFORMANCE STATE` on 2022+), already covered by the
+`VIEW SERVER STATE` the monitoring requires — **no `DBCC PAGE`** (it would need `sysadmin`).
+Tempdb (`prof != nil` in the shared `chunkLoop`) and log shrinks never walk.
 
-A found tail object is emitted as a `ReactionEvent{Tail: *TailFinding}`; the engine sink
+A recorded tail object is emitted as a `ReactionEvent{Tail: *TailFinding}`; the engine sink
 records it into the same `<manifest>.contended.yaml` accumulator as the lock capture, tagged
-`confirmed_by: tail_position` (with `index_id` and `page_from_end`). If the same object was
-also lock-captured, the entry is upgraded to `tail_position` while its lock stats are
-preserved. `plan --confirmed` promotes tail-position blockers ahead of lock-confirmed ones
-(and, among tail entries, the one closest to the file end first).
+`confirmed_by: tail_position` (with `index_id` and `page_from_end`, and `first_seen`/`last_seen`
+timestamps). If the same object was also lock-captured, the entry is upgraded to `tail_position`
+while its lock stats are preserved. `plan --confirmed` promotes tail-position blockers ahead of
+lock-confirmed ones (and, among tail entries, the one closest to the file end first).
 
 ## 9. Progress, reporting, TUI
 
