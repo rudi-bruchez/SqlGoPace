@@ -109,3 +109,63 @@ func TestTailAndMaintWarningsAreIndependent(t *testing.T) {
 		t.Errorf("both warnings must fire independently: tailWarn=%v maintWarn=%v", tailWarn, maintWarn)
 	}
 }
+
+// TestMaintBlockRecordsTransientTail: a give-up under concurrent ALTER INDEX records the tail
+// as transient (Transient + blocked-by set), and the give-up reason names the maintenance op.
+func TestMaintBlockRecordsTransientTail(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true,
+		sessions:  blockedByMaint("ALTER INDEX"),
+		tail:      mssql.TailObject{ObjectID: 21, Schema: "dbo", Table: "Rebuilt", IndexID: 1, PageFromEnd: 3},
+		tailFound: true,
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.major = 15
+
+	var events []ReactionEvent
+	sink := func(e ReactionEvent) { events = append(events, e) }
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason == "" {
+		t.Fatalf("got %+v, want a give-up result with a reason", res)
+	}
+	tf := wantTail(events)
+	if tf == nil || !tf.Transient {
+		t.Fatalf("want a transient tail-bearing event, got %+v", tf)
+	}
+	if tf.BlockedByCommand != "ALTER INDEX" || tf.BlockedBySPID != 104 {
+		t.Errorf("blocked-by = (%q, %d), want (ALTER INDEX, 104)", tf.BlockedByCommand, tf.BlockedBySPID)
+	}
+	if !strings.Contains(res[0].Reason, "maintenance") || !strings.Contains(res[0].Reason, "ALTER INDEX") {
+		t.Errorf("give-up reason must name the maintenance op: %q", res[0].Reason)
+	}
+}
+
+// TestApplicationBlockerStaysTailPosition: the SAME give-up, but the blocker is an application
+// UPDATE, records a normal structural tail_position (Transient false) — unchanged behavior.
+func TestApplicationBlockerStaysTailPosition(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true,
+		sessions:  blockedByMaint("UPDATE"),
+		tail:      mssql.TailObject{ObjectID: 22, Schema: "dbo", Table: "Hot", IndexID: 1, PageFromEnd: 1},
+		tailFound: true,
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.major = 15
+
+	var events []ReactionEvent
+	sink := func(e ReactionEvent) { events = append(events, e) }
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	tf := wantTail(events)
+	if tf == nil || tf.Transient {
+		t.Fatalf("want a non-transient tail_position record, got %+v", tf)
+	}
+}

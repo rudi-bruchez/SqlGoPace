@@ -416,6 +416,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// On full success (FinalMB <= TargetMB) it was relocated fine, so recording it would leave a
 	// false blocker in the sidecar and mislead `plan --confirmed`; drop it.
 	if tp != nil && tp.finding != nil && out.FinalMB > out.TargetMB {
+		r.markTransient(tp.finding, tp)
 		r.emitTail(sink, tp.finding, f.Name, true)
 	}
 	return out, err
@@ -497,7 +498,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
-				result.Reason = fmt.Sprintf("no further progress: %v (work preserved)", err)
+				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress: %v (work preserved)", err))
 				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
@@ -541,7 +542,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
-				result.Reason = "no further progress (work preserved)"
+				result.Reason = giveUpReason(tp, "no further progress (work preserved)")
 				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
@@ -902,9 +903,35 @@ func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace,
 	if tp == nil || tp.finding != nil {
 		return
 	}
-	if tf := r.walkTail(ctx, f, sink, tp.warned, false); tf != nil {
-		r.emitTail(sink, tf, f.Name, true)
+	tf := r.walkTail(ctx, f, sink, tp.warned, false)
+	if tf == nil {
+		return
 	}
+	r.markTransient(tf, tp)
+	r.emitTail(sink, tf, f.Name, true)
+}
+
+// markTransient tags a give-up tail finding as transient-maintenance when a concurrent
+// maintenance op was found blocking the shrink, so it is recorded as informational rather
+// than a structural blocker.
+func (r *ShrinkRunner) markTransient(tf *TailFinding, tp *tailProbe) {
+	if tp == nil || tp.maintBlock == nil || tf == nil {
+		return
+	}
+	tf.Transient = true
+	tf.BlockedByCommand = tp.maintBlock.Command
+	tf.BlockedBySPID = tp.maintBlock.SPID
+}
+
+// giveUpReason builds the give-up reason, naming a concurrent maintenance op when one was
+// found blocking the shrink; base is the default reason for a non-maintenance give-up.
+func giveUpReason(tp *tailProbe, base string) string {
+	if tp != nil && tp.maintBlock != nil {
+		return fmt.Sprintf("stopped: file tail pinned by concurrent maintenance (%s, session %d) — "+
+			"transient, not a structural blocker; work preserved, re-run after maintenance",
+			tp.maintBlock.Command, tp.maintBlock.SPID)
+	}
+	return base
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait
