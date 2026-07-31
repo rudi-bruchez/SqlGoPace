@@ -186,6 +186,55 @@ func setupEngine(t *testing.T, pf run.Preflighter, runner run.OpRunner, opts ...
 	return eng, dirs
 }
 
+const reorgManifest = `
+database: TESTDB
+description: reorg rcsi test
+operations:
+  - operation: reorganize_index
+    schema: dbo
+    table: MEASUREMENT
+    index: PK_MEASUREMENT
+`
+
+func TestProcessAllReorgWarnsWhenRCSIOff(t *testing.T) {
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithDatabase("TESTDB"), run.WithRCSI(false))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "011_reorg.yaml"), []byte(reorgManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	logBytes, err := os.ReadFile(filepath.Join(dirs.Done, "011_reorg.yaml.log"))
+	if err != nil {
+		t.Fatalf("read run log: %v", err)
+	}
+	log := string(logBytes)
+	for _, want := range []string{"reaction: warn", "RCSI is OFF on TESTDB", "dbo.MEASUREMENT"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("run log missing %q\n--- log ---\n%s", want, log)
+		}
+	}
+}
+
+func TestProcessAllReorgSilentWhenRCSIOn(t *testing.T) {
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithDatabase("TESTDB"), run.WithRCSI(true))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "011_reorg.yaml"), []byte(reorgManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	logBytes, err := os.ReadFile(filepath.Join(dirs.Done, "011_reorg.yaml.log"))
+	if err != nil {
+		t.Fatalf("read run log: %v", err)
+	}
+	if strings.Contains(string(logBytes), "RCSI is OFF") {
+		t.Errorf("run log should not warn when RCSI is on\n--- log ---\n%s", logBytes)
+	}
+}
+
 func TestProcessAllSuccess(t *testing.T) {
 	runner := &fakeOpRunner{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner)

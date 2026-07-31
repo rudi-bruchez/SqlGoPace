@@ -167,6 +167,7 @@ type Engine struct {
 	tempdbShrink     TempdbShrinkDriver
 	batchDML         BatchDMLDriver
 	adr              bool
+	rcsi             bool
 	clk              Clock
 	session          SessionInfo
 	notifiers        []Notifier
@@ -210,6 +211,10 @@ type Notifier interface {
 
 // WithADR sets the target's Accelerated Database Recovery state (biases reactions).
 func WithADR(adr bool) EngineOption { return func(e *Engine) { e.adr = adr } }
+
+// WithRCSI sets the connected database's READ_COMMITTED_SNAPSHOT state. Used to warn
+// before a reorganize_index whose page locks would block readers when RCSI is off.
+func WithRCSI(rcsi bool) EngineOption { return func(e *Engine) { e.rcsi = rcsi } }
 
 // WithShrinkRunner routes ddl.Shrink operations to the dedicated shrink driver
 // instead of the OpRunner. Without it, a shrink operation falls back to the
@@ -674,6 +679,17 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if prepErr != nil {
 			runErr = prepErr
 		} else {
+			// Advisory: a reorganize_index against an RCSI-off database blocks readers on
+			// its page locks. Emitted through the sink so it lands in the run's .log and TUI.
+			// manifest.Database is empty for a no-database manifest, which runs on the
+			// engine's connected database (e.database). The helper self-gates to reorg only.
+			db := manifest.Database
+			if db == "" {
+				db = e.database
+			}
+			if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
+				sink(ReactionEvent{Kind: "warn", Detail: msg})
+			}
 			switch op := step.Operation.(type) {
 			case ddl.Shrink:
 				if e.shrink != nil {

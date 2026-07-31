@@ -49,7 +49,7 @@ func reuseWaitSuffix(reuseWait string) string {
 // ReactionEvent records a reaction the runner took while an operation ran, so the
 // engine can narrate it and attach it to the run report.
 type ReactionEvent struct {
-	Kind   string // "pause" | "resume" | "cancel" | "kill"
+	Kind   string // "pause" | "resume" | "cancel" | "kill" | "abort" | "warn" | "info"
 	Detail string
 	Tail   *TailFinding // non-nil only on a "tail object found" info event
 }
