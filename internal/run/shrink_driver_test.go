@@ -41,6 +41,10 @@ type fakeServer struct {
 
 	sessions []mssql.Session // returned by ActiveSessions (constant across calls)
 
+	// sampledOnce, if non-nil, is closed the first time ActiveSessions is called, so a test can
+	// hold a chunk open until the in-flight self-block sampler has read.
+	sampledOnce chan struct{}
+
 	percentComplete float64 // dm_exec_requests percent_complete for the running chunk (0 = no active request)
 
 	tail      mssql.TailObject // scripted FindTailObject result
@@ -126,6 +130,13 @@ func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait
 }
 
 func (s *fakeServer) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	if s.sampledOnce != nil {
+		select {
+		case <-s.sampledOnce:
+		default:
+			close(s.sampledOnce)
+		}
+	}
 	return s.sessions, nil
 }
 

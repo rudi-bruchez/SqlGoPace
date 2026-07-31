@@ -95,7 +95,7 @@ type TempdbProfile struct {
 type tailProbe struct {
 	proactive   bool
 	warned      *bool
-	maintWarned *bool // separate once-per-op guard for the maintenance-block warning (#kimi-1)
+	maintWarned *bool // separate once-per-op guard from warned, so the maintenance-block and 2019+ tail warnings never suppress each other
 	finding     *TailFinding
 	maintBlock  *MaintBlock // set when a concurrent maintenance op is found blocking the shrink
 }
@@ -452,6 +452,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 	var stallWaited time.Duration
 	var blocked time.Duration  // cumulative unproductive time (no-gain chunks, stalls, relief waits)
 	shrinkStart := r.clk.Now() // anchors the ETA from the reduction rate achieved so far
+	var lastMaint *MaintBlock  // most recent in-flight maintenance-block observation from runChunk
 
 	for current > final {
 		// Graceful stop: each chunk commits, so stopping between chunks preserves work;
@@ -476,7 +477,10 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
-		stopped, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog)
+		stopped, mb, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog, tp != nil)
+		if mb != nil {
+			lastMaint = mb
+		}
 		if err != nil {
 			// A DBCC SHRINKFILE chunk error almost never means the operation is broken — it
 			// means the shrink could not move a page right now (Msg 3140 "could not adjust the
@@ -493,7 +497,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			step = clampStep(step/2, r.tuning.MinStepMB, maxStep)
 			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
 			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
-			r.probeMaintBlock(ctx, f, sink, tp, noProgress)
+			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
 			} else if stop {
@@ -537,7 +541,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			s0 := r.clk.Now()
 			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			blocked += r.clk.Since(s0)
-			r.probeMaintBlock(ctx, f, sink, tp, noProgress)
+			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
 			} else if stop {
@@ -649,8 +653,12 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 // stopped=true when sustained pressure made the driver stop the chunk (context
 // cancel, KILL via the pool as a fallback) with its committed work preserved;
 // stopped=false when the statement finished on its own (err carries a real DDL
-// failure, if any). It mirrors MonitoredRunner.runStatement.
-func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, base ShrinkProgress) (stopped bool, err error) {
+// failure, if any). It mirrors MonitoredRunner.runStatement. When watchSelfBlock is
+// true, it also samples our own session in-flight (via pumpSelfBlock) for a concurrent
+// maintenance operation blocking the chunk — the only window such a block is
+// observable, since between chunks our session has no live request row (see
+// pumpSelfBlock) — and returns the first such observation, if any.
+func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, base ShrinkProgress, watchSelfBlock bool) (stopped bool, maint *MaintBlock, err error) {
 	stmt := ddl.ShrinkChunkSQL(file, targetMB, res)
 
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -665,17 +673,34 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	// Re-emit progress with the chunk's live server-side percent_complete while it runs.
 	go r.pumpChunkProgress(sampleCtx, base)
 
+	var selfBlockCh chan MaintBlock
+	if watchSelfBlock {
+		selfBlockCh = make(chan MaintBlock, 1)
+		go r.pumpSelfBlock(sampleCtx, selfBlockCh)
+	}
+
 	// A shrink chunk is cancel-safe: each internal ~32-page batch commits, so a stop
 	// preserves work and is re-entrant. It is never resumable in the ALTER sense.
 	caps := Capabilities{CancelSafe: true, MaxBlock: blockCap(res.MaxBlockMinutes)}
 	action, pressure, serr := supervise(ctx, r.clk, caps, r.blockTO, samples, done)
+
+	// Collect any in-flight maintenance-block observation (best-effort, non-blocking):
+	// pumpSelfBlock sends at most once on a buffered channel and returns.
+	if selfBlockCh != nil {
+		select {
+		case mb := <-selfBlockCh:
+			maint = &mb
+		default:
+		}
+	}
+
 	if action == Continue {
-		return false, serr
+		return false, maint, serr
 	}
 
 	sink(ReactionEvent{Kind: "pause", Detail: "shrink chunk stopped under pressure; committed work preserved — " + pressure.Detail()})
 	r.cancelAndAwait(cancelExec, done, sink, "abort did not stop the chunk within the grace period")
-	return true, nil
+	return true, maint, nil
 }
 
 // cancelAndAwait cancels the running statement and waits for it to stop, falling back to a
@@ -781,6 +806,46 @@ func (r *ShrinkRunner) pumpChunkProgress(ctx context.Context, base ShrinkProgres
 	}
 }
 
+// pumpSelfBlock samples the running chunk's self-block: while a DBCC SHRINKFILE chunk waits on a
+// lock held by a concurrent operation, our session appears in dm_exec_requests with a
+// blocking_session_id. It reads immediately, then on the blocking poll cadence, and sends the
+// first observation of a maintenance blocker (ALTER INDEX / DBCC) on out (buffered, at most once),
+// then returns. Reads go through the pooled connection, concurrent with the chunk — the same
+// pattern pumpChunkProgress uses. Best-effort: a read error is skipped; a non-maintenance or
+// absent blocker just keeps polling until the chunk's sampling context is canceled.
+func (r *ShrinkRunner) pumpSelfBlock(ctx context.Context, out chan<- MaintBlock) {
+	observe := func() bool {
+		sessions, err := r.reader.ActiveSessions(ctx)
+		if err != nil {
+			return false
+		}
+		sb := mssql.FindSelfBlock(sessions, r.exec.SPID())
+		if !sb.Blocked || !mssql.IsMaintenanceCommand(sb.Command) {
+			return false
+		}
+		select {
+		case out <- MaintBlock{SPID: sb.SPID, Command: sb.Command, WaitMS: sb.WaitMS}:
+		default:
+		}
+		return true
+	}
+	if observe() {
+		return
+	}
+	t := time.NewTicker(r.pollIntv)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if observe() {
+				return
+			}
+		}
+	}
+}
+
 // stall records a no-progress chunk (a real no-gain, or any DBCC error that left the file
 // unmoved — "could not adjust the space allocation", a buffer-latch time-out, …) and
 // decides whether to give up. On the tempdb
@@ -823,30 +888,22 @@ func (r *ShrinkRunner) flushTempdbCaches(ctx context.Context, sink ReactionSink)
 	return r.exec.ExecDDL(ctx, "CHECKPOINT;\nDBCC FREESYSTEMCACHE ('Temporary Tables & Table Variables') WITH NO_INFOMSGS;")
 }
 
-// probeMaintBlock samples the self-block once the shrink has stalled (noProgress >= 2) and,
-// if a concurrent maintenance operation (ALTER INDEX / DBCC) is blocking us, stashes it on tp
-// and emits one clear warning per operation. Best-effort: a nil tp, an already-known block, a
-// read error, or a non-maintenance blocker leaves today's behavior unchanged. tp == nil on the
-// tempdb path, so tempdb never probes.
-func (r *ShrinkRunner) probeMaintBlock(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe, noProgress int) {
-	if tp == nil || tp.maintBlock != nil || noProgress < 2 {
+// applyMaintBlock promotes an in-flight maintenance-block observation (from runChunk) to the
+// operation's tailProbe once the shrink has stalled, emitting one warning per operation. Called
+// only from the stall branches, so being here already means the shrink is not making progress; a
+// non-nil mb means pumpSelfBlock observed our session blocked by a concurrent ALTER INDEX / DBCC.
+// Pure and main-goroutine-only. No-op on the tempdb path (tp == nil) or once already recorded.
+func (r *ShrinkRunner) applyMaintBlock(sink ReactionSink, f mssql.FileSpace, tp *tailProbe, mb *MaintBlock) {
+	if tp == nil || tp.maintBlock != nil || mb == nil {
 		return
 	}
-	sessions, err := r.reader.ActiveSessions(ctx)
-	if err != nil {
-		return
-	}
-	sb := mssql.FindSelfBlock(sessions, r.exec.SPID())
-	if !sb.Blocked || !mssql.IsMaintenanceCommand(sb.Command) {
-		return
-	}
-	tp.maintBlock = &MaintBlock{SPID: sb.SPID, Command: sb.Command, WaitMS: sb.WaitMS}
+	tp.maintBlock = mb
 	if tp.maintWarned != nil && !*tp.maintWarned {
 		*tp.maintWarned = true
 		sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf(
 			"shrink of %q blocked by a concurrent maintenance operation — %s on session %d (waiting %s). "+
 				"Transient; SqlGoPace is yielding, not forcing. Re-run after maintenance completes.",
-			f.Name, sb.Command, sb.SPID, formatWait(sb.WaitMS))})
+			f.Name, mb.Command, mb.SPID, formatWait(mb.WaitMS))})
 	}
 }
 
@@ -914,6 +971,10 @@ func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace,
 // markTransient tags a give-up tail finding as transient-maintenance when a concurrent
 // maintenance op was found blocking the shrink, so it is recorded as informational rather
 // than a structural blocker.
+//
+// Note: this tags the tail object the walk found even if the concurrent maintenance op operates
+// on a different object — the maintenance context is treated as the salient explanation, and a
+// re-run without concurrent maintenance re-classifies a genuine structural tail as tail_position.
 func (r *ShrinkRunner) markTransient(tf *TailFinding, tp *tailProbe) {
 	if tp == nil || tp.maintBlock == nil || tf == nil {
 		return
