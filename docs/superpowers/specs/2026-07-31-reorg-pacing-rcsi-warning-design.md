@@ -35,9 +35,10 @@ emits an advisory warning when a reorg starts against a database with RCSI off.
 
 - Changes are confined to the pure, testable core of `internal/run`
   (`monitored_runner.go`'s `runLoop`, plus a small hook and helper for the engine),
-  plus one engine wiring option and its call site in `cmd/sqlgopace/main.go`.
-- No new manifest fields and no new config knobs. Yielding-by-default and the warning
-  are both automatic.
+  plus one engine wiring option and its call site in `cmd/sqlgopace/main.go`, and a
+  one-line addition to `internal/mssql`'s `conn.go` `harden()` (§3).
+- No new manifest fields and no new config knobs. Yielding-by-default, the warning, and
+  the `IMPLICIT_TRANSACTIONS OFF` hardening are all automatic.
 - The compatibility matrix (`reorganize_index: {}` stays optionless), the generator,
   the shrink driver, and the resumable pause/resume path are unchanged.
 
@@ -69,15 +70,21 @@ Pause   -> waitForRelief(); resumeSQL(); loop
 Continue-> return err                    (statement finished)
 ```
 
-New: `runLoop` takes a `paced bool`, and the `Cancel` branch splits:
+New: `runLoop` gains a `reissue func() (string, error)` closure (nil on the ordinary
+path), and the `Cancel` branch splits on whether it is set:
 
 ```
-Cancel & paced   -> waitForRelief(); stmt = sql; loop   (re-issue same REORGANIZE, UNCAPPED)
-Cancel & !paced  -> return ErrCancelled                 (unchanged; Run bounded-retries)
+Cancel & paced   -> waitForRelief(); stmt, _ = reissue(); loop   (narrate + re-issue same REORGANIZE, UNCAPPED)
+Cancel & !paced  -> return ErrCancelled                          (unchanged; Run bounded-retries)
 ```
 
-`paced` is set **only for `reorganize_index`** — a type switch on the operation, not a
-capability bit. It is *not* `caps.CancelSafe`: only reorg re-issues from persisted
+where `paced` ≡ `reissue != nil`. The `reissue` closure (see the narration bullet
+below) emits the re-issue event and returns the original SQL, mirroring how the Pause
+branch uses `resumeSQL`.
+
+The paced path is wired **only for `reorganize_index`** — the runner constructs a
+non-nil `reissue` only when the operation is `ddl.ReorganizeIndex` (a type switch, not a
+capability bit). It is *not* `caps.CancelSafe`: only reorg re-issues from persisted
 progress, so only reorg's uncapped loop is guaranteed to converge (see "Scope" below).
 `check_db` and `update_statistics` — the other two cancel-safe ops — keep today's
 bounded-retry `ErrCancelled` behavior.
@@ -88,6 +95,13 @@ Details:
   `ALTER INDEX ... REORGANIZE`), *not* a resume statement — SQL Server continues from
   its persisted progress. This is distinct from the Pause branch, which issues
   `ALTER INDEX ... RESUME`.
+- **Re-issue is narrated.** The paced branch calls a `reissue` closure — symmetric to
+  the Pause branch's `resumeSQL` — that emits `ReactionEvent{Kind: "resume", Detail:
+  "pressure cleared — re-issuing REORGANIZE"}` and returns the original SQL, so the
+  operator sees cancel → (wait) → re-issue instead of a silent re-run. `"resume"` is an
+  already-rendered kind (the Pause branch uses it), so no TUI change is needed. Encoding
+  the paced path as a non-nil `reissue` closure (vs. `nil` for the ordinary
+  bounded-retry path) also serves as the `paced` discriminator inside `runLoop`.
 - The statement is still physically stopped the same way before the wait
   (`runStatement`: context-abort first, KILL as a fallback if it does not stop within
   `killGrace`). The cancel is still narrated via `reactionEvent` with the existing
@@ -150,18 +164,24 @@ and a one-line add if a future op ever gains the same persisted-progress propert
 - The decision is a small pure helper so it is unit-testable without the engine:
 
   ```go
-  // reorgRCSIWarning returns the warning text to emit before running op, and whether
-  // to emit it: only for a REORGANIZE against a database with RCSI off (readers block
-  // on its page locks). Empty/false for every other operation or when RCSI is on.
-  func reorgRCSIWarning(op ddl.Operation, rcsi bool) (string, bool)
+  // reorgRCSIWarning returns the complete warning text to emit before running op, and
+  // whether to emit it: only for a REORGANIZE against a database with RCSI off (readers
+  // block on its page locks). The database name is passed in so the returned message is
+  // complete and the helper stays a pure, testable decision function. Empty/false for
+  // every other operation or when RCSI is on.
+  func reorgRCSIWarning(op ddl.Operation, database string, rcsi bool) (string, bool)
   ```
 
-- In `processOne`, before the reorg executes, call the helper; when it returns true,
-  emit one warning that names `schema.table` and the database, states that readers may
-  block on the REORGANIZE's page locks with RCSI off, and notes that the pacing loop
-  will still yield on blocking. It goes to the existing progress output and is recorded
-  in the operation's `.log` sidecar via the existing note/report path — no new report
-  plumbing.
+- **Emission point.** In `processOne`, the per-step `sink` is constructed at
+  `engine.go:600` (it appends every event to `report.ReactionLine` and prints to
+  `e.out`). Immediately after `emitStep(stepEv)` and before `e.runner.Run(...)`, call
+  the helper; when it returns true, emit `sink(ReactionEvent{Kind: "warn", Detail:
+  <msg>})`. This records the warning in the operation's `.log` (via the unconditional
+  append at `engine.go:624`) and prints it live — no new report plumbing. Reorg takes
+  this standard runner path (the shrink branch is taken earlier and does not apply).
+- The message names `schema.table` and the database, states that readers may block on
+  the REORGANIZE's page locks with RCSI off, and notes that the pacing loop will still
+  yield on blocking.
 - **Advisory only.** It never blocks or skips the operation (per the tool's
   "act, don't nanny" philosophy). Only `ReorganizeIndex` triggers it; the warning is
   specifically about reader-blocking page locks and would be noise on `check_db` or
@@ -174,9 +194,34 @@ Illustrative output:
        REORGANIZE's page locks; the pacing loop will still yield on blocking.
 ```
 
-## 3. Testing
+## 3. Connection hardening: `IMPLICIT_TRANSACTIONS OFF`
 
-All logic lands in the pure core (no database):
+`docs/REORGANIZE.md` identifies `IMPLICIT_TRANSACTIONS ON` as the most likely mechanism
+behind the motivating incident: with it on, a REORGANIZE holds every lock until the
+whole operation commits, turning short-term page locks into a sustained blocking chain.
+Pacing reduces the *impact* of that; setting the option off removes the *mechanism* for
+every SqlGoPace-issued statement.
+
+The fix is a **connection-hardening** change, not a generator change: extend
+`conn.go`'s `harden()` — which already runs `SET XACT_ABORT ON; SET DEADLOCK_PRIORITY
+LOW;` on the pinned execution connection — to also set `SET IMPLICIT_TRANSACTIONS OFF;`.
+This applies once, to every operation, and keeps the DDL generator producing pure DDL
+(no `SET` leaking into `plan`/`--explain` output, and no reorg-only special case).
+
+This is **defensive, not load-bearing**: go-mssqldb already defaults
+`implicit_transactions` to off (unlike JDBC), so a SqlGoPace-issued reorg is already
+unaffected in the common case. The explicit `SET` guarantees it regardless of a
+server-level `user options` default that could turn it on. Rejecting Kimi's alternative
+(prefix `SET IMPLICIT_TRANSACTIONS OFF;` inside `generateReorganizeIndex`): that would
+pollute the pure generator, surface in `plan`/`--explain`, and cover only reorg.
+
+Testing: the existing `harden()` path has no unit test (it issues SQL); this is a
+one-line addition to the hardening statement, verified by the integration/e2e suite that
+already exercises the execution connection. No new pure-core test.
+
+## 4. Testing
+
+All new decision logic lands in the pure core (no database):
 
 - **`runLoop`** (table-driven, deterministic via injected `runStatement` /
   `waitForRelief` / `resumeSQL`), driving the `paced` flag:
@@ -191,14 +236,33 @@ All logic lands in the pure core (no database):
     `update_statistics`).
   - paced never consumes `MaxRetries` (drive many cancels; assert no
     "retries exhausted" error).
-  - the `paced` flag is set only for `ReorganizeIndex`: a small test on the
-    engine-side mapping (op → paced) asserts true for `ReorganizeIndex` and false for
+  - paced + pressure asserts the `reissue` closure is invoked and a `"resume"`-kind
+    re-issue event is emitted before the re-run (narration coverage).
+  - the paced path is wired only for `ReorganizeIndex`: a small test on the engine-side
+    mapping (op → non-nil `reissue`) asserts it is set for `ReorganizeIndex` and nil for
     `CheckDB` / `UpdateStatistics` / a non-cancel-safe op.
+- **Existing `runLoop` tests** in `executor_test.go` (7 call sites) gain the new
+  `reissue` argument (nil) — an implementation-plan step, not only new tests.
 - **`reorgRCSIWarning`**: warns (true, non-empty) only for `ReorganizeIndex` with
-  `rcsi == false`; silent (false) for `ReorganizeIndex` with `rcsi == true`, and for
-  `CheckDB` / `UpdateStatistics` / other ops regardless of `rcsi`.
+  `rcsi == false`, and the returned message contains the passed-in database name; silent
+  (false) for `ReorganizeIndex` with `rcsi == true`, and for `CheckDB` /
+  `UpdateStatistics` / other ops regardless of `rcsi`.
 
-## 4. Non-goals
+## 5. Implementation notes (for the plan)
+
+- **Stale `ReactionEvent.Kind` comment.** The doc-comment lists `pause | resume | cancel
+  | kill`, but `warn` and `info` are already emitted in production (the shrink driver).
+  Update the comment to include them while adding the RCSI `warn` event; no behavior
+  change.
+- **Version bump.** Bump `internal/version/VERSION` (per project convention — no build
+  flags).
+- **Docs.** Update `docs/REORGANIZE.md`: replace its "paced, cancel-and-reissue driver
+  is the natural follow-up … shrink driver's shape" note with the actual decision (a
+  `runLoop` refinement, no new driver), and document the RCSI warning + the
+  `IMPLICIT_TRANSACTIONS OFF` hardening. Add a short line to `README.md` if reorg
+  behavior is user-facing there.
+
+## 6. Non-goals
 
 - No new manifest fields, config knobs, or the ability to skip/fail a reorg on RCSI off
   (warn-and-proceed only).
