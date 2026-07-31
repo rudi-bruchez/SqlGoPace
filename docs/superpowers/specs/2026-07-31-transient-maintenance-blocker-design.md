@@ -140,10 +140,13 @@ the transient-maintenance nature unmistakable and state the recommended action.
 
 - **First recognition (while still trying), once per operation:**
   `Kind: "warn"`, e.g.
-  `shrink of "PRODDB" file "PRODDB" is blocked by a concurrent maintenance
-  operation — ALTER INDEX on session 104 (waiting 00:12:31). This is transient;
-  SqlGoPace is yielding, not forcing. Re-run the shrink after maintenance
-  completes.`
+  `shrink of "PRODDB" is blocked by a concurrent maintenance operation —
+  ALTER INDEX on session 104 (waiting 12m31s). Transient; SqlGoPace is yielding,
+  not forcing. Re-run after maintenance completes.`
+  (The runner message is **file-scoped** — `shrink of "<file>"` — matching every
+  other `ShrinkRunner` message, which name the file, not the database; the runner
+  is not passed a database name. The engine's narration supplies the manifest/database
+  context around the event.)
 
 - **At give-up attributable to maintenance:** the give-up reason string names it
   explicitly instead of the generic "no further progress":
@@ -158,9 +161,9 @@ Message content requirements:
 - name the **object** at the tail **only when one is already available** — i.e. a
   `TailFinding` from the proactive walk or an earlier reactive walk. At the first
   `noProgress ≥ 2` stall the reactive tail walk has not run yet, so the message is
-  driven by the **database and file name** (as in the example above), never by
-  parsing the blocker's `ActiveQuery` (too fragile). The object name is added to
-  the give-up message and the sidecar entry once a walk has produced it;
+  driven by the **file name** (as in the example above), never by parsing the
+  blocker's `ActiveQuery` (too fragile). The object name is added to the give-up
+  message and the sidecar entry once a walk has produced it;
 - state it is **transient** and that SqlGoPace is **yielding, not killing**;
 - give the **action**: re-run after maintenance (or schedule via the maintenance
   window).

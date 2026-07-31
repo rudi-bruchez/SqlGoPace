@@ -381,6 +381,40 @@ timestamps). If the same object was also lock-captured, the entry is upgraded to
 while its lock stats are preserved. `plan --confirmed` promotes tail-position blockers ahead of
 lock-confirmed ones (and, among tail entries, the one closest to the file end first).
 
+### 8.7 Concurrency with index maintenance
+
+A shrink stalled behind a concurrent `ALTER INDEX` (rebuild or reorganize) or `DBCC`
+(indexdefrag, another shrink, ...) is not a structural tail blocker — it's a maintenance job
+that will finish and release the file's tail on its own. The driver doesn't special-case its
+reaction: the same yielding it already does for any self-wait (§8.2) or no-progress stall
+(§8.3) applies — bounded backoff, then a clean stop with work preserved and the manifest
+re-queued. It never waits indefinitely on the blocker, and it never `KILL`s it.
+
+What changes is recognition and reporting. The self-block is only observable **while a chunk is
+executing** — that is the one moment the shrink's session appears in `sys.dm_exec_requests` with
+a `blocking_session_id`; between chunks it holds no lock request and is invisible. So a
+`pumpSelfBlock` sampler runs in-flight during each `runChunk` (alongside the progress pump),
+takes an `ActiveSessions` snapshot and runs it through `FindSelfBlock` (our own SPID's direct
+blocker) and `IsMaintenanceCommand` (an allow-list of `ALTER INDEX`/`DBCC` verbs read off
+`sys.dm_exec_requests.command`), and hands the first maintenance-block observation back to the
+chunk loop. Both reads need only `VIEW SERVER STATE` — already required for monitoring — so the
+recognition works below SQL 2019 too, unlike the page-walk in §8.6. Once the shrink has stalled,
+that stashed observation is promoted (`applyMaintBlock`): it emits one `warn` per operation
+naming the verb, the blocking session, and the elapsed wait (e.g. "shrink of ... blocked by a concurrent maintenance operation — ALTER
+INDEX on session 62 (waiting 2m31s). Transient; SqlGoPace is yielding, not forcing. Re-run
+after maintenance completes."), through the same `ReactionSink` that feeds the `.log` and the
+TUI, and a give-up while blocked states the same in its stop reason.
+
+If the shrink then gives up while a maintenance block was seen, the tail object the give-up
+walk (or an already-stashed proactive walk, §8.6) found is recorded with
+`confirmed_by: transient_maintenance` instead of `tail_position`, plus `blocked_by_command` and
+`blocked_by_spid` naming the operation and session that pinned it. `plan --confirmed` skips
+`transient_maintenance` entries entirely (`confirmedSetFor` filters them before they ever reach
+`DecidePreShrink`) — a rebuild that happened to be running is never mistaken for the kind of
+structural blocker a pre-shrink reorganize should target. Below SQL 2019, or when the tail walk
+itself fails, there is no sidecar entry at all — only the `.log`/TUI message; the give-up reason
+still names the blocker, there's just nothing to feed back into the planner.
+
 ## 9. Progress, reporting, TUI
 
 - **Deterministic progress** (an advantage of chunking, unlike the fluctuating

@@ -39,6 +39,12 @@ type fakeServer struct {
 
 	waits []mssql.SessionWait // returned by SessionWaits (constant across calls)
 
+	sessions []mssql.Session // returned by ActiveSessions (constant across calls)
+
+	// sampledOnce, if non-nil, is closed the first time ActiveSessions is called, so a test can
+	// hold a chunk open until the in-flight self-block sampler has read.
+	sampledOnce chan struct{}
+
 	percentComplete float64 // dm_exec_requests percent_complete for the running chunk (0 = no active request)
 
 	tail      mssql.TailObject // scripted FindTailObject result
@@ -121,6 +127,17 @@ func (s *fakeServer) ActiveLogFloorMB(_ context.Context) (int, error) { return s
 
 func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
 	return s.waits, nil
+}
+
+func (s *fakeServer) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	if s.sampledOnce != nil {
+		select {
+		case <-s.sampledOnce:
+		default:
+			close(s.sampledOnce)
+		}
+	}
+	return s.sessions, nil
 }
 
 func (s *fakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {
@@ -697,6 +714,9 @@ func (s *tempdbFakeServer) FileSizeMB(_ context.Context, file string) (int, erro
 func (s *tempdbFakeServer) LogReuse(_ context.Context) (string, string, error) { return "SIMPLE", "NOTHING", nil }
 func (s *tempdbFakeServer) ActiveLogFloorMB(_ context.Context) (int, error)    { return 0, nil }
 func (s *tempdbFakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
+	return nil, nil
+}
+func (s *tempdbFakeServer) ActiveSessions(context.Context) ([]mssql.Session, error) {
 	return nil, nil
 }
 func (s *tempdbFakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {

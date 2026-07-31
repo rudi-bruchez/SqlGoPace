@@ -24,6 +24,9 @@ func confirmedSetFor(doc maint.ContendedDoc, db string) (map[int64]maint.Confirm
 	}
 	set := make(map[int64]maint.Confirmation, len(doc.Observed))
 	for _, o := range doc.Observed {
+		if o.ConfirmedBy == "transient_maintenance" {
+			continue // informational only — never drives a pre-shrink reorganize
+		}
 		set[o.ObjectID] = maint.Confirmation{
 			TimesBlocked: o.TimesBlocked,
 			ByTail:       o.ConfirmedBy == "tail_position",

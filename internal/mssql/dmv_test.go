@@ -87,7 +87,7 @@ func TestFindSelfBlock(t *testing.T) {
 func TestFindSelfBlockCapturesHost(t *testing.T) {
 	sessions := []Session{
 		{SPID: 119, WaitType: "LCK_M_SCH_M", WaitMS: 5000, BlockingSPID: 104},
-		{SPID: 104, Login: "app_login", Host: "APPSRV01", Program: "SQLCMD"},
+		{SPID: 104, Login: "app_login", Host: "APPSRV01", Program: "SQLCMD", Command: "ALTER INDEX"},
 	}
 	sb := FindSelfBlock(sessions, 119)
 	if !sb.Blocked || sb.SPID != 104 {
@@ -95,6 +95,9 @@ func TestFindSelfBlockCapturesHost(t *testing.T) {
 	}
 	if sb.Host != "APPSRV01" {
 		t.Errorf("Host = %q, want APPSRV01", sb.Host)
+	}
+	if sb.Command != "ALTER INDEX" {
+		t.Errorf("SelfBlock.Command = %q, want ALTER INDEX", sb.Command)
 	}
 }
 

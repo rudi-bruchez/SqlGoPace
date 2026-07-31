@@ -132,3 +132,39 @@ func TestRenderContendedRoundTrips(t *testing.T) {
 		t.Errorf("round-tripped doc = %+v", doc)
 	}
 }
+
+func TestContendedAddTailTransientMaintenance(t *testing.T) {
+	var acc contendedCapture
+	acc.addTail(TailFinding{
+		ObjectID: 9, Schema: "dbo", Table: "Big", IndexID: 1, PageFromEnd: 4,
+		Transient: true, BlockedByCommand: "ALTER INDEX", BlockedBySPID: 104,
+	}, "t0")
+
+	o := acc.doc("DB").Observed[0]
+	if o.ConfirmedBy != "transient_maintenance" {
+		t.Errorf("ConfirmedBy = %q, want transient_maintenance", o.ConfirmedBy)
+	}
+	if o.BlockedByCommand != "ALTER INDEX" || o.BlockedBySPID != 104 {
+		t.Errorf("blocked-by = (%q, %d), want (ALTER INDEX, 104)", o.BlockedByCommand, o.BlockedBySPID)
+	}
+	if o.IndexID != 1 || o.PageFromEnd != 4 {
+		t.Errorf("tail fields lost: %+v", o)
+	}
+}
+
+func TestRenderContendedTransientRoundTrips(t *testing.T) {
+	var acc contendedCapture
+	acc.addTail(TailFinding{
+		ObjectID: 9, Schema: "dbo", Table: "Big", IndexID: 1, PageFromEnd: 4,
+		Transient: true, BlockedByCommand: "DBCC", BlockedBySPID: 55,
+	}, "t0")
+	out := renderContended("050_shrink.yaml", "DB", &acc)
+	doc, err := maint.ParseContended(out) // KnownFields(true): guards new-field drift
+	if err != nil {
+		t.Fatalf("ParseContended: %v", err)
+	}
+	o := doc.Observed[0]
+	if o.ConfirmedBy != "transient_maintenance" || o.BlockedByCommand != "DBCC" || o.BlockedBySPID != 55 {
+		t.Errorf("round-tripped = %+v", o)
+	}
+}
