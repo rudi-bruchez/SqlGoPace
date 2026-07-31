@@ -4,6 +4,11 @@
 **Status:** Design (follow-up to the tail-object-identification feature)
 **Scope:** small — one classification helper, one narrow read wired into the
 shrink driver, one new `confirmed_by` value, and clear operator messaging.
+**Revision:** 2026-07-31 — resolves the six points from the Kimi assessment
+(`…-kimi.md`): separate warning guard (§3), `transient_maintenance` filtered in
+`confirmedSetFor` not surfaced as a `Confirmation` (§5), object-name source made
+explicit (§4), "maintBlock set" wording (§6), the no-tail-object case stated (§5),
+and the allow-list narrowed to verified `command` verbs (§1).
 
 ## Motivation
 
@@ -63,16 +68,24 @@ func IsMaintenanceCommand(cmd string) bool
 
 Recognized verbs (case-insensitive, trimmed):
 
-| `command` value        | Operation                                   |
-|------------------------|---------------------------------------------|
-| `ALTER INDEX`          | `ALTER INDEX … REBUILD` / `… REORGANIZE`    |
-| `DBCC`                 | `DBCC INDEXDEFRAG` (legacy reorganize)      |
-| `DbccFilesCompact`     | another `DBCC SHRINKFILE`/`SHRINKDATABASE`  |
+| `command` value | Covers                                                        |
+|-----------------|---------------------------------------------------------------|
+| `ALTER INDEX`   | `ALTER INDEX … REBUILD` / `… REORGANIZE`                      |
+| `DBCC`          | `DBCC INDEXDEFRAG`, and a concurrent `DBCC SHRINKFILE`/`SHRINKDATABASE` |
 
-The allow-list is intentionally short and lives in one place so it is trivial to
-extend. `command` does not distinguish REBUILD from REORGANIZE (both report
-`ALTER INDEX`); that is fine — the operator-facing message names the *object* and
-the raw command verb, and both are transient for our purposes.
+Verified against the `sys.dm_exec_requests` reference: `command` is `nvarchar(32)`
+holding a **command verb**, and every DBCC statement (including `SHRINKFILE`,
+`SHRINKDATABASE`, `INDEXDEFRAG`) reports the verb `DBCC`. The earlier draft's
+`DbccFilesCompact` was wrong — that string is an internal wait/task name, never a
+`command` value — so it is dropped; `DBCC` already subsumes a concurrent shrink.
+`ALTER INDEX` is the verb for both REBUILD and REORGANIZE; `command` does not
+distinguish them, which is fine — the operator message names the *object* and the
+raw verb, and both are transient for our purposes. The list is intentionally short
+and lives in one place so it is trivial to extend.
+
+`DBCC` also matches read-only checks (`DBCC CHECKDB`, which runs against a
+snapshot and rarely blocks a shrink); classifying those as transient is harmless —
+they are transient too, and yield-then-re-run is the right response regardless.
 
 ### 2. Observe the self-blocker (narrow read, no new SQL)
 
@@ -88,6 +101,13 @@ driver does not read `ActiveSessions` today, so:
   `Command` field, filled alongside `Login`/`Program` in `FindSelfBlock`, so
   callers do not re-scan the slice.)
 
+Caveat (acceptable): `activeSessionsSQL` inner-joins `dm_exec_requests`, so a
+blocker that is **idle-in-transaction** (holding locks but not executing a
+request) has no `command` and will not appear as a maintenance blocker — it falls
+through to today's behavior. That is correct: an idle session is not a running
+maintenance op, and a running REBUILD/REORGANIZE/DBCC always has a live request
+row, so the case we target is covered.
+
 ### 3. When we sample it
 
 Sample the self-block **on the stall backoff cadence** — the loop is already
@@ -99,10 +119,15 @@ threshold (e.g. ≥ 2, so a one-off blip is not mislabeled):
 1. Read `ActiveSessions`, compute `FindSelfBlock`.
 2. If `Blocked && IsMaintenanceCommand(sb.Command)` → we have a **transient
    maintenance block**. Record it on the operation's `tailProbe` (a new
-   `maintBlock *MaintBlock` field: blocker SPID, command, object name if
-   resolvable, first-observed timestamp).
-3. Emit the clear message (§4) **once per operation** (guarded like the existing
-   `warned` flag) so the operator learns *why* early, not only at give-up.
+   `maintBlock *MaintBlock` field: blocker SPID, command verb, and
+   first-observed timestamp; see §4 on the object name).
+3. Emit the clear message (§4) **once per operation** so the operator learns
+   *why* early, not only at give-up.
+
+**Warning guard — do not reuse `tailProbe.warned`.** `warned` guards the
+"tail-object identification needs SQL 2019+" message; reusing it would let one
+warning suppress the other. Add a separate `maintWarned *bool` on `tailProbe` so
+the two once-per-operation messages fire independently.
 
 Best-effort throughout: a nil reader, a read error, or a blocker missing from the
 snapshot degrades silently to today's behavior.
@@ -128,7 +153,14 @@ the transient-maintenance nature unmistakable and state the recommended action.
 
 Message content requirements:
 - name the **operation verb** (from `command`) and the **blocker SPID**;
-- name the **object** at the tail when resolvable (from the tail walk / lock);
+- include the **elapsed wait** so the operator sees how long the shrink has
+  already yielded (from `SelfBlock.WaitMS`, or the time since first observation);
+- name the **object** at the tail **only when one is already available** — i.e. a
+  `TailFinding` from the proactive walk or an earlier reactive walk. At the first
+  `noProgress ≥ 2` stall the reactive tail walk has not run yet, so the message is
+  driven by the **database and file name** (as in the example above), never by
+  parsing the blocker's `ActiveQuery` (too fragile). The object name is added to
+  the give-up message and the sidecar entry once a walk has produced it;
 - state it is **transient** and that SqlGoPace is **yielding, not killing**;
 - give the **action**: re-run after maintenance (or schedule via the maintenance
   window).
@@ -147,11 +179,27 @@ chooses (a):
 - **(a) Record it with a distinct, non-confirming kind (chosen).** Add
   `ConfirmedBy: "transient_maintenance"` to the `confirmed_by` enum. The entry is
   still written to `.contended.yaml` (so the operator sees a durable record with
-  the blocker command and timestamp), but `maint.DecidePreShrink` **skips**
-  `transient_maintenance` entries — they never drive a pre-shrink reorganize.
-  This preserves the audit trail without the false recommendation.
+  the blocker command and timestamp), but it never drives a pre-shrink
+  reorganize. This preserves the audit trail without the false recommendation.
 - (b) Omit the entry entirely. Rejected: loses the durable "why did this shrink
   stop" record that makes the sidecar useful post-mortem.
+
+**Where the filtering happens.** `confirmedSetFor` (`cmd/sqlgopace/shrink_plan.go`)
+is the single place that interprets `ConfirmedBy` into a `maint.Confirmation`, and
+`DecidePreShrink` is the single consumer. Rather than add a
+`Confirmation.TransientMaintenance` flag that `DecidePreShrink` must then remember
+to skip, **filter `transient_maintenance` entries out in `confirmedSetFor`** so
+they never become a `Confirmation` at all. This keeps `DecidePreShrink` unchanged
+and puts the "informational only" decision at the one interpretation point. The
+entry remains in the YAML for the operator; it is simply absent from the confirmed
+set the planner acts on.
+
+**When there is no object to record (SQL < 2019, or the tail walk fails).** The
+`.contended.yaml` sidecar is keyed by object; with no `TailFinding` there is no
+entry to write. That is acceptable: the transient-maintenance fact still reaches
+the operator through the **`.log` and TUI messages** (§4), which are
+version-independent. Only the *durable sidecar record* requires a resolved tail
+object; its absence loses no reaction correctness.
 
 `ContendedObject` gains an optional `BlockedByCommand string
 \`yaml:"blocked_by_command,omitempty"\`` and `BlockedBySPID int
@@ -167,11 +215,14 @@ The header comment in `renderContended` documents the third `confirmed_by` value
 ### 6. Interaction with the existing proactive/reactive tail walk
 
 - The **reactive give-up walk** (`captureGiveUpTail`): before recording a tail as
-  `tail_position`, check the operation's `maintBlock`. If set and current, record
-  `transient_maintenance` (with the blocker command) instead of `tail_position`.
+  `tail_position`, check whether `tp.maintBlock` **is set**. Give-up follows
+  immediately from the stall that set it, so no timestamp-freshness check is
+  needed — a set `maintBlock` means "this give-up was under maintenance blocking".
+  If set, record `transient_maintenance` (with the blocker command) instead of
+  `tail_position`.
 - The **proactive walk** stash (recorded post-loop in `shrinkData` only on a
-  missed target): same guard — if the miss coincided with a recognized
-  maintenance block, downgrade the recorded kind to `transient_maintenance`.
+  missed target): same guard — if `tp.maintBlock` is set, downgrade the recorded
+  kind to `transient_maintenance`.
 - A give-up **not** attributable to maintenance (application lock, WALP timeout,
   genuinely pinned heap/LOB) keeps `confirmed_by: tail_position` exactly as today.
 
@@ -189,26 +240,30 @@ give-up
                            give-up reason names the maintenance op   → .log + TUI
     else:                  record confirmed_by=tail_position (today)
 plan --confirmed
-  → DecidePreShrink skips confirmed_by=transient_maintenance entries
+  → confirmedSetFor drops confirmed_by=transient_maintenance (never a Confirmation)
+  → DecidePreShrink unchanged
 ```
 
 ## Testing
 
 Pure, no database — extend the existing shrink/contended unit tests:
 
-- `IsMaintenanceCommand`: table test over `ALTER INDEX`, `DBCC`,
-  `DbccFilesCompact`, lower/mixed case, and non-maintenance verbs
-  (`SELECT`, `INSERT`, `BACKUP DATABASE`, `""`) → false.
+- `IsMaintenanceCommand`: table test over `ALTER INDEX`, `DBCC` (and
+  lower/mixed case, leading/trailing space) → true; non-maintenance verbs
+  (`SELECT`, `INSERT`, `BACKUP DATABASE`, `""`, and the internal wait-name
+  `DbccFilesCompact`, which must NOT be treated as a command verb) → false.
 - `FindSelfBlock` fills `Command` from the blocker row.
 - Shrink give-up with a fake `ActiveSessions` where our SPID is blocked by an
   `ALTER INDEX` session → sidecar entry is `transient_maintenance`, carries
-  `blocked_by_command`/`blocked_by_spid`, and a `warn` event with the required
-  wording was emitted to the sink.
+  `blocked_by_command`/`blocked_by_spid`, and a `warn` event whose detail names
+  the verb, SPID, and elapsed wait was emitted to the sink.
+- The tail-2019+ warning and the maintenance-block warning can both fire in one
+  operation (separate guards) — neither suppresses the other.
 - Same setup but blocker command `UPDATE` (application) → still
   `tail_position` (unchanged behavior).
-- `DecidePreShrink` ignores a `transient_maintenance` entry (no pre-shrink reorg
-  recommended for it) while still acting on a sibling `tail_position`/`lock`
-  entry.
+- `confirmedSetFor` drops a `transient_maintenance` entry (it never becomes a
+  `Confirmation`) while still mapping a sibling `tail_position`/`lock` entry, so
+  `DecidePreShrink` recommends a pre-shrink reorg for the sibling only.
 - Round-trip: `renderContended` → `ParseContended` accepts the new fields and the
   third `confirmed_by` value (guards format drift).
 

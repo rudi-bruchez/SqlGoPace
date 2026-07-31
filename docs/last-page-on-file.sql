@@ -26,3 +26,6 @@ BEGIN
         BREAK
     END
 END
+
+
+--SELECT 508610 * 8 / 1024
