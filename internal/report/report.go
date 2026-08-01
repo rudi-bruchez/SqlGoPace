@@ -22,8 +22,9 @@ type OptionDecision struct {
 	Reason string `json:"reason"`
 }
 
-// ReactionLine records one reaction taken while an operation ran (a pause,
-// resume, cancel, or fallback kill), so the log shows how pressure was handled.
+// ReactionLine records one reaction taken while an operation ran (pause, resume,
+// cancel, fallback kill, abort, or an advisory warn/info), so the log shows how
+// pressure was handled.
 type ReactionLine struct {
 	Kind   string `json:"kind"`
 	At     string `json:"at"`

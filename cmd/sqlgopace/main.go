@@ -475,6 +475,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	}, run.WithBatchDMLProgress(batchProgress), run.WithBatchDMLStop(drain))
 	opts := []run.EngineOption{
 		run.WithADR(info.ADREnabled),
+		run.WithRCSI(info.RCSIEnabled),
 		run.WithSession(conn),
 		run.WithExpander(conn),
 		run.WithProgress(conn),

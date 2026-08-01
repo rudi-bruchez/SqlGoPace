@@ -108,11 +108,12 @@ Two hard constraints, and one convenient property:
   > completes.
   > — [Optimize index maintenance …](https://learn.microsoft.com/sql/relational-databases/indexes/reorganize-and-rebuild-indexes?view=sql-server-ver17#index-maintenance-methods-reorganize-and-rebuild)
 
-  This means a paced REORGANIZE belongs to a `ShrinkRunner`-style driver, **not**
-  `MonitoredRunner`: run it, sample blocking in-flight, and **cancel when it blocks —
-  the completed work stays** — then re-issue later. Cancel-and-reissue *is* the pause
-  mechanism, because there is no RESUMABLE to pause. This mirrors the shrink driver
-  and the transient-maintenance-blocker recognition already in the codebase.
+  As of 0.12.0, SqlGoPace paces a REORGANIZE by cancelling the statement when it
+  blocks (the completed work stays), waiting for relief, and re-issuing the same
+  statement — inside `MonitoredRunner`'s `runLoop`, not a separate driver.
+  Cancel-and-reissue *is* the pause mechanism, because there is no RESUMABLE to
+  pause. This mirrors the transient-maintenance-blocker recognition already in the
+  codebase.
 
 - **Force `SET IMPLICIT_TRANSACTIONS OFF`** on the connection that issues REORGANIZE.
   Cheap insurance against mechanism #1, which is otherwise driver-dependent and easy
@@ -130,9 +131,16 @@ ALTER INDEX <index> ON <schema>.<table> REORGANIZE [WITH (LOB_COMPACTION = ON)];
 field is set (a rule-driven switch, not a version-gated capability — see the comment
 on `reorganize_index` in `ddl_compatibility.yaml`). It is not injected automatically.
 Reorganize is emitted one op per index by the planner (density-selected — see
-`docs/superpowers/specs/2026-07-28-pre-shrink-reorganize-design.md`), never as a
-paced/monitored statement yet: turning it into a paced, cancel-and-reissue driver is
-the natural follow-up, and would reuse the shrink driver's shape.
+`docs/superpowers/specs/2026-07-28-pre-shrink-reorganize-design.md`).
+
+As of 0.12.0, SqlGoPace paces a reorganize_index directly in `MonitoredRunner`'s
+`runLoop` (no separate driver): under blocking pressure it cancels the statement
+(committed work preserved), waits for relief, and re-issues the same REORGANIZE —
+which continues from SQL Server's persisted progress — looping uncapped until the
+reorg completes or a graceful stop / log-drain timeout ends it. When RCSI is off on
+the target database, it prints an advisory warning at reorg start (readers will block
+on the page locks). The execution connection is also hardened with
+`SET IMPLICIT_TRANSACTIONS OFF` so a reorg releases its locks incrementally.
 
 ## References
 

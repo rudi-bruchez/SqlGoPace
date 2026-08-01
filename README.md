@@ -110,6 +110,11 @@ When the running DDL causes pressure, SqlGoPace escalates from gentlest to harsh
 The exact set of options that are even *eligible* is driven by
 `ddl_compatibility.yaml`, keyed by SQL Server major version and edition tier.
 
+`reorganize_index` has no `WAIT_AT_LOW_PRIORITY`/`RESUMABLE` to fall back on, so it
+paces instead by cancelling and re-issuing the statement (SQL Server persists its
+progress across the cancel) and warns at start if RCSI is off on the target database,
+since readers will then block on its page locks.
+
 ## Installation
 
 Requires Go 1.26+.

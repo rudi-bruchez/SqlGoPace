@@ -1,6 +1,6 @@
 # Paced reorg yielding + RCSI-off warning
 
-Status: design approved, pending implementation plan.
+Status: implemented (0.12.0).
 Date: 2026-07-31.
 
 ## Motivation

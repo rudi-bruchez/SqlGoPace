@@ -80,10 +80,13 @@ func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
 }
 
 // harden applies the safety session settings to the execution connection:
-// XACT_ABORT ON, and DEADLOCK_PRIORITY LOW so the DDL is the deadlock victim
-// rather than a user query.
+// XACT_ABORT ON, DEADLOCK_PRIORITY LOW (so the DDL is the deadlock victim rather than
+// a user query), and IMPLICIT_TRANSACTIONS OFF (so a REORGANIZE releases its locks
+// incrementally instead of holding them until an implicit transaction commits —
+// defensive; go-mssqldb already defaults it off, but a server-level `user options`
+// default could turn it on).
 func (c *Conn) harden(ctx context.Context) error {
-	const stmt = "SET XACT_ABORT ON; SET DEADLOCK_PRIORITY LOW;"
+	const stmt = "SET XACT_ABORT ON; SET DEADLOCK_PRIORITY LOW; SET IMPLICIT_TRANSACTIONS OFF;"
 	if _, err := c.exec.ExecContext(ctx, stmt); err != nil {
 		return fmt.Errorf("harden execution session: %w", err)
 	}
