@@ -782,11 +782,18 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
 			}
 		}
-		// Stop the narrator and wait for it to fully exit before reading `reactions`
-		// below, so a late sink() append cannot race with the read.
+		// Stop the narrator; it is joined, so it appends nothing past this point. The
+		// pump goroutine is not joined (monitored_runner.go only stops sampling), and
+		// the victim killer emits kills on this same sink from it — a kill decided just
+		// before the statement finished can still be mid-flight here. So the report
+		// state is read under reactionMu, on a copy, exactly as sink() writes it.
 		stopHold()
 		<-holdDone
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
+		reactionMu.Lock()
+		opReactions := append([]report.ReactionLine(nil), reactions...)
+		opPeakBlocked := peakBlocked
+		reactionMu.Unlock()
 
 		opRep := report.OperationReport{
 			Index:          i + 1,
@@ -794,8 +801,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			Target:         opTarget(step.Operation),
 			SQL:            stmt, // the statement actually executed (RESUME when continuing a paused resumable)
 			Options:        optionDecisions(step.Decisions),
-			Reactions:      reactions,
-			PeakBlocked:    peakBlocked,
+			Reactions:      opReactions,
+			PeakBlocked:    opPeakBlocked,
 			ContendedCount: contended.len(),
 			Waits:          waitLines,
 			WaitTotalMS:    waitTotal,
