@@ -1,7 +1,7 @@
 # Killing amplifying maintenance victims of a non-blocking operation
 
 Status: design approved, pending implementation plan.
-Date: 2026-08-03.
+Date: 2026-08-03. Revised the same day after review (see `*-kimi.md`).
 
 ## Motivation
 
@@ -104,7 +104,24 @@ A victim qualifies for the kill when all of the following hold:
    queued reader means the amplification has already begun, and it only grows);
 4. (1)–(3) have held continuously for `after_seconds` (default 60);
 5. it matches no `ignore_blocked_sessions` rule (see §2.2);
-6. it is not another SqlGoPace session (§1.4).
+6. it is not another SqlGoPace session (§1.4);
+7. it is not our own direct blocker (§1.6).
+
+### 1.6 Disjointness from `BlockerKiller`
+
+`BlockerKiller` targets the session *we* are blocked by; `VictimKiller` targets
+sessions blocked *by us*. A SPID satisfying both would mean a mutual block — a
+two-session cycle that SQL Server's deadlock monitor normally resolves, but which a
+DMV snapshot assembled row by row can show transiently.
+
+Rather than reconcile two killers after the fact, criterion 7 makes the sets disjoint
+by construction: a session appearing as our direct blocker in the same snapshot is
+never a kill candidate for `VictimKiller`. `BlockerKiller` owns it.
+
+Two consequences follow. Episode state is never shared, because no SPID is ever in
+both. And the order in which `ServerSampler.Blocking` consults the two killers does
+not matter — a property worth asserting in a test so a later refactor cannot quietly
+introduce a double `KILL`.
 
 ### 1.4 Self-exclusion
 
@@ -147,6 +164,12 @@ victim we never manage to kill still forces a yield at the cap.
 named as allowed to stay blocked is never killed, whatever its command. Explicit
 instruction beats automatic classification.
 
+There is nothing to reconcile between the ignore list and the suppression rule of
+§2.1, because an ignored session already does not set `Unignored` — that is what
+ignoring it means. It contributes to `Any` only, exactly as it does today, and
+`max_block_minutes` remains its sole backstop. Kill suppression applies to a distinct
+population: victims that *would* otherwise trip the yield timer.
+
 **`ignore_blocking: true` does not suppress the kill.** That option means "do not
 yield", not "do not intervene". An operator holding the lock through blocking is
 precisely the one who benefits from the amplifier being cleared.
@@ -157,9 +180,15 @@ timer. The feature can never make us block *longer* than today when it is not wo
 
 ### 2.3 Grace window
 
-After a successful kill, the victim's SPID stays suppressed for two further **blocking
-polls**, so a rollback still visible in the snapshot does not instantly trip the
-yield. It then counts normally again.
+After a successful kill, the victim's SPID stays suppressed for a fixed **15 seconds**,
+so a rollback still visible in the snapshot does not instantly trip the yield. It then
+counts normally again.
+
+The window is time-based rather than a poll count on purpose: the blocking poll
+interval is configurable, so "two polls" would silently mean anything from two seconds
+to a minute, and the fake clock makes a duration far easier to test than a tick count.
+Fifteen seconds is not configurable — a killed lock request clears from the wait queue
+almost immediately, and the window exists only to absorb one stale snapshot.
 
 ### 2.4 Configuration
 
@@ -174,7 +203,9 @@ monitoring:
 
 A non-empty `commands` list **replaces** the built-in allow-list of §1.2 rather than
 extending it, so an operator can narrow the feature to `UPDATE STATISTIC` alone.
-Entries are matched by the same case-folded prefix rule.
+Entries are matched by the same case-folded prefix rule. An **absent or empty** list
+means the built-in allow-list, never "match nothing" — the only way to disable the
+feature is `enabled: false`.
 
 `KILL` requires `ALTER ANY CONNECTION`, which `kill_blocking_sessions` already
 requires — no new grant. `SELECT` on `msdb.dbo.sysjobs` / `sysjobsteps` is new,
@@ -234,15 +265,62 @@ one line.
 
 It is deliberately **not** folded into `.blocked.yaml`: that file's stated purpose is
 "paste this into `ignore_blocked_sessions`", and an amplifier is the exact opposite
-instruction. The new file lists each killed amplifier with its command, chain size,
-kill timestamp, and job attribution, plus a deduplicated block of ready-to-paste
-`sp_update_job` statements. Advisory only, never read back, like its siblings.
+instruction. Advisory only, never read back, like its siblings.
+
+```yaml
+# Amplifying maintenance victims killed during 032-compress-small.yaml
+# Advisory only — SqlGoPace never reads this file back.
+# Each entry is a session this run terminated because it requested a Sch-M lock
+# behind our operation while other sessions queued behind it.
+
+killed:
+  - session_id: 79
+    command: "UPDATE STATISTICS"
+    statement: "UPDATE STATISTICS [dbo].[MEASUREMENT] [PK_MEASUREMENT] WITH MAXDOP 2"
+    database: "PRODDB"
+    login_name: "CORP\\svc_sqlagent"
+    host_name: "SQLPROD01"
+    app_name: "SQLAgent - TSQL JobStep (Job 0x9B3C... : Step 1)"
+    blocked_behind: 16
+    waited_ms: 19280023
+    first_eligible: "2026-08-03T13:41:11Z"
+    killed_at: "2026-08-03T13:42:11Z"
+    agent_job:
+      resolved: true
+      job_id: "0x9B3C..."
+      job_name: "IndexOptimize - USER_DATABASES"
+      step_id: 1
+      step_name: "Update statistics"
+
+# Distinct SQL Agent jobs terminated by this run. Review before disabling:
+#   EXEC msdb.dbo.sp_update_job @job_name = N'IndexOptimize - USER_DATABASES', @enabled = 0;
+```
+
+`login_name`, `host_name`, `app_name` and `statement` are recorded on **every** entry,
+not only the attributed ones. When `resolved: false` — msdb unreadable, or a CmdExec /
+PowerShell step that carries no job id in `program_name` — `job_name` and `step_name`
+are omitted and those four fields are all the operator has to identify the source
+manually. That is precisely the case where they matter most, so they are never
+conditional on attribution succeeding.
+
+Multiple kills attributed to the same job produce one `killed:` entry each (they are
+distinct sessions, at distinct times) but a **single** `sp_update_job` line in the
+trailing comment block, deduplicated on job id.
 
 ### 3.4 TUI
 
 Reaction events already render in the incident feed, but a job warning that scrolls
 away is a warning nobody acts on. The distinct conflicting job names get a sticky line
 in the alert area, reusing the existing manifest-alert mechanism.
+
+Deduplication key: `(job_id, step_id)` when attribution resolved, falling back to the
+raw `program_name` when it did not — so an unattributed CmdExec step still produces
+one stable line rather than one per kill.
+
+Lifetime: the alerts clear at the end of the manifest, alongside the other
+manifest-scoped alerts. A queue that runs for hours would otherwise accumulate jobs
+from manifests the operator has already dealt with, and a stale alert is read as noise
+within about two manifests.
 
 ## 4. `ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY` preflight advisory
 
@@ -309,9 +387,13 @@ Everything decision-shaped is pure and needs no database:
 - eligibility timing against the fake clock (`internal/run/clock.go`);
 - `ignore_blocked_sessions` precedence (an ignored maintenance victim is never
   killed);
-- kill-failure withdrawal and the two-poll grace window;
-- `ParseJobStepProgram` table test, including a CmdExec program name that must not
-  match;
+- kill-failure withdrawal and the 15-second grace window, on the fake clock;
+- disjointness from `BlockerKiller` (§1.6): a snapshot showing a mutual block must
+  produce exactly one `KILL`, and must do so regardless of the order the two killers
+  are consulted in;
+- `ParseJobStepProgram` table test: the canonical form, tolerance for extra internal
+  whitespace and casing, a CmdExec program name that must not match, and a truncated
+  or malformed program name that must fail closed rather than yield a wrong job id;
 - the advisory decision function across the three emission rules in §4.
 
 Sampler-level tests assert the load-bearing invariant directly: an eligible victim
@@ -328,6 +410,13 @@ than about our logic:
 compose container is disproportionate to the risk, and the unit/integration split
 covers what can actually break. Recorded here as a deliberate omission rather than
 left silent.
+
+**No live-Agent-job test either.** Creating a job, starting it, and catching its
+`program_name` mid-flight would require enabling SQL Agent in the compose container
+and racing a running step — substantial machinery to test a fixed string format. The
+format is pinned by the table test above using real captured samples, and the part
+that genuinely depends on the server (the `uniqueidentifier` conversion in the msdb
+lookup) is already covered by the integration test below.
 
 ## 7. Files touched
 
