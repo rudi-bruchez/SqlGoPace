@@ -414,6 +414,30 @@ func TestModelShowsAlertAndKeepsItSticky(t *testing.T) {
 	}
 }
 
+func TestModelShowsConflictingJobsAndReplacesThem(t *testing.T) {
+	m := tui.New("reorganize_index dbo.MEASUREMENT", nil)
+	m, _ = send(m, tui.ConflictingJobsMsg{Jobs: []string{"IndexOptimize - USER_DATABASES (step 1)"}})
+	if got := m.View(); !strings.Contains(got, "IndexOptimize - USER_DATABASES (step 1)") {
+		t.Errorf("view does not show the conflicting job\n---\n%s", got)
+	}
+
+	// Replace semantics, not append: a second message supersedes the first.
+	m, _ = send(m, tui.ConflictingJobsMsg{Jobs: []string{"Nightly stats (step 2)"}})
+	got := m.View()
+	if strings.Contains(got, "IndexOptimize") {
+		t.Errorf("view still shows the superseded job\n---\n%s", got)
+	}
+	if !strings.Contains(got, "Nightly stats (step 2)") {
+		t.Errorf("view does not show the replacement job\n---\n%s", got)
+	}
+
+	// An empty set clears the line at the end of a manifest.
+	m, _ = send(m, tui.ConflictingJobsMsg{Jobs: nil})
+	if got := m.View(); strings.Contains(got, "Nightly stats") {
+		t.Errorf("view still shows a job after the set was cleared\n---\n%s", got)
+	}
+}
+
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", actions)

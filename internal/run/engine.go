@@ -183,6 +183,10 @@ type Engine struct {
 	liveReload       bool                  // re-read ignore_blocked_sessions from the manifest mid-run
 	killer           *BlockerKiller        // when set, kills matching blockers per kill_blocking_sessions
 	killDefaultAfter time.Duration         // default delay for a kill rule that sets none
+	victims          *VictimKiller         // when set, kills amplifying maintenance victims we block
+	victimPolicy     AmplifierPolicy       // the armed policy for that killer
+	asyncStats       AsyncStatsSetting     // ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY on the target
+	amplifierSink    func([]string)        // notified with the distinct conflicting jobs (TUI)
 	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)       // manifest-level per-operation progress (stdout + TUI)
@@ -235,6 +239,26 @@ func WithTempdbShrinkRunner(d TempdbShrinkDriver) EngineOption {
 // the sampler (ServerSampler.SetKiller) so it is consulted on each blocking poll.
 func WithBlockerKiller(k *BlockerKiller, defaultAfter time.Duration) EngineOption {
 	return func(e *Engine) { e.killer = k; e.killDefaultAfter = defaultAfter }
+}
+
+// WithVictimKiller arms the amplifying-maintenance-victim kill: the killer terminates
+// maintenance statements this run's operation blocks once other sessions have queued
+// behind them for the policy's dwell. The same killer must be attached to the sampler
+// (ServerSampler.SetVictimKiller) so it is consulted on each blocking poll.
+func WithVictimKiller(k *VictimKiller, p AmplifierPolicy) EngineOption {
+	return func(e *Engine) { e.victims = k; e.victimPolicy = p }
+}
+
+// WithAsyncStatsSetting supplies the target's ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY
+// state, used for the pre-reorganize advisory.
+func WithAsyncStatsSetting(s AsyncStatsSetting) EngineOption {
+	return func(e *Engine) { e.asyncStats = s }
+}
+
+// WithAmplifierSink is notified with the distinct SQL Agent jobs whose statements this
+// run has killed, whenever that set changes, and with nil at the end of each manifest.
+func WithAmplifierSink(f func([]string)) EngineOption {
+	return func(e *Engine) { e.amplifierSink = f }
 }
 
 // WithBatchDMLRunner routes ddl.BatchDML operations to the batch-DML driver instead
@@ -553,6 +577,20 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		defer e.killer.SetSource(nil)
 	}
 
+	// Arm the amplifying-victim killer for this manifest, if wired. Disarm when the
+	// manifest is done so a later manifest does not inherit its episode state, and
+	// clear the TUI's conflicting-jobs line at the same moment.
+	amplifiers := &amplifierCapture{}
+	if e.victims != nil {
+		e.victims.Arm(e.victimPolicy)
+		defer func() {
+			e.victims.Disarm()
+			if e.amplifierSink != nil {
+				e.amplifierSink(nil)
+			}
+		}()
+	}
+
 	var failedOps []ddl.Operation
 	captured := &blockerCapture{}
 	contended := &contendedCapture{}
@@ -606,6 +644,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			if ev.Tail != nil {
 				e.captureTail(contended, name, manifest.Database, *ev.Tail)
 			}
+			if ev.Amplifier != nil {
+				amplifiers.add(*ev.Amplifier, e.now())
+				e.flushAmplifiers(name, amplifiers)
+				if e.amplifierSink != nil {
+					e.amplifierSink(amplifiers.jobs())
+				}
+			}
 			detail := ev.Detail
 			if isInterruption(ev.Kind) {
 				if pct, ok := e.operationPercent(ctx); ok {
@@ -636,6 +681,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
 			}
 		}
+		// The victim killer emits kills on this operation's sink, from the pump
+		// goroutine. Each iteration overwrites it before any kill can occur, and
+		// Disarm clears it at the end of the manifest.
+		e.victims.SetSink(sink)
 		waitsBefore := e.snapshotWaits(ctx)
 
 		// Narrate, once each, the ignored sessions we hold the lock through, so the run
@@ -688,6 +737,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				db = e.database
 			}
 			if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
+				sink(ReactionEvent{Kind: "warn", Detail: msg})
+			}
+			if msg, ok := asyncStatsAdvisory(step.Operation, db, e.asyncStats); ok {
 				sink(ReactionEvent{Kind: "warn", Detail: msg})
 			}
 			switch op := step.Operation.(type) {

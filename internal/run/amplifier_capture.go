@@ -2,6 +2,8 @@ package run
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -133,4 +135,17 @@ func renderAmplifiers(name string, acc *amplifierCapture) []byte {
 		}
 	}
 	return []byte(b.String())
+}
+
+// flushAmplifiers writes the accumulated amplifier capture next to the manifest in
+// processing, so it is available during the run; relocateCaptures moves it to the
+// manifest's final directory on finalize.
+func (e *Engine) flushAmplifiers(name string, acc *amplifierCapture) {
+	if acc.len() == 0 {
+		return
+	}
+	path := filepath.Join(e.dirs.Processing, name+amplifierCaptureSuffix)
+	if err := os.WriteFile(path, renderAmplifiers(name, acc), 0o644); err != nil {
+		fmt.Fprintf(e.out, "write amplifier capture %s: %v\n", name, err)
+	}
 }

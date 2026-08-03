@@ -385,7 +385,9 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
 	}
-	killArmed := cfg.KillBlockers.Enabled || cfg.OptionsOverride.AllowAbortBlockers
+	killArmed := cfg.KillBlockers.Enabled ||
+		cfg.KillAmplifyingMaintenance.Enabled ||
+		cfg.OptionsOverride.AllowAbortBlockers
 	checker := run.NewPreflightChecker(conn, info, thresholds, killArmed)
 	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
@@ -403,6 +405,41 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		killer := run.NewBlockerKiller(conn.Kill, killed, nil)
 		sampler.SetKiller(killer)
 		killOpt = run.WithBlockerKiller(killer, cfg.KillBlockers.DefaultAfter())
+	}
+	// Amplifying-maintenance-victim kill (off unless armed in config): terminates a
+	// maintenance statement our operation blocks once other sessions have queued
+	// behind it. The killer is shared with the sampler, exactly like the blocker
+	// killer above.
+	var victimOpt run.EngineOption = func(*run.Engine) {}
+	if cfg.KillAmplifyingMaintenance.Enabled {
+		policy := run.AmplifierPolicy{
+			MinBlockedBehind: cfg.KillAmplifyingMaintenance.MinBehind(),
+			After:            cfg.KillAmplifyingMaintenance.After(),
+			Commands:         cfg.KillAmplifyingMaintenance.Commands,
+		}
+		// Presentation only. The engine's reaction sink records the same line in the
+		// run report, but in TUI mode engineOut is io.Discard (main.go:206), so without
+		// this forward the operator would see no per-kill narration at all.
+		amplifierKilled := func(ev run.AmplifierKillEvent) {
+			detail := run.AmplifierDetail(ev)
+			fmt.Fprintf(engineOut, "-- %s\n", detail)
+			if fwd != nil {
+				fwd.send(tui.LogMsg{Line: detail})
+			}
+		}
+		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, mssql.AppNamePrefix)
+		sampler.SetVictimKiller(victims)
+		victimOpt = run.WithVictimKiller(victims, policy)
+	}
+	// ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY is database-scoped, so it must be read
+	// from this per-database conn, not the startup connection — otherwise a
+	// multi-database run would report the wrong database's setting.
+	asyncStats := run.AsyncStatsAbsent
+	if on, present, err := conn.AsyncStatsWaitAtLowPriority(ctx); err == nil && present {
+		asyncStats = run.AsyncStatsOff
+		if on {
+			asyncStats = run.AsyncStatsOn
+		}
 	}
 	runner := run.NewMonitoredRunner(conn, sampler, run.System, run.RunnerConfig{
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
@@ -493,6 +530,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		run.WithDrainSignal(drain),
 		run.WithOutput(engineOut),
 		run.WithStepSink(stepSink),
+		victimOpt,
+		run.WithAsyncStatsSetting(asyncStats),
+		run.WithAmplifierSink(func(jobs []string) {
+			if fwd != nil {
+				fwd.send(tui.ConflictingJobsMsg{Jobs: jobs})
+			}
+		}),
 	}
 	if killOpt != nil {
 		opts = append(opts, killOpt)

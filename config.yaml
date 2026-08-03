@@ -107,4 +107,16 @@ kill_blockers:
   enabled: true                # master arm; kills only happen when true
   default_after_seconds: 60    # delay applied to a rule that sets no after_seconds
 
+# Terminate maintenance statements this run's operation blocks once other sessions
+# have queued behind them. An online REORGANIZE stops being online the moment a
+# Sch-M request (UPDATE STATISTICS, ALTER INDEX, TRUNCATE TABLE, ...) queues behind
+# it: every reader arriving afterwards queues behind that request rather than
+# barging past. Off by default. Requires ALTER ANY CONNECTION, and SELECT on
+# msdb.dbo.sysjobs to name the SQL Agent job (optional; attribution degrades without it).
+kill_amplifying_maintenance:
+  enabled: false
+  min_blocked_behind: 1   # sessions queued behind the victim before it counts as an amplifier
+  after_seconds: 60       # how long it must stay eligible before the KILL
+  commands: []            # empty = the built-in allow-list; a non-empty list REPLACES it
+
 matrix_file: "./ddl_compatibility.yaml"

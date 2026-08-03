@@ -181,6 +181,12 @@ type (
 	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
+	// ConflictingJobsMsg carries the SQL Agent jobs whose maintenance statements this
+	// run has terminated, for a sticky line above the dashboard. Unlike AlertMsg it
+	// REPLACES the current set rather than appending: the jobs are manifest-scoped, and
+	// the engine sends an empty set when it finishes a manifest. Reusing AlertMsg would
+	// mean teaching a never-cleared slice to clear, changing every existing alert.
+	ConflictingJobsMsg struct{ Jobs []string }
 	// ServerInfoMsg carries the target's identity for the header banner. Sent once at
 	// startup; App is the SqlGoPace version, Product the SQL Server year label.
 	ServerInfoMsg struct {
@@ -297,6 +303,7 @@ type Model struct {
 	blockers        []Blocker
 	waits           []WaitCategory
 	waitTotalMS     int64
+	conflictJobs    []string
 	cursor          int
 	mode            inputMode
 	notice          string // last host feedback line (e.g. "ignoring SPID 53 …")
@@ -527,6 +534,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tick()
 	case LogMsg:
 		m.notice = msg.Line
+	case ConflictingJobsMsg:
+		m.conflictJobs = msg.Jobs
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}

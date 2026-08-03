@@ -92,9 +92,10 @@ func (m Model) View() string {
 	return b.String()
 }
 
-// alertsBlock renders the sticky failure alerts shown above the dashboard, or "" when none.
+// alertsBlock renders the sticky failure alerts and conflicting-job notices shown
+// above the dashboard, or "" when there are none.
 func (m Model) alertsBlock() string {
-	if len(m.alerts) == 0 {
+	if len(m.alerts) == 0 && len(m.conflictJobs) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -105,6 +106,15 @@ func (m Model) alertsBlock() string {
 		b.WriteString(alertStyle.Render("⚠ " + a.Title))
 		for _, line := range a.Lines {
 			b.WriteString("\n" + alertStyle.Render("    "+line))
+		}
+	}
+	if len(m.conflictJobs) > 0 {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(alertStyle.Render("⚠ conflicting SQL Agent jobs terminated this run"))
+		for _, j := range m.conflictJobs {
+			b.WriteString("\n" + alertStyle.Render("    "+j+" — consider disabling it during maintenance"))
 		}
 	}
 	return b.String()
