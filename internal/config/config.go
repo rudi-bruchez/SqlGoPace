@@ -24,17 +24,17 @@ var ErrInvalidConfig = errors.New("invalid config")
 // Config is the full SqlGoPace configuration.
 type Config struct {
 	Database                  DatabaseConfig                  `yaml:"database"`
-	Directories                DirectoriesConfig              `yaml:"directories"`
-	Monitoring                 MonitoringConfig                `yaml:"monitoring"`
-	Preflight                  PreflightConfig                 `yaml:"preflight"`
-	OptionsOverride            OptionsOverrideConfig           `yaml:"options_override"`
-	Notifications              NotificationsConfig             `yaml:"notifications"`
-	History                    HistoryConfig                   `yaml:"history"`
-	Shrink                     ShrinkConfig                    `yaml:"shrink"`
-	BatchDML                   BatchDMLConfig                  `yaml:"batch_dml"`
-	KillBlockers               KillBlockersConfig              `yaml:"kill_blockers"`
-	KillAmplifyingMaintenance  KillAmplifyingMaintenanceConfig `yaml:"kill_amplifying_maintenance"`
-	MatrixFile                 string                          `yaml:"matrix_file"`
+	Directories               DirectoriesConfig               `yaml:"directories"`
+	Monitoring                MonitoringConfig                `yaml:"monitoring"`
+	Preflight                 PreflightConfig                 `yaml:"preflight"`
+	OptionsOverride           OptionsOverrideConfig           `yaml:"options_override"`
+	Notifications             NotificationsConfig             `yaml:"notifications"`
+	History                   HistoryConfig                   `yaml:"history"`
+	Shrink                    ShrinkConfig                    `yaml:"shrink"`
+	BatchDML                  BatchDMLConfig                  `yaml:"batch_dml"`
+	KillBlockers              KillBlockersConfig              `yaml:"kill_blockers"`
+	KillAmplifyingMaintenance KillAmplifyingMaintenanceConfig `yaml:"kill_amplifying_maintenance"`
+	MatrixFile                string                          `yaml:"matrix_file"`
 }
 
 // KillBlockersConfig arms the selective blocker-kill policy. The match rules themselves

@@ -65,7 +65,7 @@ type victimEpisode struct {
 type VictimKiller struct {
 	kill        func(context.Context, int) error
 	resolve     func(context.Context, string, int) (mssql.AgentJob, error)
-	onKill      func(AmplifierKillEvent) // presentation only (console + TUI); see notify
+	onKill      func(AmplifierKillEvent) // presentation only (console + TUI); called unlocked, see consider
 	clk         Clock
 	selfProgram string // our own application name prefix; never kill a session running it
 
@@ -172,23 +172,59 @@ func (k *VictimKiller) Suppressed(spid int) bool {
 	}
 }
 
+// pendingEmit is a reaction event to emit once the killer's mutex is released. Kill is
+// non-nil for a successful amplifier kill: its Job field is not yet resolved (attribute
+// makes a synchronous msdb round trip) and Event.Detail is not yet rendered (AmplifierDetail
+// needs the resolved Job) — consider fills both after unlocking, then calls onKill too. Kill
+// is nil for a failed-KILL warn, whose Event is already complete and never triggers onKill.
+type pendingEmit struct {
+	Event ReactionEvent
+	Kill  *AmplifierKillEvent
+}
+
 // consider inspects one snapshot, updates episode state for every direct victim, and
 // kills the ones that have been eligible for the policy's dwell. A no-op when
 // disarmed. Victims absent from this snapshot have their episodes dropped, so the
 // dwell restarts if they come back.
 //
-// It runs on the PUMP goroutine, from ServerSampler.Blocking. A kill (and the msdb
-// attribution lookup behind it) is synchronous server I/O on that path, so on a loaded
-// server it can delay the next blocking sample past its interval. Acceptable for an
-// opt-in feature that fires rarely; do not add per-poll work here casually.
+// It runs on the PUMP goroutine, from ServerSampler.Blocking. The eligibility scan and
+// each due KILL happen under k.mu, in considerLocked — that lock is what makes a kill
+// at-most-once per episode. The resulting sink/onKill callbacks, and the msdb attribution
+// lookup behind a successful kill's Job field, run here AFTER considerLocked returns and
+// the lock is released: were they still under mu, Disarm (called from the engine goroutine
+// at manifest end) would block behind whichever call is slow, and SqlGoPace has no query
+// timeouts to bound that wait.
 func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) {
 	if k == nil {
 		return
 	}
+	pending, sink, onKill := k.considerLocked(ctx, sessions, ddlSPID, ignore)
+	for _, p := range pending {
+		ev := p.Event
+		if p.Kill != nil {
+			p.Kill.Job = k.attribute(ctx, p.Kill.Program)
+			ev.Detail = AmplifierDetail(*p.Kill)
+			ev.Amplifier = p.Kill
+		}
+		if sink != nil {
+			sink(ev)
+		}
+		if p.Kill != nil && onKill != nil {
+			onKill(*p.Kill)
+		}
+	}
+}
+
+// considerLocked runs the eligibility scan and issues each due KILL, under k.mu, and
+// returns what consider must emit once unlocked — plus a snapshot of k.sink and k.onKill
+// (mutable via SetSink, so they must be read under the same lock). It does not itself
+// call either callback or the msdb resolver: see consider for why that matters.
+func (k *VictimKiller) considerLocked(ctx context.Context, sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (pending []pendingEmit, sink ReactionSink, onKill func(AmplifierKillEvent)) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	sink, onKill = k.sink, k.onKill
 	if !k.armed {
-		return
+		return nil, sink, onKill
 	}
 
 	now := k.clk.Now()
@@ -214,17 +250,15 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 			// Amplifier stays nil — that field means a kill happened, and here it did
 			// not — but a failed KILL must still be operator-visible, not a silent
 			// fallback to the normal yield timer.
-			if k.sink != nil {
-				k.sink(ReactionEvent{
-					Kind: "warn",
-					Detail: fmt.Sprintf("failed to kill amplifying maintenance session SPID %d (%s): %v",
-						v.SPID, v.Command, err),
-				})
-			}
+			pending = append(pending, pendingEmit{Event: ReactionEvent{
+				Kind: "warn",
+				Detail: fmt.Sprintf("failed to kill amplifying maintenance session SPID %d (%s): %v",
+					v.SPID, v.Command, err),
+			}})
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
-		k.notify(ctx, v, sessions, ep.since, now.Sub(ep.since))
+		pending = append(pending, pendingKill(v, sessions, ep.since, now.Sub(ep.since)))
 	}
 	// Drop episodes for victims no longer eligible, except those inside their grace
 	// window — a killed victim leaves the snapshot, and dropping it early would end
@@ -235,6 +269,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 		}
 		delete(k.episodes, spid)
 	}
+	return pending, sink, onKill
 }
 
 // eligible applies the six conditions of the design's §1.3, in cheapest-first order.
@@ -260,15 +295,18 @@ func (k *VictimKiller) blocksUs(spid int, sessions []mssql.Session, ddlSPID int)
 	return mssql.FindSelfBlock(sessions, ddlSPID).SPID == spid
 }
 
-// notify resolves the victim's Agent job (cached) and delivers the kill on both
-// routes: the sink (engine — run report and sidecar) and onKill (presentation —
-// console and TUI). Called with mu held.
-func (k *VictimKiller) notify(ctx context.Context, v mssql.Session, sessions []mssql.Session, firstEligible time.Time, waited time.Duration) {
+// pendingKill builds the not-yet-attributed emission for a successful kill: everything
+// except Job (attribute makes a synchronous msdb round trip) and Event.Detail
+// (AmplifierDetail needs the resolved Job) — consider fills both once the lock from
+// considerLocked is released. It touches no VictimKiller state, so it needs no lock
+// itself; it is called from inside considerLocked only because that is where the
+// episode's since/waited values are at hand.
+func pendingKill(v mssql.Session, sessions []mssql.Session, firstEligible time.Time, waited time.Duration) pendingEmit {
 	stmt := v.ActiveQuery
 	if stmt == "" {
 		stmt = v.ParentQuery
 	}
-	ev := AmplifierKillEvent{
+	ev := &AmplifierKillEvent{
 		SPID:          v.SPID,
 		Command:       v.Command,
 		Statement:     stmt,
@@ -280,14 +318,8 @@ func (k *VictimKiller) notify(ctx context.Context, v mssql.Session, sessions []m
 		WaitedMS:      v.WaitMS,
 		FirstEligible: firstEligible,
 		Waited:        waited,
-		Job:           k.attribute(ctx, v.Program),
 	}
-	if k.sink != nil {
-		k.sink(ReactionEvent{Kind: "kill", Detail: AmplifierDetail(ev), Amplifier: &ev})
-	}
-	if k.onKill != nil {
-		k.onKill(ev)
-	}
+	return pendingEmit{Event: ReactionEvent{Kind: "kill"}, Kill: ev}
 }
 
 // statementExcerpt trims a statement to a single readable line for the narration.
@@ -327,19 +359,31 @@ func AmplifierDetail(ev AmplifierKillEvent) string {
 // attribute resolves an Agent job from a program_name, caching per (job, step).
 // An unparseable program name, a nil resolver, or an msdb failure all yield an
 // unresolved AgentJob — the caller falls back to the raw program/login/host.
+//
+// The cache is read and written under k.mu, but resolve itself — a synchronous msdb
+// query — runs with the lock released: holding it across a server round trip would
+// block Disarm (and any other lock waiter) for as long as that query takes, and
+// SqlGoPace has no query timeouts to bound it. A cache miss racing with another lookup
+// for the same job just resolves it twice; both calls agree on the answer, so the
+// second store simply overwrites the first with an equal value.
 func (k *VictimKiller) attribute(ctx context.Context, program string) mssql.AgentJob {
 	hex, step, ok := mssql.ParseJobStepProgram(program)
 	if !ok || k.resolve == nil {
 		return mssql.AgentJob{}
 	}
 	key := hex + ":" + strconv.Itoa(step)
-	if job, hit := k.jobs[key]; hit {
+	k.mu.Lock()
+	job, hit := k.jobs[key]
+	k.mu.Unlock()
+	if hit {
 		return job
 	}
 	job, err := k.resolve(ctx, hex, step)
 	if err != nil {
 		return mssql.AgentJob{}
 	}
+	k.mu.Lock()
 	k.jobs[key] = job
+	k.mu.Unlock()
 	return job
 }

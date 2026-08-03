@@ -432,6 +432,70 @@ func TestVictimKillerDefaultsSelfProgramWhenEmpty(t *testing.T) {
 	}
 }
 
+// TestVictimKillerCallbacksRunUnlocked covers the review finding that the sink and
+// onKill callbacks used to fire while k.mu was held (inside the old notify method,
+// called from considerLocked's predecessor): Disarm — called from the engine goroutine
+// at manifest end — would then block behind whichever callback was slow, and SqlGoPace
+// has no query timeouts to bound that wait. Calling Suppressed (which itself takes k.mu)
+// from inside the sink is a lock-reentrancy probe: sync.Mutex is not reentrant, so a
+// regression back to notify-under-lock hangs this test rather than merely failing an
+// assertion — which is exactly the "silent regression" the coordinator's review warned
+// against missing.
+func TestVictimKillerCallbacksRunUnlocked(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	var (
+		sinkCalled             bool
+		suppressedDuringSink   bool
+		onKillCalled           bool
+		suppressedDuringOnKill bool
+	)
+	f.killer.SetSink(func(ev ReactionEvent) {
+		if ev.Amplifier == nil {
+			return
+		}
+		sinkCalled = true
+		suppressedDuringSink = f.killer.Suppressed(ev.Amplifier.SPID)
+	})
+	// newVictimFixture's onKill only appends to f.narrated, so probe onKill's locking
+	// with a second, purpose-built killer whose onKill also calls Suppressed. Declared
+	// before NewVictimKiller so the closure can capture the variable (assigned below,
+	// but not invoked until consider() runs, well after k2 is set).
+	var k2 *VictimKiller
+	k2 = NewVictimKiller(
+		func(_ context.Context, spid int) error { return nil },
+		func(_ context.Context, hex string, step int) (mssql.AgentJob, error) {
+			return mssql.AgentJob{}, nil
+		},
+		func(ev AmplifierKillEvent) {
+			onKillCalled = true
+			suppressedDuringOnKill = k2.Suppressed(ev.SPID)
+		},
+		f.clk,
+		mssql.AppNamePrefix,
+	)
+	k2.Arm(defaultPolicy())
+
+	snap := amplifierSnapshot(16)
+	f.killer.consider(context.Background(), snap, 67, nil)
+	k2.consider(context.Background(), snap, 67, nil)
+	f.clk.Advance(61 * time.Second)
+	f.killer.consider(context.Background(), snap, 67, nil)
+	k2.consider(context.Background(), snap, 67, nil)
+
+	if !sinkCalled {
+		t.Fatal("sink was never called with an Amplifier event")
+	}
+	if !suppressedDuringSink {
+		t.Error("Suppressed(79) = false when called from inside the sink, want true — the kill was already recorded when the sink fired")
+	}
+	if !onKillCalled {
+		t.Fatal("onKill was never called")
+	}
+	if !suppressedDuringOnKill {
+		t.Error("Suppressed(79) = false when called from inside onKill, want true")
+	}
+}
+
 func TestAmplifierDetailNamesTheObjectAndJob(t *testing.T) {
 	ev := AmplifierKillEvent{
 		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 16,
