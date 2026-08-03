@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -315,6 +316,28 @@ func TestKillAmplifyingMaintenanceDefaults(t *testing.T) {
 	}
 	if len(k.Commands) != 0 {
 		t.Errorf("Commands = %v, want empty — an empty list means the built-in allow-list", k.Commands)
+	}
+}
+
+// A dangling YAML item leaves an empty string in the list, which is a prefix of every
+// command verb — the allow-list would silently become "kill every session we block".
+func TestKillAmplifyingMaintenanceRejectsEmptyCommand(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	for _, entry := range []string{`""`, `"   "`} {
+		yaml := validYAML + "kill_amplifying_maintenance:\n" +
+			"  enabled: true\n" +
+			"  commands: [" + entry + ", \"UPDATE STATISTIC\"]\n"
+		_, err := config.Parse([]byte(yaml))
+		if err == nil {
+			t.Fatalf("Parse() with a %s commands entry error = nil, want non-nil", entry)
+		}
+		if !errors.Is(err, config.ErrInvalidConfig) {
+			t.Errorf("Parse() error = %v, want it to wrap ErrInvalidConfig", err)
+		}
+		if !strings.Contains(err.Error(), "kill_amplifying_maintenance.commands") {
+			t.Errorf("Parse() error = %v, want it to name the option", err)
+		}
 	}
 }
 

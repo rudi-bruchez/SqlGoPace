@@ -48,6 +48,11 @@ func DefaultAmplifyingCommands() []string {
 // allow means the built-in list, never "match nothing". Matching is case-insensitive,
 // space-trimmed, and by prefix. It is deliberately separate from IsMaintenanceCommand,
 // which answers a different question for the shrink driver and must not change.
+//
+// An entry that is empty after trimming is skipped rather than treated as a prefix:
+// every string has the empty prefix, so a dangling YAML item would silently turn the
+// allow-list into "kill anything we block". Config validation rejects such an entry
+// outright; this is the second half of that guard, for any other caller.
 func IsAmplifyingCommand(cmd string, allow []string) bool {
 	c := strings.ToUpper(strings.TrimSpace(cmd))
 	if c == "" {
@@ -58,7 +63,11 @@ func IsAmplifyingCommand(cmd string, allow []string) bool {
 		list = allow
 	}
 	for _, want := range list {
-		if strings.HasPrefix(c, strings.ToUpper(strings.TrimSpace(want))) {
+		want = strings.ToUpper(strings.TrimSpace(want))
+		if want == "" {
+			continue
+		}
+		if strings.HasPrefix(c, want) {
 			return true
 		}
 	}

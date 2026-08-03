@@ -56,6 +56,13 @@ func TestIsAmplifyingCommand(t *testing.T) {
 		{name: "override matches its own entry", cmd: "UPDATE STATISTICS", allow: []string{"UPDATE STATISTIC"}, want: true},
 		{name: "override entry is case folded", cmd: "UPDATE STATISTICS", allow: []string{"update statistic"}, want: true},
 		{name: "empty override falls back to built-in", cmd: "ALTER INDEX", allow: []string{}, want: true},
+		// A dangling YAML item leaves "" in the list. Every string has the empty
+		// prefix, so treating it as one would kill every session we block — an
+		// application SELECT, an INSERT, an open user transaction.
+		{name: "empty entry does not match a select", cmd: "SELECT", allow: []string{"", "UPDATE STATISTIC"}, want: false},
+		{name: "whitespace entry does not match a select", cmd: "SELECT", allow: []string{" ", "UPDATE STATISTIC"}, want: false},
+		{name: "empty entry does not widen an insert", cmd: "INSERT", allow: []string{""}, want: false},
+		{name: "real entries beside an empty one still match", cmd: "UPDATE STATISTICS", allow: []string{"", "UPDATE STATISTIC"}, want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

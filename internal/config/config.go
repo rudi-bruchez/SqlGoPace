@@ -448,6 +448,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",
 			c.BatchDML.MinRows, c.BatchDML.MaxRows, ErrInvalidConfig)
 	}
+	// An entry that is empty after trimming would be a prefix of every command verb,
+	// turning the allow-list into "kill every session we block" — including application
+	// SELECTs and open user transactions. A dangling YAML item is the easy way to write
+	// one, so refuse to start rather than run with a silently widened policy.
+	for i, cmd := range c.KillAmplifyingMaintenance.Commands {
+		if strings.TrimSpace(cmd) == "" {
+			return fmt.Errorf("kill_amplifying_maintenance.commands[%d] is empty; remove the entry or name a command verb: %w",
+				i, ErrInvalidConfig)
+		}
+	}
 	if e := c.Notifications.Email; e.Host != "" {
 		if strings.TrimSpace(e.From) == "" || len(e.To) == 0 {
 			return fmt.Errorf("notifications.email.from and at least one to are required when host is set: %w", ErrInvalidConfig)
