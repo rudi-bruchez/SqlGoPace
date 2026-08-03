@@ -417,17 +417,20 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 			After:            cfg.KillAmplifyingMaintenance.After(),
 			Commands:         cfg.KillAmplifyingMaintenance.Commands,
 		}
-		// Presentation only. The engine's reaction sink records the same line in the
-		// run report, but in TUI mode engineOut is io.Discard (main.go:206), so without
-		// this forward the operator would see no per-kill narration at all.
+		// Presentation only, and only for the TUI: in TUI mode engineOut is io.Discard
+		// (main.go:206), so the engine's reaction sink — which renders the very same
+		// line — reaches nobody. In non-TUI mode that sink already prints to stdout, so
+		// writing here too would narrate every kill twice.
 		amplifierKilled := func(ev run.AmplifierKillEvent) {
-			detail := run.AmplifierDetail(ev)
-			fmt.Fprintf(engineOut, "-- %s\n", detail)
 			if fwd != nil {
-				fwd.send(tui.LogMsg{Line: detail})
+				fwd.send(tui.LogMsg{Line: run.AmplifierDetail(ev)})
 			}
 		}
-		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, mssql.AppNamePrefix)
+		// Self-exclusion keys off this connection's effective application name, not the
+		// mssql.AppNamePrefix constant: a DSN carrying `app name=...` changes what our
+		// own sessions report as program_name, and a stale constant would let one
+		// instance of a size-split campaign kill another's in-flight REBUILD.
+		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, conn.AppNamePrefix())
 		sampler.SetVictimKiller(victims)
 		victimOpt = run.WithVictimKiller(victims, policy)
 	}

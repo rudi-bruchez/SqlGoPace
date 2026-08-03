@@ -21,3 +21,31 @@ func TestAppNameWithVersion(t *testing.T) {
 		})
 	}
 }
+
+// The victim killer excludes our own sessions by prefix-matching program_name against
+// this value, so it has to be what the DSN actually configured — not the constant.
+func TestAppNameBase(t *testing.T) {
+	tests := []struct {
+		name, app, want string
+	}{
+		{"dsn app name wins over the constant", "DBAToolkit", "DBAToolkit"},
+		{"driver default falls back", "go-mssqldb", AppNamePrefix},
+		{"empty falls back", "", AppNamePrefix},
+		{"whitespace trimmed", "  DBAToolkit  ", "DBAToolkit"},
+		{"already a base is idempotent", AppNamePrefix, AppNamePrefix},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := appNameBase(tt.app); got != tt.want {
+				t.Errorf("appNameBase(%q) = %q, want %q", tt.app, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConnAppNamePrefix(t *testing.T) {
+	c := &Conn{appName: appNameBase("DBAToolkit")}
+	if got := c.AppNamePrefix(); got != "DBAToolkit" {
+		t.Errorf("AppNamePrefix() = %q, want %q", got, "DBAToolkit")
+	}
+}
