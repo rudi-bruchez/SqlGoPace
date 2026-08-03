@@ -912,9 +912,20 @@ func (e *Engine) killSource(name string, rules []ddl.KilledSession) (KillSource,
 	return staticKill{rules: compiled}, nil
 }
 
+// stopVictims stops the amplifying-victim killer for the manifest that is finishing.
+// Disarm clears the sink as well as the episodes, so no kill decided after this point
+// can reach the finished operation's sink — which would re-create the .amplifiers.yaml
+// sidecar in processing right after relocateCaptures moved it, leaving a file nothing
+// ever cleans up. It must therefore run BEFORE any relocation: processOne's
+// `defer e.victims.Disarm()` runs after finalize returns, far too late. Nil-receiver
+// safe and idempotent, so every finalize path can call it and the defer still stands as
+// a backstop.
+func (e *Engine) stopVictims() { e.victims.Disarm() }
+
 // finalize records a terminal outcome: moves the manifest, writes the report,
 // notifies, and persists history.
 func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunReport, start time.Time, success bool) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -995,6 +1006,7 @@ func shrinkShortReason(results []ShrinkResult) string {
 // distinctly in the run summary. It does not join e.failures — that list drives the
 // "FAILED" echo and the failed exit code; an incomplete run is surfaced separately.
 func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *report.RunReport, start time.Time) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -1036,6 +1048,7 @@ func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, 
 // recovery manifest (the failed operations, carrying on_failure: continue) next to
 // it, and reports/records the run like a failure so the exit code reflects it.
 func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -1199,6 +1212,9 @@ func (e *Engine) finalizeInterrupted(ctx context.Context, name string, rep *repo
 // INTERRUPTED outcome, report, notify, and history) without moving the manifest — it is
 // left in processing. The caller sets rep.Error and prints its own log line.
 func (e *Engine) recordInterrupted(ctx context.Context, name string, rep *report.RunReport, start time.Time) {
+	// The manifest stays in processing, so nothing is relocated here — but the report is
+	// written now, and a kill landing after it would be in the sidecar and not in the .log.
+	e.stopVictims()
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"

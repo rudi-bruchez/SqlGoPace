@@ -144,6 +144,16 @@ func (e *Engine) flushAmplifiers(name string, acc *amplifierCapture) {
 	if acc.len() == 0 {
 		return
 	}
+	// A kill already in flight when the manifest finalized still reaches that operation's
+	// sink — the killer snapshots the sink before issuing the KILL — and by then the queue
+	// has moved the manifest out of processing and relocateCaptures has moved this sidecar
+	// with it. Writing it back would resurrect a file nothing ever cleans up (Recover only
+	// sweeps .state.json orphans and .sqlgopace-*.tmp), so anchor the write to the manifest
+	// still being in processing. A drained or interrupted manifest stays there, and so does
+	// its sidecar, which is the intended behavior.
+	if _, err := os.Stat(filepath.Join(e.dirs.Processing, name)); err != nil {
+		return
+	}
 	path := filepath.Join(e.dirs.Processing, name+amplifierCaptureSuffix)
 	if err := os.WriteFile(path, renderAmplifiers(name, acc), 0o644); err != nil {
 		fmt.Fprintf(e.out, "write amplifier capture %s: %v\n", name, err)

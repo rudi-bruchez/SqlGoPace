@@ -1,6 +1,10 @@
 package run
 
 import (
+	"context"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -114,5 +118,119 @@ func TestAmplifierCaptureJobsFallsBackToProgram(t *testing.T) {
 	jobs := acc.jobs()
 	if len(jobs) != 1 || !strings.Contains(jobs[0], "SQLAgent - Job invocation engine") {
 		t.Errorf("jobs() = %v, want one entry keyed on the raw program name", jobs)
+	}
+}
+
+// amplifierEngine builds an Engine over a fresh queue layout with the manifest already
+// in processing, plus the per-operation sink processOne installs on the victim killer.
+func amplifierEngine(t *testing.T, name string) (*Engine, *amplifierCapture, ReactionSink) {
+	t.Helper()
+	root := t.TempDir()
+	dirs := Dirs{
+		ToRun:      filepath.Join(root, "01.to_run"),
+		Processing: filepath.Join(root, "02.processing"),
+		Done:       filepath.Join(root, "03.done"),
+		Failed:     filepath.Join(root, "04.failed"),
+	}
+	if err := NewQueue(dirs).EnsureDirs(); err != nil {
+		t.Fatalf("EnsureDirs() error = %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dirs.Processing, name), []byte("operations: []\n"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	e := &Engine{dirs: dirs, queue: NewQueue(dirs), clk: System, out: io.Discard}
+	acc := &amplifierCapture{}
+	sink := func(ev ReactionEvent) {
+		if ev.Amplifier == nil {
+			return
+		}
+		acc.add(*ev.Amplifier, e.now())
+		e.flushAmplifiers(name, acc)
+	}
+	return e, acc, sink
+}
+
+// TestStopVictimsPreventsSidecarResurrection covers review finding 2: processOne's
+// `defer e.victims.Disarm()` runs AFTER finalize has relocated the sidecars, so a kill
+// landing in that window reached the still-installed sink and re-created
+// .amplifiers.yaml in processing — a file nothing ever cleans up. Every finalize path
+// now stops the killer before any relocation.
+func TestStopVictimsPreventsSidecarResurrection(t *testing.T) {
+	const name = "032-compress-small.yaml"
+	e, acc, sink := amplifierEngine(t, name)
+	f := newVictimFixture(t, defaultPolicy())
+	f.killer.SetSink(sink)
+	e.victims = f.killer
+
+	// A kill during the run writes the sidecar next to the manifest in processing.
+	snap := amplifierSnapshot(16)
+	f.killer.consider(context.Background(), snap, 67, nil)
+	f.clk.Advance(61 * time.Second)
+	f.killer.consider(context.Background(), snap, 67, nil)
+	sidecar := filepath.Join(e.dirs.Processing, name+amplifierCaptureSuffix)
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("sidecar not written during the run: %v", err)
+	}
+
+	// Finalize: the killer stops first, then the manifest and its sidecars are moved.
+	e.stopVictims()
+	if err := e.queue.Fail(name); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	e.relocateCaptures(name, e.dirs.Failed)
+	if _, err := os.Stat(filepath.Join(e.dirs.Failed, name+amplifierCaptureSuffix)); err != nil {
+		t.Fatalf("sidecar not relocated to failed: %v", err)
+	}
+
+	// A late poll that would have killed another amplifier must reach nothing.
+	// A second amplifier appears (SPID 84, with its own readers queued behind it).
+	late := amplifierSnapshot(16)
+	for i := range late {
+		if late[i].SPID == 79 {
+			late[i].SPID = 84
+		}
+		if late[i].BlockingSPID == 79 {
+			late[i].BlockingSPID = 84
+		}
+	}
+	f.killer.consider(context.Background(), late, 67, nil)
+	f.clk.Advance(61 * time.Second)
+	f.killer.consider(context.Background(), late, 67, nil)
+	if len(f.killed) != 1 {
+		t.Errorf("killed = %v after finalize, want only the one kill from the run — the killer is disarmed", f.killed)
+	}
+	if acc.len() != 1 {
+		t.Errorf("capture holds %d kills after finalize, want 1 — the sink is cleared", acc.len())
+	}
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("os.Stat(%s) err = %v, want not-exist — finalize already relocated it", sidecar, err)
+	}
+}
+
+// TestFlushAmplifiersSkipsWhenTheManifestLeftProcessing covers the other half of review
+// finding 2: a KILL already in flight when the manifest finalized still calls the sink it
+// snapshotted, so ordering alone cannot close the window. The write is anchored to the
+// manifest still being in processing.
+func TestFlushAmplifiersSkipsWhenTheManifestLeftProcessing(t *testing.T) {
+	const name = "032-compress-small.yaml"
+	e, acc, _ := amplifierEngine(t, name)
+	acc.add(amplifierEvent(79, resolvedJob()), "2026-08-03T13:42:11Z")
+
+	e.flushAmplifiers(name, acc)
+	sidecar := filepath.Join(e.dirs.Processing, name+amplifierCaptureSuffix)
+	if _, err := os.Stat(sidecar); err != nil {
+		t.Fatalf("sidecar not written while the manifest is in processing: %v", err)
+	}
+	if err := os.Remove(sidecar); err != nil {
+		t.Fatalf("remove sidecar: %v", err)
+	}
+
+	// The manifest has finalized: it left processing and its sidecar went with it.
+	if err := e.queue.Fail(name); err != nil {
+		t.Fatalf("Fail() error = %v", err)
+	}
+	e.flushAmplifiers(name, acc)
+	if _, err := os.Stat(sidecar); !os.IsNotExist(err) {
+		t.Errorf("os.Stat(%s) err = %v, want not-exist — the manifest is no longer in processing", sidecar, err)
 	}
 }
