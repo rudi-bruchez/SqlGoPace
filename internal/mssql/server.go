@@ -9,6 +9,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -94,4 +95,24 @@ func DetectServer(ctx context.Context, conn *sql.Conn) (ServerInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+const asyncStatsWALPSQL = `
+SELECT CONVERT(bit, value)
+FROM sys.database_scoped_configurations
+WHERE name = 'ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY';`
+
+// AsyncStatsWaitAtLowPriority reads the ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY
+// database-scoped configuration. present is false on a server where the setting does
+// not exist (before SQL Server 2022), which is not an error — the caller emits no
+// advisory in that case.
+func (c *Conn) AsyncStatsWaitAtLowPriority(ctx context.Context) (on bool, present bool, err error) {
+	switch err := c.pool.QueryRowContext(ctx, asyncStatsWALPSQL).Scan(&on); {
+	case errors.Is(err, sql.ErrNoRows):
+		return false, false, nil
+	case err != nil:
+		return false, false, fmt.Errorf("read ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY: %w", err)
+	default:
+		return on, true, nil
+	}
 }
