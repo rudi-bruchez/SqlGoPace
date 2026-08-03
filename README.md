@@ -115,6 +115,16 @@ paces instead by cancelling and re-issuing the statement (SQL Server persists it
 progress across the cancel) and warns at start if RCSI is off on the target database,
 since readers will then block on its page locks.
 
+On SQL Server 2022+ it also checks the database-scoped
+`ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY` setting and, when it is off, recommends turning it
+on: doing so lets *automatic, asynchronous* statistics updates queue politely at low priority
+instead of blocking the reorganize. The advisory states its own limit in the same breath —
+enabling the setting does **not** cover an explicit `UPDATE STATISTICS` run by a job or by hand;
+those still block and can still queue readers behind them, which is exactly the collision the
+`kill_amplifying_maintenance` feature (below) exists to clear. When the setting is already on,
+the advisory still repeats that limitation, so an operator who has already enabled it is not
+left assuming explicit `UPDATE STATISTICS` is handled too.
+
 ## Installation
 
 Requires Go 1.26+.
@@ -374,6 +384,107 @@ exclusion takes effect before the next abort. It is also folded into the recover
 later resumed run remembers it. In the interactive console (`--tui`), select a blocked session and
 press `i`, then pick the criterion (`s` session_id / `a` app_name / `l` login_name / `h`
 host_name) — the rule is written into the running manifest for you and hot-reloaded.
+
+### Killing amplifying maintenance victims: `kill_amplifying_maintenance`
+
+`ALTER INDEX ... REORGANIZE` is an online operation: it takes only `Sch-S` plus short-lived
+page locks and does not block readers — until a single incompatible request queues behind it.
+SQL Server never lets a compatible lock request barge past a queued incompatible one, so the
+moment a `Sch-M` requester (a nightly `UPDATE STATISTICS`, another `ALTER INDEX`, a `TRUNCATE
+TABLE`, ...) starts waiting on your reorganize, every reader that arrives afterwards queues
+behind *that* request instead of passing through. The fan-out only grows while the reorganize
+runs: one queued statistics job on `dbo.MEASUREMENT` on `PRODDB` turned an online index
+maintenance pass into a full-table outage for every subsequent `SELECT`. The victim is not
+application work, though — it is a SQL Agent maintenance statement that will simply run again on
+its next schedule, which makes it the cheapest thing to terminate and the direct cause of the
+outage.
+
+`kill_amplifying_maintenance:` (top-level in `config.yaml`, a sibling of `kill_blockers:`) arms a
+second, independent killer for exactly this situation — the mirror direction of `kill_blockers`,
+which kills sessions blocking *us*; this one kills sessions blocked *by us*. Off by default:
+
+```yaml
+kill_amplifying_maintenance:
+  enabled: false          # opt-in
+  min_blocked_behind: 1   # sessions queued behind the victim before it counts as an amplifier
+  after_seconds: 60       # how long it must stay eligible before the KILL
+  commands: []            # empty = the built-in allow-list; a non-empty list REPLACES it
+```
+
+A blocked session is a kill candidate only when all of the following hold:
+
+1. it is directly blocked by our DDL session, not merely a transitive victim further down the
+   chain;
+2. it is not another SqlGoPace session (matched by application-name prefix, so a second
+   size-split manifest running concurrently is never a candidate);
+3. its `sys.dm_exec_requests.command` matches the allow-list — by default `ALTER INDEX`, `ALTER
+   TABLE`, `CREATE INDEX`, `CREATE STATISTICS`, `UPDATE STATISTIC` (both spellings SQL Server
+   reports), `DROP INDEX`, `DROP TABLE`, `TRUNCATE TABLE`, `DBCC`; a non-empty `commands:` list
+   *replaces* this set rather than extending it, so you can narrow the feature to, say,
+   `UPDATE STATISTIC` alone;
+4. it matches no `ignore_blocked_sessions` rule;
+5. it is not the session our own DDL is directly waiting on (that one belongs to
+   `kill_blockers`, never to this feature — the two killers are disjoint by construction, so a
+   mutual-block snapshot still produces exactly one `KILL`);
+6. at least `min_blocked_behind` sessions are queued transitively behind it (default 1: one
+   queued reader means the amplification has already begun, and it only grows from there).
+
+Conditions 1–6 must hold *continuously* for `after_seconds` (default 60) before the `KILL` fires.
+
+**Precedence — read this twice, the two options behave oppositely:**
+
+- **`ignore_blocked_sessions` beats the kill.** A session the operator explicitly named as
+  allowed to stay blocked is never killed, whatever its command — explicit instruction beats
+  automatic classification.
+- **`ignore_blocking: true` does *not*.** That option only means "do not yield" — it suppresses
+  this run's own pause/cancel reaction to being blocked. It says nothing about intervening on the
+  victim, so an operator running with `ignore_blocking: true` will still see maintenance victims
+  killed. Precisely because that operator is holding the lock through blocking, they are the one
+  who most benefits from the amplifier being cleared.
+
+A failed `KILL` (permission denied, session already gone) immediately falls back to the normal
+yield: the victim stops being suppressed and counts toward the blocking timer again on the very
+next poll, so this feature can never make a run block *longer* than it would without it.
+`max_block_minutes` is unaffected either way and continues to backstop the whole run: a victim
+this feature never manages to kill still forces a yield once the cap is reached.
+
+**Permissions.** `KILL` requires `ALTER ANY CONNECTION` — the same grant `kill_blockers` already
+needs, so enabling this feature alone adds no new grant. Naming the SQL Agent job that owned the
+killed statement additionally needs `SELECT` on `msdb.dbo.sysjobs` (and `sysjobsteps`); that grant
+is optional and attribution degrades gracefully without it (see below). Enabling either kill
+feature makes preflight **warn** (never fail) if the connected login lacks `ALTER ANY CONNECTION`.
+SqlGoPace never writes to msdb and never disables an Agent job itself — it only reports which one
+collided and prints a ready-to-paste statement for you to run by hand:
+
+```
+EXEC msdb.dbo.sp_update_job @job_name = N'IndexOptimize - USER_DATABASES', @enabled = 0;
+```
+
+**Attribution.** A T-SQL Agent job step sets `program_name` to `SQLAgent - TSQL JobStep (Job
+0x... : Step N)`; SqlGoPace parses that and looks up the job/step name in msdb. Only **T-SQL** job
+steps carry this program name — a CmdExec or PowerShell step (including Ola Hallengren's scripts
+driven through `sqlcmd`) will not match. The kill still happens; attribution then degrades to the
+raw program name, login, and host, which is why those three fields are always recorded, whether or
+not the job resolved.
+
+**`.amplifiers.yaml` sidecar.** Alongside `.blocked.yaml` and `.contended.yaml`, a run that kills
+at least one amplifying victim writes `<manifest>.amplifiers.yaml` next to the run report: one
+entry per kill (session, statement, database, login/host/app, how many sessions were queued
+behind it, and the resolved Agent job when attribution succeeded), plus a trailing comment block
+with one deduplicated `sp_update_job` statement per distinct job terminated. Advisory only, like
+its siblings — SqlGoPace never reads it back. It is deliberately a separate file from
+`.blocked.yaml`: that file's whole purpose is "paste this into `ignore_blocked_sessions`", and an
+amplifier is the exact opposite instruction.
+
+**Where a kill is (and is not) reported.** Every kill reaches the run `.log`, the
+`.amplifiers.yaml` sidecar, and stdout. In `--tui` mode it also reaches the incident feed (as a
+narration line) and a sticky alert line listing the distinct SQL Agent jobs this run has
+terminated, cleared when the manifest ends. It does **not** reach webhook or email notifications:
+`notifications.on_events` only ever fires for `pause`, `cancel`, and `abort` — the reaction kinds
+that mean the run itself yielded — and a `kill` is a different kind of event. Extending
+notifications to cover it would mean widening `on_events` and the notify branch in `engine.go`,
+which this feature deliberately does not do; do not assume a configured webhook will tell you
+about a killed maintenance job.
 
 ### Shrinking files: `operation: shrink`
 
