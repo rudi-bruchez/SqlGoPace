@@ -234,3 +234,57 @@ func TestFlushAmplifiersSkipsWhenTheManifestLeftProcessing(t *testing.T) {
 		t.Errorf("os.Stat(%s) err = %v, want not-exist — the manifest is no longer in processing", sidecar, err)
 	}
 }
+
+// blockedSessionsReader serves a fixed session snapshot to captureBlockers; the
+// HeldObjectLocks half of BlockerReader is unused here.
+type blockedSessionsReader struct{ sessions []mssql.Session }
+
+func (r blockedSessionsReader) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	return r.sessions, nil
+}
+func (r blockedSessionsReader) HeldObjectLocks(context.Context, int) ([]mssql.LockedObject, error) {
+	return nil, nil
+}
+
+// ddlSession is the executing session captureBlockers reads its SPID from.
+type ddlSession struct{ spid int }
+
+func (s ddlSession) SPID() int                                 { return s.spid }
+func (s ddlSession) LoginTime(context.Context) (string, error) { return "", nil }
+func (s ddlSession) SetMarker(context.Context, [16]byte) error { return nil }
+
+// TestCaptureBlockersSkipsSuppressedVictim covers review finding 5: a victim pending a
+// kill was still written into .blocked.yaml — whose stated purpose is "paste this into
+// ignore_blocked_sessions" — and counted in peakBlocked, moments before the same session
+// was killed and written into .amplifiers.yaml. The two files carry opposite
+// instructions, so the capture now mirrors ServerSampler.Blocking and skips it.
+func TestCaptureBlockersSkipsSuppressedVictim(t *testing.T) {
+	const name = "032-compress-small.yaml"
+	e, _, _ := amplifierEngine(t, name)
+	snap := amplifierSnapshot(5)
+	e.blockers = blockedSessionsReader{sessions: snap}
+	e.session = ddlSession{spid: 67}
+
+	f := newVictimFixture(t, defaultPolicy())
+	e.victims = f.killer
+	f.killer.consider(context.Background(), snap, 67, nil) // 79 is now kill-pending
+
+	acc := &blockerCapture{}
+	blocked := e.captureBlockers(context.Background(), nil, acc, name)
+	if blocked != 0 {
+		t.Errorf("captureBlockers() = %d, want 0 — the only session we block is a suppressed victim", blocked)
+	}
+	if acc.len() != 0 {
+		t.Errorf("capture holds %d session(s), want 0 — a pending-kill victim belongs in .amplifiers.yaml, not .blocked.yaml", acc.len())
+	}
+	if _, err := os.Stat(filepath.Join(e.dirs.Processing, name+blockedCaptureSuffix)); !os.IsNotExist(err) {
+		t.Errorf("os.Stat(.blocked.yaml) err = %v, want not-exist", err)
+	}
+
+	// A session we block that is NOT a victim is still captured, unchanged.
+	app := mssql.Session{SPID: 91, Command: "SELECT", BlockingSPID: 67, Login: "app_user", Host: "SQLPROD01"}
+	e.blockers = blockedSessionsReader{sessions: append(snap, app)}
+	if blocked := e.captureBlockers(context.Background(), nil, acc, name); blocked != 1 {
+		t.Errorf("captureBlockers() = %d with an application session blocked, want 1", blocked)
+	}
+}
