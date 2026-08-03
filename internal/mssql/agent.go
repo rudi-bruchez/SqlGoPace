@@ -25,9 +25,12 @@ type AgentJob struct {
 // "SQLAgent - TSQL JobStep (Job 0x<hex job_id> : Step <n>)". Internal runs of
 // whitespace are tolerated because the exact spacing has varied across versions.
 // Anything else — a CmdExec step, an application, a truncated string — fails to
-// match, and attribution degrades rather than guessing.
+// match, and attribution degrades rather than guessing. Anchored at both ends: without
+// the trailing $, a crafted program_name carrying extra content after the closing
+// parenthesis would still parse, and the kill would be attributed to a real but wrong
+// job — down to an sp_update_job line naming it in the advisory sidecar.
 var jobStepProgram = regexp.MustCompile(
-	`^SQLAgent\s*-\s*TSQL\s+JobStep\s*\(\s*Job\s+(0[xX][0-9A-Fa-f]+)\s*:\s*Step\s+(\d+)\s*\)`)
+	`^SQLAgent\s*-\s*TSQL\s+JobStep\s*\(\s*Job\s+(0[xX][0-9A-Fa-f]+)\s*:\s*Step\s+(\d+)\s*\)$`)
 
 // ParseJobStepProgram extracts the job id literal and step number from an Agent T-SQL
 // step's program_name. ok is false for any other program name.

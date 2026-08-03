@@ -48,6 +48,10 @@ func TestParseJobStepProgram(t *testing.T) {
 		{name: "truncated fails closed", program: "SQLAgent - TSQL JobStep (Job 0x9B3C", wantOK: false},
 		{name: "missing step fails closed", program: "SQLAgent - TSQL JobStep (Job 0x9B3C : Step )", wantOK: false},
 		{name: "non-hex job id fails closed", program: "SQLAgent - TSQL JobStep (Job 0xZZZZ : Step 1)", wantOK: false},
+		// Without the trailing anchor this parsed, and the kill would be attributed to
+		// a real but wrong job — sp_update_job line included.
+		{name: "trailing content fails closed", program: "SQLAgent - TSQL JobStep (Job 0x9B3C : Step 1) and more", wantOK: false},
+		{name: "trailing parenthesis fails closed", program: "SQLAgent - TSQL JobStep (Job 0x9B3C : Step 1))", wantOK: false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
