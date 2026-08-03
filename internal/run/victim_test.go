@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -505,7 +506,7 @@ func TestAmplifierDetailNamesTheObjectAndJob(t *testing.T) {
 	got := AmplifierDetail(ev)
 	for _, want := range []string{
 		"SPID 79",
-		"[dbo].[MEASUREMENT]",          // the object, not just the verb
+		"[dbo].[MEASUREMENT]", // the object, not just the verb
 		"16 session(s) queued behind it",
 		`SQL Agent job "IndexOptimize - USER_DATABASES" step 1`,
 		"sp_update_job",
@@ -516,6 +517,169 @@ func TestAmplifierDetailNamesTheObjectAndJob(t *testing.T) {
 	}
 	if strings.Contains(got, "\n") {
 		t.Errorf("AmplifierDetail() must be one line, got %q", got)
+	}
+}
+
+// TestVictimKillerExcludesTheConnectionsOwnApplicationName covers the whole-branch
+// finding that self-exclusion used to key off the mssql.AppNamePrefix constant instead
+// of the application name the connection actually presents. An operator DSN carrying
+// `app name=DBAToolkit` makes every SqlGoPace session report program_name
+// "DBAToolkit/<version>", and a constant-keyed check would let one instance of a
+// size-split campaign KILL another's in-flight, non-resumable REBUILD.
+func TestVictimKillerExcludesTheConnectionsOwnApplicationName(t *testing.T) {
+	// The base is what (*mssql.Conn).AppNamePrefix returns; the full effective name is
+	// what a caller passing the version-suffixed value would supply. Both must exclude.
+	for _, selfProgram := range []string{"DBAToolkit", "DBAToolkit/0.13.0"} {
+		t.Run(selfProgram, func(t *testing.T) {
+			var killed []int
+			k := NewVictimKiller(
+				func(_ context.Context, spid int) error { killed = append(killed, spid); return nil },
+				nil, nil,
+				NewManualClock(time.Unix(1_800_000_000, 0)),
+				selfProgram,
+			)
+			k.Arm(AmplifierPolicy{MinBlockedBehind: 1})
+			k.consider(context.Background(), renamedInstanceSnapshot(), 67, nil)
+
+			if len(killed) != 1 || killed[0] != 80 {
+				t.Errorf("killed = %v, want [80] — the Agent job only, never the sibling instance", killed)
+			}
+		})
+	}
+}
+
+// renamedInstanceSnapshot is the size-split campaign on a renamed DSN: our own DDL
+// (67), a sibling SqlGoPace instance's REBUILD (79) that must never be killed, and a
+// genuine Agent maintenance amplifier (80) that must be, each with a reader queued
+// behind it. Zero dwell, so a single consider decides.
+func renamedInstanceSnapshot() []mssql.Session {
+	return []mssql.Session{
+		{SPID: 67, Command: "ALTER INDEX", Program: "DBAToolkit/0.13.0"},
+		{SPID: 79, Command: "ALTER INDEX", BlockingSPID: 67, Program: "DBAToolkit/0.13.0"},
+		{SPID: 1001, Command: "SELECT", BlockingSPID: 79},
+		{SPID: 80, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+			Program: "SQLAgent - TSQL JobStep (Job 0xAB : Step 1)"},
+		{SPID: 2001, Command: "SELECT", BlockingSPID: 80},
+	}
+}
+
+// TestVictimKillerDisarmDoesNotBlockOnAKillInFlight covers the whole-branch finding
+// that k.kill was still issued under the killer's mutex. Disarm runs on the engine
+// goroutine at manifest end; a KILL that does not return — the connection dies
+// mid-statement and the pool waits to reconnect — would then block manifest
+// finalization indefinitely.
+func TestVictimKillerDisarmDoesNotBlockOnAKillInFlight(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	killing, release := make(chan struct{}), make(chan struct{})
+	k := NewVictimKiller(
+		func(context.Context, int) error {
+			close(killing)
+			<-release
+			return nil
+		},
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(defaultPolicy())
+
+	snap := amplifierSnapshot(16)
+	k.consider(context.Background(), snap, 67, nil)
+	clk.Advance(61 * time.Second)
+
+	considered := make(chan struct{})
+	go func() { defer close(considered); k.consider(context.Background(), snap, 67, nil) }()
+	<-killing // the KILL is now in flight, and stays there until release
+
+	disarmed := make(chan struct{})
+	go func() { defer close(disarmed); k.Disarm() }()
+	select {
+	case <-disarmed:
+	case <-time.After(5 * time.Second):
+		t.Error("Disarm() blocked while a KILL was in flight — the mutex must not be held across the KILL")
+	}
+	close(release)
+	<-considered
+}
+
+// TestVictimKillerBoundsAttributionAndReportsItsFailure covers the whole-branch finding
+// that the msdb attribution lookup was unbounded on the poll path: it runs on the pump
+// goroutine, so a hung msdb would stop sampling and neither the blocking timeout nor
+// max_block_minutes would advance. The kill must still be fully reported from the raw
+// program/login/host, and the failure must be visible (design §5).
+func TestVictimKillerBoundsAttributionAndReportsItsFailure(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	var (
+		hadDeadline bool
+		budget      time.Duration
+		events      []ReactionEvent
+	)
+	k := NewVictimKiller(
+		func(context.Context, int) error { return nil },
+		func(ctx context.Context, _ string, _ int) (mssql.AgentJob, error) {
+			dl, ok := ctx.Deadline()
+			hadDeadline = ok
+			if ok {
+				budget = time.Until(dl)
+			}
+			return mssql.AgentJob{}, errors.New("msdb unavailable")
+		},
+		nil, clk, mssql.AppNamePrefix,
+	)
+	k.SetSink(func(ev ReactionEvent) { events = append(events, ev) })
+	k.Arm(defaultPolicy())
+
+	snap := amplifierSnapshot(16)
+	k.consider(context.Background(), snap, 67, nil)
+	clk.Advance(61 * time.Second)
+	k.consider(context.Background(), snap, 67, nil)
+
+	if !hadDeadline {
+		t.Fatal("the attribution context carried no deadline — a hung msdb would stall the pump")
+	}
+	if budget <= 0 || budget > attributeTimeout {
+		t.Errorf("attribution budget = %v, want a positive value no larger than %v", budget, attributeTimeout)
+	}
+	var kills, warns []ReactionEvent
+	for _, ev := range events {
+		switch ev.Kind {
+		case "kill":
+			kills = append(kills, ev)
+		case "warn":
+			warns = append(warns, ev)
+		}
+	}
+	if len(kills) != 1 {
+		t.Fatalf("kill events = %d, want 1 — failed attribution must not suppress the kill report", len(kills))
+	}
+	for _, want := range []string{"SPID 79", "SQLAgent - TSQL JobStep", "login=svc_agent", "host=SQLPROD01"} {
+		if !strings.Contains(kills[0].Detail, want) {
+			t.Errorf("kill Detail = %q, missing %q", kills[0].Detail, want)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("warn events = %d, want 1 naming the failed attribution", len(warns))
+	}
+	if !strings.Contains(warns[0].Detail, "msdb unavailable") {
+		t.Errorf("warn Detail = %q, want the msdb error", warns[0].Detail)
+	}
+}
+
+// TestAmplifierDetailTruncatesOnARuneBoundary covers the whole-branch finding that the
+// statement excerpt was cut by bytes: SQL Server allows Unicode identifiers, and half a
+// rune is invalid UTF-8 in the run report and in the TUI, where lipgloss then
+// mis-measures the line.
+func TestAmplifierDetailTruncatesOnARuneBoundary(t *testing.T) {
+	// "UPDATE STATISTICS [dbo].[" is 25 bytes, so the 120-byte cut lands 95 bytes into
+	// a run of two-byte runes — mid-rune.
+	ev := AmplifierKillEvent{
+		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 3,
+		Statement: "UPDATE STATISTICS [dbo].[" + strings.Repeat("é", 200) + "]",
+	}
+	got := AmplifierDetail(ev)
+	if !utf8.ValidString(got) {
+		t.Errorf("AmplifierDetail() = %q, want valid UTF-8 — the excerpt split a rune", got)
+	}
+	if !strings.Contains(got, "…") {
+		t.Errorf("AmplifierDetail() = %q, want the truncation marker", got)
 	}
 }
 

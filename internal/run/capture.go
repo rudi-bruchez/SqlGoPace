@@ -152,8 +152,9 @@ func (e *Engine) relocateSidecar(name, dir, suffix, label string) {
 	}
 }
 
-// relocateCaptures moves both advisory sidecars — the blocked-session capture and the
-// .contended.yaml — from processing to dir on finalize. Each is a no-op when absent.
+// relocateCaptures moves the three advisory sidecars — the blocked-session capture,
+// the .contended.yaml and the .amplifiers.yaml — from processing to dir on finalize.
+// Each is a no-op when absent.
 func (e *Engine) relocateCaptures(name, dir string) {
 	e.relocateSidecar(name, dir, blockedCaptureSuffix, "blocked-session capture")
 	e.relocateSidecar(name, dir, contendedCaptureSuffix, "contended capture")
