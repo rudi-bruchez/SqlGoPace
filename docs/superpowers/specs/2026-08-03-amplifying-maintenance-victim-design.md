@@ -193,13 +193,17 @@ almost immediately, and the window exists only to absorb one stale snapshot.
 ### 2.4 Configuration
 
 ```yaml
-monitoring:
-  kill_amplifying_maintenance:
-    enabled: false           # opt-in
-    min_blocked_behind: 1
-    after_seconds: 60
-    commands: []             # optional override of the built-in allow-list
+kill_amplifying_maintenance:
+  enabled: false           # opt-in
+  min_blocked_behind: 1
+  after_seconds: 60
+  commands: []             # optional override of the built-in allow-list
 ```
+
+Top-level, as a sibling of the existing `kill_blockers:` block, not nested under
+`monitoring:`. `kill_blockers` is the mirror-direction feature and is already
+top-level; putting its counterpart somewhere else would be gratuitously
+inconsistent. `monitoring:` holds cadences and thresholds, not policy arming.
 
 A non-empty `commands` list **replaces** the built-in allow-list of §1.2 rather than
 extending it, so an operator can narrow the feature to `UPDATE STATISTIC` alone.
@@ -307,18 +311,33 @@ Multiple kills attributed to the same job produce one `killed:` entry each (they
 distinct sessions, at distinct times) but a **single** `sp_update_job` line in the
 trailing comment block, deduplicated on job id.
 
+One concurrency note, because it differs from `blockerCapture`: that accumulator is
+touched only from the engine goroutine, but a kill happens on the **pump** goroutine
+inside `Sampler.Blocking`. The amplifier accumulator therefore carries its own mutex.
+It is small and append-mostly, so a mutex is the right amount of machinery — no
+channel funnel.
+
 ### 3.4 TUI
 
 Reaction events already render in the incident feed, but a job warning that scrolls
 away is a warning nobody acts on. The distinct conflicting job names get a sticky line
-in the alert area, reusing the existing manifest-alert mechanism.
+rendered in the alert area.
+
+It uses a **new** `tui.ConflictingJobsMsg{Jobs []string}` that *replaces* the model's
+current set, rather than the existing `AlertMsg`. `AlertMsg` appends to a slice that is
+never cleared — correct for a manifest failure, which should stay on screen for the
+rest of the run, but wrong here. Reusing it would mean teaching it to clear and
+changing the behavior of every existing alert. A replace-semantics message keeps the
+two lifetimes independent and is less code.
 
 Deduplication key: `(job_id, step_id)` when attribution resolved, falling back to the
 raw `program_name` when it did not — so an unattributed CmdExec step still produces
-one stable line rather than one per kill.
+one stable line rather than one per kill. Dedup lives in the run package's capture
+accumulator (§3.3), which needs the same distinct-job set for the sidecar; the TUI
+just renders what it is sent.
 
-Lifetime: the alerts clear at the end of the manifest, alongside the other
-manifest-scoped alerts. A queue that runs for hours would otherwise accumulate jobs
+Lifetime: the engine sends `ConflictingJobsMsg{Jobs: nil}` when it disarms the killer
+at the end of a manifest. A queue that runs for hours would otherwise accumulate jobs
 from manifests the operator has already dealt with, and a stale alert is read as noise
 within about two manifests.
 
