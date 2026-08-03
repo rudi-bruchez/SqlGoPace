@@ -206,13 +206,34 @@ type killTarget struct {
 // At-most-one-kill-per-episode survives that split because the locked scan marks each
 // selected episode killed optimistically; a failed KILL withdraws the mark here and
 // sets killFailed, which the scan treats as terminal for the episode either way.
+//
+// ctx is the pump's, which dies with the DDL statement: a kill is either skipped (the
+// statement already finished) or detached from it — see the two blocks below.
 func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) {
 	if k == nil {
 		return
 	}
 	targets, sink, onKill := k.considerLocked(sessions, ddlSPID, ignore)
+	if len(targets) == 0 {
+		return
+	}
+	// The pump's context dies the moment the DDL statement returns (runStatement cancels
+	// sampleCtx on return), which can be the very poll a victim reached its dwell on.
+	// Starting a KILL on a context that is already done would fail instantly with
+	// "context canceled" and report a kill failure that never happened, so skip it and
+	// leave the episode unkilled — the victim is simply retried on a later run.
+	if ctx.Err() != nil {
+		for _, t := range targets {
+			k.abandonKill(t.ep)
+		}
+		return
+	}
+	// The KILL and the attribution behind it must outlive that cancellation: they are
+	// control work about the statement that just ended, not part of it. Detaching them
+	// mirrors runStatement's own fallback KILL on context.Background().
+	detached := context.WithoutCancel(ctx)
 	for _, t := range targets {
-		if err := k.kill(ctx, t.spid); err != nil {
+		if err := k.killDetached(detached, t.spid); err != nil {
 			k.withdrawKill(t.ep)
 			// Reached only on the failure transition: killFailed is terminal for the
 			// episode, so the scan short-circuits before selecting this SPID again and
@@ -229,7 +250,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 			}
 			continue
 		}
-		job, err := k.attribute(ctx, t.kill.Program)
+		job, err := k.attribute(detached, t.kill.Program)
 		t.kill.Job = job
 		if sink != nil {
 			if err != nil {
@@ -293,6 +314,36 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 		delete(k.episodes, spid)
 	}
 	return targets, sink, onKill
+}
+
+// killTimeout bounds one KILL against an amplifying victim.
+//
+// Like attributeTimeout, this is not the "no query timeout" rule of CLAUDE.md: that rule
+// governs the executing DDL, whose duration must be decided by the monitoring loop and the
+// reaction hierarchy. A KILL is a control command issued about another session, and it runs
+// on the pump goroutine inside ServerSampler.Blocking — an unbounded one that hangs (a
+// dying connection can take a while to accept an attention) would stop the pump emitting
+// samples, and neither the blocking timeout nor max_block_minutes would advance while our
+// DDL kept running and kept blocking. 30s is generous for an attention that normally
+// returns at once, and still short enough to keep the loop reactive.
+const killTimeout = 30 * time.Second
+
+// killDetached issues one KILL on the detached context, bounded by killTimeout so a KILL
+// that does not come back cannot stall the pump.
+func (k *VictimKiller) killDetached(detached context.Context, spid int) error {
+	ctx, cancel := context.WithTimeout(detached, killTimeout)
+	defer cancel()
+	return k.kill(ctx, spid)
+}
+
+// abandonKill undoes the optimistic mark considerLocked set for a kill that was never
+// attempted (the run was shutting down). Unlike withdrawKill it does NOT set killFailed:
+// nothing failed, so the episode stays open and the victim is reconsidered on a later poll
+// or a later run instead of being permanently written off. No warn is emitted either.
+func (k *VictimKiller) abandonKill(ep *victimEpisode) {
+	k.mu.Lock()
+	ep.killed = false
+	k.mu.Unlock()
 }
 
 // withdrawKill undoes the optimistic mark considerLocked set when the KILL turns out to

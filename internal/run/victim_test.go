@@ -21,6 +21,7 @@ type victimFixture struct {
 	killed   []int
 	events   []AmplifierKillEvent
 	narrated []AmplifierKillEvent
+	raw      []ReactionEvent // every sink event, including the warns
 	killErr  error
 }
 
@@ -43,6 +44,7 @@ func newVictimFixture(t *testing.T, p AmplifierPolicy) *victimFixture {
 		mssql.AppNamePrefix,
 	)
 	f.killer.SetSink(func(ev ReactionEvent) {
+		f.raw = append(f.raw, ev)
 		if ev.Amplifier != nil {
 			f.events = append(f.events, *ev.Amplifier)
 		}
@@ -693,5 +695,76 @@ func TestAmplifierDetailFallsBackToProgramWhenUnattributed(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("AmplifierDetail() = %q, missing %q", got, want)
 		}
+	}
+}
+
+// TestVictimKillerSkipsKillWhenTheRunIsShuttingDown covers review finding 1: the pump's
+// context is canceled the moment the DDL statement returns, and a victim can reach its
+// dwell on that very poll. Starting the KILL there would fail instantly with
+// "context canceled" and report a kill failure that never happened. Nothing is attempted
+// and nothing is warned about; the episode stays open so the victim is reconsidered later.
+func TestVictimKillerSkipsKillWhenTheRunIsShuttingDown(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	snap := amplifierSnapshot(16)
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	f.killer.consider(done, snap, 67, nil)
+	f.clk.Advance(61 * time.Second)
+	f.killer.consider(done, snap, 67, nil)
+
+	if len(f.killed) != 0 {
+		t.Errorf("killed = %v, want none — no KILL is started on a context that is already done", f.killed)
+	}
+	if len(f.raw) != 0 {
+		t.Errorf("sink events = %v, want none — nothing failed, so nothing is reported", f.raw)
+	}
+
+	// Not written off: the same victim is still killable on a live context.
+	f.killer.consider(context.Background(), snap, 67, nil)
+	if len(f.killed) != 1 || f.killed[0] != 79 {
+		t.Errorf("killed = %v after the run resumed polling, want [79]", f.killed)
+	}
+}
+
+// TestVictimKillerDetachesTheKillFromThePumpContext covers review finding 1: the KILL and
+// the msdb attribution behind it are control work about the statement that just ended, so
+// they must survive the pump context dying mid-flight — exactly what runStatement does for
+// its own fallback KILL. The KILL is still bounded (killTimeout), so it cannot stall the pump.
+func TestVictimKillerDetachesTheKillFromThePumpContext(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	ctx, cancel := context.WithCancel(context.Background())
+	var (
+		killErrDuring, attrErrDuring error
+		killDeadline                 bool
+	)
+	k := NewVictimKiller(
+		func(kctx context.Context, _ int) error {
+			cancel() // the DDL statement returns while the KILL is in flight
+			killErrDuring = kctx.Err()
+			_, killDeadline = kctx.Deadline()
+			return nil
+		},
+		func(actx context.Context, hex string, step int) (mssql.AgentJob, error) {
+			attrErrDuring = actx.Err()
+			return mssql.AgentJob{Resolved: true, JobID: hex, StepID: step}, nil
+		},
+		nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(defaultPolicy())
+
+	snap := amplifierSnapshot(16)
+	k.consider(ctx, snap, 67, nil)
+	clk.Advance(61 * time.Second)
+	k.consider(ctx, snap, 67, nil)
+
+	if killErrDuring != nil {
+		t.Errorf("KILL context Err() = %v while the pump context was canceled, want nil (detached)", killErrDuring)
+	}
+	if !killDeadline {
+		t.Error("KILL context has no deadline, want one bounded by killTimeout so a hung KILL cannot stall the pump")
+	}
+	if attrErrDuring != nil {
+		t.Errorf("attribution context Err() = %v after the pump context was canceled, want nil (detached)", attrErrDuring)
 	}
 }
