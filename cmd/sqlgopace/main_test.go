@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 
+	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
@@ -263,6 +264,47 @@ func TestRunErrors(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if err := cli(io.Discard, io.Discard, tt.args); err == nil {
 				t.Errorf("run(%v) error = nil, want non-nil", tt.args)
+			}
+		})
+	}
+}
+
+// TestAmplifierDwellWarning covers review finding 6: a dwell longer than the blocking
+// timeout suppresses the yield reaction for that victim for the whole dwell, and nothing
+// on the config surface said so. It is a warning, not a rejection — a long dwell is a
+// legitimate choice.
+func TestAmplifierDwellWarning(t *testing.T) {
+	cfgWith := func(enabled bool, afterSeconds, timeoutMinutes int) *config.Config {
+		c := &config.Config{}
+		c.KillAmplifyingMaintenance.Enabled = enabled
+		c.KillAmplifyingMaintenance.AfterSeconds = afterSeconds
+		c.Monitoring.BlockingTimeoutMinutes = timeoutMinutes
+		return c
+	}
+	tests := []struct {
+		name string
+		cfg  *config.Config
+		warn bool
+	}{
+		{"disabled", cfgWith(false, 600, 1), false},
+		{"dwell under the timeout", cfgWith(true, 60, 5), false},
+		{"dwell equal to the timeout", cfgWith(true, 300, 5), false},
+		{"dwell over the timeout", cfgWith(true, 600, 1), true},
+		{"default dwell over a one-minute timeout", cfgWith(true, 0, 1), false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := amplifierDwellWarning(tc.cfg)
+			if (got != "") != tc.warn {
+				t.Fatalf("amplifierDwellWarning() = %q, want warning = %t", got, tc.warn)
+			}
+			if !tc.warn {
+				return
+			}
+			for _, want := range []string{"after_seconds", "blocking_timeout_minutes", "max_block_minutes", "10m0s", "1m0s"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("warning = %q, missing %q", got, want)
+				}
 			}
 		})
 	}

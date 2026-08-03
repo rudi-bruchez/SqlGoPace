@@ -434,6 +434,12 @@ A blocked session is a kill candidate only when all of the following hold:
    queued reader means the amplification has already begun, and it only grows from there).
 
 Conditions 1–6 must hold *continuously* for `after_seconds` (default 60) before the `KILL` fires.
+A victim is suppressed from the yield reaction for that whole dwell — from the first poll it is
+eligible, well before any `KILL` — so an `after_seconds` longer than
+`monitoring.blocking_timeout_minutes` means the operation keeps its lock through the amplifier for
+the whole dwell, with the manifest's `max_block_minutes` as the only backstop. That is a valid
+choice (killing sooner is the more destructive one), so SqlGoPace only **warns** about it at
+startup.
 
 **Precedence — read this twice, the two options behave oppositely:**
 

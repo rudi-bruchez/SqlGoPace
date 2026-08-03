@@ -167,6 +167,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
+	if w := amplifierDwellWarning(cfg); w != "" {
+		fmt.Fprintln(stdout, w)
+	}
 
 	// --auto: analyze and materialize maintenance manifests into the queue before
 	// the engine processes it. Materializing (rather than running purely in memory)
@@ -370,6 +373,32 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		return fmt.Errorf("%d manifest(s) failed", total.Failed)
 	}
 	return nil
+}
+
+// amplifierDwellWarning returns the startup warning to print when the amplifying-victim
+// dwell outlasts the blocking timeout, or "" when there is nothing to warn about.
+//
+// A victim is suppressed from BlockState.Unignored from the first poll it is eligible —
+// well before any KILL — so the yield reaction never fires for it while it waits out
+// after_seconds. With a dwell longer than blocking_timeout_minutes the operation holds
+// its lock through the amplifier for the whole dwell, and a manifest's max_block_minutes
+// (often unset) is the only backstop left. That is a legitimate trade — killing sooner is
+// the more destructive choice — so this warns rather than rejects.
+//
+// Pure over config, so the decision is tested without a server.
+func amplifierDwellWarning(cfg *config.Config) string {
+	if !cfg.KillAmplifyingMaintenance.Enabled {
+		return ""
+	}
+	dwell, timeout := cfg.KillAmplifyingMaintenance.After(), cfg.Monitoring.BlockingTimeout()
+	if dwell <= timeout {
+		return ""
+	}
+	return fmt.Sprintf("-- warning: kill_amplifying_maintenance.after_seconds (%s) is longer than "+
+		"monitoring.blocking_timeout_minutes (%s): an amplifying victim is suppressed from the yield "+
+		"reaction for the whole dwell, so an operation can hold its lock through it for %s before "+
+		"anything reacts — only a manifest's max_block_minutes stops it sooner",
+		dwell, timeout, dwell)
 }
 
 // buildEngine wires a run.Engine for one database's connection, sharing the given
