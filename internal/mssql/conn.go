@@ -93,6 +93,12 @@ func (c *Conn) harden(ctx context.Context) error {
 	return nil
 }
 
+// AppNamePrefix is the application name SqlGoPace connects with, before the version
+// suffix appNameWithVersion appends ("SqlGoPace/0.13.0"). It is exported because the
+// victim killer matches program_name against it by prefix to avoid ever terminating
+// another SqlGoPace session — including one running a different build.
+const AppNamePrefix = "SqlGoPace"
+
 // appNameWithVersion appends the application version to the configured application
 // name so the running build is visible server-side (sys.dm_exec_sessions
 // program_name), e.g. "SqlGoPace/0.1.0". A missing or default-driver app name
@@ -100,7 +106,7 @@ func (c *Conn) harden(ctx context.Context) error {
 func appNameWithVersion(appName, version string) string {
 	base := strings.TrimSpace(appName)
 	if base == "" || base == "go-mssqldb" {
-		base = "SqlGoPace"
+		base = AppNamePrefix
 	}
 	v := strings.TrimSpace(version)
 	if v == "" {

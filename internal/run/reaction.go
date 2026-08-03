@@ -52,6 +52,12 @@ type ReactionEvent struct {
 	Kind   string // "pause" | "resume" | "cancel" | "kill" | "abort" | "warn" | "info"
 	Detail string
 	Tail   *TailFinding // non-nil only on a "tail object found" info event
+	// Amplifier is non-nil only on a kill of an amplifying maintenance victim: the
+	// session this run terminated, for the engine sink to record in the
+	// .amplifiers.yaml sidecar and the TUI's conflicting-jobs line. It rides the event
+	// for the same reason Tail does — the killer runs on the pump goroutine and has no
+	// other route to per-manifest engine state.
+	Amplifier *AmplifierKillEvent
 }
 
 // TailFinding is a tail object the shrink driver found and passes to the engine sink to
