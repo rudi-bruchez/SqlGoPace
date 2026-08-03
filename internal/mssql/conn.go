@@ -14,9 +14,10 @@ import (
 // execution connection (so @@SPID is stable across the whole DDL) and a separate
 // monitoring pool that is never blocked by the DDL it observes.
 type Conn struct {
-	pool *sql.DB   // monitoring connections
-	exec *sql.Conn // pinned execution connection
-	spid int
+	pool    *sql.DB   // monitoring connections
+	exec    *sql.Conn // pinned execution connection
+	spid    int
+	appName string // effective application-name base, version suffix excluded
 }
 
 // Open connects with the given DSN (ADO or URL form), stamps the application
@@ -43,7 +44,11 @@ func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse connection string: %w", err)
 	}
-	cfg.AppName = appNameWithVersion(cfg.AppName, version)
+	// The base is what program_name is built from, and therefore what self-exclusion
+	// must key off — not the AppNamePrefix constant, which is only the fallback when
+	// the DSN sets no application name of its own.
+	base := appNameBase(cfg.AppName)
+	cfg.AppName = appNameWithVersion(base, version)
 	if database != "" {
 		cfg.Database = database
 	}
@@ -60,7 +65,7 @@ func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
 		return nil, fmt.Errorf("pin execution connection: %w", err)
 	}
 
-	c := &Conn{pool: pool, exec: exec}
+	c := &Conn{pool: pool, exec: exec, appName: base}
 	if err := c.harden(ctx); err != nil {
 		_ = c.Close()
 		return nil, err
@@ -93,21 +98,45 @@ func (c *Conn) harden(ctx context.Context) error {
 	return nil
 }
 
+// AppNamePrefix is the application name SqlGoPace connects with when the DSN sets
+// none of its own, before the version suffix appNameWithVersion appends
+// ("SqlGoPace/0.13.0"). It is only the fallback: an operator DSN carrying
+// `app name=...` overrides it, which is why self-exclusion keys off
+// (*Conn).AppNamePrefix rather than this constant.
+const AppNamePrefix = "SqlGoPace"
+
+// appNameBase returns the application name program_name is built from: whatever the
+// DSN configured, or AppNamePrefix when it configured nothing. The driver's own
+// default ("go-mssqldb") counts as nothing.
+func appNameBase(appName string) string {
+	base := strings.TrimSpace(appName)
+	if base == "" || base == "go-mssqldb" {
+		return AppNamePrefix
+	}
+	return base
+}
+
 // appNameWithVersion appends the application version to the configured application
 // name so the running build is visible server-side (sys.dm_exec_sessions
 // program_name), e.g. "SqlGoPace/0.1.0". A missing or default-driver app name
 // falls back to "SqlGoPace".
 func appNameWithVersion(appName, version string) string {
-	base := strings.TrimSpace(appName)
-	if base == "" || base == "go-mssqldb" {
-		base = "SqlGoPace"
-	}
+	base := appNameBase(appName)
 	v := strings.TrimSpace(version)
 	if v == "" {
 		return base
 	}
 	return base + "/" + v
 }
+
+// AppNamePrefix returns the application-name base this connection presents
+// server-side, without the version suffix — "SqlGoPace" by default, or whatever the
+// DSN's `app name` set. The victim killer matches program_name against it by prefix
+// so it never terminates another SqlGoPace session, including one running a different
+// build (whose program_name differs only in the suffix). Reading it from the live
+// connection rather than from the AppNamePrefix constant is what makes that guarantee
+// hold for an operator who renamed the application in the DSN.
+func (c *Conn) AppNamePrefix() string { return c.appName }
 
 // SPID returns the session id of the pinned execution connection.
 func (c *Conn) SPID() int { return c.spid }

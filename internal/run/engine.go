@@ -183,6 +183,10 @@ type Engine struct {
 	liveReload       bool                  // re-read ignore_blocked_sessions from the manifest mid-run
 	killer           *BlockerKiller        // when set, kills matching blockers per kill_blocking_sessions
 	killDefaultAfter time.Duration         // default delay for a kill rule that sets none
+	victims          *VictimKiller         // when set, kills amplifying maintenance victims we block
+	victimPolicy     AmplifierPolicy       // the armed policy for that killer
+	asyncStats       AsyncStatsSetting     // ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY on the target
+	amplifierSink    func([]string)        // notified with the distinct conflicting jobs (TUI)
 	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
 	stepSink         func(StepEvent)       // manifest-level per-operation progress (stdout + TUI)
@@ -235,6 +239,26 @@ func WithTempdbShrinkRunner(d TempdbShrinkDriver) EngineOption {
 // the sampler (ServerSampler.SetKiller) so it is consulted on each blocking poll.
 func WithBlockerKiller(k *BlockerKiller, defaultAfter time.Duration) EngineOption {
 	return func(e *Engine) { e.killer = k; e.killDefaultAfter = defaultAfter }
+}
+
+// WithVictimKiller arms the amplifying-maintenance-victim kill: the killer terminates
+// maintenance statements this run's operation blocks once other sessions have queued
+// behind them for the policy's dwell. The same killer must be attached to the sampler
+// (ServerSampler.SetVictimKiller) so it is consulted on each blocking poll.
+func WithVictimKiller(k *VictimKiller, p AmplifierPolicy) EngineOption {
+	return func(e *Engine) { e.victims = k; e.victimPolicy = p }
+}
+
+// WithAsyncStatsSetting supplies the target's ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY
+// state, used for the pre-reorganize advisory.
+func WithAsyncStatsSetting(s AsyncStatsSetting) EngineOption {
+	return func(e *Engine) { e.asyncStats = s }
+}
+
+// WithAmplifierSink is notified with the distinct SQL Agent jobs whose statements this
+// run has killed, whenever that set changes, and with nil at the end of each manifest.
+func WithAmplifierSink(f func([]string)) EngineOption {
+	return func(e *Engine) { e.amplifierSink = f }
 }
 
 // WithBatchDMLRunner routes ddl.BatchDML operations to the batch-DML driver instead
@@ -553,6 +577,20 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		defer e.killer.SetSource(nil)
 	}
 
+	// Arm the amplifying-victim killer for this manifest, if wired. Disarm when the
+	// manifest is done so a later manifest does not inherit its episode state, and
+	// clear the TUI's conflicting-jobs line at the same moment.
+	amplifiers := &amplifierCapture{}
+	if e.victims != nil {
+		e.victims.Arm(e.victimPolicy)
+		defer func() {
+			e.victims.Disarm()
+			if e.amplifierSink != nil {
+				e.amplifierSink(nil)
+			}
+		}()
+	}
+
 	var failedOps []ddl.Operation
 	captured := &blockerCapture{}
 	contended := &contendedCapture{}
@@ -606,6 +644,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			if ev.Tail != nil {
 				e.captureTail(contended, name, manifest.Database, *ev.Tail)
 			}
+			if ev.Amplifier != nil {
+				amplifiers.add(*ev.Amplifier, e.now())
+				e.flushAmplifiers(name, amplifiers)
+				if e.amplifierSink != nil {
+					e.amplifierSink(amplifiers.jobs())
+				}
+			}
 			detail := ev.Detail
 			if isInterruption(ev.Kind) {
 				if pct, ok := e.operationPercent(ctx); ok {
@@ -636,6 +681,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
 			}
 		}
+		// The victim killer emits kills on this operation's sink, from the pump
+		// goroutine. Each iteration overwrites it before any kill can occur, and
+		// Disarm clears it at the end of the manifest.
+		e.victims.SetSink(sink)
 		waitsBefore := e.snapshotWaits(ctx)
 
 		// Narrate, once each, the ignored sessions we hold the lock through, so the run
@@ -690,6 +739,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
 				sink(ReactionEvent{Kind: "warn", Detail: msg})
 			}
+			if msg, ok := asyncStatsAdvisory(step.Operation, db, e.asyncStats); ok {
+				sink(ReactionEvent{Kind: "warn", Detail: msg})
+			}
 			switch op := step.Operation.(type) {
 			case ddl.Shrink:
 				if e.shrink != nil {
@@ -730,11 +782,18 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
 			}
 		}
-		// Stop the narrator and wait for it to fully exit before reading `reactions`
-		// below, so a late sink() append cannot race with the read.
+		// Stop the narrator; it is joined, so it appends nothing past this point. The
+		// pump goroutine is not joined (monitored_runner.go only stops sampling), and
+		// the victim killer emits kills on this same sink from it — a kill decided just
+		// before the statement finished can still be mid-flight here. So the report
+		// state is read under reactionMu, on a copy, exactly as sink() writes it.
 		stopHold()
 		<-holdDone
 		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
+		reactionMu.Lock()
+		opReactions := append([]report.ReactionLine(nil), reactions...)
+		opPeakBlocked := peakBlocked
+		reactionMu.Unlock()
 
 		opRep := report.OperationReport{
 			Index:          i + 1,
@@ -742,8 +801,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			Target:         opTarget(step.Operation),
 			SQL:            stmt, // the statement actually executed (RESUME when continuing a paused resumable)
 			Options:        optionDecisions(step.Decisions),
-			Reactions:      reactions,
-			PeakBlocked:    peakBlocked,
+			Reactions:      opReactions,
+			PeakBlocked:    opPeakBlocked,
 			ContendedCount: contended.len(),
 			Waits:          waitLines,
 			WaitTotalMS:    waitTotal,
@@ -853,9 +912,20 @@ func (e *Engine) killSource(name string, rules []ddl.KilledSession) (KillSource,
 	return staticKill{rules: compiled}, nil
 }
 
+// stopVictims stops the amplifying-victim killer for the manifest that is finishing.
+// Disarm clears the sink as well as the episodes, so no kill decided after this point
+// can reach the finished operation's sink — which would re-create the .amplifiers.yaml
+// sidecar in processing right after relocateCaptures moved it, leaving a file nothing
+// ever cleans up. It must therefore run BEFORE any relocation: processOne's
+// `defer e.victims.Disarm()` runs after finalize returns, far too late. Nil-receiver
+// safe and idempotent, so every finalize path can call it and the defer still stands as
+// a backstop.
+func (e *Engine) stopVictims() { e.victims.Disarm() }
+
 // finalize records a terminal outcome: moves the manifest, writes the report,
 // notifies, and persists history.
 func (e *Engine) finalize(ctx context.Context, name string, rep *report.RunReport, start time.Time, success bool) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -936,6 +1006,7 @@ func shrinkShortReason(results []ShrinkResult) string {
 // distinctly in the run summary. It does not join e.failures — that list drives the
 // "FAILED" echo and the failed exit code; an incomplete run is surfaced separately.
 func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *report.RunReport, start time.Time) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -977,6 +1048,7 @@ func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, 
 // recovery manifest (the failed operations, carrying on_failure: continue) next to
 // it, and reports/records the run like a failure so the exit code reflects it.
 func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
 	rep.FinishedAt = e.now()
@@ -1140,6 +1212,9 @@ func (e *Engine) finalizeInterrupted(ctx context.Context, name string, rep *repo
 // INTERRUPTED outcome, report, notify, and history) without moving the manifest — it is
 // left in processing. The caller sets rep.Error and prints its own log line.
 func (e *Engine) recordInterrupted(ctx context.Context, name string, rep *report.RunReport, start time.Time) {
+	// The manifest stays in processing, so nothing is relocated here — but the report is
+	// written now, and a kill landing after it would be in the sidecar and not in the .log.
+	e.stopVictims()
 	rep.FinishedAt = e.now()
 	rep.DurationMS = e.msSince(start)
 	rep.Outcome = "INTERRUPTED"

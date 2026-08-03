@@ -505,6 +505,16 @@ unaffected. Unset/zero means no cap. In `--tui`, selecting a blocked session and
 writes the rule into the running manifest via a structured atomic rewrite, which the live reload
 then picks up.
 
+**`kill_amplifying_maintenance` and the yield timer.** A blocked session that is kill-eligible
+(§1.3 of the amplifying-victim design) contributes to `BlockState.Any` but not to
+`BlockState.Unignored` for as long as its `KILL` is pending or within the post-kill grace window —
+so the yield timer does not fire while the kill is in flight. `max_block_minutes` keys off `Any`
+and is therefore unchanged: it still backstops a victim this feature never manages to kill. A
+failed `KILL` withdraws the suppression immediately, folding that session back into `Unignored` on
+the same poll. `DecideReaction` gains no new `Action` from this feature — the kill is issued
+directly from `ServerSampler.Blocking`, alongside the existing `BlockerKiller` consultation, not
+through the reaction hierarchy above.
+
 ---
 
 ## 10. Clean `KILL` strategy (cancel vs kill)

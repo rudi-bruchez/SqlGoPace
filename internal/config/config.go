@@ -23,17 +23,18 @@ var ErrInvalidConfig = errors.New("invalid config")
 
 // Config is the full SqlGoPace configuration.
 type Config struct {
-	Database        DatabaseConfig        `yaml:"database"`
-	Directories     DirectoriesConfig     `yaml:"directories"`
-	Monitoring      MonitoringConfig      `yaml:"monitoring"`
-	Preflight       PreflightConfig       `yaml:"preflight"`
-	OptionsOverride OptionsOverrideConfig `yaml:"options_override"`
-	Notifications   NotificationsConfig   `yaml:"notifications"`
-	History         HistoryConfig         `yaml:"history"`
-	Shrink          ShrinkConfig          `yaml:"shrink"`
-	BatchDML        BatchDMLConfig        `yaml:"batch_dml"`
-	KillBlockers    KillBlockersConfig    `yaml:"kill_blockers"`
-	MatrixFile      string                `yaml:"matrix_file"`
+	Database                  DatabaseConfig                  `yaml:"database"`
+	Directories               DirectoriesConfig               `yaml:"directories"`
+	Monitoring                MonitoringConfig                `yaml:"monitoring"`
+	Preflight                 PreflightConfig                 `yaml:"preflight"`
+	OptionsOverride           OptionsOverrideConfig           `yaml:"options_override"`
+	Notifications             NotificationsConfig             `yaml:"notifications"`
+	History                   HistoryConfig                   `yaml:"history"`
+	Shrink                    ShrinkConfig                    `yaml:"shrink"`
+	BatchDML                  BatchDMLConfig                  `yaml:"batch_dml"`
+	KillBlockers              KillBlockersConfig              `yaml:"kill_blockers"`
+	KillAmplifyingMaintenance KillAmplifyingMaintenanceConfig `yaml:"kill_amplifying_maintenance"`
+	MatrixFile                string                          `yaml:"matrix_file"`
 }
 
 // KillBlockersConfig arms the selective blocker-kill policy. The match rules themselves
@@ -49,6 +50,35 @@ type KillBlockersConfig struct {
 // DefaultAfter returns the default kill delay for a rule that sets none.
 func (k KillBlockersConfig) DefaultAfter() time.Duration {
 	return time.Duration(k.DefaultAfterSeconds) * time.Second
+}
+
+// KillAmplifyingMaintenanceConfig arms the kill of maintenance statements our
+// operation blocks that have other sessions queued behind them. Top-level, as a
+// sibling of kill_blockers: that is the mirror-direction feature, and monitoring:
+// holds cadences and thresholds rather than policy arming.
+type KillAmplifyingMaintenanceConfig struct {
+	Enabled          bool     `yaml:"enabled"`
+	MinBlockedBehind int      `yaml:"min_blocked_behind"`
+	AfterSeconds     int      `yaml:"after_seconds"`
+	Commands         []string `yaml:"commands"`
+}
+
+// MinBehind is how many sessions must be queued behind a victim before it counts as an
+// amplifier; defaults to 1, because one queued reader means the amplification has
+// already begun and the fan only grows from there.
+func (k KillAmplifyingMaintenanceConfig) MinBehind() int {
+	if k.MinBlockedBehind <= 0 {
+		return 1
+	}
+	return k.MinBlockedBehind
+}
+
+// After is how long a victim must stay eligible before it is killed; defaults to 60s.
+func (k KillAmplifyingMaintenanceConfig) After() time.Duration {
+	if k.AfterSeconds <= 0 {
+		return 60 * time.Second
+	}
+	return time.Duration(k.AfterSeconds) * time.Second
 }
 
 // DatabaseConfig holds connection settings. LoginTimeout is the connection
@@ -417,6 +447,16 @@ func (c *Config) validate() error {
 	if c.BatchDML.MinRows > c.BatchDML.MaxRows {
 		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",
 			c.BatchDML.MinRows, c.BatchDML.MaxRows, ErrInvalidConfig)
+	}
+	// An entry that is empty after trimming would be a prefix of every command verb,
+	// turning the allow-list into "kill every session we block" — including application
+	// SELECTs and open user transactions. A dangling YAML item is the easy way to write
+	// one, so refuse to start rather than run with a silently widened policy.
+	for i, cmd := range c.KillAmplifyingMaintenance.Commands {
+		if strings.TrimSpace(cmd) == "" {
+			return fmt.Errorf("kill_amplifying_maintenance.commands[%d] is empty; remove the entry or name a command verb: %w",
+				i, ErrInvalidConfig)
+		}
 	}
 	if e := c.Notifications.Email; e.Host != "" {
 		if strings.TrimSpace(e.From) == "" || len(e.To) == 0 {

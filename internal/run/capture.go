@@ -53,6 +53,13 @@ func (c *blockerCapture) len() int { return len(c.order) }
 // returns how many such sessions it saw this call (the current simultaneous count,
 // which drives the per-operation peak and the reaction narration). Best-effort: 0
 // without a blocker reader or an execution session.
+//
+// The condition mirrors ServerSampler.Blocking's, suppression included: a victim pending
+// a kill (or inside its post-kill grace window) is deliberately excluded from
+// BlockState.Unignored, so counting it here would put it in peakBlocked anyway — and
+// writing it into .blocked.yaml would offer the operator an ignore_blocked_sessions entry
+// for the very session about to be listed in .amplifiers.yaml as killed. The two files
+// carry opposite instructions; a session must never appear in both.
 func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *blockerCapture, name string) int {
 	if e.blockers == nil || e.session == nil {
 		return 0
@@ -66,7 +73,7 @@ func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *
 	now := e.now()
 	blocked := 0
 	for _, s := range sessions {
-		if !s.BlockedBy(spid) || rules.ignores(s) {
+		if !s.BlockedBy(spid) || rules.ignores(s) || e.victims.Suppressed(s.SPID) {
 			continue
 		}
 		acc.add(s, now)
@@ -152,11 +159,13 @@ func (e *Engine) relocateSidecar(name, dir, suffix, label string) {
 	}
 }
 
-// relocateCaptures moves both advisory sidecars — the blocked-session capture and the
-// .contended.yaml — from processing to dir on finalize. Each is a no-op when absent.
+// relocateCaptures moves the three advisory sidecars — the blocked-session capture,
+// the .contended.yaml and the .amplifiers.yaml — from processing to dir on finalize.
+// Each is a no-op when absent.
 func (e *Engine) relocateCaptures(name, dir string) {
 	e.relocateSidecar(name, dir, blockedCaptureSuffix, "blocked-session capture")
 	e.relocateSidecar(name, dir, contendedCaptureSuffix, "contended capture")
+	e.relocateSidecar(name, dir, amplifierCaptureSuffix, "amplifier capture")
 }
 
 // renderCapture builds the advisory blocked-session capture file: a commented,

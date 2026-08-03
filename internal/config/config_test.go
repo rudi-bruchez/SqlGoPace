@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -264,6 +265,79 @@ func TestEmailConfigRequiresPasswordWhenUsername(t *testing.T) {
 		"    host: smtp.internal\n    from: a@x\n    to: [b@y]\n    username: u\n"
 	if _, err := config.Parse([]byte(yaml)); err == nil {
 		t.Fatal("Parse() want error when username set without password")
+	}
+}
+
+// Both tests below layer kill_amplifying_maintenance on top of validYAML rather than
+// the brief's bare-minimum snippet (database + the new block only): validate() requires
+// directories/monitoring polls/matrix_file regardless of this feature, so a config
+// missing them never reaches Parse() success — matching every other test in this file.
+func TestParseKillAmplifyingMaintenance(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "kill_amplifying_maintenance:\n" +
+		"  enabled: true\n" +
+		"  min_blocked_behind: 3\n" +
+		"  after_seconds: 90\n" +
+		"  commands: [\"UPDATE STATISTIC\"]\n"
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	k := cfg.KillAmplifyingMaintenance
+	if !k.Enabled {
+		t.Error("Enabled = false, want true")
+	}
+	if got, want := k.MinBehind(), 3; got != want {
+		t.Errorf("MinBehind() = %d, want %d", got, want)
+	}
+	if got, want := k.After(), 90*time.Second; got != want {
+		t.Errorf("After() = %v, want %v", got, want)
+	}
+	if len(k.Commands) != 1 || k.Commands[0] != "UPDATE STATISTIC" {
+		t.Errorf("Commands = %v, want [UPDATE STATISTIC]", k.Commands)
+	}
+}
+
+func TestKillAmplifyingMaintenanceDefaults(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "kill_amplifying_maintenance:\n  enabled: true\n"
+	cfg, err := config.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	k := cfg.KillAmplifyingMaintenance
+	if got, want := k.MinBehind(), 1; got != want {
+		t.Errorf("MinBehind() = %d, want %d — one queued reader means amplification has begun", got, want)
+	}
+	if got, want := k.After(), 60*time.Second; got != want {
+		t.Errorf("After() = %v, want %v", got, want)
+	}
+	if len(k.Commands) != 0 {
+		t.Errorf("Commands = %v, want empty — an empty list means the built-in allow-list", k.Commands)
+	}
+}
+
+// A dangling YAML item leaves an empty string in the list, which is a prefix of every
+// command verb — the allow-list would silently become "kill every session we block".
+func TestKillAmplifyingMaintenanceRejectsEmptyCommand(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	for _, entry := range []string{`""`, `"   "`} {
+		yaml := validYAML + "kill_amplifying_maintenance:\n" +
+			"  enabled: true\n" +
+			"  commands: [" + entry + ", \"UPDATE STATISTIC\"]\n"
+		_, err := config.Parse([]byte(yaml))
+		if err == nil {
+			t.Fatalf("Parse() with a %s commands entry error = nil, want non-nil", entry)
+		}
+		if !errors.Is(err, config.ErrInvalidConfig) {
+			t.Errorf("Parse() error = %v, want it to wrap ErrInvalidConfig", err)
+		}
+		if !strings.Contains(err.Error(), "kill_amplifying_maintenance.commands") {
+			t.Errorf("Parse() error = %v, want it to name the option", err)
+		}
 	}
 }
 

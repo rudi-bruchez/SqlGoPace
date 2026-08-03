@@ -167,6 +167,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
+	if w := amplifierDwellWarning(cfg); w != "" {
+		fmt.Fprintln(stdout, w)
+	}
 
 	// --auto: analyze and materialize maintenance manifests into the queue before
 	// the engine processes it. Materializing (rather than running purely in memory)
@@ -372,6 +375,32 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	return nil
 }
 
+// amplifierDwellWarning returns the startup warning to print when the amplifying-victim
+// dwell outlasts the blocking timeout, or "" when there is nothing to warn about.
+//
+// A victim is suppressed from BlockState.Unignored from the first poll it is eligible —
+// well before any KILL — so the yield reaction never fires for it while it waits out
+// after_seconds. With a dwell longer than blocking_timeout_minutes the operation holds
+// its lock through the amplifier for the whole dwell, and a manifest's max_block_minutes
+// (often unset) is the only backstop left. That is a legitimate trade — killing sooner is
+// the more destructive choice — so this warns rather than rejects.
+//
+// Pure over config, so the decision is tested without a server.
+func amplifierDwellWarning(cfg *config.Config) string {
+	if !cfg.KillAmplifyingMaintenance.Enabled {
+		return ""
+	}
+	dwell, timeout := cfg.KillAmplifyingMaintenance.After(), cfg.Monitoring.BlockingTimeout()
+	if dwell <= timeout {
+		return ""
+	}
+	return fmt.Sprintf("-- warning: kill_amplifying_maintenance.after_seconds (%s) is longer than "+
+		"monitoring.blocking_timeout_minutes (%s): an amplifying victim is suppressed from the yield "+
+		"reaction for the whole dwell, so an operation can hold its lock through it for %s before "+
+		"anything reacts — only a manifest's max_block_minutes stops it sooner",
+		dwell, timeout, dwell)
+}
+
 // buildEngine wires a run.Engine for one database's connection, sharing the given
 // history (may be nil) and reading policy, monitoring, and notification settings
 // from cfg. It is called once per database in a multi-database run. It also opens
@@ -385,7 +414,9 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
 	}
-	killArmed := cfg.KillBlockers.Enabled || cfg.OptionsOverride.AllowAbortBlockers
+	killArmed := cfg.KillBlockers.Enabled ||
+		cfg.KillAmplifyingMaintenance.Enabled ||
+		cfg.OptionsOverride.AllowAbortBlockers
 	checker := run.NewPreflightChecker(conn, info, thresholds, killArmed)
 	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
@@ -403,6 +434,44 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		killer := run.NewBlockerKiller(conn.Kill, killed, nil)
 		sampler.SetKiller(killer)
 		killOpt = run.WithBlockerKiller(killer, cfg.KillBlockers.DefaultAfter())
+	}
+	// Amplifying-maintenance-victim kill (off unless armed in config): terminates a
+	// maintenance statement our operation blocks once other sessions have queued
+	// behind it. The killer is shared with the sampler, exactly like the blocker
+	// killer above.
+	var victimOpt run.EngineOption = func(*run.Engine) {}
+	if cfg.KillAmplifyingMaintenance.Enabled {
+		policy := run.AmplifierPolicy{
+			MinBlockedBehind: cfg.KillAmplifyingMaintenance.MinBehind(),
+			After:            cfg.KillAmplifyingMaintenance.After(),
+			Commands:         cfg.KillAmplifyingMaintenance.Commands,
+		}
+		// Presentation only, and only for the TUI: in TUI mode engineOut is io.Discard
+		// (main.go:206), so the engine's reaction sink — which renders the very same
+		// line — reaches nobody. In non-TUI mode that sink already prints to stdout, so
+		// writing here too would narrate every kill twice.
+		amplifierKilled := func(ev run.AmplifierKillEvent) {
+			if fwd != nil {
+				fwd.send(tui.LogMsg{Line: run.AmplifierDetail(ev)})
+			}
+		}
+		// Self-exclusion keys off this connection's effective application name, not the
+		// mssql.AppNamePrefix constant: a DSN carrying `app name=...` changes what our
+		// own sessions report as program_name, and a stale constant would let one
+		// instance of a size-split campaign kill another's in-flight REBUILD.
+		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, conn.AppNamePrefix())
+		sampler.SetVictimKiller(victims)
+		victimOpt = run.WithVictimKiller(victims, policy)
+	}
+	// ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY is database-scoped, so it must be read
+	// from this per-database conn, not the startup connection — otherwise a
+	// multi-database run would report the wrong database's setting.
+	asyncStats := run.AsyncStatsAbsent
+	if on, present, err := conn.AsyncStatsWaitAtLowPriority(ctx); err == nil && present {
+		asyncStats = run.AsyncStatsOff
+		if on {
+			asyncStats = run.AsyncStatsOn
+		}
 	}
 	runner := run.NewMonitoredRunner(conn, sampler, run.System, run.RunnerConfig{
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
@@ -493,6 +562,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		run.WithDrainSignal(drain),
 		run.WithOutput(engineOut),
 		run.WithStepSink(stepSink),
+		victimOpt,
+		run.WithAsyncStatsSetting(asyncStats),
+		run.WithAmplifierSink(func(jobs []string) {
+			if fwd != nil {
+				fwd.send(tui.ConflictingJobsMsg{Jobs: jobs})
+			}
+		}),
 	}
 	if killOpt != nil {
 		opts = append(opts, killOpt)
