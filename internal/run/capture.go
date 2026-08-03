@@ -157,6 +157,7 @@ func (e *Engine) relocateSidecar(name, dir, suffix, label string) {
 func (e *Engine) relocateCaptures(name, dir string) {
 	e.relocateSidecar(name, dir, blockedCaptureSuffix, "blocked-session capture")
 	e.relocateSidecar(name, dir, contendedCaptureSuffix, "contended capture")
+	e.relocateSidecar(name, dir, amplifierCaptureSuffix, "amplifier capture")
 }
 
 // renderCapture builds the advisory blocked-session capture file: a commented,
