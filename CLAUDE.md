@@ -56,6 +56,16 @@ mandatory for monitoring).
 - **No query timeout.** Operation duration is governed by the monitoring loop and the reaction
   hierarchy, never a fixed timer. Don't add `context.WithTimeout` around the executing DDL.
 - **Secrets via `${VAR}`** from `.env` (gitignored); never put credentials in `config.yaml`.
+- **Never commit client identifiers.** Real database names, server/host names, table and index
+  names, logins, domains, and company names from a client engagement must not appear anywhere
+  in the repo — not in code, tests, docs, `specs/`, or `docs/superpowers/` designs and plans.
+  Findings from a live campaign are exactly where these leak in, because a DMV screenshot or a
+  blocking chain is the most convincing motivation to quote. Anonymize at the moment of writing,
+  not in a later cleanup pass: once committed, the name is in the history. Use neutral
+  placeholders — `PRODDB` for a database, `dbo.MEASUREMENT` / `PK_MEASUREMENT` for objects,
+  `SQLPROD01` for a host, `CORP\svc_sqlagent` for a service account. Keeping the *shape* of a
+  real incident (session ids, wait types, chain depth, elapsed times) is encouraged; keeping its
+  names is not.
 - **Version** lives in `internal/version/VERSION` (embedded with `//go:embed`). Bump that file,
   no build flags. CI can override via `-ldflags "-X ...internal/version.override=X.Y.Z"`.
 - **Windows binary lock**: `bin/sqlgopace.exe` is locked while running — stop a running instance

@@ -107,6 +107,20 @@ A victim qualifies for the kill when all of the following hold:
 6. it is not another SqlGoPace session (§1.4);
 7. it is not our own direct blocker (§1.6).
 
+### 1.4 Self-exclusion
+
+A second SqlGoPace instance running a `REBUILD` reports `command = ALTER INDEX` and
+would classify as a killable amplifier. Sessions whose `program_name` matches our own
+connection's application name are never considered. This is not hypothetical: the
+PRODDB campaign runs size-split manifests that can overlap in time.
+
+### 1.5 Episode state
+
+Keyed by victim SPID — unlike `BlockerKiller`, which tracks the single session
+blocking us, several victims can be eligible at once. Per SPID: the timestamp it first
+became eligible, and a killed flag. Each victim is killed at most once per episode;
+its entry is dropped when it stops being blocked by us.
+
 ### 1.6 Disjointness from `BlockerKiller`
 
 `BlockerKiller` targets the session *we* are blocked by; `VictimKiller` targets
@@ -122,20 +136,6 @@ Two consequences follow. Episode state is never shared, because no SPID is ever 
 both. And the order in which `ServerSampler.Blocking` consults the two killers does
 not matter — a property worth asserting in a test so a later refactor cannot quietly
 introduce a double `KILL`.
-
-### 1.4 Self-exclusion
-
-A second SqlGoPace instance running a `REBUILD` reports `command = ALTER INDEX` and
-would classify as a killable amplifier. Sessions whose `program_name` matches our own
-connection's application name are never considered. This is not hypothetical: the
-PRODDB campaign runs size-split manifests that can overlap in time.
-
-### 1.5 Episode state
-
-Keyed by victim SPID — unlike `BlockerKiller`, which tracks the single session
-blocking us, several victims can be eligible at once. Per SPID: the timestamp it first
-became eligible, and a killed flag. Each victim is killed at most once per episode;
-its entry is dropped when it stops being blocked by us.
 
 ## 2. Reaction wiring
 
