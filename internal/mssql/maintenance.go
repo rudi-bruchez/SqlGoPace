@@ -17,3 +17,50 @@ func IsMaintenanceCommand(cmd string) bool {
 		return false
 	}
 }
+
+// amplifyingCommands are the dm_exec_requests.command verbs whose blocked Sch-M
+// request converts an online operation into a full-table outage: every reader
+// arriving afterwards queues behind the waiting Sch-M rather than barging past it.
+// Prefix-matched, so "UPDATE STATISTIC" covers both spellings SQL Server reports.
+var amplifyingCommands = []string{
+	"ALTER INDEX",
+	"ALTER TABLE",
+	"CREATE INDEX",
+	"CREATE STATISTICS",
+	"UPDATE STATISTIC",
+	"DROP INDEX",
+	"DROP TABLE",
+	"TRUNCATE TABLE",
+	"DBCC",
+}
+
+// DefaultAmplifyingCommands returns a copy of the built-in allow-list, for config
+// validation and for documenting the effective set.
+func DefaultAmplifyingCommands() []string {
+	out := make([]string, len(amplifyingCommands))
+	copy(out, amplifyingCommands)
+	return out
+}
+
+// IsAmplifyingCommand reports whether cmd is a maintenance statement worth killing
+// when it is blocked by our operation with other sessions queued behind it. allow
+// replaces the built-in list when non-empty (never extends it); an absent or empty
+// allow means the built-in list, never "match nothing". Matching is case-insensitive,
+// space-trimmed, and by prefix. It is deliberately separate from IsMaintenanceCommand,
+// which answers a different question for the shrink driver and must not change.
+func IsAmplifyingCommand(cmd string, allow []string) bool {
+	c := strings.ToUpper(strings.TrimSpace(cmd))
+	if c == "" {
+		return false
+	}
+	list := amplifyingCommands
+	if len(allow) > 0 {
+		list = allow
+	}
+	for _, want := range list {
+		if strings.HasPrefix(c, strings.ToUpper(strings.TrimSpace(want))) {
+			return true
+		}
+	}
+	return false
+}
