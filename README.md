@@ -415,13 +415,17 @@ A blocked session is a kill candidate only when all of the following hold:
 
 1. it is directly blocked by our DDL session, not merely a transitive victim further down the
    chain;
-2. it is not another SqlGoPace session (matched by application-name prefix, so a second
-   size-split manifest running concurrently is never a candidate);
+2. it is not another SqlGoPace session (matched by prefix against *this connection's own*
+   application name — whatever `app name=` your `connection_string` sets, or `SqlGoPace` when it
+   sets none — so a second size-split manifest running concurrently is never a candidate,
+   including one on a different build);
 3. its `sys.dm_exec_requests.command` matches the allow-list — by default `ALTER INDEX`, `ALTER
    TABLE`, `CREATE INDEX`, `CREATE STATISTICS`, `UPDATE STATISTIC` (both spellings SQL Server
    reports), `DROP INDEX`, `DROP TABLE`, `TRUNCATE TABLE`, `DBCC`; a non-empty `commands:` list
    *replaces* this set rather than extending it, so you can narrow the feature to, say,
-   `UPDATE STATISTIC` alone;
+   `UPDATE STATISTIC` alone. An entry that is empty or whitespace-only — the usual result of a
+   dangling YAML item — is rejected at startup: it would be a prefix of every command verb and
+   would silently widen the feature to every session the run blocks;
 4. it matches no `ignore_blocked_sessions` rule;
 5. it is not the session our own DDL is directly waiting on (that one belongs to
    `kill_blockers`, never to this feature — the two killers are disjoint by construction, so a
