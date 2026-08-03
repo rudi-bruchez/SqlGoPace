@@ -927,9 +927,9 @@ git commit -m "feat(run): advise on ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY befo
 - Consumes: `run.BlockedBehind`, `run.DirectVictims` (Task 2); `mssql.IsAmplifyingCommand` (Task 1); `run.IgnoredSessions.ignores` (existing, `executor.go`); `run.Clock`, `run.NewManualClock` (existing, `clock.go`).
 - Produces:
   - `type AmplifierPolicy struct { MinBlockedBehind int; After time.Duration; Commands []string }`
-  - `type AmplifierKillEvent struct { SPID int; Command string; Statement string; Database string; Login string; Host string; Program string; BlockedBehind int; WaitedMS int64; Waited time.Duration; Job mssql.AgentJob }`
+  - `type AmplifierKillEvent struct { SPID int; Command string; Statement string; Database string; Login string; Host string; Program string; BlockedBehind int; WaitedMS int64; FirstEligible time.Time; Waited time.Duration; Job mssql.AgentJob }`
   - `type VictimKiller struct { ... }`
-  - `func NewVictimKiller(kill func(context.Context, int) error, resolve func(context.Context, string, int) (mssql.AgentJob, error), clk Clock, selfProgram string) *VictimKiller`
+  - `func NewVictimKiller(kill func(context.Context, int) error, resolve func(context.Context, string, int) (mssql.AgentJob, error), onKill func(AmplifierKillEvent), clk Clock, selfProgram string) *VictimKiller`
   - `func (k *VictimKiller) Arm(p AmplifierPolicy)` / `func (k *VictimKiller) Disarm()`
   - `func (k *VictimKiller) SetSink(sink ReactionSink)` — the engine sets this per operation, where it builds `sink`; `nil` between operations.
   - `func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions)`
@@ -938,7 +938,11 @@ git commit -m "feat(run): advise on ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY befo
 
 Read `internal/run/kill.go` end to end first. This type is its mirror and must match its conventions: mutex-guarded state, `nil`-receiver tolerance, episode reset.
 
-**How the kill reaches the engine.** `BlockerKiller` takes an `onKill` callback at construction, because its consumer (`main.go`) only needs to print. This killer's output has to reach the run report and a per-manifest sidecar, which are engine state — so it emits a `ReactionEvent` instead, carrying the structured event in a new `Amplifier` field. That is exactly how `TailFinding` already rides `ReactionEvent.Tail` from the shrink driver into `engine.go`'s sink (`engine.go:606`), and the engine's sink is already documented and mutex-guarded for being called from a sibling goroutine — which is what the pump goroutine is.
+**Two output paths, both needed.** The kill has two consumers with different lifetimes.
+
+*Engine state* — the run report and the per-manifest `.amplifiers.yaml` — is reached by emitting a `ReactionEvent` carrying the structured event in a new `Amplifier` field. That is exactly how `TailFinding` already rides `ReactionEvent.Tail` from the shrink driver into `engine.go`'s sink (`engine.go:606`), and that sink is already documented and mutex-guarded for being called from a sibling goroutine — which is what the pump goroutine is.
+
+*Presentation* is a separate `onKill` callback at construction, mirroring `BlockerKiller` (`main.go:395`). This is **not** redundant: in TUI mode `engineOut` is `io.Discard` (`main.go:206`), so the line the engine sink prints goes nowhere and the operator would see no per-kill narration at all. The callback sends a `tui.LogMsg` and prints to the run output.
 
 Add to `internal/run/reaction.go`, beside the existing `Tail` field:
 
@@ -951,7 +955,24 @@ Add to `internal/run/reaction.go`, beside the existing `Tail` field:
 	Amplifier *AmplifierKillEvent
 ```
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Export the application-name prefix first**
+
+The tests below reference `mssql.AppNamePrefix`, so it must exist before the red step, or Step 3 fails with `undefined: mssql.AppNamePrefix` rather than the failure this task is about.
+
+Self-exclusion needs the same constant `internal/mssql/conn.go` uses for the connection's application name. In `conn.go`, replace the two literal `"SqlGoPace"` occurrences in `appNameWithVersion` with a named constant and export it:
+
+```go
+// AppNamePrefix is the application name SqlGoPace connects with, before the version
+// suffix appNameWithVersion appends ("SqlGoPace/0.13.0"). It is exported because the
+// victim killer matches program_name against it by prefix to avoid ever terminating
+// another SqlGoPace session — including one running a different build.
+const AppNamePrefix = "SqlGoPace"
+```
+
+Run: `go build ./... && go test -race ./internal/mssql`
+Expected: builds, tests PASS.
+
+- [ ] **Step 2: Write the failing test**
 
 Create `internal/run/victim_test.go`. Like every test file in this package it is an **internal** test (`package run`), so the identifiers are unqualified and `consider`/`Suppressed` are directly reachable — no `export_test.go` entry is needed.
 
@@ -968,13 +989,16 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
-// victimFixture builds a killer plus the levers a test needs over it.
+// victimFixture builds a killer plus the levers a test needs over it. events are what
+// the engine route (the ReactionEvent sink) saw; narrated is what the presentation
+// route (the onKill callback) saw. Both must fire on a kill.
 type victimFixture struct {
-	killer  *VictimKiller
-	clk     *ManualClock
-	killed  []int
-	events  []AmplifierKillEvent
-	killErr error
+	killer   *VictimKiller
+	clk      *ManualClock
+	killed   []int
+	events   []AmplifierKillEvent
+	narrated []AmplifierKillEvent
+	killErr  error
 }
 
 func newVictimFixture(t *testing.T, p AmplifierPolicy) *victimFixture {
@@ -991,6 +1015,7 @@ func newVictimFixture(t *testing.T, p AmplifierPolicy) *victimFixture {
 		func(_ context.Context, hex string, step int) (mssql.AgentJob, error) {
 			return mssql.AgentJob{Resolved: true, JobID: hex, StepID: step, JobName: "IndexOptimize"}, nil
 		},
+		func(ev AmplifierKillEvent) { f.narrated = append(f.narrated, ev) },
 		f.clk,
 		mssql.AppNamePrefix,
 	)
@@ -1074,6 +1099,14 @@ func TestVictimKillerEventCarriesChainAndJob(t *testing.T) {
 	}
 	if ev.Waited != 61*time.Second {
 		t.Errorf("event Waited = %v, want 61s", ev.Waited)
+	}
+	if want := time.Unix(1_800_000_000, 0); !ev.FirstEligible.Equal(want) {
+		t.Errorf("event FirstEligible = %v, want %v", ev.FirstEligible, want)
+	}
+	// Both routes must fire: the engine sink feeds the report and sidecar, the
+	// presentation callback feeds the TUI, whose run output is io.Discard.
+	if len(f.narrated) != 1 || f.narrated[0].SPID != 79 {
+		t.Errorf("narrated = %+v, want a single event for SPID 79", f.narrated)
 	}
 	if !ev.Job.Resolved || ev.Job.JobName != "IndexOptimize" || ev.Job.StepID != 1 {
 		t.Errorf("event Job = %+v, want a resolved IndexOptimize step 1", ev.Job)
@@ -1175,8 +1208,8 @@ func TestVictimKillerFailedKillWithdrawsSuppression(t *testing.T) {
 	if f.killer.Suppressed(79) {
 		t.Error("Suppressed(79) = true after a failed KILL, want false so the normal yield timer applies")
 	}
-	if len(f.events) != 0 {
-		t.Errorf("events = %v, want none when the KILL failed", f.events)
+	if len(f.events) != 0 || len(f.narrated) != 0 {
+		t.Errorf("events = %v, narrated = %v, want none on either route when the KILL failed", f.events, f.narrated)
 	}
 }
 
@@ -1247,12 +1280,54 @@ func TestVictimKillerNilReceiverIsSafe(t *testing.T) {
 
 `amplifierSnapshot` is reused by Task 6's sampler tests, so it must stay at package scope in this file.
 
-- [ ] **Step 2: Run test to verify it fails**
+Add one more test for the narration, which is the operator-facing artefact and easy to let drift:
 
-Run: `go test -race ./internal/run -run TestVictimKiller -v`
+```go
+func TestAmplifierDetailNamesTheObjectAndJob(t *testing.T) {
+	ev := AmplifierKillEvent{
+		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 16,
+		Statement: "UPDATE STATISTICS\n   [dbo].[MEASUREMENT] [PK_MEASUREMENT]\n   WITH MAXDOP 2",
+		Job:       mssql.AgentJob{Resolved: true, JobName: "IndexOptimize - USER_DATABASES", StepID: 1},
+	}
+	got := AmplifierDetail(ev)
+	for _, want := range []string{
+		"SPID 79",
+		"[dbo].[MEASUREMENT]",          // the object, not just the verb
+		"16 session(s) queued behind it",
+		`SQL Agent job "IndexOptimize - USER_DATABASES" step 1`,
+		"sp_update_job",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("AmplifierDetail() = %q, missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "\n") {
+		t.Errorf("AmplifierDetail() must be one line, got %q", got)
+	}
+}
+
+func TestAmplifierDetailFallsBackToProgramWhenUnattributed(t *testing.T) {
+	ev := AmplifierKillEvent{
+		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 3,
+		Program: "SQLAgent - Job invocation engine", Login: "svc_agent", Host: "SQLPROD01",
+	}
+	got := AmplifierDetail(ev)
+	for _, want := range []string{"SQLAgent - Job invocation engine", "login=svc_agent", "host=SQLPROD01"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("AmplifierDetail() = %q, missing %q", got, want)
+		}
+	}
+}
+```
+
+Add `"strings"` to the test imports.
+
+- [ ] **Step 3: Run test to verify it fails**
+
+Run: `go test -race ./internal/run -run 'TestVictimKiller|TestAmplifierDetail' -v`
 Expected: FAIL — `undefined: NewVictimKiller`
 
-- [ ] **Step 3: Write minimal implementation**
+- [ ] **Step 4: Write minimal implementation**
 
 Create `internal/run/victim.go`:
 
@@ -1295,6 +1370,7 @@ type AmplifierKillEvent struct {
 	Program       string
 	BlockedBehind int
 	WaitedMS      int64         // the victim's own wait_time, from the DMV
+	FirstEligible time.Time     // when it first met every eligibility condition
 	Waited        time.Duration // how long it was kill-eligible before we killed it
 	Job           mssql.AgentJob
 }
@@ -1320,6 +1396,7 @@ type victimEpisode struct {
 type VictimKiller struct {
 	kill        func(context.Context, int) error
 	resolve     func(context.Context, string, int) (mssql.AgentJob, error)
+	onKill      func(AmplifierKillEvent) // presentation only (console + TUI); see notify
 	clk         Clock
 	selfProgram string // our own application name prefix; never kill a session running it
 
@@ -1333,12 +1410,15 @@ type VictimKiller struct {
 
 // NewVictimKiller builds a killer. kill terminates a SPID (mssql.Conn.Kill on the
 // monitoring pool); resolve attributes a program_name to an Agent job (may be nil);
+// onKill narrates a successful kill to the console and TUI (may be nil) — a separate
+// route from the sink, because in TUI mode the engine's run output is io.Discard;
 // clk defaults to System; selfProgram is our own application-name prefix
 // (mssql.AppNamePrefix), matched by prefix because program_name carries the build
 // version — which also excludes a different SqlGoPace version running concurrently.
 func NewVictimKiller(
 	kill func(context.Context, int) error,
 	resolve func(context.Context, string, int) (mssql.AgentJob, error),
+	onKill func(AmplifierKillEvent),
 	clk Clock,
 	selfProgram string,
 ) *VictimKiller {
@@ -1346,9 +1426,12 @@ func NewVictimKiller(
 		clk = System
 	}
 	return &VictimKiller{
-		kill: kill, resolve: resolve, clk: clk, selfProgram: selfProgram,
+		kill: kill, resolve: resolve, onKill: onKill, clk: clk, selfProgram: selfProgram,
 		episodes: make(map[int]*victimEpisode),
-		jobs:     make(map[string]mssql.AgentJob),
+		// jobs deliberately outlives Arm/Disarm: Agent job ids are globally unique, so
+		// an attribution cached under one manifest is still correct under the next, and
+		// re-reading msdb per manifest would buy nothing.
+		jobs: make(map[string]mssql.AgentJob),
 	}
 }
 
@@ -1414,6 +1497,11 @@ func (k *VictimKiller) Suppressed(spid int) bool {
 // kills the ones that have been eligible for the policy's dwell. A no-op when
 // disarmed. Victims absent from this snapshot have their episodes dropped, so the
 // dwell restarts if they come back.
+//
+// It runs on the PUMP goroutine, from ServerSampler.Blocking. A kill (and the msdb
+// attribution lookup behind it) is synchronous server I/O on that path, so on a loaded
+// server it can delay the next blocking sample past its interval. Acceptable for an
+// opt-in feature that fires rarely; do not add per-poll work here casually.
 func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) {
 	if k == nil {
 		return
@@ -1444,7 +1532,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
-		k.notify(ctx, v, sessions, now.Sub(ep.since))
+		k.notify(ctx, v, sessions, ep.since, now.Sub(ep.since))
 	}
 	// Drop episodes for victims no longer eligible, except those inside their grace
 	// window — a killed victim leaves the snapshot, and dropping it early would end
@@ -1480,12 +1568,10 @@ func (k *VictimKiller) blocksUs(spid int, sessions []mssql.Session, ddlSPID int)
 	return mssql.FindSelfBlock(sessions, ddlSPID).SPID == spid
 }
 
-// notify resolves the victim's Agent job (cached) and emits the kill on the sink.
-// Called with mu held.
-func (k *VictimKiller) notify(ctx context.Context, v mssql.Session, sessions []mssql.Session, waited time.Duration) {
-	if k.sink == nil {
-		return
-	}
+// notify resolves the victim's Agent job (cached) and delivers the kill on both
+// routes: the sink (engine — run report and sidecar) and onKill (presentation —
+// console and TUI). Called with mu held.
+func (k *VictimKiller) notify(ctx context.Context, v mssql.Session, sessions []mssql.Session, firstEligible time.Time, waited time.Duration) {
 	stmt := v.ActiveQuery
 	if stmt == "" {
 		stmt = v.ParentQuery
@@ -1500,19 +1586,40 @@ func (k *VictimKiller) notify(ctx context.Context, v mssql.Session, sessions []m
 		Program:       v.Program,
 		BlockedBehind: BlockedBehind(sessions, v.SPID),
 		WaitedMS:      v.WaitMS,
+		FirstEligible: firstEligible,
 		Waited:        waited,
 		Job:           k.attribute(ctx, v.Program),
 	}
-	k.sink(ReactionEvent{Kind: "kill", Detail: amplifierDetail(ev), Amplifier: &ev})
+	if k.sink != nil {
+		k.sink(ReactionEvent{Kind: "kill", Detail: AmplifierDetail(ev), Amplifier: &ev})
+	}
+	if k.onKill != nil {
+		k.onKill(ev)
+	}
 }
 
-// amplifierDetail narrates one kill for the console, the run report and the TUI feed.
-// The source clause names the Agent job when attribution resolved and falls back to
-// the raw program/login/host when it did not — that fallback is the whole point of
-// recording those fields unconditionally.
-func amplifierDetail(ev AmplifierKillEvent) string {
+// statementExcerpt trims a statement to a single readable line for the narration.
+const statementExcerpt = 120
+
+// AmplifierDetail narrates one kill for the console, the run report and the TUI feed.
+// It names the statement, not just the command verb, because "UPDATE STATISTICS" alone
+// does not tell the operator which object was involved — and the object is what they
+// act on. The source clause names the Agent job when attribution resolved and falls
+// back to the raw program/login/host when it did not; that fallback is the whole point
+// of recording those fields unconditionally.
+//
+// Exported so the CLI's presentation callback renders exactly the same line as the
+// run report, rather than a second, drifting copy.
+func AmplifierDetail(ev AmplifierKillEvent) string {
+	subject := ev.Command
+	if stmt := strings.Join(strings.Fields(ev.Statement), " "); stmt != "" {
+		if len(stmt) > statementExcerpt {
+			stmt = stmt[:statementExcerpt] + "…"
+		}
+		subject = fmt.Sprintf("%s: %s", ev.Command, stmt)
+	}
 	d := fmt.Sprintf("killed amplifying maintenance session SPID %d (%s) — %d session(s) queued behind it",
-		ev.SPID, ev.Command, ev.BlockedBehind)
+		ev.SPID, subject, ev.BlockedBehind)
 	switch {
 	case ev.Job.Resolved:
 		d += fmt.Sprintf("; source: SQL Agent job %q step %d", ev.Job.JobName, ev.Job.StepID)
@@ -1548,21 +1655,9 @@ func (k *VictimKiller) attribute(ctx context.Context, program string) mssql.Agen
 
 Add `"fmt"`, `"strconv"` and `"strings"` to the imports.
 
-- [ ] **Step 4: Export the application-name prefix**
-
-Self-exclusion needs the same constant `internal/mssql/conn.go` uses for the connection's application name. In `conn.go`, replace the two literal `"SqlGoPace"` occurrences in `appNameWithVersion` with a named constant and export it:
-
-```go
-// AppNamePrefix is the application name SqlGoPace connects with, before the version
-// suffix appNameWithVersion appends ("SqlGoPace/0.13.0"). It is exported because the
-// victim killer matches program_name against it by prefix to avoid ever terminating
-// another SqlGoPace session — including one running a different build.
-const AppNamePrefix = "SqlGoPace"
-```
-
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `go test -race ./internal/run -run TestVictimKiller -v`
+Run: `go test -race ./internal/run -run 'TestVictimKiller|TestAmplifierDetail' -v`
 Expected: PASS, all subtests.
 
 - [ ] **Step 6: Run the whole run package to check for regressions**
@@ -1573,9 +1668,11 @@ Expected: PASS.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add internal/run/victim.go internal/run/victim_test.go internal/run/reaction.go internal/run/export_test.go internal/mssql/conn.go
+git add internal/run/victim.go internal/run/victim_test.go internal/run/reaction.go internal/mssql/conn.go
 git commit -m "feat(run): kill amplifying maintenance victims of a blocking operation"
 ```
+
+`export_test.go` is deliberately not in that list: `victim_test.go` is an internal test, and `ManualClock`, `NewManualClock` and `CompileIgnoredSessions` are already exported, so nothing needs re-exporting for tests.
 
 ---
 
@@ -1602,7 +1699,7 @@ func TestServerSamplerSuppressesPendingVictim(t *testing.T) {
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
 	killer := NewVictimKiller(
 		func(context.Context, int) error { return nil },
-		nil, clk, mssql.AppNamePrefix,
+		nil, nil, clk, mssql.AppNamePrefix,
 	)
 	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
 	sampler.SetVictimKiller(killer)
@@ -1627,7 +1724,7 @@ func TestServerSamplerCountsVictimWhenKillFails(t *testing.T) {
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
 	killer := NewVictimKiller(
 		func(context.Context, int) error { return errors.New("permission denied") },
-		nil, clk, mssql.AppNamePrefix,
+		nil, nil, clk, mssql.AppNamePrefix,
 	)
 	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
 	sampler.SetVictimKiller(killer)
@@ -1657,7 +1754,69 @@ func TestServerSamplerWithoutVictimKillerIsUnchanged(t *testing.T) {
 		t.Errorf("BlockState = %+v, want both true — without a killer the behavior is today's", st)
 	}
 }
+
+// A suppressed victim must not mask an ordinary application session we are also
+// blocking: the yield timer still has to fire for that one. This is what the dropped
+// `break` in the rewritten loop buys, so it needs an explicit assertion.
+func TestServerSamplerSuppressionDoesNotMaskAnotherBlockedSession(t *testing.T) {
+	snap := append(amplifierSnapshot(16),
+		mssql.Session{SPID: 500, Command: "SELECT", BlockingSPID: 67, Login: "app", Program: "PayrollApp"})
+	probe := fakeProbe{sessions: snap}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	killer := NewVictimKiller(
+		func(context.Context, int) error { return nil },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+	sampler.SetVictimKiller(killer)
+
+	st, err := sampler.Blocking(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if !st.Unignored {
+		t.Error("BlockState.Unignored = false, want true — SPID 500 is an ordinary blocked " +
+			"session and must still drive the yield even while the amplifier kill is pending")
+	}
+}
+
+// Spec §1.6: with both killers armed on a snapshot showing a mutual block, exactly one
+// KILL must be issued, whichever order they are consulted in. VictimKiller declines its
+// own direct blocker, so BlockerKiller owns it.
+func TestSamplerMutualBlockIssuesExactlyOneKill(t *testing.T) {
+	snap := amplifierSnapshot(16)
+	snap[0].BlockingSPID = 79 // 79 blocks us and we block 79
+	probe := fakeProbe{sessions: snap}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	var killed []int
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+
+	victims := NewVictimKiller(
+		func(_ context.Context, spid int) error { killed = append(killed, spid); return nil },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	victims.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 0})
+	sampler.SetVictimKiller(victims)
+
+	blockers := NewBlockerKiller(
+		func(_ context.Context, spid int) error { killed = append(killed, spid); return nil },
+		nil, clk.Now)
+	blockers.SetSource(staticKill{rules: []killRule{{match: sessionRule{sessionID: 79}, after: 0}}})
+	sampler.SetKiller(blockers)
+
+	if _, err := sampler.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if len(killed) != 1 || killed[0] != 79 {
+		t.Errorf("killed = %v, want exactly one KILL of SPID 79 — the two killers must be disjoint", killed)
+	}
+}
 ```
+
+Add `"time"` and the `mssql` import to `executor_test.go` if they are not already there. `staticKill`, `killRule` and `sessionRule` are unexported types in this package, reachable because the test is internal.
 
 - [ ] **Step 2: Run test to verify it fails**
 
@@ -1715,7 +1874,7 @@ Note the loop no longer `break`s on the first unignored session: it must visit e
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test -race ./internal/run -run TestServerSampler -v`
+Run: `go test -race ./internal/run -run 'TestServerSampler|TestSamplerMutualBlock' -v`
 Expected: PASS, all subtests.
 
 - [ ] **Step 5: Run the whole package**
@@ -1773,6 +1932,7 @@ func amplifierEvent(spid int, job mssql.AgentJob) AmplifierKillEvent {
 		Program:       "SQLAgent - TSQL JobStep (Job 0xAB : Step 1)",
 		BlockedBehind: 16,
 		WaitedMS:      19_280_023,
+		FirstEligible: time.Date(2026, 8, 3, 13, 41, 11, 0, time.UTC),
 		Job:           job,
 	}
 }
@@ -1790,6 +1950,8 @@ func TestRenderAmplifiersIncludesVictimAndJob(t *testing.T) {
 		"session_id: 79",
 		`command: "UPDATE STATISTICS"`,
 		"blocked_behind: 16",
+		`first_eligible: "2026-08-03T13:41:11Z"`,
+		`killed_at: "2026-08-03T13:42:11Z"`,
 		`login_name: "svc_agent"`,
 		`host_name: "SQLPROD01"`,
 		`job_name: "IndexOptimize - USER_DATABASES"`,
@@ -1885,6 +2047,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 )
 
 // amplifierCaptureSuffix names the advisory capture file written next to a manifest.
@@ -1981,6 +2144,9 @@ func renderAmplifiers(name string, acc *amplifierCapture) []byte {
 		writeYAMLString(&b, "    app_name", ev.Program)
 		fmt.Fprintf(&b, "    blocked_behind: %d\n", ev.BlockedBehind)
 		fmt.Fprintf(&b, "    waited_ms: %d\n", ev.WaitedMS)
+		if !ev.FirstEligible.IsZero() {
+			writeYAMLString(&b, "    first_eligible", ev.FirstEligible.UTC().Format(time.RFC3339))
+		}
 		writeYAMLString(&b, "    killed_at", ca.killedAt)
 		b.WriteString("    agent_job:\n")
 		fmt.Fprintf(&b, "      resolved: %t\n", ev.Job.Resolved)
@@ -2271,7 +2437,7 @@ Expected: PASS, including `TestModelShowsAlertAndKeepsItSticky`.
 
 - [ ] **Step 9: Wire the engine**
 
-In `internal/run/engine.go`:
+In `internal/run/engine.go`. The line numbers below are from the pre-change file and will shift once earlier tasks land — locate each site by the quoted surrounding code, not by line number.
 
 Add fields to `Engine` next to `killer`:
 
@@ -2353,7 +2519,9 @@ Record the kill in the sink itself, beside the existing `ev.Tail` branch at `eng
 		}
 ```
 
-The existing body already appends a `report.ReactionLine` and prints `-- kill <target>: <detail>` to `e.out`, so the narration and the run report come for free. `Kind` is `"kill"`, which is not in the `capture` set (`pause`/`cancel`/`abort`) — correct, because we did not yield and there is nothing to snapshot.
+The existing body already appends a `report.ReactionLine` and prints `-- kill <target>: <detail>` to `e.out`, so the run report comes for free. `Kind` is `"kill"`, which is not in the `capture` set (`pause`/`cancel`/`abort`) — correct, because we did not yield and there is nothing to snapshot.
+
+Note what that also means: `e.notify` is only called for the `capture` kinds, so an amplifier kill does **not** reach the webhook or email notifier. That is pre-existing behavior, not something this task changes; Task 9 documents it so the run report is not mistaken for a notification.
 
 Add the flush helper to `internal/run/amplifier_capture.go`, modelled on `flushCapture`:
 
@@ -2387,7 +2555,17 @@ Emit the advisory next to the RCSI warning (around line 690):
 
 - [ ] **Step 10: Wire the CLI**
 
-In `cmd/sqlgopace/main.go`, next to the `cfg.KillBlockers.Enabled` block (around line 395), add:
+All of this goes in **`buildEngine`**, not `runEngine`. `buildEngine` is called once per database with a connection already scoped to that database (`main.go:383`); `runEngine` holds only the startup connection. Putting the reads there is what makes multi-database runs correct.
+
+First, extend the preflight permission predicate at `main.go:388`. This feature issues `KILL` and so needs `ALTER ANY CONNECTION` exactly as `kill_blockers` does; without this an operator enables the feature and only learns about the missing grant when the first victim appears:
+
+```go
+	killArmed := cfg.KillBlockers.Enabled ||
+		cfg.KillAmplifyingMaintenance.Enabled ||
+		cfg.OptionsOverride.AllowAbortBlockers
+```
+
+Then, next to the `cfg.KillBlockers.Enabled` block (around line 395):
 
 ```go
 	var victimOpt run.EngineOption = func(*run.Engine) {}
@@ -2397,17 +2575,25 @@ In `cmd/sqlgopace/main.go`, next to the `cfg.KillBlockers.Enabled` block (around
 			After:            cfg.KillAmplifyingMaintenance.After(),
 			Commands:         cfg.KillAmplifyingMaintenance.Commands,
 		}
-		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, run.System, mssql.AppNamePrefix)
+		// Presentation only. The engine's reaction sink records the same line in the
+		// run report, but in TUI mode engineOut is io.Discard (main.go:206), so without
+		// this forward the operator would see no per-kill narration at all.
+		amplifierKilled := func(ev run.AmplifierKillEvent) {
+			detail := run.AmplifierDetail(ev)
+			fmt.Fprintf(engineOut, "-- %s\n", detail)
+			if fwd != nil {
+				fwd.send(tui.LogMsg{Line: detail})
+			}
+		}
+		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, mssql.AppNamePrefix)
 		sampler.SetVictimKiller(victims)
 		victimOpt = run.WithVictimKiller(victims, policy)
 	}
 ```
 
-No console/TUI callback is wired here: the killer emits on the engine's per-operation reaction sink, which already prints `-- kill <target>: <detail>` to `engineOut` and appends a line to the run report. The only thing the CLI adds is the TUI's sticky jobs line, via `WithAmplifierSink` below.
+`mssql.AppNamePrefix` is the constant added in Task 5 Step 1. `conn.Kill` and `conn.LookupAgentJob` both run on the monitoring pool, so a blocked execution session does not stop either.
 
-`mssql.AppNamePrefix` is the constant added in Task 5 Step 4. `conn.Kill` and `conn.LookupAgentJob` both run on the monitoring pool, so a blocked execution session does not stop either.
-
-Read the `ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY` state once after `conn.Detect` and translate it:
+Read the `ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY` state from the **same per-database `conn`**, in `buildEngine`. The setting is database-scoped, so reading it from the startup connection in `runEngine` would report the wrong database in a multi-database run:
 
 ```go
 	asyncStats := run.AsyncStatsAbsent
@@ -2478,11 +2664,13 @@ Find the section documenting `kill_blockers` and add a sibling subsection for `k
 
 - what the feature does and the lock mechanic that makes it necessary (a queued Sch-M request stops readers barging past, so one waiter turns an online operation into a table outage);
 - the six eligibility conditions from §1.3 of the spec;
-- that `ignore_blocked_sessions` beats the kill, `ignore_blocking` does not, and a failed `KILL` falls back to the normal yield;
+- that `ignore_blocked_sessions` beats the kill, and that **`ignore_blocking` does not** — an operator running with `ignore_blocking: true` will still see maintenance victims killed, because that option only suppresses the yield reaction;
+- that a failed `KILL` falls back to the normal yield;
 - that `max_block_minutes` still backstops the whole thing;
-- the required permissions (`ALTER ANY CONNECTION`; `SELECT` on `msdb.dbo.sysjobs` optional);
+- the required permissions (`ALTER ANY CONNECTION`; `SELECT` on `msdb.dbo.sysjobs` optional), and that enabling the feature makes preflight warn when the login lacks the former;
 - that SqlGoPace never writes to msdb and never disables a job;
-- the `.amplifiers.yaml` sidecar and that it is advisory only.
+- the `.amplifiers.yaml` sidecar, and that it is advisory only and never read back;
+- **where kills are and are not reported**: the run `.log`, the `.amplifiers.yaml` sidecar, stdout, and the TUI (feed line plus sticky job alert) — but **not** webhook or email, because the notifier only fires for `pause`/`cancel`/`abort`. Reaching those would require extending the `on_events` list and the `notify` branch in `engine.go`, which this feature deliberately does not do.
 
 - [ ] **Step 2: Document the two advisories in README.md**
 

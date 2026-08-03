@@ -243,15 +243,24 @@ the kill still happens.
 
 ### 3.2 Reaction events
 
-The kill emits `ReactionEvent{Kind: "kill"}`, which already flows to console, the
-`.log` run report, the TUI incident feed, and webhook/email notification — no new
-plumbing:
+The kill emits `ReactionEvent{Kind: "kill"}`, which the engine sink already records in
+the `.log` run report and prints to the run output:
 
 ```
 killed amplifying maintenance session SPID 79 (UPDATE STATISTICS on
 [dbo].[MEASUREMENT]) — 16 sessions queued behind it; source: SQL Agent job
 "IndexOptimize - USER_DATABASES" step 1
 ```
+
+Two limits of that path, both verified against the code rather than assumed:
+
+- **Webhook and email do not fire.** `engine.go` calls `e.notify` only for `pause`,
+  `cancel` and `abort` — the kinds that mean we yielded. A `kill` is recorded but not
+  pushed. That is pre-existing behavior and this design does not change it; it is
+  stated here so the run report is not mistaken for a notification.
+- **In TUI mode the run output is `io.Discard`** (`main.go:206`), so the printed line
+  goes nowhere. Per-kill narration therefore needs an explicit forward to the TUI, the
+  way `BlockerKiller` already forwards its own kills — see §3.4.
 
 Alongside it, one warning per **distinct job** per run, carrying the remediation:
 
@@ -319,9 +328,18 @@ channel funnel.
 
 ### 3.4 TUI
 
-Reaction events already render in the incident feed, but a job warning that scrolls
-away is a warning nobody acts on. The distinct conflicting job names get a sticky line
-rendered in the alert area.
+The TUI needs **two** things, because the run output it would otherwise read from is
+`io.Discard` while the console is up.
+
+Per-kill narration is forwarded explicitly, by a callback on the killer that sends a
+`tui.LogMsg` — exactly what `BlockerKiller` already does for its own kills
+(`main.go:395`). This is presentation only and lives in the CLI; the engine keeps its
+own `ReactionEvent` path for the run report and the sidecar. The two exist because
+they have different consumers and different lifetimes, not by accident.
+
+The second is the sticky line: a job warning that scrolls past in the incident feed is
+a warning nobody acts on, so the distinct conflicting job names are rendered in the
+alert area.
 
 It uses a **new** `tui.ConflictingJobsMsg{Jobs []string}` that *replaces* the model's
 current set, rather than the existing `AlertMsg`. `AlertMsg` appends to a slice that is
@@ -364,6 +382,11 @@ TUI without new plumbing.
 Inputs: the operation, the database name, the server major version, and the current
 setting value read from `sys.database_scoped_configurations` where
 `name = 'ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY'`.
+
+The setting is **database-scoped**, so it must be read per target database. In a
+multi-database run `buildEngine` is called once per database with a connection already
+scoped to it; the read belongs there, not in `runEngine`, which holds only the startup
+connection.
 
 Emission rules:
 
