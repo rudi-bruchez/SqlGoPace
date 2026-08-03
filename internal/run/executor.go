@@ -278,6 +278,7 @@ type ServerSampler struct {
 	logMaxBytes   int64
 	logMaxPercent int
 	killer        *BlockerKiller // optional: kills matching blockers, reusing the Blocking snapshot
+	victims       *VictimKiller  // optional: kills amplifying maintenance victims we block
 }
 
 // NewServerSampler returns a sampler for the given DDL session and log thresholds.
@@ -291,6 +292,11 @@ var _ Sampler = (*ServerSampler)(nil)
 // session snapshot. A nil killer (the default) leaves killing off.
 func (s *ServerSampler) SetKiller(k *BlockerKiller) { s.killer = k }
 
+// SetVictimKiller attaches the amplifying-victim killer, consulted on every Blocking
+// poll using the same session snapshot. A nil killer (the default) leaves the feature
+// off and Blocking behaves exactly as it did before.
+func (s *ServerSampler) SetVictimKiller(k *VictimKiller) { s.victims = k }
+
 // Blocking reports how our DDL is blocking other sessions: Any when it blocks at
 // least one session (ignored or not), Unignored when it blocks a session the operator
 // has not allowed to stay blocked. The yield reaction keys off Unignored; the
@@ -300,16 +306,20 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 	if err != nil {
 		return BlockState{}, err
 	}
+	// Update victim episodes and kill anything eligible before reading suppression, so
+	// a victim that becomes eligible on this very poll is suppressed on this poll too.
+	s.victims.consider(ctx, sessions, s.spid, ignore)
+
 	var st BlockState
 	for _, sess := range sessions {
 		if !sess.BlockedBy(s.spid) {
 			continue
 		}
 		st.Any = true
-		if !ignore.ignores(sess) {
-			st.Unignored = true
-			break
+		if ignore.ignores(sess) || s.victims.Suppressed(sess.SPID) {
+			continue
 		}
+		st.Unignored = true
 	}
 	// Reuse the same snapshot to kill any session blocking our DDL that matches a kill
 	// rule (the inverse direction: here we are the victim). No-op when no killer is set.

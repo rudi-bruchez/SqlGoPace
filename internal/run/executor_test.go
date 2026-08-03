@@ -540,6 +540,130 @@ func TestServerSamplerLog(t *testing.T) {
 	})
 }
 
+func TestServerSamplerSuppressesPendingVictim(t *testing.T) {
+	snap := amplifierSnapshot(16)
+	probe := fakeProbe{sessions: snap} // the existing fake in this file; a value type, not a pointer
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	killer := NewVictimKiller(
+		func(context.Context, int) error { return nil },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+	sampler.SetVictimKiller(killer)
+
+	st, err := sampler.Blocking(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if !st.Any {
+		t.Error("BlockState.Any = false, want true — a pending victim still counts toward max_block")
+	}
+	if st.Unignored {
+		t.Error("BlockState.Unignored = true for a pending kill, want false — the yield timer must not fire")
+	}
+}
+
+func TestServerSamplerCountsVictimWhenKillFails(t *testing.T) {
+	snap := amplifierSnapshot(16)
+	probe := &fakeProbe{sessions: snap}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	killer := NewVictimKiller(
+		func(context.Context, int) error { return errors.New("permission denied") },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+	sampler.SetVictimKiller(killer)
+
+	if _, err := sampler.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	clk.Advance(61 * time.Second)
+	st, err := sampler.Blocking(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if !st.Unignored {
+		t.Error("BlockState.Unignored = false after a failed KILL, want true — we must fall back to yielding")
+	}
+}
+
+func TestServerSamplerWithoutVictimKillerIsUnchanged(t *testing.T) {
+	probe := fakeProbe{sessions: amplifierSnapshot(16)}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	st, err := sampler.Blocking(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if !st.Any || !st.Unignored {
+		t.Errorf("BlockState = %+v, want both true — without a killer the behavior is today's", st)
+	}
+}
+
+// A suppressed victim must not mask an ordinary application session we are also
+// blocking: the yield timer still has to fire for that one. This is what the dropped
+// `break` in the rewritten loop buys, so it needs an explicit assertion.
+func TestServerSamplerSuppressionDoesNotMaskAnotherBlockedSession(t *testing.T) {
+	snap := append(amplifierSnapshot(16),
+		mssql.Session{SPID: 500, Command: "SELECT", BlockingSPID: 67, Login: "app", Program: "PayrollApp"})
+	probe := fakeProbe{sessions: snap}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	killer := NewVictimKiller(
+		func(context.Context, int) error { return nil },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	killer.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+	sampler.SetVictimKiller(killer)
+
+	st, err := sampler.Blocking(context.Background(), nil)
+	if err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if !st.Unignored {
+		t.Error("BlockState.Unignored = false, want true — SPID 500 is an ordinary blocked " +
+			"session and must still drive the yield even while the amplifier kill is pending")
+	}
+}
+
+// Spec §1.6: with both killers armed on a snapshot showing a mutual block, exactly one
+// KILL must be issued, whichever order they are consulted in. VictimKiller declines its
+// own direct blocker, so BlockerKiller owns it.
+func TestSamplerMutualBlockIssuesExactlyOneKill(t *testing.T) {
+	snap := amplifierSnapshot(16)
+	snap[0].BlockingSPID = 79 // 79 blocks us and we block 79
+	probe := fakeProbe{sessions: snap}
+	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+
+	var killed []int
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+
+	victims := NewVictimKiller(
+		func(_ context.Context, spid int) error { killed = append(killed, spid); return nil },
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	victims.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 0})
+	sampler.SetVictimKiller(victims)
+
+	blockers := NewBlockerKiller(
+		func(_ context.Context, spid int) error { killed = append(killed, spid); return nil },
+		nil, clk.Now)
+	blockers.SetSource(staticKill{rules: []killRule{{match: sessionRule{sessionID: 79}, after: 0}}})
+	sampler.SetKiller(blockers)
+
+	if _, err := sampler.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking() error = %v", err)
+	}
+	if len(killed) != 1 || killed[0] != 79 {
+		t.Errorf("killed = %v, want exactly one KILL of SPID 79 — the two killers must be disjoint", killed)
+	}
+}
+
 // runRelief starts waitForRelief in a goroutine and returns its result channel.
 func runRelief(clk Clock, drain time.Duration, samples chan Sample, sink ReactionSink) <-chan error {
 	out := make(chan error, 1)
