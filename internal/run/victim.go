@@ -94,6 +94,9 @@ func NewVictimKiller(
 	if clk == nil {
 		clk = System
 	}
+	if selfProgram == "" {
+		selfProgram = mssql.AppNamePrefix
+	}
 	return &VictimKiller{
 		kill: kill, resolve: resolve, onKill: onKill, clk: clk, selfProgram: selfProgram,
 		episodes: make(map[int]*victimEpisode),
@@ -120,6 +123,13 @@ func (k *VictimKiller) SetSink(sink ReactionSink) {
 func (k *VictimKiller) Arm(p AmplifierPolicy) {
 	if k == nil {
 		return
+	}
+	// A fan-out of zero is not an amplifier — the whole premise of this feature — so
+	// MinBlockedBehind < 1 can only mean "unset", never "kill with nothing queued
+	// behind it". Floor it here rather than depend on every caller (config included)
+	// supplying a positive value.
+	if p.MinBlockedBehind < 1 {
+		p.MinBlockedBehind = 1
 	}
 	k.mu.Lock()
 	k.policy, k.armed = p, true
@@ -198,6 +208,19 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 		}
 		if err := k.kill(ctx, v.SPID); err != nil {
 			ep.killFailed = true
+			// Reached only on the failure transition: once killFailed is set, the
+			// guard above short-circuits before this point on every later poll, so
+			// this fires exactly once per episode rather than spamming the run log.
+			// Amplifier stays nil — that field means a kill happened, and here it did
+			// not — but a failed KILL must still be operator-visible, not a silent
+			// fallback to the normal yield timer.
+			if k.sink != nil {
+				k.sink(ReactionEvent{
+					Kind: "warn",
+					Detail: fmt.Sprintf("failed to kill amplifying maintenance session SPID %d (%s): %v",
+						v.SPID, v.Command, err),
+				})
+			}
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
