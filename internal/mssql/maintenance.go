@@ -22,6 +22,9 @@ func IsMaintenanceCommand(cmd string) bool {
 // request converts an online operation into a full-table outage: every reader
 // arriving afterwards queues behind the waiting Sch-M rather than barging past it.
 // Prefix-matched, so "UPDATE STATISTIC" covers both spellings SQL Server reports.
+// Verified 2026-08-04 against a live server: the verb is "UPDATE STATISTICS", with
+// the trailing S. The entry keeps the shorter prefix deliberately, so a version that
+// reports the truncated form still matches; do not "correct" it to the full verb.
 var amplifyingCommands = []string{
 	"ALTER INDEX",
 	"ALTER TABLE",

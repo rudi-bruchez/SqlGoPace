@@ -83,10 +83,11 @@ ALTER INDEX · ALTER TABLE · CREATE INDEX · CREATE STATISTICS
 UPDATE STATISTIC · DROP INDEX · DROP TABLE · TRUNCATE TABLE · DBCC
 ```
 
-Prefix matching is deliberate: the verb SQL Server reports for `UPDATE STATISTICS`
-must be confirmed against a live server (the SSMS grid truncates it, and it is
-rendered without the trailing `S` in some versions). `UPDATE STATISTIC` as a prefix
-covers both spellings. An integration test pins the actual value.
+Prefix matching is deliberate. **Verified 2026-08-04 against a live server: the verb
+is `UPDATE STATISTICS`, with the trailing `S`** — so the allow-list matches. The entry
+keeps the shorter `UPDATE STATISTIC` prefix on purpose, because the SSMS grid truncates
+the column and the form without the trailing `S` has been reported on other versions;
+the prefix covers both and costs nothing. An integration test pins the actual value.
 
 This is a **new** function, not an extension of `mssql.IsMaintenanceCommand`. That
 existing function answers a different question — "is this blocker of the shrink a
