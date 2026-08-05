@@ -790,10 +790,11 @@ func TestBlockerKillerCapsRepeatKillsAndWarnsOnce(t *testing.T) {
 	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
 	now = now.Add(60 * time.Second)
 	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
-	for i, spid := range []int{155, 162, 170, 181} {
+	// 104 was kill 1. 155 and 162 spend kills 2 and 3; 170 is the first refused, and is
+	// therefore the session the single warn names; 181 must add no second warn.
+	for _, spid := range []int{155, 162, 170, 181} {
 		now = now.Add(time.Second)
 		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
-		_ = i
 	}
 
 	if len(rec.spids) != maxRepeatKills {
@@ -802,7 +803,7 @@ func TestBlockerKillerCapsRepeatKillsAndWarnsOnce(t *testing.T) {
 	if len(warns) != 1 {
 		t.Fatalf("the cap must warn exactly once per identity, got %d warns: %v", len(warns), warns)
 	}
-	for _, want := range []string{"stopped killing blockers", `login=~"^SVC_RPT$"`, "SPID 181"} {
+	for _, want := range []string{"stopped killing blockers", `login=~"^SVC_RPT$"`, "SPID 170"} {
 		if !strings.Contains(warns[0], want) {
 			t.Errorf("warn %q must contain %q", warns[0], want)
 		}
