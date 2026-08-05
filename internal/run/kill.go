@@ -18,10 +18,14 @@ type KillEvent struct {
 }
 
 // killRule is one compiled kill_blocking_sessions entry: a session matcher (shared with the
-// ignore rules) plus the delay the blocker must persist before it is killed.
+// ignore rules), the delay the blocker must persist before it is killed, and the identity
+// key its blocking debt accumulates under. The key is computed here, once per compile, not
+// per poll: compileKilledSessions rebuilds every killRule on each reload, so a compile-time
+// key has exactly the matcher's lifetime and cannot go stale.
 type killRule struct {
 	match sessionRule
 	after time.Duration
+	key   string
 }
 
 // KillSource provides the current compiled kill rules. Like IgnoreSource it is re-read live
@@ -57,7 +61,7 @@ func compileKilledSessions(rules []ddl.KilledSession, def time.Duration) ([]kill
 		if after <= 0 {
 			after = def
 		}
-		out[i] = killRule{match: compiled[i], after: after}
+		out[i] = killRule{match: compiled[i], after: after, key: compiled[i].key()}
 	}
 	return out, nil
 }

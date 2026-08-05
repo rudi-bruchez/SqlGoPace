@@ -183,3 +183,52 @@ func TestManifestKillSourceReloadPicksUpNewRule(t *testing.T) {
 		t.Errorf("reload should pick up the appended rule, got %d rules", len(src.Current()))
 	}
 }
+
+func TestSessionRuleKeyIsStableAndInjective(t *testing.T) {
+	compile := func(t *testing.T, rules ...ddl.KilledSession) []killRule {
+		t.Helper()
+		out, err := compileKilledSessions(rules, 0)
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return out
+	}
+
+	t.Run("same rule text compiles to the same key", func(t *testing.T) {
+		a := compile(t, killRuleFor("^SVC_RPT$", 60))
+		b := compile(t, killRuleFor("^SVC_RPT$", 600)) // the delay is not part of the identity
+		if a[0].key != b[0].key {
+			t.Errorf("same matcher must give the same key: %q vs %q", a[0].key, b[0].key)
+		}
+	})
+
+	t.Run("different rule text gives a different key", func(t *testing.T) {
+		rules := compile(t, killRuleFor("^SVC_RPT$", 0), killRuleFor("^SVC_ETL$", 0))
+		if rules[0].key == rules[1].key {
+			t.Errorf("different logins must give different keys, both %q", rules[0].key)
+		}
+	})
+
+	t.Run("an alternation cannot collide with two fields", func(t *testing.T) {
+		alt := ddl.KilledSession{IgnoredSession: ddl.IgnoredSession{AppName: "x|y"}}
+		split := ddl.KilledSession{IgnoredSession: ddl.IgnoredSession{AppName: "x", HostName: "y"}}
+		rules := compile(t, alt, split)
+		if rules[0].key == rules[1].key {
+			t.Errorf("a | inside a regexp must not collide with the field separator, both %q", rules[0].key)
+		}
+	})
+}
+
+func TestSessionRuleStringOmitsUnsetFields(t *testing.T) {
+	rules, err := compileKilledSessions([]ddl.KilledSession{{
+		IgnoredSession: ddl.IgnoredSession{AppName: "^SQLAgent", LoginName: `^CORP\\svc_`},
+	}}, 0)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	got := rules[0].match.String()
+	want := `{app=~"^SQLAgent", login=~"^CORP\\\\svc_"}`
+	if got != want {
+		t.Errorf("String() = %s, want %s", got, want)
+	}
+}
