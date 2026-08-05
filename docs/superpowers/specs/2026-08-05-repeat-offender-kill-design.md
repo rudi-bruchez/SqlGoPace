@@ -1,7 +1,7 @@
 # Accelerating the kill of a repeat-offender blocker
 
 Status: design approved, pending implementation plan.
-Date: 2026-08-05.
+Date: 2026-08-05. Revised the same day after review (see `*-kmim.md`).
 
 ## Motivation
 
@@ -66,8 +66,26 @@ the debt accumulated against the others. A rule that pins `session_id` is inhere
 single-session; keying on it is meaningless but harmless, since a new SPID cannot match
 it anyway.
 
-The victim key deliberately excludes the command verb: a job that alternates
-`UPDATE STATISTICS` and `ALTER INDEX` across restarts is one offender, not two.
+**The key is computed once, in `compileKilledSessions`, and stored in `killRule`** — not
+rebuilt per poll. `compileKilledSessions` (`kill.go:42`) reconstructs every `killRule`, and
+is re-run on each reload (`kill.go:102`), so a compile-time key has the matcher's exact
+lifetime and cannot outlive the rule text it describes. Recomputing it per poll would be
+strictly more work for the same value.
+
+**Editing an existing rule's text loses that rule's debt**, because the edited rule is a
+different key. This is deliberate, not a bug: an operator who rewrites a rule mid-run has
+changed which sessions it describes, and carrying the old population's debt onto the new
+one would be the surprising behavior. Appending a rule leaves every other rule's debt intact.
+
+**Two representations, deliberately distinct.** The bucket key is a canonical machine
+string (`sid|app|host|login|stmt`, regexp sources verbatim, empty for unset fields); the
+escalation warn renders the rule for a human (`{app=~"^SQLAgent", login=~"CORP\\svc_"}`,
+omitting unset fields). They are never interchanged: the key must be stable and total, the
+narration must be readable.
+
+The victim key deliberately excludes the command verb **and the statement text**: a job
+that alternates `UPDATE STATISTICS` and `ALTER INDEX` across restarts, or runs the same
+verb against a different object, is one offender, not two or three.
 
 ## 2. The debt clock
 
@@ -79,6 +97,7 @@ hold theirs across the call.
 type bucket struct {
     accrued    time.Duration // blocking time already served under this identity
     kills      int
+    escalated  bool // the cap warn has been emitted for this bucket
     lastActive time.Time
 }
 
@@ -90,40 +109,60 @@ type recidivism struct {
 func (r *recidivism) debt(key string) time.Duration
 func (r *recidivism) accrue(key string, d time.Duration)
 func (r *recidivism) kills(key string) int
-func (r *recidivism) recordKill(key string) int
+func (r *recidivism) recordKill(key string) int  // reserve/confirm a kill, returns the new count
+func (r *recidivism) undoKill(key string)        // withdraw a reservation that never landed
+func (r *recidivism) escalate(key string) bool   // true the first time only, for the cap warn
 func (r *recidivism) prune()
 ```
 
 `now func() time.Time` rather than the `Clock` interface, because `BlockerKiller` already
 holds a `now` func and `VictimKiller` can pass `k.clk.Now`. Neither killer changes shape.
 
-The kill decision becomes:
+The kill decision becomes simply:
 
 ```
-debt(key) + elapsed(current episode) >= after
+debt(key) >= after
 ```
 
-The current episode's elapsed time is folded into `accrued` when that episode ends —
-when the blocker vanishes, or when a different SPID replaces it. The two never overlap,
-so nothing is double counted. Concretely, with `after = 60s`:
+**Debt is banked incrementally, one poll at a time**, not folded in when an episode ends.
+At every poll where the offender is present and eligible, the time since *that episode's
+previous poll* is added to the identity's bucket; the first poll of an episode contributes
+zero, which is exactly today's `since = clk.Now()` semantics.
+
+Folding at episode end was the first formulation and it does not survive contact with the
+code: when an episode ends the offender is gone from the snapshot, so there is nothing left
+to match rules against, and the killer would have to remember which key the vanished
+episode belonged to. That memory would then be wrong the moment a hot reload changed which
+rule matches. Banking per poll keeps one writer, cannot double count, needs no orphaned
+attribution, and has the side benefit that a run ending with the blocker still present has
+already banked everything it observed.
+
+Concretely, with `after = 60s` and a 10 s poll:
 
 ```
-t=0    SPID 101 blocks, matches rule R    debt(R)=0    -> episode starts
-t=60   0 + 60s >= 60s                                  -> KILL 101
-t=61   101 gone: episode ends             debt(R)=60s
-t=61   SPID 155 blocks, matches R         debt(R)=60s  -> 60s + 0 >= 60s -> KILL 155
-t=62   SPID 162 blocks, matches R                      -> KILL 162
+t=0    SPID 101 blocks, matches rule R   +0s   debt(R)=0   -> episode starts
+t=10   still 101                         +10s  debt(R)=10s
 ...
-t+5m   no session matched R for 5 min     bucket pruned -> back to a full 60s dwell
+t=60   still 101                         +10s  debt(R)=60s -> 60s >= 60s -> KILL 101
+t=61   SPID 155 blocks, matches R        +0s   debt(R)=60s -> 60s >= 60s -> KILL 155
+t=71   SPID 162 blocks, matches R        +0s   debt(R)=60s -> KILL 162
+...
+t+5m   no session matched R for 5 min          bucket pruned -> back to a full 60s dwell
 ```
 
 The invariant worth keeping is that nobody is killed until 60 s of blocking has actually
-been suffered under that identity. The feature does not lower the price of a kill; it
+been observed under that identity. The feature does not lower the price of a kill; it
 stops refunding it at every new SPID.
 
-`prune` drops any bucket idle longer than `recidivismWindow`, and runs on each `consider`.
-The map is bounded by the number of distinct rules (blocker side) or distinct jobs
-(victim side), so a linear sweep costs nothing.
+`prune` drops any bucket idle longer than `recidivismWindow`. It runs **at the top of each
+`consider`, before any debt is read**, so an offender returning after a quiet window is
+judged against a pruned map and serves the full dwell. The map is bounded by the number of
+distinct rules (blocker side) or distinct jobs (victim side), so a linear sweep costs nothing.
+
+Nothing else drives `prune`: `consider` only runs while a statement is in flight and the
+killer is armed, so buckets belonging to an idle run are not reclaimed until the next
+offender wakes the killer. That is harmless — the map is tiny and per-manifest — and it does
+not change semantics, since a forgotten bucket can only matter at the moment it is consulted.
 
 ## 3. Constants
 
@@ -154,26 +193,57 @@ six-hour shrink because of a burst in its second minute.
 
 ```go
 if blocker.SPID != k.current {
-    k.flushEpisode(now)                                   // accrue the ended episode
     k.current, k.since, k.killed = blocker.SPID, now, false
+    k.lastPoll = time.Time{}                              // first poll of the episode: banks 0
 }
-...
-key := r.match.key()
-if k.rec.debt(key)+now.Sub(k.since) < r.after {
+...                                                       // r is the first matching rule
+k.rec.accrue(r.key, k.sincePoll(now))                     // 0 on an episode's first poll
+k.lastPoll = now
+if k.rec.debt(r.key) < r.after {
     return                                                // not yet owed
 }
-if k.rec.kills(key) >= maxRepeatKills {
-    k.escalate(key, blocker)                              // once per bucket
+if k.rec.kills(r.key) >= maxRepeatKills {
+    if k.rec.escalate(r.key) {                            // true the first time only
+        sink(ReactionEvent{Kind: "warn", Detail: capDetail(r, blocker, maxRepeatKills)})
+    }
     return
+}
+if err := k.kill(ctx, blocker.SPID); err == nil {
+    k.killed = true
+    k.rec.recordKill(r.key)                               // successful kills only
+    ...
 }
 ```
 
-`resetEpisode` — reached when we are no longer blocked, and from `SetSource` — accrues
-the ended episode before clearing, since that is where most debt is actually recorded.
+The episode state keeps its existing role — `k.killed` still means "already killed *this*
+SPID", `k.since` still dates the current episode — and gains only `lastPoll`, the previous
+observation of this episode. `resetEpisode` keeps its current meaning (clear the episode,
+touch no bucket), so the naming ambiguity the review raised disappears rather than being
+renamed around: no method both accrues and resets.
 
-`SetSource` keeps clearing the episode *and* now the buckets: they are per-manifest
-state, exactly like the rules they are keyed on. Within a manifest they survive operation
-boundaries and shrink chunk boundaries, which is the whole point on the shrink path.
+`KillEvent.Waited` becomes `debt(key)`, not `now.Sub(k.since)`. For a recidivist the
+episode's own elapsed time is near zero, and a console line reading *"killed blocker SPID
+155 after 0s blocking the DDL"* would misstate why the kill was justified. The debt is the
+blocking actually observed under that identity, which is what the operator needs to see.
+
+**The counter follows the kill, not the intent.** `BlockerKiller` handles one blocker at a
+time and issues the `KILL` inline, under `k.mu`, so incrementing after `k.kill` returns nil
+is both correct and sufficient. A failed `KILL` consumes no budget — it already leaves
+`k.killed` false and falls through to the normal reaction. (`VictimKiller` cannot do this;
+see §5.)
+
+**Buckets are per-manifest state**, cleared by `SetSource` alongside the episode, exactly
+like the rules they are keyed on — so debt is never carried across manifests. Because
+banking is incremental, there is no unflushed tail to worry about when a statement (or the
+whole manifest) ends with the blocker still present: everything observed is already banked,
+and what happens to it next is simply that `SetSource(nil)` discards it.
+
+Within a manifest, buckets survive operation boundaries and shrink chunk boundaries. Note
+what that does *and does not* fix on the shrink path: the sampler runs only while a
+statement is in flight, so between chunks `consider` is not called at all and `since` is
+not reset — an offender that keeps the *same* SPID across a chunk gap already accumulates
+correctly today. What the debt adds is continuity when the offender comes back under a
+*different* SPID, which is the case the shrink actually hits against a hot table.
 
 ### Reporting
 
@@ -199,10 +269,12 @@ is unchanged.
 
 ## 5. `VictimKiller`
 
-`considerLocked` replaces `k.clk.Since(ep.since) < k.policy.After` with the same
-debt-plus-episode comparison, keyed by `victimKey(v)`. Episodes stay per-SPID: they still
-track *this* session's kill state, grace window and optimistic marking. Only the dwell
-comparison moves to the bucket.
+`considerLocked` banks the same per-poll increment against `victimKey(v)` and replaces
+`k.clk.Since(ep.since) < k.policy.After` with `k.rec.debt(key) < k.policy.After`. Episodes
+stay per-SPID: they still track *this* session's kill state, grace window, optimistic
+marking, and now its `lastPoll`. Only the dwell comparison moves to the bucket, and
+`AmplifierKillEvent.Waited` becomes the debt for the same reason `KillEvent.Waited` does
+(§4) — `FirstEligible` keeps naming this episode's own start.
 
 One trap has to be handled explicitly. `Suppressed` returns true for any live episode,
 meaning "a kill is pending, do not count this victim toward the yield timer":
@@ -214,21 +286,40 @@ default:
 
 A capped victim that kept an episode would be suppressed forever while no kill would ever
 come — the run would block indefinitely, the exact inverse of the intent. **A capped
-identity therefore creates no episode at all**: it counts normally toward
-`BlockState.Unignored` and the yield timer resumes. This preserves the property the
-original design was careful about — the feature can never make us block longer than we
-would without it.
+identity therefore creates no episode and is not marked `seen`**, which hands it to the
+existing end-of-scan sweep (`victim.go:310-315`): the episode is dropped as soon as it is
+outside its post-kill grace window, `Suppressed` goes false, and the victim counts toward
+`BlockState.Unignored` again. This preserves the property the original design was careful
+about — the feature can never make us block longer than we would without it.
+
+**The kill counter is reserved under the lock, not incremented on success.** This is the
+one place the design departs from the review's advice, and the reason is structural:
+`considerLocked` selects *several* victims in a single scan (`victim.go:288-306`), and the
+`KILL`s are issued afterwards with `k.mu` released. If the counter only moved on success,
+three sessions of the same Agent job would all pass the `kills >= maxRepeatKills` test in
+one scan against a counter still reading zero, and the cap would be exceeded by the number
+of targets in that scan. So the counter follows the same optimistic pattern the code
+already uses for `ep.killed`:
+
+- `considerLocked` calls `recordKill(key)` as it selects a target — the reservation;
+- `withdrawKill` (the `KILL` failed) also calls `undoKill(key)`;
+- `abandonKill` (the run was shutting down, no `KILL` attempted) also calls `undoKill(key)`.
+
+The review's actual concern — a failed `KILL` must not consume the budget — is satisfied
+by the withdrawal, and the cap is genuinely enforced rather than approximately.
 
 `Arm` clears the buckets alongside the episodes; `Disarm` likewise.
 
 ## 6. Testing
 
-TDD, three files:
+TDD, four files:
 
 **`recidivism_test.go`** (pure, fake clock)
 - debt accrues across episodes and is readable per key
 - a bucket idle beyond `recidivismWindow` is pruned; one seen at `window - 1s` is not
-- `recordKill` returns the new count; the count is lost with the bucket
+- `recordKill` returns the new count; `undoKill` gives the budget back; the count is lost
+  with the bucket
+- `escalate` returns true exactly once per bucket, and again after the bucket is pruned
 - keys are independent
 
 **`kill_test.go`**
@@ -241,8 +332,22 @@ TDD, three files:
 **`victim_test.go`**
 - two SPIDs resolving to the same `job:<hex>:<step>` → the second is killed immediately
 - two SPIDs with unparseable program names but the same login/host/program → same
-- **a capped victim is not `Suppressed`** — the regression test for §5's trap
+- the same job running a *different* statement is still one identity (key excludes the verb
+  and the statement)
+- **a capped victim is not `Suppressed`** once its grace window ends — the regression test
+  for §5's trap
+- **one scan selecting more victims than the cap allows kills exactly `maxRepeatKills`** —
+  the regression test for the reservation, which increment-on-success would fail
+- a failed `KILL` returns the budget: the next eligible victim of that identity is still
+  killable
 - an ignored victim still never accrues debt (eligibility is checked first, unchanged)
+
+**`shrink_driver_test.go`** — the integration the review asks for: a fake sampler whose
+snapshots present a *different* blocker SPID matching the same rule on each chunk, driven
+through `ShrinkRunner` across chunk boundaries, asserting the second chunk's blocker is
+killed without serving a fresh dwell. Confirmed the path exists: `runChunk` and
+`runWatchedStatement` both pump through `pumpSamples` → `ServerSampler.Blocking`, which is
+where both killers are consulted (`executor.go:326`, `shrink.go:696` and `shrink.go:779`).
 
 ## 7. Rejected alternatives
 
@@ -258,3 +363,8 @@ TDD, three files:
 - **Configuration knobs.** `kill_blockers.enabled` is already the deliberate, destructive
   arming step. An operator who set it wants the blocker gone, not returned forty times;
   the window and the cap are safety properties of the mechanism, not policy.
+- **Folding the episode's elapsed time into the bucket when the episode ends** (the first
+  formulation of §2). It reads well but cannot be implemented cleanly: the offender is gone
+  from the snapshot by then, so the episode would have to carry the key it accrued under —
+  a copy that a hot reload can invalidate, and a second writer to reconcile against the
+  live match. Per-poll banking has one writer and no attribution to remember.
