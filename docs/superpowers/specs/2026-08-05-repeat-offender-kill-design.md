@@ -1,7 +1,7 @@
 # Accelerating the kill of a repeat-offender blocker
 
 Status: design approved, pending implementation plan.
-Date: 2026-08-05. Revised the same day after review (see `*-kmim.md`).
+Date: 2026-08-05. Revised the same day after review (see `*-kimi.md`).
 
 ## Motivation
 
@@ -342,12 +342,17 @@ TDD, four files:
   killable
 - an ignored victim still never accrues debt (eligibility is checked first, unchanged)
 
-**`shrink_driver_test.go`** — the integration the review asks for: a fake sampler whose
-snapshots present a *different* blocker SPID matching the same rule on each chunk, driven
-through `ShrinkRunner` across chunk boundaries, asserting the second chunk's blocker is
-killed without serving a fresh dwell. Confirmed the path exists: `runChunk` and
-`runWatchedStatement` both pump through `pumpSamples` → `ServerSampler.Blocking`, which is
-where both killers are consulted (`executor.go:326`, `shrink.go:696` and `shrink.go:779`).
+**`executor_test.go`** — the integration the review asks for, at the seam that actually
+carries it: a `ServerSampler` over a fake `sampleProbe` that returns a *different* blocker
+SPID matching the same rule on each call, with a real `BlockerKiller` attached, asserting the
+blocker returning after a long gap is killed without serving a fresh dwell.
+
+The shrink driver reaches the killers only through `pumpSamples` → `ServerSampler.Blocking`
+(`shrink.go:696` in `runChunk`, `shrink.go:779` in `runWatchedStatement`, consulted at
+`executor.go:326`), and a killer never observes chunks — only a sequence of `Blocking` calls
+with time between them. A chunk boundary is therefore indistinguishable from any other poll
+gap, and driving the sampler directly reproduces the scenario with the production types on
+the path, without standing up the shrink driver's execution fakes.
 
 ## 7. Rejected alternatives
 
