@@ -152,6 +152,21 @@ func (s *fakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObje
 	return s.tail, s.tailFound, nil
 }
 
+// signalSampler is noPressureSampler that also signals every blocking poll, so a test can
+// assert which phases of the driver actually sample the server.
+type signalSampler struct {
+	noPressureSampler
+	polled chan struct{}
+}
+
+func (s *signalSampler) Blocking(context.Context, IgnoredSessions) (BlockState, error) {
+	select {
+	case s.polled <- struct{}{}:
+	default:
+	}
+	return BlockState{}, nil
+}
+
 // noPressureSampler never reports blocking or log pressure.
 type noPressureSampler struct{}
 
@@ -267,6 +282,150 @@ func TestShrinkTruncateOnlyStopsOnDrain(t *testing.T) {
 			t.Errorf("no page-moving chunk should run after a stop in Phase A; got %q", stmt)
 		}
 	}
+}
+
+// TestShrinkEmitsPercentCompleteDuringTruncateOnly verifies the driver polls SQL Server's
+// percent_complete during the TRUNCATEONLY pass too, not only during the page-moving chunks.
+// On a large file that pass runs for a long time, and the console would otherwise sit on a
+// frozen line with no completion at all. The fake holds the TRUNCATEONLY open until the test
+// requests a graceful stop, so the progress pump has time to fire.
+func TestShrinkEmitsPercentCompleteDuringTruncateOnly(t *testing.T) {
+	drain := &DrainFlag{}
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 8_000_000, usedMB: 200, blockTruncate: true, percentComplete: 17,
+	}
+	seen := make(chan ShrinkProgress, 1)
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.pollIntv = 2 * time.Millisecond // fast enough that the pump fires during the held pass
+	r.stop = drain.Draining
+	r.progress = func(p ShrinkProgress) {
+		if p.PercentComplete > 0 && strings.Contains(p.Statement, "TRUNCATEONLY") {
+			select {
+			case seen <- p:
+			default:
+			}
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+		_, _ = r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+		close(done)
+	}()
+
+	select {
+	case p := <-seen:
+		if p.PercentComplete != 17 {
+			t.Errorf("emitted PercentComplete = %v, want 17", p.PercentComplete)
+		}
+		if p.File != "Data" || p.CurrentMB != 8_000_000 {
+			t.Errorf("progress lost its base fields: got %+v", p)
+		}
+	case <-time.After(2 * time.Second):
+		drain.Request()
+		<-done
+		t.Fatal("no TRUNCATEONLY progress carrying server percent_complete within 2s")
+	}
+	drain.Request() // cancel the held TRUNCATEONLY and let the run finish
+	<-done
+}
+
+// TestShrinkPollsBlockingDuringTruncateOnly verifies the driver samples the server during
+// the TRUNCATEONLY pass, not only during the page-moving chunks. Both killers hang off
+// ServerSampler.Blocking (BlockerKiller for sessions blocking us, VictimKiller for the
+// amplifying victims we block), so a phase that never polls can never kill anything. The
+// fake holds the pass open until the test drains, so any poll observed here is necessarily
+// Phase A: no chunk has run yet.
+func TestShrinkPollsBlockingDuringTruncateOnly(t *testing.T) {
+	drain := &DrainFlag{}
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 8_000_000, usedMB: 200, blockTruncate: true}
+	sampler := &signalSampler{polled: make(chan struct{}, 1)}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = sampler
+	r.stop = drain.Draining
+
+	done := make(chan struct{})
+	go func() {
+		op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+		_, _ = r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+		close(done)
+	}()
+
+	select {
+	case <-sampler.polled:
+	case <-time.After(2 * time.Second):
+		drain.Request()
+		<-done
+		t.Fatal("no blocking poll during the TRUNCATEONLY pass within 2s — killers cannot run")
+	}
+	drain.Request() // cancel the held TRUNCATEONLY and let the run finish
+	<-done
+}
+
+// TestShrinkLogMonitorsItsStatement verifies the log shrink runs its DBCC SHRINKFILE under
+// the same monitoring as the other phases: the blocking poll runs (the killers hang off it)
+// and the server's percent_complete reaches the console. The log statement is a single
+// unchunked shrink to a VLF boundary, and it used to run completely dark. The fake holds it
+// open until the test releases it.
+func TestShrinkLogMonitorsItsStatement(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeLog, name: "Log", recovery: "SIMPLE",
+		sizeMB: 4000, usedMB: 400, floorMB: 400, percentComplete: 23,
+	}
+	release := make(chan struct{})
+	s.onExec = func(sql string) {
+		if strings.Contains(sql, "DBCC SHRINKFILE") {
+			<-release // hold the log shrink open so the pumps have time to fire
+		}
+	}
+	sampler := &signalSampler{polled: make(chan struct{}, 1)}
+	seen := make(chan ShrinkProgress, 1)
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = sampler
+	r.progress = func(p ShrinkProgress) {
+		if p.PercentComplete > 0 {
+			select {
+			case seen <- p:
+			default:
+			}
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		op := ddl.Shrink{Type: "log", Files: "Log", TargetFreeSpace: "10%"}
+		_, _ = r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+		close(done)
+	}()
+
+	fail := func(msg string) {
+		t.Helper()
+		close(release)
+		<-done
+		t.Fatal(msg)
+	}
+	select {
+	case <-sampler.polled:
+	case <-time.After(2 * time.Second):
+		fail("no blocking poll during the log shrink within 2s — killers cannot run")
+	}
+	select {
+	case p := <-seen:
+		if p.Type != "log" || p.File != "Log" {
+			t.Errorf("progress = %+v, want the log file's own progress", p)
+		}
+		if p.PercentComplete != 23 {
+			t.Errorf("emitted PercentComplete = %v, want 23", p.PercentComplete)
+		}
+	case <-time.After(2 * time.Second):
+		fail("no log-shrink progress carrying server percent_complete within 2s")
+	}
+	close(release) // let the log shrink (and the run) finish
+	<-done
 }
 
 func TestShrinkDataNoOp(t *testing.T) {

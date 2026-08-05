@@ -236,6 +236,28 @@ for current > finalTarget {
 }
 ```
 
+**Phase A is monitored, but does not react.** On a large file the `TRUNCATEONLY` pass runs for
+minutes, so it samples the server for its whole duration exactly as a chunk does: the progress
+pump reports the server's `percent_complete` (`dm_exec_requests`) to the console, and the
+blocking poll runs so the blocker and victim killers — which are consulted inside
+`ServerSampler.Blocking` — can act on a session that blocks it. The samples are otherwise
+discarded: **no pressure reaction applies to Phase A**. `TRUNCATEONLY` takes no
+`WAIT_AT_LOW_PRIORITY` (§3), and aborting it stays the operator's call through a graceful stop,
+which is clean and re-entrant (the space already released is preserved).
+
+This gives the driver **two** monitoring postures, split on whether the statement is chunked:
+
+| Statement | Samples (killers, progress) | Reacts to pressure |
+|---|---|---|
+| Phase B chunk (§7.1, §8) | yes | yes — pause between chunks, abort |
+| Phase A `TRUNCATEONLY` | yes | no |
+| Log shrink (§5.2) | yes | no |
+
+The log shrink is a single unchunked statement like Phase A, so it takes the same posture and
+the same code path (`runWatchedStatement`): it can be blocked (§8.2) and can block others, so
+it must not run dark, but it has no chunk boundary to pause at. A graceful stop cancels either
+one and the run stays re-entrant.
+
 ### 7.2 Stepsize calibration
 
 Initial step by volume to reclaim (Perplexity §9.2), taking the low end of each band as a
