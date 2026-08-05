@@ -300,7 +300,7 @@ git commit -m "feat(run): add the per-identity blocking-debt accumulator"
 ### Task 2: A stable identity key for a kill rule
 
 **Files:**
-- Modify: `internal/run/executor.go:69-78` (add `key()` and `String()` on `sessionRule`)
+- Modify: `internal/run/executor.go` (add `key()` and `String()` on `sessionRule`, after `matches` at `:133-147`)
 - Modify: `internal/run/kill.go:20-25` (add `key` to `killRule`), `internal/run/kill.go:42-63` (fill it in `compileKilledSessions`)
 - Test: `internal/run/kill_test.go`
 
@@ -372,7 +372,7 @@ Expected: FAIL — `rules[0].key undefined`, `r.match.String undefined`.
 
 - [ ] **Step 3: Write the implementation**
 
-In `internal/run/executor.go`, add after `matches` (around line 147). Add `"strconv"` and `"strings"` to that file's imports if they are not already there:
+In `internal/run/executor.go`, add after `matches` (which ends at line 147). **Both `"strconv"` and `"strings"` must be added to that file's import block** — as of this writing it imports only `context`, `errors`, `fmt`, `regexp`, `time`, `ddl` and `mssql` (`executor.go:3-12`). Do not skip this on the assumption that a sibling file's imports apply: `victim.go` has them, `executor.go` does not.
 
 ```go
 // key renders the rule as a canonical map key for the blocking-debt accumulator: the
@@ -725,17 +725,25 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Update the `Waited` doc comment**
+
+`KillEvent.Waited` (`internal/run/kill.go:17`) still says "how long it blocked the DDL before the kill", which is now only true for a first offender. Replace that line:
+
+```go
+	Waited time.Duration // how long this identity has blocked the DDL, accumulated across sessions
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `go test -race ./internal/run -run TestBlockerKiller -v`
 Expected: PASS — the four new tests and all six pre-existing `BlockerKiller` tests.
 
-- [ ] **Step 5: Run the whole package to catch collateral damage**
+- [ ] **Step 6: Run the whole package to catch collateral damage**
 
 Run: `go test -race ./internal/run`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add internal/run/kill.go internal/run/kill_test.go
@@ -1127,6 +1135,14 @@ type killTarget struct {
 // kill. firstEligible still dates this episode.
 ```
 
+And the field itself, `AmplifierKillEvent.Waited` (`internal/run/victim.go:44`), which still says "how long it was kill-eligible before we killed it":
+
+```go
+	Waited        time.Duration // how long this identity has been kill-eligible, accumulated across sessions
+```
+
+`victim.go` already imports `"fmt"` (`victim.go:5`), so `victimKey` needs no import change.
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `go test -race ./internal/run -run 'TestVictim' -v`
@@ -1309,7 +1325,7 @@ Change `considerLocked`'s signature and return to carry the capped warnings out 
 func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (targets []killTarget, capped []ReactionEvent, sink ReactionSink, onKill func(AmplifierKillEvent)) {
 ```
 
-and update its two early returns to `return nil, nil, sink, onKill` / the final one to `return targets, capped, sink, onKill`.
+then update both of its returns: the `!k.armed` guard becomes `return nil, nil, sink, onKill`, and the final one becomes `return targets, capped, sink, onKill`.
 
 In `consider`, emit them after the lock is released and before the kills:
 
@@ -1457,8 +1473,12 @@ Ensure `executor_test.go` imports `"context"`, `"time"`, `"testing"`, `ddl` and 
 
 - [ ] **Step 2: Run the test to verify it fails against the pre-feature behavior**
 
-Run: `git stash && go test ./internal/run -run TestSamplerKillsARecurringBlocker; git stash pop`
-Expected: the stashed run FAILS to compile or fails the final assertion (the returning blocker is not killed) — this is the regression the feature fixes. After `git stash pop`, continue.
+This is a demonstration, not a requirement — skip it if you have unrelated unstaged work, because `git stash` takes *everything* in the working tree, not just this task's test file.
+
+Run: `git stash push -- internal/run/kill.go internal/run/recidivism.go && go test ./internal/run -run TestSamplerKillsARecurringBlocker; git stash pop`
+Expected: FAIL — without the debt clock the returning blocker serves a fresh dwell and is never killed. This is the regression the feature fixes.
+
+A safer alternative if the working tree is dirty: `git worktree add ../sqlgopace-preverify <commit-before-task-3>`, copy the test file in, run it there, and remove the worktree.
 
 - [ ] **Step 3: Run the test against the implementation**
 
