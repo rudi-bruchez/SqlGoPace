@@ -245,6 +245,14 @@ intent: compression     # optional manifest-level default for rebuild_index oper
 ignore_blocked_sessions:
   - app_name: "^SQLAgent"          # e.g. a nightly job that may wait
   - login_name: "svc_(reporting|etl)"
+
+# Optional, and the OPPOSITE direction: sessions that may be KILLED when they block
+# these operations. Same matcher fields, plus after_seconds. Inert unless
+# kill_blockers.enabled is true in config.yaml. See "Killing the sessions that block
+# you" below — the two lists are not interchangeable.
+kill_blocking_sessions:
+  - login_name: "svc_(reporting|etl)"
+    after_seconds: 120
 operations:
   - operation: rebuild_index
     schema: dbo
@@ -384,6 +392,63 @@ exclusion takes effect before the next abort. It is also folded into the recover
 later resumed run remembers it. In the interactive console (`--tui`), select a blocked session and
 press `i`, then pick the criterion (`s` session_id / `a` app_name / `l` login_name / `h`
 host_name) — the rule is written into the running manifest for you and hot-reloaded.
+
+### Killing the sessions that block you: `kill_blocking_sessions`
+
+`ignore_blocked_sessions` handles sessions **we** hold up. `kill_blocking_sessions` handles the
+opposite case: a session **we are waiting on**, which we may terminate so our operation can
+proceed. The two lists share the same matcher fields, and that similarity is exactly what makes
+them easy to confuse — putting a login in the wrong one silently does nothing, because a rule
+only ever fires in its own direction.
+
+**Which list do I need?** Find the session in the run's advisory sidecar, then read across:
+
+| Where the session shows up | What is happening | The list to use |
+|---|---|---|
+| `<manifest>.blocked.yaml`, or the TUI's blocked list | **we** block **it** — it waits on our lock (`LCK_M_SCH_S`, `LCK_M_IX`, …) | `ignore_blocked_sessions` — let it stay blocked instead of aborting our operation |
+| our operation is suspended and the run log names it as our blocker | **it** blocks **us** | `kill_blocking_sessions` — terminate it after a delay |
+| it is blocked by us *and* has sessions queued behind it | it amplifies our block into an outage | `kill_amplifying_maintenance` (next section) |
+
+Both directions can be right for the same login at the same time: a dashboard query can block a
+shrink chunk on Monday and be blocked by it on Tuesday. Naming it in both lists is coherent, not
+contradictory.
+
+Arming is a two-step, deliberate act — the match rules live in the manifest (hot-reloadable,
+appendable from the TUI with `[x]`), but nothing is ever killed unless the config also allows it:
+
+```yaml
+# config.yaml — the master arm. Off by default; killing a session is destructive.
+kill_blockers:
+  enabled: true              # without this, every kill_blocking_sessions rule is inert
+  default_after_seconds: 60  # delay applied to a rule that sets no after_seconds
+```
+
+```yaml
+# the manifest — who may be killed, and after how long they have blocked us
+kill_blocking_sessions:
+  - login_name: "^svc_dashboard$"    # a read-only dashboard: kill it quickly
+    after_seconds: 30
+  - app_name: "^SQLAgent"            # a maintenance job: give it longer to finish
+    after_seconds: 600
+```
+
+The delay is measured from when that session started blocking us, and the first matching rule
+decides — order your rules from most to least specific, since a broad rule with a short delay
+placed first will shadow a narrower one behind it. Each blocker is killed at most once.
+
+`KILL` requires `ALTER ANY CONNECTION`. A failed kill is reported and changes nothing else: the
+operation falls back to the normal reaction hierarchy, exactly as if the feature were off.
+
+**A worked example of getting it backwards.** A shrink on `PRODDB` kept aborting its chunks. The
+manifest named the two dashboard logins under `kill_blocking_sessions`, but `<manifest>.blocked.yaml`
+listed them under `observed:` — they were waiting on `LCK_M_SCH_S` behind the shrink's page
+relocation, i.e. *victims*, not blockers. The rules never matched anything, the dashboards tripped
+the yield timer every time they refreshed, and the shrink lost each chunk it had started. They
+belonged in `ignore_blocked_sessions`: read-only `SELECT`s with `open_transactions: 0` cost nothing
+to keep waiting. The ingestion login in the same capture — an `INSERT` with two open transactions —
+was correctly left out of both lists, and `options.max_block_minutes` kept backstopping the run.
+The lesson generalizes: **read `.blocked.yaml` before writing session policy.** Every session in
+that file is a session you block, so every entry it suggests belongs to `ignore_blocked_sessions`.
 
 ### Killing amplifying maintenance victims: `kill_amplifying_maintenance`
 

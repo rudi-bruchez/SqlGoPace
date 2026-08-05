@@ -46,6 +46,14 @@ manifest**, explain usage, and warn about what to verify before running.
   operation (no true resume yet).
 - **Ask before guessing** the database, the target compression tier, or whether a rebuild
   is meant to recompress vs. defragment.
+- **Session policy has a direction.** `ignore_blocked_sessions` is for sessions *we* block
+  (the ones listed in `<manifest>.blocked.yaml`); `kill_blocking_sessions` is for sessions
+  that block *us*. Same match fields, opposite meanings, and a rule in the wrong list fails
+  silently. Never write either from a login the user names offhand — read the run's
+  `.blocked.yaml` first, ask whether the session holds open transactions, and ask for the
+  kill delay rather than choosing it. `kill_blocking_sessions` also does nothing unless
+  `kill_blockers.enabled: true` in the config; say so when you write one. See the guide's
+  "Session policy: get the direction right before you write a rule".
 
 ## When the user asks for automatic maintenance
 

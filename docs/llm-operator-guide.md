@@ -142,6 +142,32 @@ to the run report — ready-to-paste entries plus a full diagnostic block — so
 blocked you and decide what to add. The engine never reads that file back; copying an entry
 into the manifest is a deliberate step.
 
+### Session policy: get the direction right before you write a rule
+
+Two manifest lists share the same matcher fields and do opposite things. Writing a login into
+the wrong one fails silently — a rule only fires in its own direction, so nothing happens and
+nothing is reported.
+
+| The session… | …means | List |
+|---|---|---|
+| appears in `<manifest>.blocked.yaml` / the TUI blocked list | **we block it** (it waits on our lock) | `ignore_blocked_sessions` — let it wait, keep going |
+| is what our own operation is waiting on | **it blocks us** | `kill_blocking_sessions` — terminate it after `after_seconds` |
+| is blocked by us with sessions queued behind it | it amplifies our block | `kill_amplifying_maintenance` in `config.yaml` |
+
+`kill_blocking_sessions` is inert unless `kill_blockers.enabled: true` in the config file the
+run uses — say so whenever you write such a rule, since a manifest alone never kills anything.
+
+**Questions to ask before writing session policy** (do not guess these):
+
+1. Which sessions may be made to *wait* — and do they hold open transactions? A read-only
+   `SELECT` with `open_transactions: 0` is cheap to block; a writer with open transactions is
+   not, and belongs in neither list.
+2. Which sessions may be *killed*, and after how long? Killing is destructive and the delay is
+   the operator's risk call — never pick it silently.
+3. Is there a `.blocked.yaml` from a previous run to read first? It is evidence; a login the
+   user names from memory usually is not.
+4. What is the `max_block_minutes` backstop for this operation? Any ignore rule needs one.
+
 **You normally leave `options` empty.** The matrix (`ddl_compatibility.yaml`) decides
 what is legal and injects it. Key gates for `rebuild_index` (the common case):
 
