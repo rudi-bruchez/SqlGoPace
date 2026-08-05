@@ -232,3 +232,131 @@ func TestSessionRuleStringOmitsUnsetFields(t *testing.T) {
 		t.Errorf("String() = %s, want %s", got, want)
 	}
 }
+
+func TestBlockerKillerRecidivistDoesNotBuyAFreshDwell(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)})
+	first := blockedSnapshot(100, 104, "SVC_RPT")
+
+	k.consider(context.Background(), first, 100) // banks 0, starts the episode
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), first, 100) // banks 60s -> kill
+	if len(rec.spids) != 1 || rec.spids[0] != 104 {
+		t.Fatalf("expected the first blocker killed after its dwell, got %v", rec.spids)
+	}
+
+	// One second later the same job is back under a new SPID: the debt is already paid.
+	now = now.Add(time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 155, "SVC_RPT"), 100)
+	if len(rec.spids) != 2 || rec.spids[1] != 155 {
+		t.Fatalf("a returning offender must be killed at once, got %v", rec.spids)
+	}
+}
+
+func TestBlockerKillerDebtIsPerRule(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{
+		killRuleFor("^SVC_RPT$", 60),
+		killRuleFor("^SVC_ETL$", 60),
+	})
+
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("setup: the first rule's blocker should have been killed, got %v", rec.spids)
+	}
+
+	// A blocker matching a DIFFERENT rule has its own debt and serves the full dwell.
+	now = now.Add(time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 200, "SVC_ETL"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("another rule's blocker must not inherit the first rule's debt, got %v", rec.spids)
+	}
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 200, "SVC_ETL"), 100)
+	if len(rec.spids) != 2 || rec.spids[1] != 200 {
+		t.Fatalf("the second rule's blocker should be killed after its own dwell, got %v", rec.spids)
+	}
+}
+
+func TestBlockerKillerDebtIsForgottenAfterTheWindow(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)})
+
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("setup: expected one kill, got %v", rec.spids)
+	}
+
+	// Quiet for longer than the window: the bucket is forgotten, the dwell is full again.
+	now = now.Add(recidivismWindow + time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 155, "SVC_RPT"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("after a quiet window the offender must serve the full dwell, got %v", rec.spids)
+	}
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 155, "SVC_RPT"), 100)
+	if len(rec.spids) != 2 || rec.spids[1] != 155 {
+		t.Fatalf("expected the kill once the full dwell was served again, got %v", rec.spids)
+	}
+}
+
+func TestBlockerKillerSetSourceClearsTheDebt(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)})
+
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("setup: expected one kill, got %v", rec.spids)
+	}
+
+	// A new manifest re-arms the killer: debt must not leak across manifests.
+	compiled, err := compileKilledSessions([]ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)}, 0)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	k.SetSource(staticKill{rules: compiled})
+
+	now = now.Add(time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 155, "SVC_RPT"), 100)
+	if len(rec.spids) != 1 {
+		t.Fatalf("SetSource must clear the debt, got %v", rec.spids)
+	}
+}
+
+func TestBlockerKillerReportsTheDebtAsWaited(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	var events []KillEvent
+	k := NewBlockerKiller(rec.kill, func(ev KillEvent) { events = append(events, ev) },
+		func() time.Time { return now })
+	compiled, err := compileKilledSessions([]ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)}, 0)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	k.SetSource(staticKill{rules: compiled})
+
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 155, "SVC_RPT"), 100)
+
+	if len(events) != 2 {
+		t.Fatalf("expected two kill events, got %d", len(events))
+	}
+	// The recidivist's own episode is one second old; the identity has blocked us for 60s,
+	// and that is what the operator must read.
+	if events[1].Waited != 60*time.Second {
+		t.Errorf("Waited = %s, want the identity's debt (60s)", events[1].Waited)
+	}
+}

@@ -14,7 +14,7 @@ import (
 type KillEvent struct {
 	SPID   int
 	Login  string
-	Waited time.Duration // how long it blocked the DDL before the kill
+	Waited time.Duration // how long this identity has blocked the DDL, accumulated across sessions
 }
 
 // killRule is one compiled kill_blocking_sessions entry: a session matcher (shared with the
@@ -123,11 +123,13 @@ type BlockerKiller struct {
 	onKill func(KillEvent)
 	now    func() time.Time
 
-	mu      sync.Mutex
-	src     KillSource
-	current int       // SPID of the blocker in the current episode, 0 when unblocked
-	since   time.Time // when the current blocker first blocked us
-	killed  bool      // already issued KILL for the current episode
+	mu       sync.Mutex
+	src      KillSource
+	rec      *recidivism // blocking debt per matched rule, so a returning blocker keeps its dwell
+	current  int         // SPID of the blocker in the current episode, 0 when unblocked
+	since    time.Time   // when the current blocker first blocked us
+	lastPoll time.Time   // previous observation of the current episode; zero on its first poll
+	killed   bool        // already issued KILL for the current episode
 }
 
 // NewBlockerKiller builds a killer. kill terminates a SPID (mssql.Conn.Kill on the monitoring
@@ -136,12 +138,24 @@ func NewBlockerKiller(kill func(context.Context, int) error, onKill func(KillEve
 	if now == nil {
 		now = time.Now
 	}
-	return &BlockerKiller{kill: kill, onKill: onKill, now: now}
+	return &BlockerKiller{kill: kill, onKill: onKill, now: now, rec: newRecidivism(now)}
 }
 
 // resetEpisode clears the current-blocker tracking (called when unblocked or re-sourced).
+// It deliberately does not touch the debt: debt is banked poll by poll while the blocker is
+// observed, so there is never an unflushed remainder to fold in here.
 func (k *BlockerKiller) resetEpisode() {
-	k.current, k.since, k.killed = 0, time.Time{}, false
+	k.current, k.since, k.lastPoll, k.killed = 0, time.Time{}, time.Time{}, false
+}
+
+// sincePoll returns the time to bank for this poll: zero on an episode's first observation
+// (we do not know how long the blocker was there before we saw it, exactly as the previous
+// per-episode timer assumed), the inter-poll gap afterwards.
+func (k *BlockerKiller) sincePoll(now time.Time) time.Duration {
+	if k.lastPoll.IsZero() {
+		return 0
+	}
+	return now.Sub(k.lastPoll)
 }
 
 // SetSource swaps the per-manifest kill-rule source and resets the episode state. Called by
@@ -152,13 +166,14 @@ func (k *BlockerKiller) SetSource(src KillSource) {
 	}
 	k.mu.Lock()
 	k.src = src
+	k.rec.reset()
 	k.resetEpisode()
 	k.mu.Unlock()
 }
 
 // consider inspects one blocking snapshot and kills the session blocking ddlSPID when it
-// matches a rule and has blocked for at least that rule's delay. A no-op when no source is
-// set or no rule matches. Each blocker is killed at most once per episode.
+// matches a rule and its identity has blocked for at least that rule's delay. A no-op when
+// no source is set or no rule matches. Each blocker is killed at most once per episode.
 func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int) {
 	if k == nil {
 		return
@@ -168,6 +183,7 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 	if k.src == nil {
 		return
 	}
+	k.rec.prune() // before any debt is read, so a quiet window really restores the full dwell
 	blocker, ok := blockerSession(sessions, ddlSPID)
 	if !ok {
 		k.resetEpisode()
@@ -175,22 +191,33 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 	}
 	now := k.now()
 	if blocker.SPID != k.current {
-		k.current, k.since, k.killed = blocker.SPID, now, false
-	}
-	if k.killed {
-		return
+		k.current, k.since, k.lastPoll, k.killed = blocker.SPID, now, time.Time{}, false
 	}
 	for _, r := range k.src.Current() {
 		if !r.match.matches(blocker) {
 			continue
 		}
-		if now.Sub(k.since) < r.after {
-			return // matched, but has not blocked long enough yet
+		k.rec.accrue(r.key, k.sincePoll(now))
+		k.lastPoll = now
+		if k.killed {
+			// Already killed in this episode. The banking above still runs: a killed session
+			// that lingers in rollback is genuinely still blocking us, and counting that time
+			// keeps the identity's bucket alive and its debt honest. It cannot cause a second
+			// kill — this return is what prevents that — and the debt is already past `after`
+			// anyway, so it changes no decision.
+			return
+		}
+		if k.rec.debt(r.key) < r.after {
+			return // matched, but this identity has not blocked us long enough yet
 		}
 		if err := k.kill(ctx, blocker.SPID); err == nil {
 			k.killed = true
+			k.rec.recordKill(r.key)
 			if k.onKill != nil {
-				k.onKill(KillEvent{SPID: blocker.SPID, Login: blocker.Login, Waited: now.Sub(k.since)})
+				// Waited is the identity's debt, not this episode's elapsed time: for a
+				// recidivist the episode is seconds old, and "after 0s blocking the DDL"
+				// would misstate why the kill was justified.
+				k.onKill(KillEvent{SPID: blocker.SPID, Login: blocker.Login, Waited: k.rec.debt(r.key)})
 			}
 		}
 		return // first matching rule decides; don't fall through to a longer-delay rule
