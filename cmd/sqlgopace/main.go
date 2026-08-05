@@ -422,6 +422,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
 	// sampler's per-poll session snapshot; the engine feeds it each manifest's kill rules.
 	var killOpt run.EngineOption
+	var blockerKiller *run.BlockerKiller // shared with the tempdb sampler below
 	if cfg.KillBlockers.Enabled {
 		killed := func(ev run.KillEvent) {
 			fmt.Fprintf(engineOut, "-- killed blocker SPID %d (login=%s) after %s blocking the DDL\n",
@@ -431,15 +432,16 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 				fwd.send(tui.KilledMsg{SPID: ev.SPID, Login: ev.Login}) // annotate the suspension-history entry
 			}
 		}
-		killer := run.NewBlockerKiller(conn.Kill, killed, nil)
-		sampler.SetKiller(killer)
-		killOpt = run.WithBlockerKiller(killer, cfg.KillBlockers.DefaultAfter())
+		blockerKiller = run.NewBlockerKiller(conn.Kill, killed, nil)
+		sampler.SetKiller(blockerKiller)
+		killOpt = run.WithBlockerKiller(blockerKiller, cfg.KillBlockers.DefaultAfter())
 	}
 	// Amplifying-maintenance-victim kill (off unless armed in config): terminates a
 	// maintenance statement our operation blocks once other sessions have queued
 	// behind it. The killer is shared with the sampler, exactly like the blocker
 	// killer above.
 	var victimOpt run.EngineOption = func(*run.Engine) {}
+	var victimKiller *run.VictimKiller // shared with the tempdb sampler below
 	if cfg.KillAmplifyingMaintenance.Enabled {
 		policy := run.AmplifierPolicy{
 			MinBlockedBehind: cfg.KillAmplifyingMaintenance.MinBehind(),
@@ -459,9 +461,9 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		// mssql.AppNamePrefix constant: a DSN carrying `app name=...` changes what our
 		// own sessions report as program_name, and a stale constant would let one
 		// instance of a size-split campaign kill another's in-flight REBUILD.
-		victims := run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, conn.AppNamePrefix())
-		sampler.SetVictimKiller(victims)
-		victimOpt = run.WithVictimKiller(victims, policy)
+		victimKiller = run.NewVictimKiller(conn.Kill, conn.LookupAgentJob, amplifierKilled, run.System, conn.AppNamePrefix())
+		sampler.SetVictimKiller(victimKiller)
+		victimOpt = run.WithVictimKiller(victimKiller, policy)
 	}
 	// ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY is database-scoped, so it must be read
 	// from this per-database conn, not the startup connection — otherwise a
@@ -524,6 +526,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
 	tempdbSampler := run.NewServerSampler(conn, tempdbConn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	// The killers are per-run, not per-sampler: a tempdb shrink must be able to kill a
+	// blocker exactly like any other operation, and it is the sampler poll that consults
+	// them. The instances are shared with the primary sampler — safe, because the engine
+	// runs one operation at a time, so the two samplers never poll concurrently. Both
+	// setters accept a nil killer (the feature stays off when not armed in config).
+	tempdbSampler.SetKiller(blockerKiller)
+	tempdbSampler.SetVictimKiller(victimKiller)
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:            shrinkTuning(cfg.Shrink),
 		PollInterval:      cfg.Monitoring.BlockingPoll(),
