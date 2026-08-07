@@ -156,6 +156,16 @@ nothing is reported.
 
 `kill_blocking_sessions` is inert unless `kill_blockers.enabled: true` in the config file the
 run uses — say so whenever you write such a rule, since a manifest alone never kills anything.
+The delay is served by the rule, not by the session: an offender killed and returning under a
+new SPID inherits the time already served, and one rule kills at most three sessions before five
+*quiet* minutes, after which the run reports it and falls back to yielding. Quiet is the operative
+word — an offender returning every few minutes keeps refreshing the window, so the rule stays
+capped for the rest of the manifest rather than getting three more kills every five minutes. Do
+not suggest a very short `after_seconds` to "keep up" with a restarting job — that is the case the
+mechanism already handles, and a short delay only makes the run kill innocent short-lived
+sessions. One detail to state when you write the rule: a rule that matches on `statement:` only
+accrues time on the polls where that statement is the one running, so such a rule fires *later*
+than `after_seconds` of wall-clock blocking, never earlier.
 
 **Questions to ask before writing session policy** (do not guess these):
 

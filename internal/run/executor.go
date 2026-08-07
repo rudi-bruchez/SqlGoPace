@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -144,6 +146,50 @@ func (r sessionRule) matches(s mssql.Session) bool {
 		return false
 	}
 	return true
+}
+
+// key renders the rule as a canonical map key for the blocking-debt accumulator: the
+// session id and every regexp source, in a fixed order. Each field is quoted rather than
+// raw-joined because a regexp source can contain the separator itself ("x|y" as an
+// alternation), which would make an unquoted join collide with a two-field rule and merge
+// two rules' debts. Derived from the rule's text, so it is stable across the hot reload in
+// manifestKillSource.Current: appending a rule mid-run leaves the other keys untouched.
+func (r sessionRule) key() string {
+	return fmt.Sprintf("%d|%s|%s|%s|%s", r.sessionID,
+		strconv.Quote(reSource(r.app)), strconv.Quote(reSource(r.host)),
+		strconv.Quote(reSource(r.login)), strconv.Quote(reSource(r.stmt)))
+}
+
+// String renders the rule for an operator-facing message, naming only the fields it sets.
+// It is deliberately a different rendering from key(): the key must be total and stable,
+// this must be readable.
+func (r sessionRule) String() string {
+	var parts []string
+	if r.sessionID != 0 {
+		parts = append(parts, fmt.Sprintf("session_id=%d", r.sessionID))
+	}
+	for _, f := range []struct {
+		name string
+		re   *regexp.Regexp
+	}{
+		{"app", r.app}, {"host", r.host}, {"login", r.login}, {"statement", r.stmt},
+	} {
+		if f.re != nil {
+			parts = append(parts, fmt.Sprintf("%s=~%q", f.name, f.re.String()))
+		}
+	}
+	if len(parts) == 0 {
+		return "{}" // a rule that sets nothing matches everything
+	}
+	return "{" + strings.Join(parts, ", ") + "}"
+}
+
+// reSource returns a regexp's source, empty for an unset (nil) field.
+func reSource(re *regexp.Regexp) string {
+	if re == nil {
+		return ""
+	}
+	return re.String()
 }
 
 // ErrCancelled signals the operation was canceled under pressure and may be

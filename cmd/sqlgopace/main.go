@@ -424,11 +424,16 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	var killOpt run.EngineOption
 	var blockerKiller *run.BlockerKiller // shared with the tempdb sampler below
 	if cfg.KillBlockers.Enabled {
+		// Waited is the rule's accumulated debt across every session that matched it, not
+		// this SPID's own blocking time, so both lines attribute it to the rule. For a
+		// recidivist the two differ by minutes, and a figure the operator cannot reconcile
+		// against sys.dm_exec_requests for the named SPID would read as a bug.
 		killed := func(ev run.KillEvent) {
-			fmt.Fprintf(engineOut, "-- killed blocker SPID %d (login=%s) after %s blocking the DDL\n",
+			fmt.Fprintf(engineOut, "-- killed blocker SPID %d (login=%s) after %s of blocking by sessions matching this rule\n",
 				ev.SPID, ev.Login, ev.Waited.Round(time.Second))
 			if fwd != nil {
-				fwd.send(tui.LogMsg{Line: fmt.Sprintf("killed blocker SPID %d (%s) after %s", ev.SPID, ev.Login, ev.Waited.Round(time.Second))})
+				fwd.send(tui.LogMsg{Line: fmt.Sprintf("killed blocker SPID %d (%s) after %s of blocking by sessions matching this rule",
+					ev.SPID, ev.Login, ev.Waited.Round(time.Second))})
 				fwd.send(tui.KilledMsg{SPID: ev.SPID, Login: ev.Login}) // annotate the suspension-history entry
 			}
 		}

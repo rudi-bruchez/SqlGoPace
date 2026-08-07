@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -378,15 +379,21 @@ func TestVictimKillerTracksIndependentDwellsForTwoVictims(t *testing.T) {
 
 // twoVictimSnapshot is DirectVictims 79 and (when includeB) 80, both blocked by our
 // DDL (67) and each with one session queued behind it — two independent amplifiers.
+// They carry DIFFERENT Agent job steps on purpose: the dwell is served per offender
+// identity, not per SPID, so two sessions sharing a login/host/program would be one
+// offender sharing one debt and B would inherit A's dwell. Independent dwells are a
+// property of independent offenders, and that is what this test is about.
 func twoVictimSnapshot(includeB bool) []mssql.Session {
 	out := []mssql.Session{
 		{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"},
-		{SPID: 79, Command: "UPDATE STATISTICS", BlockingSPID: 67},
+		{SPID: 79, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+			Program: "SQLAgent - TSQL JobStep (Job 0xA1 : Step 1)"},
 		{SPID: 1001, Command: "SELECT", BlockingSPID: 79},
 	}
 	if includeB {
 		out = append(out,
-			mssql.Session{SPID: 80, Command: "UPDATE STATISTICS", BlockingSPID: 67},
+			mssql.Session{SPID: 80, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Program: "SQLAgent - TSQL JobStep (Job 0xB2 : Step 1)"},
 			mssql.Session{SPID: 2001, Command: "SELECT", BlockingSPID: 80},
 		)
 	}
@@ -685,6 +692,243 @@ func TestAmplifierDetailTruncatesOnARuneBoundary(t *testing.T) {
 	}
 }
 
+func TestVictimKeyIdentifiesTheJobNotTheSession(t *testing.T) {
+	// Two different sessions running two different statements for the same Agent job step
+	// are one offender.
+	a := mssql.Session{SPID: 79, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`,
+		Command: "UPDATE STATISTICS", ActiveQuery: "UPDATE STATISTICS dbo.MEASUREMENT"}
+	b := mssql.Session{SPID: 91, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`,
+		Command: "ALTER INDEX", ActiveQuery: "ALTER INDEX ALL ON dbo.MEASUREMENT REORGANIZE"}
+	if victimKey(a) != victimKey(b) {
+		t.Errorf("one job step must be one identity: %q vs %q", victimKey(a), victimKey(b))
+	}
+
+	// A program name that is not a job step falls back to the connection triplet, and the
+	// statement is still not part of the identity.
+	c := mssql.Session{SPID: 54, Login: `CORP\svc_etl`, Host: "SQLPROD01", Program: "ETL",
+		ActiveQuery: "UPDATE STATISTICS dbo.MEASUREMENT"}
+	d := mssql.Session{SPID: 61, Login: `CORP\svc_etl`, Host: "SQLPROD01", Program: "ETL",
+		ActiveQuery: "ALTER INDEX ALL ON dbo.OTHER REBUILD"}
+	if victimKey(c) != victimKey(d) {
+		t.Errorf("one connection identity must be one offender: %q vs %q", victimKey(c), victimKey(d))
+	}
+	if victimKey(a) == victimKey(c) {
+		t.Error("a job step and a plain connection must not share an identity")
+	}
+	// A second step of the same job is a different offender: an operator disables a step,
+	// not a session, so the step is the finest identity the advice can act on.
+	e := mssql.Session{SPID: 80, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 2)`}
+	if victimKey(a) == victimKey(e) {
+		t.Errorf("two steps of one job must not share an identity: %q", victimKey(a))
+	}
+}
+
+func TestVictimKillerRecidivistDoesNotBuyAFreshDwell(t *testing.T) {
+	killed := make(chan int, 8)
+	clk := NewManualClock(time.Unix(0, 0))
+	k := NewVictimKiller(
+		func(_ context.Context, spid int) error { killed <- spid; return nil },
+		nil, nil, clk, "SqlGoPace")
+	k.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+
+	// Our DDL is SPID 100. Victim 79 is directly blocked by us and has SPID 91 queued
+	// behind it, which is what makes it an amplifier.
+	snap := func(victim int) []mssql.Session {
+		return []mssql.Session{
+			{SPID: 100},
+			{SPID: victim, BlockingSPID: 100, Command: "UPDATE STATISTICS",
+				Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`},
+			{SPID: 91, BlockingSPID: victim, Command: "SELECT"},
+		}
+	}
+
+	k.consider(context.Background(), snap(79), 100, nil) // banks 0
+	clk.Advance(60 * time.Second)
+	k.consider(context.Background(), snap(79), 100, nil) // banks 60s -> kill
+	if got := <-killed; got != 79 {
+		t.Fatalf("expected the first victim killed after its dwell, got %d", got)
+	}
+
+	// The job restarts a second later under a new SPID: the identity already paid.
+	clk.Advance(time.Second)
+	k.consider(context.Background(), snap(155), 100, nil)
+	select {
+	case got := <-killed:
+		if got != 155 {
+			t.Fatalf("expected the returning job killed, got %d", got)
+		}
+	default:
+		t.Fatal("a returning offender must be killed at once, no kill was issued")
+	}
+}
+
+// sharedIdentitySnapshot is ONE offender running the given concurrent maintenance
+// sessions: our DDL (67) blocks each of spids, they all carry the same login/host/program
+// triplet — the sess: fallback identity every connection of one application shares — and
+// each has a reader queued behind it. The program is deliberately not an Agent job step,
+// because the sess: key is where the shared-identity case is actually reachable. The
+// caller fixes the slice order, because ActiveSessions orders by cpu_time DESC and that
+// order has no relation to how long each session has been eligible.
+func sharedIdentitySnapshot(spids ...int) []mssql.Session {
+	out := []mssql.Session{{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"}}
+	for i, spid := range spids {
+		out = append(out,
+			mssql.Session{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Login: `CORP\svc_sqlagent`, Host: "SQLPROD01", Program: "MaintenanceSolution",
+				Database: "PRODDB", ActiveQuery: "UPDATE STATISTICS [dbo].[MEASUREMENT]"},
+			mssql.Session{SPID: 1001 + i, Command: "SELECT", BlockingSPID: spid})
+	}
+	return out
+}
+
+// TestVictimKillerBanksOneIdentityOncePerPoll covers the review finding that the scan
+// accrued once per eligible victim: two sessions of one offender eligible on the same
+// poll each banked the full inter-poll gap into the same bucket, so the identity crossed
+// the dwell in roughly After/N wall-clock and Waited over-reported by up to N times.
+// TestVictimKillerTracksIndependentDwellsForTwoVictims cannot catch this — its two
+// victims are deliberately DIFFERENT offenders.
+func TestVictimKillerBanksOneIdentityOncePerPoll(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+	snap := sharedIdentitySnapshot(79, 80)
+
+	f.killer.consider(ctx, snap, 67, nil) // both episodes' first poll: banks nothing
+	f.clk.Advance(30 * time.Second)
+	f.killer.consider(ctx, snap, 67, nil) // banks the 30s gap ONCE, not once per victim
+
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v at half the dwell, want none — one identity is banked once per poll, not once per session", f.killed)
+	}
+
+	f.clk.Advance(30 * time.Second)
+	f.killer.consider(ctx, snap, 67, nil)
+	if len(f.killed) != 2 {
+		t.Fatalf("killed = %v once the dwell was served, want both sessions of the offender", f.killed)
+	}
+	for _, ev := range f.events {
+		if ev.Waited != 60*time.Second {
+			t.Errorf("event for SPID %d reports Waited = %v, want the identity's real debt (60s)", ev.SPID, ev.Waited)
+		}
+	}
+}
+
+// TestVictimKillerStaggeredArrivalStillServesTheDwell covers the review finding that the
+// once-per-poll bank charged whichever eligible victim of an identity the snapshot happened
+// to yield first. ActiveSessions orders by cpu_time DESC, which says nothing about how long
+// an episode has been running, so a session that is new on this poll sorting ahead of an
+// older one banked ITS zero gap and the older episode's real inter-poll interval was thrown
+// away. TestVictimKillerBanksOneIdentityOncePerPoll cannot catch it: both its sessions start
+// on the same poll, so their episodes are new together. The poll mark belongs to the
+// identity, not to whichever of its sessions the DMV happened to list first.
+func TestVictimKillerStaggeredArrivalStillServesTheDwell(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, sharedIdentitySnapshot(79), 67, nil) // t0: victim 79 alone
+
+	// From t0+10s a second connection of the same offender is present and the snapshot
+	// yields it FIRST, so it is the one an order-dependent bank would charge.
+	for i := 0; i < 5; i++ {
+		f.clk.Advance(10 * time.Second)
+		f.killer.consider(ctx, sharedIdentitySnapshot(80, 79), 67, nil)
+	}
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v at t0+50s, want none — the dwell is 60s", f.killed)
+	}
+
+	f.clk.Advance(10 * time.Second)
+	f.killer.consider(ctx, sharedIdentitySnapshot(80, 79), 67, nil)
+	if len(f.killed) != 2 {
+		t.Fatalf("killed = %v at t0+60s, want both sessions of the offender — the identity must reach "+
+			"its dwell at After whatever order the snapshot lists it in", f.killed)
+	}
+	for _, ev := range f.events {
+		if ev.Waited != 60*time.Second {
+			t.Errorf("event for SPID %d reports Waited = %v, want the identity's real debt (60s)", ev.SPID, ev.Waited)
+		}
+	}
+}
+
+// returningJobSnapshot is the PRODDB amplifier under an arbitrary session id: one Agent
+// job step (identity 0xAB step 1) blocked by our DDL (67), with one reader queued behind
+// it, so the same offender can be replayed after a restart under a new SPID.
+func returningJobSnapshot(spid int) []mssql.Session {
+	return []mssql.Session{
+		{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"},
+		{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+			Program: "SQLAgent - TSQL JobStep (Job 0xAB : Step 1)",
+			Login:   "svc_agent", Host: "SQLPROD01", Database: "PRODDB"},
+		{SPID: 1001, Command: "SELECT", BlockingSPID: spid},
+	}
+}
+
+// TestVictimKillerReportsTheDebtAsWaited is the victim-side mirror of
+// TestBlockerKillerReportsTheDebtAsWaited: a recidivist's event must report the
+// IDENTITY's accumulated debt, not its own seconds-old episode — that is the headline
+// meaning change of serving the dwell per offender. FirstEligible still dates the new
+// episode, and both report routes must carry the same number.
+func TestVictimKillerReportsTheDebtAsWaited(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+
+	// The job restarts a second later under a new SPID: the identity already paid.
+	f.clk.Advance(time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+
+	if len(f.events) != 2 || len(f.narrated) != 2 {
+		t.Fatalf("events = %d, narrated = %d, want two kills on both routes", len(f.events), len(f.narrated))
+	}
+	ev := f.events[1]
+	if ev.SPID != 155 {
+		t.Fatalf("second kill event SPID = %d, want 155", ev.SPID)
+	}
+	// 61s, not 60s: the offender was observed on both polls, one second apart, and the poll
+	// mark belongs to the identity rather than to a session, so that second is banked like
+	// any other inter-poll gap. A new SPID no longer donates a zero gap in place of the
+	// identity's real one — which is the same property the staggered-arrival test pins.
+	if ev.Waited != 61*time.Second {
+		t.Errorf("Waited = %v, want the identity's debt (61s), not the returning episode's 0s", ev.Waited)
+	}
+	if want := f.clk.Now(); !ev.FirstEligible.Equal(want) {
+		t.Errorf("FirstEligible = %v, want %v — it dates THIS episode", ev.FirstEligible, want)
+	}
+	if f.narrated[1].Waited != ev.Waited {
+		t.Errorf("narrated Waited = %v, want the sink event's debt (%v)", f.narrated[1].Waited, ev.Waited)
+	}
+}
+
+// TestVictimKillerQuietWindowRestoresTheFullDwell pins the victim-side effect of the
+// prune at the top of the scan: debt is what an offender owes for THIS bout of trouble,
+// so an identity that stays away longer than recidivismWindow is judged from zero again
+// rather than being killed on sight forever.
+func TestVictimKillerQuietWindowRestoresTheFullDwell(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	if len(f.killed) != 1 {
+		t.Fatalf("setup: killed = %v, want [79] once the dwell elapsed", f.killed)
+	}
+
+	f.clk.Advance(recidivismWindow + time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+	if len(f.killed) != 1 {
+		t.Fatalf("killed = %v — after a quiet window the offender must serve the full dwell again", f.killed)
+	}
+
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+	if len(f.killed) != 2 || f.killed[1] != 155 {
+		t.Fatalf("killed = %v, want the kill once the full dwell was served again", f.killed)
+	}
+}
+
 func TestAmplifierDetailFallsBackToProgramWhenUnattributed(t *testing.T) {
 	ev := AmplifierKillEvent{
 		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 3,
@@ -766,5 +1010,229 @@ func TestVictimKillerDetachesTheKillFromThePumpContext(t *testing.T) {
 	}
 	if attrErrDuring != nil {
 		t.Errorf("attribution context Err() = %v after the pump context was canceled, want nil (detached)", attrErrDuring)
+	}
+}
+
+// oneOffenderSnapshot is ONE Agent job step (identity 0x1A2B step 1) running several
+// concurrent maintenance sessions: our DDL (67) blocks each of them and each has a reader
+// queued behind it, so every one of them is eligible on the same scan. Passing a single
+// SPID replays that offender across restarts instead. The program name carries the colon
+// mssql.ParseJobStepProgram anchors on — without it the identity would silently fall back
+// to the sess: triplet and these tests would cover the wrong key.
+func oneOffenderSnapshot(spids ...int) []mssql.Session {
+	out := []mssql.Session{{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"}}
+	for i, spid := range spids {
+		out = append(out,
+			mssql.Session{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)",
+				Login:   `CORP\svc_sqlagent`, Host: "SQLPROD01", Database: "PRODDB",
+				ActiveQuery: "UPDATE STATISTICS [dbo].[MEASUREMENT]"},
+			mssql.Session{SPID: 900 + i, Command: "SELECT", BlockingSPID: spid})
+	}
+	return out
+}
+
+// killOnSight is the policy the cap tests use: a fan-out of one and no dwell, so every
+// eligible victim is killable on the poll it appears, and the only thing left to bound the
+// kills is the repeat-kill cap itself.
+func killOnSight() AmplifierPolicy {
+	return AmplifierPolicy{MinBlockedBehind: 1}
+}
+
+// TestVictimKillerCapHoldsWithinOneScan is why the victim-side budget is RESERVED while the
+// target is selected rather than counted after a successful KILL, as BlockerKiller does: one
+// scan can select several victims of the same offender, and every KILL is issued after the
+// lock is released, so a count-on-success budget would still read zero for all of them and
+// the cap would be exceeded by the number of targets in that scan.
+func TestVictimKillerCapHoldsWithinOneScan(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+
+	// Five sessions of ONE identity, all eligible in a single scan.
+	f.killer.consider(context.Background(), oneOffenderSnapshot(79, 91, 104, 155, 162), 67, nil)
+
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("killed = %v in one scan, want %d kills — the cap must hold inside a single scan",
+			f.killed, maxRepeatKills)
+	}
+}
+
+// TestVictimKillerCappedVictimStopsBeingSuppressed pins the suppression side of the cap: a
+// capped identity gets no episode and is left out of the scan's seen set, so the sweep drops
+// whatever episode it still had once the grace window ends. Suppressed then goes false and
+// the victim counts toward BlockState.Unignored again. Without that, a capped victim would
+// stay suppressed forever while no kill was ever coming, and the run would never yield.
+func TestVictimKillerCappedVictimStopsBeingSuppressed(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	ctx := context.Background()
+
+	for _, spid := range []int{79, 91, 104} {
+		f.killer.consider(ctx, oneOffenderSnapshot(spid), 67, nil)
+		f.clk.Advance(time.Second)
+	}
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("setup: killed = %v, want the identity's whole budget spent", f.killed)
+	}
+
+	// The identity is capped. A fresh victim of it is refused a kill, so it must not be
+	// suppressed either.
+	f.clk.Advance(killGraceWindow + time.Second)
+	f.killer.consider(ctx, oneOffenderSnapshot(162), 67, nil)
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("killed = %v, want no kill past the cap", f.killed)
+	}
+	if f.killer.Suppressed(162) {
+		t.Error("Suppressed(162) = true for a capped victim, want false — no kill is coming, so the run must yield")
+	}
+}
+
+// TestVictimKillerCapWarnsOnce mirrors TestBlockerKillerCapsRepeatKillsAndWarnsOnce: the
+// escalation is an operator decision ("this job is being restarted faster than we can clear
+// it"), so it must be stated once per identity and not repeated on every poll.
+func TestVictimKillerCapWarnsOnce(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	ctx := context.Background()
+
+	// 79, 91 and 104 spend the three kills; 155 is the first refused and is therefore the
+	// session the single warn names. 162 and 170 must add no second warn.
+	for _, spid := range []int{79, 91, 104, 155, 162, 170} {
+		f.killer.consider(ctx, oneOffenderSnapshot(spid), 67, nil)
+		f.clk.Advance(time.Second)
+	}
+
+	var warns []string
+	for _, ev := range f.raw {
+		if ev.Kind == "warn" {
+			warns = append(warns, ev.Detail)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("the cap must warn exactly once per identity, got %d: %v", len(warns), warns)
+	}
+	for _, want := range []string{"stopped killing amplifying maintenance sessions", "0x1A2B", "SPID 155"} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warn %q must contain %q", warns[0], want)
+		}
+	}
+}
+
+// TestVictimKillerFailedKillReturnsTheBudget is the withdrawal path the reservation makes
+// necessary: the budget is booked before the server confirms anything, so a KILL that never
+// landed must give it back. Three failed KILLs change nothing on the server, and must not
+// disarm the killer for the rest of the window — the attempt count is what proves the
+// budget came back, since a kills counter left at three would refuse attempts 4 and 5.
+func TestVictimKillerFailedKillReturnsTheBudget(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	attempts := 0
+	k := NewVictimKiller(
+		func(context.Context, int) error {
+			attempts++
+			return errors.New("permission denied")
+		},
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(killOnSight())
+
+	// A new SPID each poll: killFailed is terminal for an episode, so the same session is
+	// never retried — only the same offender returning under a fresh session id is.
+	for _, spid := range []int{79, 91, 104, 155, 162} {
+		k.consider(context.Background(), oneOffenderSnapshot(spid), 67, nil)
+		clk.Advance(time.Second)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	if !strings.HasPrefix(key, "job:") {
+		t.Fatalf("victimKey = %q, want the job-step identity — the fixture's program must parse", key)
+	}
+	k.mu.Lock()
+	spent := k.rec.kills(key)
+	k.mu.Unlock()
+	if spent != 0 {
+		t.Errorf("failed KILLs must spend no budget, kills = %d", spent)
+	}
+	if attempts != 5 {
+		t.Errorf("KILL attempted %d times, want 5 — a withdrawn reservation must let the killer keep trying", attempts)
+	}
+}
+
+// TestVictimKillerTimedOutKillKeepsTheBudget is the counterpart of the test above: a KILL
+// bounded by killTimeout that runs out of time is NOT a KILL that never landed. The attention
+// reaches the server first and only the client gives up waiting, so the victim is already
+// dying and rolling back — and a KILL slow enough to time out is precisely the large rollback
+// maxRepeatKills exists to bound. Refunding there would let the same offender be killed again
+// on its next session, which is the rollback storm the cap is there to prevent.
+func TestVictimKillerTimedOutKillKeepsTheBudget(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	attempts := 0
+	k := NewVictimKiller(
+		func(context.Context, int) error {
+			attempts++
+			// Wrapped, as a driver reports it: errors.Is must see through it.
+			return fmt.Errorf("kill: %w", context.DeadlineExceeded)
+		},
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(killOnSight())
+
+	for _, spid := range []int{79, 91, 104, 155, 162} {
+		k.consider(context.Background(), oneOffenderSnapshot(spid), 67, nil)
+		clk.Advance(time.Second)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	k.mu.Lock()
+	spent := k.rec.kills(key)
+	k.mu.Unlock()
+	if spent != maxRepeatKills {
+		t.Errorf("timed-out KILLs must keep the budget spent, kills = %d, want %d", spent, maxRepeatKills)
+	}
+	if attempts != maxRepeatKills {
+		t.Errorf("KILL attempted %d times, want %d — a timed-out KILL likely landed, so the cap must still bite",
+			attempts, maxRepeatKills)
+	}
+}
+
+// TestVictimKillerAbandonedKillsReturnTheWholeBudget covers the shutdown refund with more than
+// one target, which is the only shape that can catch it: one abandoned reservation still leaves
+// the identity under the cap, but considerLocked routinely selects several victims of one
+// identity per scan, so a single canceled poll could otherwise burn the whole budget for good.
+func TestVictimKillerAbandonedKillsReturnTheWholeBudget(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	snap := oneOffenderSnapshot(79, 91, 104)
+
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.killer.consider(done, snap, 67, nil)
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v on a context that is already done, want none", f.killed)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	f.killer.mu.Lock()
+	spent := f.killer.rec.kills(key)
+	f.killer.mu.Unlock()
+	if spent != 0 {
+		t.Errorf("abandoned reservations must all go back, kills = %d, want 0", spent)
+	}
+
+	// And the budget is really usable again: the same offender is still killable.
+	f.killer.consider(context.Background(), snap, 67, nil)
+	if len(f.killed) != maxRepeatKills {
+		t.Errorf("killed = %v after the run resumed polling, want %d kills", f.killed, maxRepeatKills)
+	}
+}
+
+// TestVictimCapDetailNamesTheSessionWhenTheProgramIsEmpty pins the fallback the narration
+// promises: a client that sets no application name has no program to name, and interpolating it
+// anyway yields a sentence reading "from :" that advises disabling a job the identity does not
+// have. login@host is exactly what the identity key falls back to in that case.
+func TestVictimCapDetailNamesTheSessionWhenTheProgramIsEmpty(t *testing.T) {
+	got := victimCapDetail(mssql.Session{
+		SPID: 155, Command: "UPDATE STATISTICS", Login: `CORP\svc_sqlagent`, Host: "SQLPROD01",
+	})
+	if !strings.Contains(got, `from CORP\svc_sqlagent@SQLPROD01`) {
+		t.Errorf("victimCapDetail() = %q, want the login@host fallback as the source", got)
+	}
+	if strings.Contains(got, "from :") || strings.Contains(got, "from  ") {
+		t.Errorf("victimCapDetail() = %q, leaves a dangling source clause", got)
 	}
 }

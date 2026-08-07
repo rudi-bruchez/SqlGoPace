@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -41,16 +42,29 @@ type AmplifierKillEvent struct {
 	BlockedBehind int
 	WaitedMS      int64         // the victim's own wait_time, from the DMV
 	FirstEligible time.Time     // when it first met every eligibility condition
-	Waited        time.Duration // how long it was kill-eligible before we killed it
+	Waited        time.Duration // how long this identity has been kill-eligible, accumulated across sessions
 	Job           mssql.AgentJob
 }
 
-// victimEpisode is the per-SPID state of one blocking episode.
+// victimEpisode is the per-SPID state of one blocking episode. It carries no poll mark: the
+// dwell is served by the offender identity, so the mark that turns polls into debt lives on
+// that identity's bucket (see recidivism.accrueSince).
 type victimEpisode struct {
 	since      time.Time // when this victim first became kill-eligible
 	killed     bool      // a KILL was issued successfully
 	killedAt   time.Time // when, for the grace window
 	killFailed bool      // the KILL errored: stop suppressing, fall back to yielding
+}
+
+// victimKey identifies the offender behind a victim session: the Agent job step when the
+// program name resolves to one, else the connection triplet. It deliberately excludes the
+// command verb and the statement text — a job that runs a different statement after a
+// restart, or the same statement against another object, is the same offender.
+func victimKey(v mssql.Session) string {
+	if hex, step, ok := mssql.ParseJobStepProgram(v.Program); ok {
+		return fmt.Sprintf("job:%s:%d", hex, step)
+	}
+	return fmt.Sprintf("sess:%s|%s|%s", v.Login, v.Host, v.Program)
 }
 
 // VictimKiller terminates maintenance statements our operation blocks that have other
@@ -75,6 +89,7 @@ type VictimKiller struct {
 	policy   AmplifierPolicy
 	armed    bool
 	sink     ReactionSink
+	rec      *recidivism // blocking debt per offender identity, so a job that restarts under a new SPID keeps its dwell
 	episodes map[int]*victimEpisode
 	jobs     map[string]mssql.AgentJob // attribution cache, keyed by "hex:step"
 }
@@ -103,6 +118,7 @@ func NewVictimKiller(
 	}
 	return &VictimKiller{
 		kill: kill, resolve: resolve, onKill: onKill, clk: clk, selfProgram: selfProgram,
+		rec:      newRecidivism(clk.Now),
 		episodes: make(map[int]*victimEpisode),
 		// jobs deliberately outlives Arm/Disarm: Agent job ids are globally unique, so
 		// an attribution cached under one manifest is still correct under the next, and
@@ -138,6 +154,7 @@ func (k *VictimKiller) Arm(p AmplifierPolicy) {
 	k.mu.Lock()
 	k.policy, k.armed = p, true
 	k.episodes = make(map[int]*victimEpisode)
+	k.rec.reset()
 	k.mu.Unlock()
 }
 
@@ -149,6 +166,7 @@ func (k *VictimKiller) Disarm() {
 	k.mu.Lock()
 	k.armed, k.sink = false, nil
 	k.episodes = make(map[int]*victimEpisode)
+	k.rec.reset()
 	k.mu.Unlock()
 }
 
@@ -183,6 +201,7 @@ func (k *VictimKiller) Suppressed(spid int) bool {
 // the narration is not yet rendered (AmplifierDetail needs the resolved Job).
 type killTarget struct {
 	ep      *victimEpisode
+	key     string // the offender identity this kill is charged to
 	spid    int
 	command string
 	kill    *AmplifierKillEvent
@@ -213,7 +232,12 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	if k == nil {
 		return
 	}
-	targets, sink, onKill := k.considerLocked(sessions, ddlSPID, ignore)
+	targets, capped, sink, onKill := k.considerLocked(sessions, ddlSPID, ignore)
+	if sink != nil {
+		for _, ev := range capped {
+			sink(ev)
+		}
+	}
 	if len(targets) == 0 {
 		return
 	}
@@ -224,7 +248,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	// leave the episode unkilled — the victim is simply retried on a later run.
 	if ctx.Err() != nil {
 		for _, t := range targets {
-			k.abandonKill(t.ep)
+			k.abandonKill(t.ep, t.key)
 		}
 		return
 	}
@@ -234,7 +258,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	detached := context.WithoutCancel(ctx)
 	for _, t := range targets {
 		if err := k.killDetached(detached, t.spid); err != nil {
-			k.withdrawKill(t.ep)
+			k.withdrawKill(t.ep, t.key, err)
 			// Reached only on the failure transition: killFailed is terminal for the
 			// episode, so the scan short-circuits before selecting this SPID again and
 			// this fires exactly once per episode rather than spamming the run log.
@@ -272,21 +296,37 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 
 // considerLocked runs the eligibility scan under k.mu and returns the victims due to be
 // killed — already marked killed, so a concurrent Suppressed keeps suppressing them
-// while the KILL is in flight — plus a snapshot of k.sink and k.onKill (both mutable via
-// SetSink, so they must be read under the same lock). It issues no KILL, calls no
-// callback and reads no msdb: see consider for why that matters.
-func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (targets []killTarget, sink ReactionSink, onKill func(AmplifierKillEvent)) {
+// while the KILL is in flight — the cap escalations this poll owes the operator, and a
+// snapshot of k.sink and k.onKill (both mutable via SetSink, so they must be read under
+// the same lock). It issues no KILL, calls no callback and reads no msdb: see consider
+// for why that matters — which is also why the capped warnings are returned rather than
+// emitted here.
+func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (targets []killTarget, capped []ReactionEvent, sink ReactionSink, onKill func(AmplifierKillEvent)) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	sink, onKill = k.sink, k.onKill
 	if !k.armed {
-		return nil, sink, onKill
+		return nil, nil, sink, onKill
 	}
 
 	now := k.clk.Now()
+	k.rec.prune() // before any debt is read: a quiet window restores the full dwell
 	seen := make(map[int]bool)
+	observed := make(map[string]bool) // identities eligible on this poll
 	for _, v := range DirectVictims(sessions, ddlSPID) {
 		if !k.eligible(v, sessions, ddlSPID, ignore) {
+			continue
+		}
+		key := victimKey(v)
+		if k.rec.kills(key) >= maxRepeatKills {
+			// Capped: issue no kill, and deliberately create no episode and leave this SPID
+			// out of `seen`, so the sweep below drops any episode it still has once the
+			// grace window ends. Suppressed then goes false and the victim counts toward the
+			// yield timer again — the alternative would suppress it forever while no kill is
+			// coming, and the run would block on a reaction that is never taken.
+			if k.rec.escalate(key) {
+				capped = append(capped, ReactionEvent{Kind: "warn", Detail: victimCapDetail(v)})
+			}
 			continue
 		}
 		seen[v.SPID] = true
@@ -295,15 +335,36 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			ep = &victimEpisode{since: now}
 			k.episodes[v.SPID] = ep
 		}
-		if ep.killed || ep.killFailed || k.clk.Since(ep.since) < k.policy.After {
+		// The gap is measured from the IDENTITY's last observation, not from this session's:
+		// the poll mark lives on the bucket. That makes the debt independent of the order
+		// ActiveSessions returned these victims in (cpu_time DESC, which says nothing about
+		// episode age) and banks one gap per identity per poll rather than one per session —
+		// a second session of the same offender banks a zero gap by construction. Banking per
+		// session would reach the dwell in After/N wall-clock and over-report Waited N-fold;
+		// charging an arbitrary session's mark would, for an offender whose new connections
+		// keep sorting first, never bank anything at all.
+		observed[key] = true
+		k.rec.accrueSince(key, now)
+		if ep.killed || ep.killFailed || k.rec.debt(key) < k.policy.After {
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
+		// Reserved here, not after the KILL: this scan can select several victims of one
+		// identity and every KILL is issued once the lock is released, so a budget spent on
+		// success would still read zero for all of them. abandonKill and withdrawKill give
+		// the reservation back when the KILL is skipped or fails.
+		k.rec.recordKill(key)
 		targets = append(targets, killTarget{
-			ep: ep, spid: v.SPID, command: v.Command,
-			kill: killEvent(v, sessions, ep.since, now.Sub(ep.since)),
+			ep: ep, key: key, spid: v.SPID, command: v.Command,
+			kill: killEvent(v, sessions, ep.since, k.rec.debt(key)),
 		})
 	}
+	// An identity that was not eligible on this poll — gone, no longer matching, or capped —
+	// loses its poll mark, so the interval it spent out of trouble is banked nowhere and its
+	// next appearance is a first sight again. Its debt survives: the dwell already served is
+	// kept until a quiet recidivismWindow prunes the bucket outright. This is what keeps
+	// "the dwell restarts if they qualify again" true now that the mark is per identity.
+	k.rec.forgetMarksExcept(observed)
 	// Drop episodes for victims no longer eligible, except those inside their grace
 	// window — a killed victim leaves the snapshot, and dropping it early would end
 	// the grace suppression the moment it worked.
@@ -313,7 +374,7 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 		}
 		delete(k.episodes, spid)
 	}
-	return targets, sink, onKill
+	return targets, capped, sink, onKill
 }
 
 // killTimeout bounds one KILL against an amplifying victim.
@@ -339,23 +400,41 @@ func (k *VictimKiller) killDetached(detached context.Context, spid int) error {
 // abandonKill undoes the optimistic mark considerLocked set for a kill that was never
 // attempted (the run was shutting down). Unlike withdrawKill it does NOT set killFailed:
 // nothing failed, so the episode stays open and the victim is reconsidered on a later poll
-// or a later run instead of being permanently written off. No warn is emitted either.
-func (k *VictimKiller) abandonKill(ep *victimEpisode) {
+// or a later run instead of being permanently written off. No warn is emitted either. The
+// reservation the scan booked against key goes back: nothing was killed, so nothing was spent.
+func (k *VictimKiller) abandonKill(ep *victimEpisode, key string) {
 	k.mu.Lock()
 	ep.killed = false
+	k.rec.undoKill(key)
 	k.mu.Unlock()
 }
 
 // withdrawKill undoes the optimistic mark considerLocked set when the KILL turns out to
 // have failed: suppression stops immediately (so we yield on the normal timer, never
 // blocking longer than we would without the feature) and killFailed makes the failure
-// terminal for the episode, keeping the warn to one per episode. ep is mutated through
-// the pointer the scan handed over: if Arm or Disarm replaced the episode map in the
-// meantime the episode is already orphaned, and writing to it is correctly a no-op.
-func (k *VictimKiller) withdrawKill(ep *victimEpisode) {
+// terminal for the episode, keeping the warn to one per episode. Both are unconditional —
+// whatever the error means on the server, we stop waiting on a kill we cannot confirm. ep
+// is mutated through the pointer the scan handed over: if Arm or Disarm replaced the
+// episode map in the meantime the episode is already orphaned, and writing to it is
+// correctly a no-op.
+//
+// The reservation only goes back when the error says the KILL never reached the server —
+// a rejected login, a permission error, a broken connection. An error carries no such
+// guarantee by itself, and running out of killTimeout says the opposite: the attention was
+// accepted and only the client stopped waiting, so the victim is already rolling back. That
+// is exactly the case maxRepeatKills exists to bound (a KILL slow enough to time out is a
+// large rollback), and refunding there would let the same identity be killed again on its
+// next session. context.Canceled is treated the same way for the same reason — the KILL runs
+// on a context.WithoutCancel, so the only cancellation that can reach it is one raised after
+// the statement was already sent.
+func (k *VictimKiller) withdrawKill(ep *victimEpisode, key string, err error) {
 	k.mu.Lock()
+	defer k.mu.Unlock()
 	ep.killed, ep.killFailed = false, true
-	k.mu.Unlock()
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return
+	}
+	k.rec.undoKill(key)
 }
 
 // eligible applies the six conditions of the design's §1.3, in cheapest-first order.
@@ -381,11 +460,13 @@ func (k *VictimKiller) blocksUs(spid int, sessions []mssql.Session, ddlSPID int)
 	return mssql.FindSelfBlock(sessions, ddlSPID).SPID == spid
 }
 
-// killEvent builds the not-yet-attributed event for a kill about to be issued:
-// everything except Job, which attribute fills once the lock from considerLocked is
-// released. It touches no VictimKiller state, so it needs no lock itself; it is called
-// from inside considerLocked only because that is where the episode's since/waited
-// values are at hand.
+// killEvent builds the not-yet-attributed event for a kill about to be issued: everything
+// except Job, which attribute fills once the lock from considerLocked is released. waited is
+// the offender identity's accumulated debt, not this episode's elapsed time — for a job that
+// restarts under a new SPID the episode is seconds old, and the debt is what justified the
+// kill. firstEligible still dates this episode. It touches no VictimKiller state, so it needs
+// no lock itself; it is called from inside considerLocked only because that is where the
+// episode's values are at hand.
 func killEvent(v mssql.Session, sessions []mssql.Session, firstEligible time.Time, waited time.Duration) *AmplifierKillEvent {
 	stmt := v.ActiveQuery
 	if stmt == "" {
@@ -501,4 +582,21 @@ func (k *VictimKiller) attribute(ctx context.Context, program string) (mssql.Age
 	k.jobs[key] = job
 	k.mu.Unlock()
 	return job, nil
+}
+
+// victimCapDetail narrates an amplifier identity that hit the repeat-kill cap. It leads with
+// the program name because that is the identity the budget was spent on — for an Agent job
+// step it carries the job id and step number the operator acts on — and falls back to
+// login@host when the connection sets no application name, which is all victimKey has to go
+// on in that case too. It resolves no job name: the scan holds k.mu and an msdb round trip
+// there is exactly what consider exists to avoid.
+func victimCapDetail(v mssql.Session) string {
+	source := v.Program
+	if source == "" {
+		source = v.Login + "@" + v.Host
+	}
+	return fmt.Sprintf("stopped killing amplifying maintenance sessions from %s: %d killed within %s and they keep "+
+		"returning (last: SPID %d, %s, login=%s host=%s) — the run falls back to the normal blocking reaction; "+
+		"consider stopping the job or workload behind it, or scheduling this run outside its window",
+		source, maxRepeatKills, recidivismWindow, v.SPID, v.Command, v.Login, v.Host)
 }
