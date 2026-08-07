@@ -239,7 +239,12 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	if k == nil {
 		return
 	}
-	targets, sink, onKill := k.considerLocked(sessions, ddlSPID, ignore)
+	targets, capped, sink, onKill := k.considerLocked(sessions, ddlSPID, ignore)
+	if sink != nil {
+		for _, ev := range capped {
+			sink(ev)
+		}
+	}
 	if len(targets) == 0 {
 		return
 	}
@@ -250,7 +255,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	// leave the episode unkilled — the victim is simply retried on a later run.
 	if ctx.Err() != nil {
 		for _, t := range targets {
-			k.abandonKill(t.ep)
+			k.abandonKill(t.ep, t.key)
 		}
 		return
 	}
@@ -260,7 +265,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	detached := context.WithoutCancel(ctx)
 	for _, t := range targets {
 		if err := k.killDetached(detached, t.spid); err != nil {
-			k.withdrawKill(t.ep)
+			k.withdrawKill(t.ep, t.key)
 			// Reached only on the failure transition: killFailed is terminal for the
 			// episode, so the scan short-circuits before selecting this SPID again and
 			// this fires exactly once per episode rather than spamming the run log.
@@ -298,15 +303,17 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 
 // considerLocked runs the eligibility scan under k.mu and returns the victims due to be
 // killed — already marked killed, so a concurrent Suppressed keeps suppressing them
-// while the KILL is in flight — plus a snapshot of k.sink and k.onKill (both mutable via
-// SetSink, so they must be read under the same lock). It issues no KILL, calls no
-// callback and reads no msdb: see consider for why that matters.
-func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (targets []killTarget, sink ReactionSink, onKill func(AmplifierKillEvent)) {
+// while the KILL is in flight — the cap escalations this poll owes the operator, and a
+// snapshot of k.sink and k.onKill (both mutable via SetSink, so they must be read under
+// the same lock). It issues no KILL, calls no callback and reads no msdb: see consider
+// for why that matters — which is also why the capped warnings are returned rather than
+// emitted here.
+func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ignore IgnoredSessions) (targets []killTarget, capped []ReactionEvent, sink ReactionSink, onKill func(AmplifierKillEvent)) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	sink, onKill = k.sink, k.onKill
 	if !k.armed {
-		return nil, sink, onKill
+		return nil, nil, sink, onKill
 	}
 
 	now := k.clk.Now()
@@ -318,6 +325,17 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			continue
 		}
 		key := victimKey(v)
+		if k.rec.kills(key) >= maxRepeatKills {
+			// Capped: issue no kill, and deliberately create no episode and leave this SPID
+			// out of `seen`, so the sweep below drops any episode it still has once the
+			// grace window ends. Suppressed then goes false and the victim counts toward the
+			// yield timer again — the alternative would suppress it forever while no kill is
+			// coming, and the run would block on a reaction that is never taken.
+			if k.rec.escalate(key) {
+				capped = append(capped, ReactionEvent{Kind: "warn", Detail: victimCapDetail(v)})
+			}
+			continue
+		}
 		seen[v.SPID] = true
 		ep, ok := k.episodes[v.SPID]
 		if !ok {
@@ -344,6 +362,11 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
+		// Reserved here, not after the KILL: this scan can select several victims of one
+		// identity and every KILL is issued once the lock is released, so a budget spent on
+		// success would still read zero for all of them. abandonKill and withdrawKill give
+		// the reservation back when the KILL is skipped or fails.
+		k.rec.recordKill(key)
 		targets = append(targets, killTarget{
 			ep: ep, key: key, spid: v.SPID, command: v.Command,
 			kill: killEvent(v, sessions, ep.since, k.rec.debt(key)),
@@ -358,7 +381,7 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 		}
 		delete(k.episodes, spid)
 	}
-	return targets, sink, onKill
+	return targets, capped, sink, onKill
 }
 
 // killTimeout bounds one KILL against an amplifying victim.
@@ -384,10 +407,12 @@ func (k *VictimKiller) killDetached(detached context.Context, spid int) error {
 // abandonKill undoes the optimistic mark considerLocked set for a kill that was never
 // attempted (the run was shutting down). Unlike withdrawKill it does NOT set killFailed:
 // nothing failed, so the episode stays open and the victim is reconsidered on a later poll
-// or a later run instead of being permanently written off. No warn is emitted either.
-func (k *VictimKiller) abandonKill(ep *victimEpisode) {
+// or a later run instead of being permanently written off. No warn is emitted either. The
+// reservation the scan booked against key goes back: nothing was killed, so nothing was spent.
+func (k *VictimKiller) abandonKill(ep *victimEpisode, key string) {
 	k.mu.Lock()
 	ep.killed = false
+	k.rec.undoKill(key)
 	k.mu.Unlock()
 }
 
@@ -396,10 +421,13 @@ func (k *VictimKiller) abandonKill(ep *victimEpisode) {
 // blocking longer than we would without the feature) and killFailed makes the failure
 // terminal for the episode, keeping the warn to one per episode. ep is mutated through
 // the pointer the scan handed over: if Arm or Disarm replaced the episode map in the
-// meantime the episode is already orphaned, and writing to it is correctly a no-op.
-func (k *VictimKiller) withdrawKill(ep *victimEpisode) {
+// meantime the episode is already orphaned, and writing to it is correctly a no-op. The
+// reservation goes back too: a KILL that never landed changed nothing on the server, and
+// must not disarm the killer against an offender it has yet to stop even once.
+func (k *VictimKiller) withdrawKill(ep *victimEpisode, key string) {
 	k.mu.Lock()
 	ep.killed, ep.killFailed = false, true
+	k.rec.undoKill(key)
 	k.mu.Unlock()
 }
 
@@ -548,4 +576,16 @@ func (k *VictimKiller) attribute(ctx context.Context, program string) (mssql.Age
 	k.jobs[key] = job
 	k.mu.Unlock()
 	return job, nil
+}
+
+// victimCapDetail narrates an amplifier identity that hit the repeat-kill cap. It leads with
+// the program name because that is the identity the budget was spent on — for an Agent job
+// step it carries the job id and step number the operator acts on — and falls back to naming
+// nothing more than the last session when the program is empty. It resolves no job name: the
+// scan holds k.mu and an msdb round trip there is exactly what consider exists to avoid.
+func victimCapDetail(v mssql.Session) string {
+	return fmt.Sprintf("stopped killing amplifying maintenance sessions from %s: %d killed within %s and they keep "+
+		"returning (last: SPID %d, %s, login=%s host=%s) — the run falls back to the normal blocking reaction; "+
+		"consider disabling the job behind it or scheduling this run outside its window",
+		v.Program, maxRepeatKills, recidivismWindow, v.SPID, v.Command, v.Login, v.Host)
 }

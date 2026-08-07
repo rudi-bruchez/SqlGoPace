@@ -968,3 +968,144 @@ func TestVictimKillerDetachesTheKillFromThePumpContext(t *testing.T) {
 		t.Errorf("attribution context Err() = %v after the pump context was canceled, want nil (detached)", attrErrDuring)
 	}
 }
+
+// oneOffenderSnapshot is ONE Agent job step (identity 0x1A2B step 1) running several
+// concurrent maintenance sessions: our DDL (67) blocks each of them and each has a reader
+// queued behind it, so every one of them is eligible on the same scan. Passing a single
+// SPID replays that offender across restarts instead. The program name carries the colon
+// mssql.ParseJobStepProgram anchors on — without it the identity would silently fall back
+// to the sess: triplet and these tests would cover the wrong key.
+func oneOffenderSnapshot(spids ...int) []mssql.Session {
+	out := []mssql.Session{{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"}}
+	for i, spid := range spids {
+		out = append(out,
+			mssql.Session{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)",
+				Login:   `CORP\svc_sqlagent`, Host: "SQLPROD01", Database: "PRODDB",
+				ActiveQuery: "UPDATE STATISTICS [dbo].[MEASUREMENT]"},
+			mssql.Session{SPID: 900 + i, Command: "SELECT", BlockingSPID: spid})
+	}
+	return out
+}
+
+// killOnSight is the policy the cap tests use: a fan-out of one and no dwell, so every
+// eligible victim is killable on the poll it appears, and the only thing left to bound the
+// kills is the repeat-kill cap itself.
+func killOnSight() AmplifierPolicy {
+	return AmplifierPolicy{MinBlockedBehind: 1}
+}
+
+// TestVictimKillerCapHoldsWithinOneScan is why the victim-side budget is RESERVED while the
+// target is selected rather than counted after a successful KILL, as BlockerKiller does: one
+// scan can select several victims of the same offender, and every KILL is issued after the
+// lock is released, so a count-on-success budget would still read zero for all of them and
+// the cap would be exceeded by the number of targets in that scan.
+func TestVictimKillerCapHoldsWithinOneScan(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+
+	// Five sessions of ONE identity, all eligible in a single scan.
+	f.killer.consider(context.Background(), oneOffenderSnapshot(79, 91, 104, 155, 162), 67, nil)
+
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("killed = %v in one scan, want %d kills — the cap must hold inside a single scan",
+			f.killed, maxRepeatKills)
+	}
+}
+
+// TestVictimKillerCappedVictimStopsBeingSuppressed pins the suppression side of the cap: a
+// capped identity gets no episode and is left out of the scan's seen set, so the sweep drops
+// whatever episode it still had once the grace window ends. Suppressed then goes false and
+// the victim counts toward BlockState.Unignored again. Without that, a capped victim would
+// stay suppressed forever while no kill was ever coming, and the run would never yield.
+func TestVictimKillerCappedVictimStopsBeingSuppressed(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	ctx := context.Background()
+
+	for _, spid := range []int{79, 91, 104} {
+		f.killer.consider(ctx, oneOffenderSnapshot(spid), 67, nil)
+		f.clk.Advance(time.Second)
+	}
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("setup: killed = %v, want the identity's whole budget spent", f.killed)
+	}
+
+	// The identity is capped. A fresh victim of it is refused a kill, so it must not be
+	// suppressed either.
+	f.clk.Advance(killGraceWindow + time.Second)
+	f.killer.consider(ctx, oneOffenderSnapshot(162), 67, nil)
+	if len(f.killed) != maxRepeatKills {
+		t.Fatalf("killed = %v, want no kill past the cap", f.killed)
+	}
+	if f.killer.Suppressed(162) {
+		t.Error("Suppressed(162) = true for a capped victim, want false — no kill is coming, so the run must yield")
+	}
+}
+
+// TestVictimKillerCapWarnsOnce mirrors TestBlockerKillerCapsRepeatKillsAndWarnsOnce: the
+// escalation is an operator decision ("this job is being restarted faster than we can clear
+// it"), so it must be stated once per identity and not repeated on every poll.
+func TestVictimKillerCapWarnsOnce(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	ctx := context.Background()
+
+	// 79, 91 and 104 spend the three kills; 155 is the first refused and is therefore the
+	// session the single warn names. 162 and 170 must add no second warn.
+	for _, spid := range []int{79, 91, 104, 155, 162, 170} {
+		f.killer.consider(ctx, oneOffenderSnapshot(spid), 67, nil)
+		f.clk.Advance(time.Second)
+	}
+
+	var warns []string
+	for _, ev := range f.raw {
+		if ev.Kind == "warn" {
+			warns = append(warns, ev.Detail)
+		}
+	}
+	if len(warns) != 1 {
+		t.Fatalf("the cap must warn exactly once per identity, got %d: %v", len(warns), warns)
+	}
+	for _, want := range []string{"stopped killing amplifying maintenance sessions", "0x1A2B", "SPID 155"} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warn %q must contain %q", warns[0], want)
+		}
+	}
+}
+
+// TestVictimKillerFailedKillReturnsTheBudget is the withdrawal path the reservation makes
+// necessary: the budget is booked before the server confirms anything, so a KILL that never
+// landed must give it back. Three failed KILLs change nothing on the server, and must not
+// disarm the killer for the rest of the window — the attempt count is what proves the
+// budget came back, since a kills counter left at three would refuse attempts 4 and 5.
+func TestVictimKillerFailedKillReturnsTheBudget(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	attempts := 0
+	k := NewVictimKiller(
+		func(context.Context, int) error {
+			attempts++
+			return errors.New("permission denied")
+		},
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(killOnSight())
+
+	// A new SPID each poll: killFailed is terminal for an episode, so the same session is
+	// never retried — only the same offender returning under a fresh session id is.
+	for _, spid := range []int{79, 91, 104, 155, 162} {
+		k.consider(context.Background(), oneOffenderSnapshot(spid), 67, nil)
+		clk.Advance(time.Second)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	if !strings.HasPrefix(key, "job:") {
+		t.Fatalf("victimKey = %q, want the job-step identity — the fixture's program must parse", key)
+	}
+	k.mu.Lock()
+	spent := k.rec.kills(key)
+	k.mu.Unlock()
+	if spent != 0 {
+		t.Errorf("failed KILLs must spend no budget, kills = %d", spent)
+	}
+	if attempts != 5 {
+		t.Errorf("KILL attempted %d times, want 5 — a withdrawn reservation must let the killer keep trying", attempts)
+	}
+}
