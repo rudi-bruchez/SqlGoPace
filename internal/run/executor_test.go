@@ -700,3 +700,68 @@ func TestWaitForReliefDrainTimeout(t *testing.T) {
 		t.Errorf("events = %+v, want one abort event", events)
 	}
 }
+
+// recurringBlockerProbe is a sampleProbe whose ActiveSessions returns a different blocker
+// SPID on each call — one connection-pool retry or Agent job restart per poll.
+type recurringBlockerProbe struct {
+	calls    int
+	blockers []int
+}
+
+func (p *recurringBlockerProbe) LogSpace(context.Context) (mssql.LogSpace, error) {
+	return mssql.LogSpace{}, nil
+}
+
+func (p *recurringBlockerProbe) LogReuseWait(context.Context) (string, error) { return "NOTHING", nil }
+
+func (p *recurringBlockerProbe) ActiveSessions(context.Context) ([]mssql.Session, error) {
+	spid := p.blockers[min(p.calls, len(p.blockers)-1)]
+	p.calls++
+	return []mssql.Session{
+		{SPID: 100, BlockingSPID: spid, WaitType: "LCK_M_SCH_M"},
+		{SPID: spid, Login: "SVC_RPT", Host: "BATCH01", Program: "Reporting"},
+	}, nil
+}
+
+// The killers are consulted from ServerSampler.Blocking, which the shrink driver reaches
+// through pumpSamples in both runChunk and runWatchedStatement. From a killer's point of
+// view a chunk boundary is indistinguishable from any other gap between polls: it only ever
+// sees a sequence of Blocking calls with time between them. Driving ServerSampler directly
+// with a probe that returns a different blocker on each call therefore reproduces the shrink
+// scenario on the real production path, without the shrink driver's execution fakes.
+func TestSamplerKillsARecurringBlockerAcrossPollGaps(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := NewBlockerKiller(rec.kill, nil, func() time.Time { return now })
+	compiled, err := compileKilledSessions([]ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)}, 0)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	k.SetSource(staticKill{rules: compiled})
+
+	probe := &recurringBlockerProbe{blockers: []int{104, 104, 155}}
+	s := NewServerSampler(probe, 100, 0, 0)
+	s.SetKiller(k)
+
+	// Poll 1 and 2 are the first chunk: the blocker serves its dwell and is killed.
+	if _, err := s.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking: %v", err)
+	}
+	now = now.Add(60 * time.Second)
+	if _, err := s.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking: %v", err)
+	}
+	if len(rec.spids) != 1 || rec.spids[0] != 104 {
+		t.Fatalf("expected SPID 104 killed after its dwell, got %v", rec.spids)
+	}
+
+	// The chunk ends; nothing is sampled for two minutes; the next chunk's first poll finds
+	// the offender back under a new SPID. It must not buy a fresh 60 seconds.
+	now = now.Add(2 * time.Minute)
+	if _, err := s.Blocking(context.Background(), nil); err != nil {
+		t.Fatalf("Blocking: %v", err)
+	}
+	if len(rec.spids) != 2 || rec.spids[1] != 155 {
+		t.Fatalf("a blocker returning after a chunk gap must be killed at once, got %v", rec.spids)
+	}
+}
