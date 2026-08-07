@@ -29,6 +29,72 @@ func TestRecidivismAccruesPerKey(t *testing.T) {
 	}
 }
 
+// TestRecidivismAccrueSinceBanksTheIdentitysGap pins the mark on the bucket: the gap the
+// poll banks is the identity's own, so it cannot depend on which of an offender's sessions
+// the caller happens to charge first, and a second session of the same identity in the same
+// poll banks zero by construction rather than by a caller-side "already banked" map.
+func TestRecidivismAccrueSinceBanksTheIdentitysGap(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := recidivismFor(&now)
+
+	r.accrueSince("k", now) // the identity's first observation: nothing to bank
+	if got := r.debt("k"); got != 0 {
+		t.Errorf("debt after a first observation = %s, want 0", got)
+	}
+
+	now = now.Add(10 * time.Second)
+	r.accrueSince("k", now)
+	r.accrueSince("k", now)
+	if got := r.debt("k"); got != 10*time.Second {
+		t.Errorf("debt = %s, want 10s — one poll banks the identity's gap once", got)
+	}
+}
+
+// TestRecidivismPrunedBucketIsAFirstSightAgain confirms the mark dies with the bucket it
+// lives in: a quiet window forgets the identity entirely, so its next observation banks
+// nothing rather than the whole silence.
+func TestRecidivismPrunedBucketIsAFirstSightAgain(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := recidivismFor(&now)
+	r.accrueSince("k", now)
+	now = now.Add(10 * time.Second)
+	r.accrueSince("k", now)
+
+	now = now.Add(recidivismWindow + time.Second)
+	r.prune()
+	r.accrueSince("k", now)
+
+	if got := r.debt("k"); got != 0 {
+		t.Errorf("debt = %s, want 0 — a pruned bucket loses its mark with the rest of its state", got)
+	}
+}
+
+// TestRecidivismForgetMarksExceptKeepsTheDebt pins the other half of the mark's contract:
+// an identity that was not observed this poll must not bank the interval when it comes
+// back, but it keeps every second it has already served.
+func TestRecidivismForgetMarksExceptKeepsTheDebt(t *testing.T) {
+	now := time.Unix(0, 0)
+	r := recidivismFor(&now)
+	r.accrueSince("seen", now)
+	r.accrueSince("gone", now)
+	now = now.Add(10 * time.Second)
+	r.accrueSince("seen", now)
+	r.accrueSince("gone", now)
+
+	r.forgetMarksExcept(map[string]bool{"seen": true})
+
+	now = now.Add(30 * time.Second)
+	r.accrueSince("seen", now)
+	r.accrueSince("gone", now)
+
+	if got := r.debt("seen"); got != 40*time.Second {
+		t.Errorf("debt(seen) = %s, want 40s", got)
+	}
+	if got := r.debt("gone"); got != 10*time.Second {
+		t.Errorf("debt(gone) = %s, want the 10s already served and nothing for the polls it was absent from", got)
+	}
+}
+
 func TestRecidivismPrunesOnlyIdleBuckets(t *testing.T) {
 	now := time.Unix(0, 0)
 	r := recidivismFor(&now)

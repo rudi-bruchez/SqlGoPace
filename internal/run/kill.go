@@ -13,9 +13,13 @@ import (
 
 // KillEvent describes a blocker the engine terminated, for console/log notification.
 type KillEvent struct {
-	SPID   int
-	Login  string
-	Waited time.Duration // how long this identity has blocked the DDL, accumulated across sessions
+	SPID  int
+	Login string
+	// Waited is the matched rule's accumulated blocking debt, summed over every session that
+	// matched it inside the window — NOT how long SPID itself blocked us, which for a
+	// recidivist is a fraction of it. Anything rendering this must attribute it to the rule,
+	// or it states something an operator cannot reconcile against sys.dm_exec_requests.
+	Waited time.Duration
 }
 
 // killRule is one compiled kill_blocking_sessions entry: a session matcher (shared with the
@@ -268,9 +272,10 @@ func (k *BlockerKiller) considerLocked(ctx context.Context, sessions []mssql.Ses
 			k.killed = true
 			k.rec.recordKill(r.key)
 			if k.onKill != nil {
-				// Waited is the identity's debt, not this episode's elapsed time: for a
-				// recidivist the episode is seconds old, and "after 0s blocking the DDL"
-				// would misstate why the kill was justified.
+				// Waited is the rule's debt, not this episode's elapsed time: for a
+				// recidivist the episode is seconds old, and reporting that would misstate
+				// why the kill was justified. It is the caller's job to say whose time it
+				// is — see KillEvent.Waited.
 				k.onKill(KillEvent{SPID: blocker.SPID, Login: blocker.Login, Waited: k.rec.debt(r.key)})
 			}
 		}

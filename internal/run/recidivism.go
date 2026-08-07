@@ -19,9 +19,15 @@ const maxRepeatKills = 3
 
 // bucket is one offender identity's accumulated blocking debt inside the window.
 type bucket struct {
-	accrued    time.Duration // blocking time already observed under this identity
-	kills      int
-	escalated  bool // the cap warning has been emitted for this bucket
+	accrued   time.Duration // blocking time already observed under this identity
+	kills     int
+	escalated bool // the cap warning has been emitted for this bucket
+	// lastPoll is the previous poll this identity was observed on, zero when it has never
+	// been observed or was not observed on the last poll. Only accrueSince/forgetMarksExcept
+	// touch it, so it is unused by callers that bank an interval they measured themselves —
+	// BlockerKiller keeps an episode-wide mark instead, because it must advance that mark on
+	// polls where NO rule matched, and a mark held per bucket has no rule to advance.
+	lastPoll   time.Time
 	lastActive time.Time
 }
 
@@ -59,6 +65,39 @@ func (r *recidivism) accrue(key string, d time.Duration) {
 	b := r.touch(key)
 	if d > 0 {
 		b.accrued += d
+	}
+}
+
+// accrueSince banks the interval since key was last observed and records this observation.
+// The identity's first observation banks nothing — we cannot know how long the offender had
+// already been there when we first saw it — and every later poll banks the gap.
+//
+// The mark lives on the bucket, not on the caller's per-session state, so the result does not
+// depend on which of an offender's concurrent sessions the snapshot happened to yield first:
+// a session that is new on this poll no longer donates its zero gap in place of an older
+// session's real one, and a second session of the same identity in the same poll banks zero
+// by construction. Callers that see several sessions per identity per poll want this;
+// callers with one observation per poll can bank a measured interval with accrue.
+func (r *recidivism) accrueSince(key string, now time.Time) {
+	b := r.touch(key)
+	if !b.lastPoll.IsZero() {
+		if d := now.Sub(b.lastPoll); d > 0 {
+			b.accrued += d
+		}
+	}
+	b.lastPoll = now
+}
+
+// forgetMarksExcept drops the poll mark of every identity outside seen, which is how a
+// caller says "these are the identities I observed this poll". An identity that was not
+// observed must not bank the silence when it comes back: the interval it spent out of
+// trouble is nobody's debt, and its next observation is a first sight again. The debt itself
+// is untouched — time already served is kept until prune forgets the bucket outright.
+func (r *recidivism) forgetMarksExcept(seen map[string]bool) {
+	for key, b := range r.buckets {
+		if !seen[key] {
+			b.lastPoll = time.Time{}
+		}
 	}
 }
 

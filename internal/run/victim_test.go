@@ -762,14 +762,16 @@ func TestVictimKillerRecidivistDoesNotBuyAFreshDwell(t *testing.T) {
 	}
 }
 
-// sharedIdentitySnapshot is ONE offender running two concurrent maintenance sessions:
-// our DDL (67) blocks 79 and 80, which carry the same login/host/program triplet — the
-// sess: fallback identity every connection of one application shares — and each has a
-// reader queued behind it. The program is deliberately not an Agent job step, because
-// the sess: key is where the shared-identity case is actually reachable.
-func sharedIdentitySnapshot() []mssql.Session {
+// sharedIdentitySnapshot is ONE offender running the given concurrent maintenance
+// sessions: our DDL (67) blocks each of spids, they all carry the same login/host/program
+// triplet — the sess: fallback identity every connection of one application shares — and
+// each has a reader queued behind it. The program is deliberately not an Agent job step,
+// because the sess: key is where the shared-identity case is actually reachable. The
+// caller fixes the slice order, because ActiveSessions orders by cpu_time DESC and that
+// order has no relation to how long each session has been eligible.
+func sharedIdentitySnapshot(spids ...int) []mssql.Session {
 	out := []mssql.Session{{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"}}
-	for i, spid := range []int{79, 80} {
+	for i, spid := range spids {
 		out = append(out,
 			mssql.Session{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
 				Login: `CORP\svc_sqlagent`, Host: "SQLPROD01", Program: "MaintenanceSolution",
@@ -788,7 +790,7 @@ func sharedIdentitySnapshot() []mssql.Session {
 func TestVictimKillerBanksOneIdentityOncePerPoll(t *testing.T) {
 	f := newVictimFixture(t, defaultPolicy())
 	ctx := context.Background()
-	snap := sharedIdentitySnapshot()
+	snap := sharedIdentitySnapshot(79, 80)
 
 	f.killer.consider(ctx, snap, 67, nil) // both episodes' first poll: banks nothing
 	f.clk.Advance(30 * time.Second)
@@ -802,6 +804,43 @@ func TestVictimKillerBanksOneIdentityOncePerPoll(t *testing.T) {
 	f.killer.consider(ctx, snap, 67, nil)
 	if len(f.killed) != 2 {
 		t.Fatalf("killed = %v once the dwell was served, want both sessions of the offender", f.killed)
+	}
+	for _, ev := range f.events {
+		if ev.Waited != 60*time.Second {
+			t.Errorf("event for SPID %d reports Waited = %v, want the identity's real debt (60s)", ev.SPID, ev.Waited)
+		}
+	}
+}
+
+// TestVictimKillerStaggeredArrivalStillServesTheDwell covers the review finding that the
+// once-per-poll bank charged whichever eligible victim of an identity the snapshot happened
+// to yield first. ActiveSessions orders by cpu_time DESC, which says nothing about how long
+// an episode has been running, so a session that is new on this poll sorting ahead of an
+// older one banked ITS zero gap and the older episode's real inter-poll interval was thrown
+// away. TestVictimKillerBanksOneIdentityOncePerPoll cannot catch it: both its sessions start
+// on the same poll, so their episodes are new together. The poll mark belongs to the
+// identity, not to whichever of its sessions the DMV happened to list first.
+func TestVictimKillerStaggeredArrivalStillServesTheDwell(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, sharedIdentitySnapshot(79), 67, nil) // t0: victim 79 alone
+
+	// From t0+10s a second connection of the same offender is present and the snapshot
+	// yields it FIRST, so it is the one an order-dependent bank would charge.
+	for i := 0; i < 5; i++ {
+		f.clk.Advance(10 * time.Second)
+		f.killer.consider(ctx, sharedIdentitySnapshot(80, 79), 67, nil)
+	}
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v at t0+50s, want none — the dwell is 60s", f.killed)
+	}
+
+	f.clk.Advance(10 * time.Second)
+	f.killer.consider(ctx, sharedIdentitySnapshot(80, 79), 67, nil)
+	if len(f.killed) != 2 {
+		t.Fatalf("killed = %v at t0+60s, want both sessions of the offender — the identity must reach "+
+			"its dwell at After whatever order the snapshot lists it in", f.killed)
 	}
 	for _, ev := range f.events {
 		if ev.Waited != 60*time.Second {
@@ -847,8 +886,12 @@ func TestVictimKillerReportsTheDebtAsWaited(t *testing.T) {
 	if ev.SPID != 155 {
 		t.Fatalf("second kill event SPID = %d, want 155", ev.SPID)
 	}
-	if ev.Waited != 60*time.Second {
-		t.Errorf("Waited = %v, want the identity's debt (60s), not the returning episode's 0s", ev.Waited)
+	// 61s, not 60s: the offender was observed on both polls, one second apart, and the poll
+	// mark belongs to the identity rather than to a session, so that second is banked like
+	// any other inter-poll gap. A new SPID no longer donates a zero gap in place of the
+	// identity's real one — which is the same property the staggered-arrival test pins.
+	if ev.Waited != 61*time.Second {
+		t.Errorf("Waited = %v, want the identity's debt (61s), not the returning episode's 0s", ev.Waited)
 	}
 	if want := f.clk.Now(); !ev.FirstEligible.Equal(want) {
 		t.Errorf("FirstEligible = %v, want %v — it dates THIS episode", ev.FirstEligible, want)

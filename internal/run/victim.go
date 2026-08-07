@@ -46,22 +46,14 @@ type AmplifierKillEvent struct {
 	Job           mssql.AgentJob
 }
 
-// victimEpisode is the per-SPID state of one blocking episode.
+// victimEpisode is the per-SPID state of one blocking episode. It carries no poll mark: the
+// dwell is served by the offender identity, so the mark that turns polls into debt lives on
+// that identity's bucket (see recidivism.accrueSince).
 type victimEpisode struct {
 	since      time.Time // when this victim first became kill-eligible
-	lastPoll   time.Time // previous observation of this episode; zero on its first poll
 	killed     bool      // a KILL was issued successfully
 	killedAt   time.Time // when, for the grace window
 	killFailed bool      // the KILL errored: stop suppressing, fall back to yielding
-}
-
-// sincePoll returns the time to bank for this poll: zero on the episode's first
-// observation, the inter-poll gap afterwards.
-func (e *victimEpisode) sincePoll(now time.Time) time.Duration {
-	if e.lastPoll.IsZero() {
-		return 0
-	}
-	return now.Sub(e.lastPoll)
 }
 
 // victimKey identifies the offender behind a victim session: the Agent job step when the
@@ -320,7 +312,7 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 	now := k.clk.Now()
 	k.rec.prune() // before any debt is read: a quiet window restores the full dwell
 	seen := make(map[int]bool)
-	banked := make(map[string]bool) // identities already charged for this poll
+	observed := make(map[string]bool) // identities eligible on this poll
 	for _, v := range DirectVictims(sessions, ddlSPID) {
 		if !k.eligible(v, sessions, ddlSPID, ignore) {
 			continue
@@ -343,22 +335,16 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			ep = &victimEpisode{since: now}
 			k.episodes[v.SPID] = ep
 		}
-		if !banked[key] {
-			// Once per identity per poll, not once per victim: one offender running two
-			// concurrent sessions would otherwise bank the inter-poll gap twice into the
-			// same bucket, reaching the dwell in After/N wall-clock and over-reporting
-			// Waited N-fold. The lastPoll mark below still advances for every victim —
-			// each episode owns its own — so nothing is banked twice and nothing is lost.
-			//
-			// One bounded imprecision is accepted: an episode kept alive by the kill grace
-			// window whose SPID SQL Server has since recycled onto a different, eligible
-			// amplifier banks now-lastPoll into the NEW session's identity. The mis-banked
-			// interval is at most killGraceWindow, and the stale ep.killed keeps that
-			// victim out of the kill path anyway.
-			k.rec.accrue(key, ep.sincePoll(now))
-			banked[key] = true
-		}
-		ep.lastPoll = now
+		// The gap is measured from the IDENTITY's last observation, not from this session's:
+		// the poll mark lives on the bucket. That makes the debt independent of the order
+		// ActiveSessions returned these victims in (cpu_time DESC, which says nothing about
+		// episode age) and banks one gap per identity per poll rather than one per session —
+		// a second session of the same offender banks a zero gap by construction. Banking per
+		// session would reach the dwell in After/N wall-clock and over-report Waited N-fold;
+		// charging an arbitrary session's mark would, for an offender whose new connections
+		// keep sorting first, never bank anything at all.
+		observed[key] = true
+		k.rec.accrueSince(key, now)
 		if ep.killed || ep.killFailed || k.rec.debt(key) < k.policy.After {
 			continue
 		}
@@ -373,6 +359,12 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			kill: killEvent(v, sessions, ep.since, k.rec.debt(key)),
 		})
 	}
+	// An identity that was not eligible on this poll — gone, no longer matching, or capped —
+	// loses its poll mark, so the interval it spent out of trouble is banked nowhere and its
+	// next appearance is a first sight again. Its debt survives: the dwell already served is
+	// kept until a quiet recidivismWindow prunes the bucket outright. This is what keeps
+	// "the dwell restarts if they qualify again" true now that the mark is per identity.
+	k.rec.forgetMarksExcept(observed)
 	// Drop episodes for victims no longer eligible, except those inside their grace
 	// window — a killed victim leaves the snapshot, and dropping it early would end
 	// the grace suppression the moment it worked.

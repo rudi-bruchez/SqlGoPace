@@ -446,26 +446,25 @@ that rule, so it is killed on the next poll instead of buying another full delay
 time is banked per rule for five minutes of quiet, after which the rule is forgotten and the
 full delay applies again.
 
-To bound the cost of that, one rule kills at most three sessions in any five-minute window.
-On the fourth, SqlGoPace stops killing, writes a `warn` into the run report naming the rule
-and the last offender, and falls back to the normal blocking reaction — the behavior you
-would get with the feature off. A blocker being restarted faster than it can be cleared is
-an operator problem (disable the job, or move the run outside its window), and an unbounded
-kill loop would trade a blocked run for a rollback storm.
+To bound the cost of that, one rule kills at most three sessions before **five quiet minutes**
+— the same quiet window that forgets the debt, and for the same reason. On the fourth,
+SqlGoPace stops killing, writes a `warn` into the run report naming the rule and the last
+offender, and falls back to the normal blocking reaction — the behavior you would get with the
+feature off. Note what that means for an offender that keeps coming back every few minutes:
+each return refreshes the window, so the rule stays capped for the rest of the manifest rather
+than earning three fresh kills every five minutes. That is deliberate — a blocker being
+restarted faster than it can be cleared is an operator problem (disable the job, or move the
+run outside its window), and an unbounded kill loop would trade a blocked run for a rollback
+storm.
 
-Two consequences of counting per rule rather than per session are worth spelling out before
-you pick an `after_seconds`:
-
-- **A rule that matches on `statement:` only accrues while a matching statement runs.** Time
-  is banked on the polls where the whole rule matched, so a blocker that alternates between a
-  matching statement and a non-matching one takes *longer* than `after_seconds` of wall-clock
-  blocking to be killed: the polls where it ran something else count for nothing against that
-  rule (they are banked against whichever other rule matched, or nowhere at all). That errs
-  toward not killing, which is the safe direction, but it is not what reading `after_seconds`
-  as "after N seconds of blocking us" would suggest.
-- **`after_seconds` is served per offender identity, not per connection.** An identity is
-  charged at most once per poll, so an application that opens several connections all matching
-  the same rule does not reach the threshold any faster than a single one would.
+One consequence of counting per rule rather than per session is worth spelling out before you
+pick an `after_seconds`: **a rule that matches on `statement:` only accrues while a matching
+statement runs.** Time is banked on the polls where the whole rule matched, so a blocker that
+alternates between a matching statement and a non-matching one takes *longer* than
+`after_seconds` of wall-clock blocking to be killed: the polls where it ran something else
+count for nothing against that rule (they are banked against whichever other rule matched, or
+nowhere at all). That errs toward not killing, which is the safe direction, but it is not what
+reading `after_seconds` as "after N seconds of blocking us" would suggest.
 
 `KILL` requires `ALTER ANY CONNECTION`. A failed kill is reported and changes nothing else: the
 operation falls back to the normal reaction hierarchy, exactly as if the feature were off.
@@ -562,12 +561,16 @@ this feature never manages to kill still forces a yield once the cap is reached.
 one — and on the login/host/program triplet when it does not — rather than on a match rule. A job
 whose step restarts under a new SPID after being killed inherits the dwell it already served, so
 it is killed as soon as it qualifies again instead of buying another full `after_seconds`. The
-same cap applies: three kills per identity in any five-minute window, after which SqlGoPace stops
-killing that offender, writes a `warn` into the run report naming its program (or `login@host`)
-and the last session, and lets the victim count toward the yield timer again — the behavior you
-would get with the feature off. Five quiet minutes forget the identity and the full
-`after_seconds` applies again. The identity is charged at most once per poll, so one job running
-several concurrent sessions does not reach the dwell any faster than a single one would.
+same cap applies: three kills per identity before **five quiet minutes**, after which SqlGoPace
+stops killing that offender, writes a `warn` into the run report naming its program (or
+`login@host`) and the last session, and lets the victim count toward the yield timer again — the
+behavior you would get with the feature off. Five quiet minutes forget the identity and the full
+`after_seconds` applies again; an offender that keeps returning sooner than that refreshes the
+window on every appearance and so stays capped for the rest of the manifest. The identity is
+charged at most once per poll — and the charge is measured from that identity's own previous
+appearance, not from any one of its sessions — so one job running several concurrent sessions, or
+an application whose pooled connections all share one login/host/program, does not reach the
+dwell any faster or slower than a single connection would.
 
 **Permissions.** `KILL` requires `ALTER ANY CONNECTION` — the same grant `kill_blockers` already
 needs, so enabling this feature alone adds no new grant. Naming the SQL Agent job that owned the
