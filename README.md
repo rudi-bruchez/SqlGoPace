@@ -432,9 +432,40 @@ kill_blocking_sessions:
     after_seconds: 600
 ```
 
-The delay is measured from when that session started blocking us, and the first matching rule
-decides — order your rules from most to least specific, since a broad rule with a short delay
-placed first will shadow a narrower one behind it. Each blocker is killed at most once.
+The delay is counted over the polls on which the rule actually matched — the first poll of a
+blocking episode contributes nothing, because we cannot know how long the blocker had already
+been there when we first saw it — and the first matching rule decides: order your rules from
+most to least specific, since a broad rule with a short delay placed first will shadow a
+narrower one behind it. Each blocker is killed at most once per episode.
+
+**A returning offender does not buy a fresh delay.** The delay is served by the *rule*, not
+by the session id. A blocker that is killed and comes straight back under a new SPID — an
+Agent job restarting its step, a connection pool retrying, or the next session of a
+population that all match the same rule — inherits the blocking time already served under
+that rule, so it is killed on the next poll instead of buying another full delay. Blocking
+time is banked per rule for five minutes of quiet, after which the rule is forgotten and the
+full delay applies again.
+
+To bound the cost of that, one rule kills at most three sessions in any five-minute window.
+On the fourth, SqlGoPace stops killing, writes a `warn` into the run report naming the rule
+and the last offender, and falls back to the normal blocking reaction — the behavior you
+would get with the feature off. A blocker being restarted faster than it can be cleared is
+an operator problem (disable the job, or move the run outside its window), and an unbounded
+kill loop would trade a blocked run for a rollback storm.
+
+Two consequences of counting per rule rather than per session are worth spelling out before
+you pick an `after_seconds`:
+
+- **A rule that matches on `statement:` only accrues while a matching statement runs.** Time
+  is banked on the polls where the whole rule matched, so a blocker that alternates between a
+  matching statement and a non-matching one takes *longer* than `after_seconds` of wall-clock
+  blocking to be killed: the polls where it ran something else count for nothing against that
+  rule (they are banked against whichever other rule matched, or nowhere at all). That errs
+  toward not killing, which is the safe direction, but it is not what reading `after_seconds`
+  as "after N seconds of blocking us" would suggest.
+- **`after_seconds` is served per offender identity, not per connection.** An identity is
+  charged at most once per poll, so an application that opens several connections all matching
+  the same rule does not reach the threshold any faster than a single one would.
 
 `KILL` requires `ALTER ANY CONNECTION`. A failed kill is reported and changes nothing else: the
 operation falls back to the normal reaction hierarchy, exactly as if the feature were off.
@@ -498,7 +529,10 @@ A blocked session is a kill candidate only when all of the following hold:
 6. at least `min_blocked_behind` sessions are queued transitively behind it (default 1: one
    queued reader means the amplification has already begun, and it only grows from there).
 
-Conditions 1–6 must hold *continuously* for `after_seconds` (default 60) before the `KILL` fires.
+Conditions 1–6 must hold for `after_seconds` (default 60) before the `KILL` fires. That dwell is
+accumulated over the polls on which every condition holds, and it is banked against the offender
+identity rather than the session id (see the repeat-offender note below), so a victim that drops
+out of eligibility for a poll loses that interval but keeps the time it has already served.
 A victim is suppressed from the yield reaction for that whole dwell — from the first poll it is
 eligible, well before any `KILL` — so an `after_seconds` longer than
 `monitoring.blocking_timeout_minutes` means the operation keeps its lock through the amplifier for
@@ -522,6 +556,18 @@ yield: the victim stops being suppressed and counts toward the blocking timer ag
 next poll, so this feature can never make a run block *longer* than it would without it.
 `max_block_minutes` is unaffected either way and continues to backstop the whole run: a victim
 this feature never manages to kill still forces a yield once the cap is reached.
+
+**A returning offender does not buy a fresh dwell here either.** The same repeat-offender rule as
+`kill_blocking_sessions` applies, keyed on the SQL Agent job step when `program_name` resolves to
+one — and on the login/host/program triplet when it does not — rather than on a match rule. A job
+whose step restarts under a new SPID after being killed inherits the dwell it already served, so
+it is killed as soon as it qualifies again instead of buying another full `after_seconds`. The
+same cap applies: three kills per identity in any five-minute window, after which SqlGoPace stops
+killing that offender, writes a `warn` into the run report naming its program (or `login@host`)
+and the last session, and lets the victim count toward the yield timer again — the behavior you
+would get with the feature off. Five quiet minutes forget the identity and the full
+`after_seconds` applies again. The identity is charged at most once per poll, so one job running
+several concurrent sessions does not reach the dwell any faster than a single one would.
 
 **Permissions.** `KILL` requires `ALTER ANY CONNECTION` — the same grant `kill_blockers` already
 needs, so enabling this feature alone adds no new grant. Naming the SQL Agent job that owned the

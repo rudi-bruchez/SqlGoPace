@@ -112,8 +112,10 @@ func (s *manifestKillSource) Current() []killRule {
 	return s.cur
 }
 
-// BlockerKiller terminates sessions that block this run's DDL and match a kill rule, once
-// they have blocked continuously for the rule's delay. It is consulted from
+// BlockerKiller terminates sessions that block this run's DDL and match a kill rule, once the
+// identity that rule names has blocked us for the rule's delay — time banked poll by poll and
+// accumulated across sessions, so a killed blocker returning under a new SPID does not restart
+// the clock (see recidivism.go). It is consulted from
 // ServerSampler.Blocking on every blocking poll, reusing that snapshot so no extra DMV read
 // is issued. It is a no-op until the engine gives it a per-manifest rule source (SetSource),
 // which is swapped between operations; the killer is only constructed when the feature is
@@ -195,9 +197,12 @@ func (k *BlockerKiller) SetSink(sink ReactionSink) {
 }
 
 // consider inspects one blocking snapshot and kills the session blocking ddlSPID when it
-// matches a rule and its identity has blocked for at least that rule's delay. Kills nothing
-// when no source is set or no rule matches, but a poll that sees the blocker still advances
-// the poll mark (see lastPoll). Each blocker is killed at most once per episode.
+// matches a rule and the identity that rule names has blocked us for at least that rule's
+// delay — accumulated across sessions, so a killed blocker returning under a new SPID does
+// not restart the clock (see recidivism.go). Kills nothing when no source is set or no rule
+// matches, but a poll that sees the blocker still advances the poll mark (see lastPoll).
+// Each blocker is killed at most once per episode, and each identity at most maxRepeatKills
+// times per recidivismWindow.
 //
 // The decision runs under mu in considerLocked; the cap escalation is emitted HERE, with the
 // lock released. The sink is the engine's per-operation narration path — it formats, writes
