@@ -312,6 +312,7 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 	now := k.clk.Now()
 	k.rec.prune() // before any debt is read: a quiet window restores the full dwell
 	seen := make(map[int]bool)
+	banked := make(map[string]bool) // identities already charged for this poll
 	for _, v := range DirectVictims(sessions, ddlSPID) {
 		if !k.eligible(v, sessions, ddlSPID, ignore) {
 			continue
@@ -323,7 +324,21 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 			ep = &victimEpisode{since: now}
 			k.episodes[v.SPID] = ep
 		}
-		k.rec.accrue(key, ep.sincePoll(now))
+		if !banked[key] {
+			// Once per identity per poll, not once per victim: one offender running two
+			// concurrent sessions would otherwise bank the inter-poll gap twice into the
+			// same bucket, reaching the dwell in After/N wall-clock and over-reporting
+			// Waited N-fold. The lastPoll mark below still advances for every victim —
+			// each episode owns its own — so nothing is banked twice and nothing is lost.
+			//
+			// One bounded imprecision is accepted: an episode kept alive by the kill grace
+			// window whose SPID SQL Server has since recycled onto a different, eligible
+			// amplifier banks now-lastPoll into the NEW session's identity. The mis-banked
+			// interval is at most killGraceWindow, and the stale ep.killed keeps that
+			// victim out of the kill path anyway.
+			k.rec.accrue(key, ep.sincePoll(now))
+			banked[key] = true
+		}
 		ep.lastPoll = now
 		if ep.killed || ep.killFailed || k.rec.debt(key) < k.policy.After {
 			continue

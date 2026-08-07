@@ -761,6 +761,130 @@ func TestVictimKillerRecidivistDoesNotBuyAFreshDwell(t *testing.T) {
 	}
 }
 
+// sharedIdentitySnapshot is ONE offender running two concurrent maintenance sessions:
+// our DDL (67) blocks 79 and 80, which carry the same login/host/program triplet — the
+// sess: fallback identity every connection of one application shares — and each has a
+// reader queued behind it. The program is deliberately not an Agent job step, because
+// the sess: key is where the shared-identity case is actually reachable.
+func sharedIdentitySnapshot() []mssql.Session {
+	out := []mssql.Session{{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"}}
+	for i, spid := range []int{79, 80} {
+		out = append(out,
+			mssql.Session{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Login: `CORP\svc_sqlagent`, Host: "SQLPROD01", Program: "MaintenanceSolution",
+				Database: "PRODDB", ActiveQuery: "UPDATE STATISTICS [dbo].[MEASUREMENT]"},
+			mssql.Session{SPID: 1001 + i, Command: "SELECT", BlockingSPID: spid})
+	}
+	return out
+}
+
+// TestVictimKillerBanksOneIdentityOncePerPoll covers the review finding that the scan
+// accrued once per eligible victim: two sessions of one offender eligible on the same
+// poll each banked the full inter-poll gap into the same bucket, so the identity crossed
+// the dwell in roughly After/N wall-clock and Waited over-reported by up to N times.
+// TestVictimKillerTracksIndependentDwellsForTwoVictims cannot catch this — its two
+// victims are deliberately DIFFERENT offenders.
+func TestVictimKillerBanksOneIdentityOncePerPoll(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+	snap := sharedIdentitySnapshot()
+
+	f.killer.consider(ctx, snap, 67, nil) // both episodes' first poll: banks nothing
+	f.clk.Advance(30 * time.Second)
+	f.killer.consider(ctx, snap, 67, nil) // banks the 30s gap ONCE, not once per victim
+
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v at half the dwell, want none — one identity is banked once per poll, not once per session", f.killed)
+	}
+
+	f.clk.Advance(30 * time.Second)
+	f.killer.consider(ctx, snap, 67, nil)
+	if len(f.killed) != 2 {
+		t.Fatalf("killed = %v once the dwell was served, want both sessions of the offender", f.killed)
+	}
+	for _, ev := range f.events {
+		if ev.Waited != 60*time.Second {
+			t.Errorf("event for SPID %d reports Waited = %v, want the identity's real debt (60s)", ev.SPID, ev.Waited)
+		}
+	}
+}
+
+// returningJobSnapshot is the PRODDB amplifier under an arbitrary session id: one Agent
+// job step (identity 0xAB step 1) blocked by our DDL (67), with one reader queued behind
+// it, so the same offender can be replayed after a restart under a new SPID.
+func returningJobSnapshot(spid int) []mssql.Session {
+	return []mssql.Session{
+		{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"},
+		{SPID: spid, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+			Program: "SQLAgent - TSQL JobStep (Job 0xAB : Step 1)",
+			Login:   "svc_agent", Host: "SQLPROD01", Database: "PRODDB"},
+		{SPID: 1001, Command: "SELECT", BlockingSPID: spid},
+	}
+}
+
+// TestVictimKillerReportsTheDebtAsWaited is the victim-side mirror of
+// TestBlockerKillerReportsTheDebtAsWaited: a recidivist's event must report the
+// IDENTITY's accumulated debt, not its own seconds-old episode — that is the headline
+// meaning change of serving the dwell per offender. FirstEligible still dates the new
+// episode, and both report routes must carry the same number.
+func TestVictimKillerReportsTheDebtAsWaited(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+
+	// The job restarts a second later under a new SPID: the identity already paid.
+	f.clk.Advance(time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+
+	if len(f.events) != 2 || len(f.narrated) != 2 {
+		t.Fatalf("events = %d, narrated = %d, want two kills on both routes", len(f.events), len(f.narrated))
+	}
+	ev := f.events[1]
+	if ev.SPID != 155 {
+		t.Fatalf("second kill event SPID = %d, want 155", ev.SPID)
+	}
+	if ev.Waited != 60*time.Second {
+		t.Errorf("Waited = %v, want the identity's debt (60s), not the returning episode's 0s", ev.Waited)
+	}
+	if want := f.clk.Now(); !ev.FirstEligible.Equal(want) {
+		t.Errorf("FirstEligible = %v, want %v — it dates THIS episode", ev.FirstEligible, want)
+	}
+	if f.narrated[1].Waited != ev.Waited {
+		t.Errorf("narrated Waited = %v, want the sink event's debt (%v)", f.narrated[1].Waited, ev.Waited)
+	}
+}
+
+// TestVictimKillerQuietWindowRestoresTheFullDwell pins the victim-side effect of the
+// prune at the top of the scan: debt is what an offender owes for THIS bout of trouble,
+// so an identity that stays away longer than recidivismWindow is judged from zero again
+// rather than being killed on sight forever.
+func TestVictimKillerQuietWindowRestoresTheFullDwell(t *testing.T) {
+	f := newVictimFixture(t, defaultPolicy())
+	ctx := context.Background()
+
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(79), 67, nil)
+	if len(f.killed) != 1 {
+		t.Fatalf("setup: killed = %v, want [79] once the dwell elapsed", f.killed)
+	}
+
+	f.clk.Advance(recidivismWindow + time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+	if len(f.killed) != 1 {
+		t.Fatalf("killed = %v — after a quiet window the offender must serve the full dwell again", f.killed)
+	}
+
+	f.clk.Advance(60 * time.Second)
+	f.killer.consider(ctx, returningJobSnapshot(155), 67, nil)
+	if len(f.killed) != 2 || f.killed[1] != 155 {
+		t.Fatalf("killed = %v, want the kill once the full dwell was served again", f.killed)
+	}
+}
+
 func TestAmplifierDetailFallsBackToProgramWhenUnattributed(t *testing.T) {
 	ev := AmplifierKillEvent{
 		SPID: 79, Command: "UPDATE STATISTICS", BlockedBehind: 3,
