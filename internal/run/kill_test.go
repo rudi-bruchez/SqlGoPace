@@ -399,3 +399,30 @@ func TestBlockerKillerUnmatchedPollDoesNotBankIntoTheNextRule(t *testing.T) {
 		t.Fatalf("rule B's debt must not include the interval where no rule matched, got kills %v", rec.spids)
 	}
 }
+
+func TestBlockerKillerUnmatchedPollKeepsTheDebtAlreadyBanked(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{
+		{IgnoredSession: ddl.IgnoredSession{Statement: "^UPDATE"}, AfterSeconds: 100},
+	})
+	update := statementSnapshot(100, 104, "UPDATE dbo.T SET x = 1")
+
+	k.consider(context.Background(), update, 100) // banks 0: episode's first poll
+
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), update, 100) // banks 60s, short of the 100s dwell
+
+	// An unmatched poll must only decline to bank its own interval. It must not reset the
+	// episode: that would drop the 60s already banked out of reach (the next matching poll
+	// would look like a first sight again and bank 0) and clear the killed flag.
+	now = now.Add(10 * time.Second)
+	k.consider(context.Background(), statementSnapshot(100, 104, "SELECT 1"), 100)
+
+	now = now.Add(40 * time.Second)
+	k.consider(context.Background(), update, 100) // banks 40s -> 100s, the dwell is reached
+
+	if len(rec.spids) != 1 || rec.spids[0] != 104 {
+		t.Fatalf("the 60s banked before the unmatched poll must still count, got kills %v", rec.spids)
+	}
+}

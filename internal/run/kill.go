@@ -127,8 +127,11 @@ type BlockerKiller struct {
 	src      KillSource
 	rec      *recidivism // blocking debt per matched rule, so a returning blocker keeps its dwell
 	current  int         // SPID of the blocker in the current episode, 0 when unblocked
-	lastPoll time.Time   // previous observation of the current episode; zero on its first poll
-	killed   bool        // already issued KILL for the current episode
+	// lastPoll is the previous observation of the current episode, zero on its first poll.
+	// consider advances it on every poll that sees the blocker, whether or not a rule
+	// matched, so an interval where no rule matched is banked nowhere.
+	lastPoll time.Time
+	killed   bool // already issued KILL for the current episode
 }
 
 // NewBlockerKiller builds a killer. kill terminates a SPID (mssql.Conn.Kill on the monitoring
@@ -149,11 +152,11 @@ func (k *BlockerKiller) resetEpisode() {
 
 // sincePoll returns the time to bank for this poll: zero on an episode's first observation
 // (we do not know how long the blocker was there before we saw it, exactly as the previous
-// per-episode timer assumed), the inter-poll gap afterwards. lastPoll advances on every poll
-// of the episode regardless of which rule (if any) matched, so an interval where no rule
-// matched is banked nowhere; the one imprecision this leaves is a poll where the blocker
-// switches from matching rule A to matching rule B directly (no unmatched poll between them)
-// still banks that whole interval into B, since lastPoll cannot tell which rule "owned" it.
+// per-episode timer assumed), the inter-poll gap afterwards. One imprecision is accepted: a
+// poll where the blocker switches from matching rule A to matching rule B directly (no
+// unmatched poll between them) banks that whole gap into B, because a single episode-wide
+// lastPoll cannot tell which rule owned it. A poll interval of slack does not justify a
+// second per-key map.
 func (k *BlockerKiller) sincePoll(now time.Time) time.Duration {
 	if k.lastPoll.IsZero() {
 		return 0
@@ -175,8 +178,9 @@ func (k *BlockerKiller) SetSource(src KillSource) {
 }
 
 // consider inspects one blocking snapshot and kills the session blocking ddlSPID when it
-// matches a rule and its identity has blocked for at least that rule's delay. A no-op when
-// no source is set or no rule matches. Each blocker is killed at most once per episode.
+// matches a rule and its identity has blocked for at least that rule's delay. Kills nothing
+// when no source is set or no rule matches, but a poll that sees the blocker still advances
+// the poll mark (see lastPoll). Each blocker is killed at most once per episode.
 func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int) {
 	if k == nil {
 		return
