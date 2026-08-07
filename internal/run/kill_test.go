@@ -2,8 +2,10 @@ package run
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -424,5 +426,89 @@ func TestBlockerKillerUnmatchedPollKeepsTheDebtAlreadyBanked(t *testing.T) {
 
 	if len(rec.spids) != 1 || rec.spids[0] != 104 {
 		t.Fatalf("the 60s banked before the unmatched poll must still count, got kills %v", rec.spids)
+	}
+}
+
+// killerWithSink builds a killer whose warns are collected, with rules already armed.
+func killerWithSink(t *testing.T, rec *killRecorder, now *time.Time, warns *[]string, rules []ddl.KilledSession) *BlockerKiller {
+	t.Helper()
+	k := killerFor(t, rec, now, rules)
+	k.SetSink(func(ev ReactionEvent) {
+		if ev.Kind == "warn" {
+			*warns = append(*warns, ev.Detail)
+		}
+	})
+	return k
+}
+
+func TestBlockerKillerCapsRepeatKillsAndWarnsOnce(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	var warns []string
+	k := killerWithSink(t, rec, &now, &warns, []ddl.KilledSession{killRuleFor("^SVC_RPT$", 60)})
+
+	// Serve the dwell once, then let the offender return under a new SPID repeatedly.
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	now = now.Add(60 * time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
+	// 104 was kill 1. 155 and 162 spend kills 2 and 3; 170 is the first refused, and is
+	// therefore the session the single warn names; 181 must add no second warn.
+	for _, spid := range []int{155, 162, 170, 181} {
+		now = now.Add(time.Second)
+		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
+	}
+
+	if len(rec.spids) != maxRepeatKills {
+		t.Fatalf("expected exactly %d kills inside the window, got %v", maxRepeatKills, rec.spids)
+	}
+	if len(warns) != 1 {
+		t.Fatalf("the cap must warn exactly once per identity, got %d warns: %v", len(warns), warns)
+	}
+	for _, want := range []string{"stopped killing blockers", `login=~"^SVC_RPT$"`, "SPID 170"} {
+		if !strings.Contains(warns[0], want) {
+			t.Errorf("warn %q must contain %q", warns[0], want)
+		}
+	}
+}
+
+func TestBlockerKillerCapLiftsAfterTheWindow(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	var warns []string
+	k := killerWithSink(t, rec, &now, &warns, []ddl.KilledSession{killRuleFor("^SVC_RPT$", 0)}) // kill on sight
+
+	for _, spid := range []int{104, 155, 162, 170} {
+		now = now.Add(time.Second)
+		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
+	}
+	if len(rec.spids) != maxRepeatKills {
+		t.Fatalf("setup: expected the cap to bite at %d kills, got %v", maxRepeatKills, rec.spids)
+	}
+
+	// Quiet for a full window: the budget and the warn guard are forgotten with the bucket.
+	now = now.Add(recidivismWindow + time.Second)
+	k.consider(context.Background(), blockedSnapshot(100, 200, "SVC_RPT"), 100)
+	if len(rec.spids) != maxRepeatKills+1 {
+		t.Fatalf("the cap must lift after a quiet window, got %v", rec.spids)
+	}
+}
+
+func TestBlockerKillerFailedKillSpendsNoBudget(t *testing.T) {
+	failing := func(_ context.Context, _ int) error { return errors.New("permission denied") }
+	now := time.Unix(0, 0)
+	k := NewBlockerKiller(failing, nil, func() time.Time { return now })
+	compiled, err := compileKilledSessions([]ddl.KilledSession{killRuleFor("^SVC_RPT$", 0)}, 0)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	k.SetSource(staticKill{rules: compiled})
+
+	for _, spid := range []int{104, 155, 162, 170, 181} {
+		now = now.Add(time.Second)
+		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
+	}
+	// Every KILL failed, so no budget was spent and the killer never reached the cap.
+	if got := k.rec.kills(k.src.Current()[0].key); got != 0 {
+		t.Errorf("a failed KILL must spend no budget, kills = %d", got)
 	}
 }

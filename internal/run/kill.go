@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"time"
@@ -125,8 +126,9 @@ type BlockerKiller struct {
 
 	mu       sync.Mutex
 	src      KillSource
-	rec      *recidivism // blocking debt per matched rule, so a returning blocker keeps its dwell
-	current  int         // SPID of the blocker in the current episode, 0 when unblocked
+	sink     ReactionSink // per-operation run-report sink; nil between operations
+	rec      *recidivism  // blocking debt per matched rule, so a returning blocker keeps its dwell
+	current  int          // SPID of the blocker in the current episode, 0 when unblocked
 	// lastPoll is the previous observation of the current episode, zero on its first poll.
 	// consider advances it on every poll that sees the blocker, whether or not a rule
 	// matched, so an interval where no rule matched is banked nowhere.
@@ -172,8 +174,22 @@ func (k *BlockerKiller) SetSource(src KillSource) {
 	}
 	k.mu.Lock()
 	k.src = src
+	k.sink = nil
 	k.rec.reset()
 	k.resetEpisode()
+	k.mu.Unlock()
+}
+
+// SetSink installs the reaction sink the cap escalation is emitted on. The engine sets it
+// per operation and SetSource clears it between manifests, for the same reason
+// VictimKiller.SetSink exists: a late event must never be attributed to the next
+// operation's report. Kills themselves keep reporting through onKill to the console.
+func (k *BlockerKiller) SetSink(sink ReactionSink) {
+	if k == nil {
+		return
+	}
+	k.mu.Lock()
+	k.sink = sink
 	k.mu.Unlock()
 }
 
@@ -181,20 +197,36 @@ func (k *BlockerKiller) SetSource(src KillSource) {
 // matches a rule and its identity has blocked for at least that rule's delay. Kills nothing
 // when no source is set or no rule matches, but a poll that sees the blocker still advances
 // the poll mark (see lastPoll). Each blocker is killed at most once per episode.
+//
+// The decision runs under mu in considerLocked; the cap escalation is emitted HERE, with the
+// lock released. The sink is the engine's per-operation narration path — it formats, writes
+// to the run log and can notify a webhook — and holding mu across it would make SetSource,
+// which runs on the engine goroutine at every manifest boundary, wait on that work.
 func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, ddlSPID int) {
 	if k == nil {
 		return
 	}
+	if sink, detail := k.considerLocked(ctx, sessions, ddlSPID); sink != nil && detail != "" {
+		sink(ReactionEvent{Kind: "warn", Detail: detail})
+	}
+}
+
+// considerLocked makes the whole decision under mu and returns the sink to narrate on plus
+// the cap-escalation text, empty when this poll has nothing to say. The KILL itself stays
+// here, where it has always been: it is one attention on the monitoring pool, and moving it
+// out would mean reserving the kill before issuing it — a different design than the one the
+// budget is built on, where only a KILL that landed spends from it.
+func (k *BlockerKiller) considerLocked(ctx context.Context, sessions []mssql.Session, ddlSPID int) (ReactionSink, string) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if k.src == nil {
-		return
+		return nil, ""
 	}
 	k.rec.prune() // before any debt is read, so a quiet window really restores the full dwell
 	blocker, ok := blockerSession(sessions, ddlSPID)
 	if !ok {
 		k.resetEpisode()
-		return
+		return nil, ""
 	}
 	now := k.now()
 	if blocker.SPID != k.current {
@@ -212,10 +244,19 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 			// keeps the identity's bucket alive and its debt honest. It cannot cause a second
 			// kill — this return is what prevents that — and the debt is already past `after`
 			// anyway, so it changes no decision.
-			return
+			return nil, ""
 		}
 		if k.rec.debt(r.key) < r.after {
-			return // matched, but this identity has not blocked us long enough yet
+			return nil, "" // matched, but this identity has not blocked us long enough yet
+		}
+		if k.rec.kills(r.key) >= maxRepeatKills {
+			// Capped: go quiet and let the normal reaction hierarchy take over — which is
+			// exactly the behavior without this feature, so the run can never block longer
+			// for having tried. The warn fires once, on the transition.
+			if k.rec.escalate(r.key) {
+				return k.sink, capDetail(r, blocker)
+			}
+			return nil, ""
 		}
 		if err := k.kill(ctx, blocker.SPID); err == nil {
 			k.killed = true
@@ -227,11 +268,23 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 				k.onKill(KillEvent{SPID: blocker.SPID, Login: blocker.Login, Waited: k.rec.debt(r.key)})
 			}
 		}
-		return // first matching rule decides; don't fall through to a longer-delay rule
+		return nil, "" // first matching rule decides; don't fall through to a longer-delay rule
 	}
 	// No rule matched this poll: advance the mark anyway, so the interval we just observed
 	// is not banked into whatever rule matches next.
 	k.lastPoll = now
+	return nil, ""
+}
+
+// capDetail narrates a rule that hit the repeat-kill cap: what was killed, how often, and
+// what the operator can do about it. It names the rule rather than only the last session,
+// because with a population of offenders the individual SPIDs are noise.
+func capDetail(r killRule, blocker mssql.Session) string {
+	return fmt.Sprintf("stopped killing blockers matching rule %s: %d killed within %s and they keep returning "+
+		"(last: SPID %d, login=%s host=%s program=%s) — the blocker is being restarted faster than it can be "+
+		"cleared, so the run falls back to the normal blocking reaction; consider disabling the job behind it or "+
+		"scheduling this run outside its window",
+		r.match, maxRepeatKills, recidivismWindow, blocker.SPID, blocker.Login, blocker.Host, blocker.Program)
 }
 
 // blockerSession returns the session directly blocking ddlSPID, found from the same

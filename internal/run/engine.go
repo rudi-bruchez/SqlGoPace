@@ -685,6 +685,10 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		// goroutine. Each iteration overwrites it before any kill can occur, and
 		// Disarm clears it at the end of the manifest.
 		e.victims.SetSink(sink)
+		// The blocker killer emits its cap escalation on the same per-operation sink,
+		// from the same pump goroutine, and is cleared by SetSource(nil) at the end of
+		// the manifest.
+		e.killer.SetSink(sink)
 		waitsBefore := e.snapshotWaits(ctx)
 
 		// Narrate, once each, the ignored sessions we hold the lock through, so the run
