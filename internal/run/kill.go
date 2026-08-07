@@ -130,11 +130,11 @@ type BlockerKiller struct {
 	onKill func(KillEvent)
 	now    func() time.Time
 
-	mu       sync.Mutex
-	src      KillSource
-	sink     ReactionSink // per-operation run-report sink; nil between operations
-	rec      *recidivism  // blocking debt per matched rule, so a returning blocker keeps its dwell
-	current  int          // SPID of the blocker in the current episode, 0 when unblocked
+	mu      sync.Mutex
+	src     KillSource
+	sink    ReactionSink // per-operation run-report sink; nil between operations
+	rec     *recidivism  // blocking debt per matched rule, so a returning blocker keeps its dwell
+	current int          // SPID of the blocker in the current episode, 0 when unblocked
 	// lastPoll is the previous observation of the current episode, zero on its first poll.
 	// consider advances it on every poll that sees the blocker, whether or not a rule
 	// matched, so an interval where no rule matched is banked nowhere.
