@@ -166,8 +166,9 @@ func (k *BlockerKiller) sincePoll(now time.Time) time.Duration {
 	return now.Sub(k.lastPoll)
 }
 
-// SetSource swaps the per-manifest kill-rule source and resets the episode state. Called by
-// the engine before each manifest's operations (nil disarms the killer between manifests).
+// SetSource swaps the per-manifest kill-rule source, resets the episode state and clears the
+// sink. Called by the engine before each manifest's operations (nil disarms the killer between
+// manifests). Because it clears the sink, SetSink must be called after it, not before.
 func (k *BlockerKiller) SetSource(src KillSource) {
 	if k == nil {
 		return

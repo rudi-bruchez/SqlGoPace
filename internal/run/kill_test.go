@@ -452,8 +452,10 @@ func TestBlockerKillerCapsRepeatKillsAndWarnsOnce(t *testing.T) {
 	now = now.Add(60 * time.Second)
 	k.consider(context.Background(), blockedSnapshot(100, 104, "SVC_RPT"), 100)
 	// 104 was kill 1. 155 and 162 spend kills 2 and 3; 170 is the first refused, and is
-	// therefore the session the single warn names; 181 must add no second warn.
-	for _, spid := range []int{155, 162, 170, 181} {
+	// therefore the session the single warn names. Polling 170 again covers the path the
+	// escalate flag actually guards - a capped blocker still present on the next poll, with
+	// no episode reset in between - and 181 must add no second warn either.
+	for _, spid := range []int{155, 162, 170, 170, 181} {
 		now = now.Add(time.Second)
 		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
 	}
@@ -494,7 +496,11 @@ func TestBlockerKillerCapLiftsAfterTheWindow(t *testing.T) {
 }
 
 func TestBlockerKillerFailedKillSpendsNoBudget(t *testing.T) {
-	failing := func(_ context.Context, _ int) error { return errors.New("permission denied") }
+	attempts := 0
+	failing := func(_ context.Context, _ int) error {
+		attempts++
+		return errors.New("permission denied")
+	}
 	now := time.Unix(0, 0)
 	k := NewBlockerKiller(failing, nil, func() time.Time { return now })
 	compiled, err := compileKilledSessions([]ddl.KilledSession{killRuleFor("^SVC_RPT$", 0)}, 0)
@@ -507,8 +513,13 @@ func TestBlockerKillerFailedKillSpendsNoBudget(t *testing.T) {
 		now = now.Add(time.Second)
 		k.consider(context.Background(), blockedSnapshot(100, spid, "SVC_RPT"), 100)
 	}
-	// Every KILL failed, so no budget was spent and the killer never reached the cap.
+	// Every KILL failed, so no budget was spent. This forbids a reservation-style cap that
+	// books the kill before the server confirms it: the attempt count proves the killer kept
+	// trying past maxRepeatKills rather than capping itself out on kills that never landed.
 	if got := k.rec.kills(k.src.Current()[0].key); got != 0 {
 		t.Errorf("a failed KILL must spend no budget, kills = %d", got)
+	}
+	if attempts != 5 {
+		t.Errorf("the cap must not bite on failed kills, KILL attempted %d times, want 5", attempts)
 	}
 }
