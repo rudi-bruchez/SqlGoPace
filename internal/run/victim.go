@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -265,7 +266,7 @@ func (k *VictimKiller) consider(ctx context.Context, sessions []mssql.Session, d
 	detached := context.WithoutCancel(ctx)
 	for _, t := range targets {
 		if err := k.killDetached(detached, t.spid); err != nil {
-			k.withdrawKill(t.ep, t.key)
+			k.withdrawKill(t.ep, t.key, err)
 			// Reached only on the failure transition: killFailed is terminal for the
 			// episode, so the scan short-circuits before selecting this SPID again and
 			// this fires exactly once per episode rather than spamming the run log.
@@ -419,16 +420,29 @@ func (k *VictimKiller) abandonKill(ep *victimEpisode, key string) {
 // withdrawKill undoes the optimistic mark considerLocked set when the KILL turns out to
 // have failed: suppression stops immediately (so we yield on the normal timer, never
 // blocking longer than we would without the feature) and killFailed makes the failure
-// terminal for the episode, keeping the warn to one per episode. ep is mutated through
-// the pointer the scan handed over: if Arm or Disarm replaced the episode map in the
-// meantime the episode is already orphaned, and writing to it is correctly a no-op. The
-// reservation goes back too: a KILL that never landed changed nothing on the server, and
-// must not disarm the killer against an offender it has yet to stop even once.
-func (k *VictimKiller) withdrawKill(ep *victimEpisode, key string) {
+// terminal for the episode, keeping the warn to one per episode. Both are unconditional —
+// whatever the error means on the server, we stop waiting on a kill we cannot confirm. ep
+// is mutated through the pointer the scan handed over: if Arm or Disarm replaced the
+// episode map in the meantime the episode is already orphaned, and writing to it is
+// correctly a no-op.
+//
+// The reservation only goes back when the error says the KILL never reached the server —
+// a rejected login, a permission error, a broken connection. An error carries no such
+// guarantee by itself, and running out of killTimeout says the opposite: the attention was
+// accepted and only the client stopped waiting, so the victim is already rolling back. That
+// is exactly the case maxRepeatKills exists to bound (a KILL slow enough to time out is a
+// large rollback), and refunding there would let the same identity be killed again on its
+// next session. context.Canceled is treated the same way for the same reason — the KILL runs
+// on a context.WithoutCancel, so the only cancellation that can reach it is one raised after
+// the statement was already sent.
+func (k *VictimKiller) withdrawKill(ep *victimEpisode, key string, err error) {
 	k.mu.Lock()
+	defer k.mu.Unlock()
 	ep.killed, ep.killFailed = false, true
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return
+	}
 	k.rec.undoKill(key)
-	k.mu.Unlock()
 }
 
 // eligible applies the six conditions of the design's §1.3, in cheapest-first order.
@@ -580,12 +594,17 @@ func (k *VictimKiller) attribute(ctx context.Context, program string) (mssql.Age
 
 // victimCapDetail narrates an amplifier identity that hit the repeat-kill cap. It leads with
 // the program name because that is the identity the budget was spent on — for an Agent job
-// step it carries the job id and step number the operator acts on — and falls back to naming
-// nothing more than the last session when the program is empty. It resolves no job name: the
-// scan holds k.mu and an msdb round trip there is exactly what consider exists to avoid.
+// step it carries the job id and step number the operator acts on — and falls back to
+// login@host when the connection sets no application name, which is all victimKey has to go
+// on in that case too. It resolves no job name: the scan holds k.mu and an msdb round trip
+// there is exactly what consider exists to avoid.
 func victimCapDetail(v mssql.Session) string {
+	source := v.Program
+	if source == "" {
+		source = v.Login + "@" + v.Host
+	}
 	return fmt.Sprintf("stopped killing amplifying maintenance sessions from %s: %d killed within %s and they keep "+
 		"returning (last: SPID %d, %s, login=%s host=%s) — the run falls back to the normal blocking reaction; "+
-		"consider disabling the job behind it or scheduling this run outside its window",
-		v.Program, maxRepeatKills, recidivismWindow, v.SPID, v.Command, v.Login, v.Host)
+		"consider stopping the job or workload behind it, or scheduling this run outside its window",
+		source, maxRepeatKills, recidivismWindow, v.SPID, v.Command, v.Login, v.Host)
 }

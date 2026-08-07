@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1107,5 +1108,88 @@ func TestVictimKillerFailedKillReturnsTheBudget(t *testing.T) {
 	}
 	if attempts != 5 {
 		t.Errorf("KILL attempted %d times, want 5 — a withdrawn reservation must let the killer keep trying", attempts)
+	}
+}
+
+// TestVictimKillerTimedOutKillKeepsTheBudget is the counterpart of the test above: a KILL
+// bounded by killTimeout that runs out of time is NOT a KILL that never landed. The attention
+// reaches the server first and only the client gives up waiting, so the victim is already
+// dying and rolling back — and a KILL slow enough to time out is precisely the large rollback
+// maxRepeatKills exists to bound. Refunding there would let the same offender be killed again
+// on its next session, which is the rollback storm the cap is there to prevent.
+func TestVictimKillerTimedOutKillKeepsTheBudget(t *testing.T) {
+	clk := NewManualClock(time.Unix(1_800_000_000, 0))
+	attempts := 0
+	k := NewVictimKiller(
+		func(context.Context, int) error {
+			attempts++
+			// Wrapped, as a driver reports it: errors.Is must see through it.
+			return fmt.Errorf("kill: %w", context.DeadlineExceeded)
+		},
+		nil, nil, clk, mssql.AppNamePrefix,
+	)
+	k.Arm(killOnSight())
+
+	for _, spid := range []int{79, 91, 104, 155, 162} {
+		k.consider(context.Background(), oneOffenderSnapshot(spid), 67, nil)
+		clk.Advance(time.Second)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	k.mu.Lock()
+	spent := k.rec.kills(key)
+	k.mu.Unlock()
+	if spent != maxRepeatKills {
+		t.Errorf("timed-out KILLs must keep the budget spent, kills = %d, want %d", spent, maxRepeatKills)
+	}
+	if attempts != maxRepeatKills {
+		t.Errorf("KILL attempted %d times, want %d — a timed-out KILL likely landed, so the cap must still bite",
+			attempts, maxRepeatKills)
+	}
+}
+
+// TestVictimKillerAbandonedKillsReturnTheWholeBudget covers the shutdown refund with more than
+// one target, which is the only shape that can catch it: one abandoned reservation still leaves
+// the identity under the cap, but considerLocked routinely selects several victims of one
+// identity per scan, so a single canceled poll could otherwise burn the whole budget for good.
+func TestVictimKillerAbandonedKillsReturnTheWholeBudget(t *testing.T) {
+	f := newVictimFixture(t, killOnSight())
+	snap := oneOffenderSnapshot(79, 91, 104)
+
+	done, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.killer.consider(done, snap, 67, nil)
+	if len(f.killed) != 0 {
+		t.Fatalf("killed = %v on a context that is already done, want none", f.killed)
+	}
+
+	key := victimKey(mssql.Session{Program: "SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)"})
+	f.killer.mu.Lock()
+	spent := f.killer.rec.kills(key)
+	f.killer.mu.Unlock()
+	if spent != 0 {
+		t.Errorf("abandoned reservations must all go back, kills = %d, want 0", spent)
+	}
+
+	// And the budget is really usable again: the same offender is still killable.
+	f.killer.consider(context.Background(), snap, 67, nil)
+	if len(f.killed) != maxRepeatKills {
+		t.Errorf("killed = %v after the run resumed polling, want %d kills", f.killed, maxRepeatKills)
+	}
+}
+
+// TestVictimCapDetailNamesTheSessionWhenTheProgramIsEmpty pins the fallback the narration
+// promises: a client that sets no application name has no program to name, and interpolating it
+// anyway yields a sentence reading "from :" that advises disabling a job the identity does not
+// have. login@host is exactly what the identity key falls back to in that case.
+func TestVictimCapDetailNamesTheSessionWhenTheProgramIsEmpty(t *testing.T) {
+	got := victimCapDetail(mssql.Session{
+		SPID: 155, Command: "UPDATE STATISTICS", Login: `CORP\svc_sqlagent`, Host: "SQLPROD01",
+	})
+	if !strings.Contains(got, `from CORP\svc_sqlagent@SQLPROD01`) {
+		t.Errorf("victimCapDetail() = %q, want the login@host fallback as the source", got)
+	}
+	if strings.Contains(got, "from :") || strings.Contains(got, "from  ") {
+		t.Errorf("victimCapDetail() = %q, leaves a dangling source clause", got)
 	}
 }
