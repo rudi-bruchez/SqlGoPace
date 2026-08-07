@@ -378,15 +378,21 @@ func TestVictimKillerTracksIndependentDwellsForTwoVictims(t *testing.T) {
 
 // twoVictimSnapshot is DirectVictims 79 and (when includeB) 80, both blocked by our
 // DDL (67) and each with one session queued behind it — two independent amplifiers.
+// They carry DIFFERENT Agent job steps on purpose: the dwell is served per offender
+// identity, not per SPID, so two sessions sharing a login/host/program would be one
+// offender sharing one debt and B would inherit A's dwell. Independent dwells are a
+// property of independent offenders, and that is what this test is about.
 func twoVictimSnapshot(includeB bool) []mssql.Session {
 	out := []mssql.Session{
 		{SPID: 67, Command: "ALTER INDEX", Program: "SqlGoPace"},
-		{SPID: 79, Command: "UPDATE STATISTICS", BlockingSPID: 67},
+		{SPID: 79, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+			Program: "SQLAgent - TSQL JobStep (Job 0xA1 : Step 1)"},
 		{SPID: 1001, Command: "SELECT", BlockingSPID: 79},
 	}
 	if includeB {
 		out = append(out,
-			mssql.Session{SPID: 80, Command: "UPDATE STATISTICS", BlockingSPID: 67},
+			mssql.Session{SPID: 80, Command: "UPDATE STATISTICS", BlockingSPID: 67,
+				Program: "SQLAgent - TSQL JobStep (Job 0xB2 : Step 1)"},
 			mssql.Session{SPID: 2001, Command: "SELECT", BlockingSPID: 80},
 		)
 	}
@@ -682,6 +688,76 @@ func TestAmplifierDetailTruncatesOnARuneBoundary(t *testing.T) {
 	}
 	if !strings.Contains(got, "…") {
 		t.Errorf("AmplifierDetail() = %q, want the truncation marker", got)
+	}
+}
+
+func TestVictimKeyIdentifiesTheJobNotTheSession(t *testing.T) {
+	// Two different sessions running two different statements for the same Agent job step
+	// are one offender.
+	a := mssql.Session{SPID: 79, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`,
+		Command: "UPDATE STATISTICS", ActiveQuery: "UPDATE STATISTICS dbo.MEASUREMENT"}
+	b := mssql.Session{SPID: 91, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`,
+		Command: "ALTER INDEX", ActiveQuery: "ALTER INDEX ALL ON dbo.MEASUREMENT REORGANIZE"}
+	if victimKey(a) != victimKey(b) {
+		t.Errorf("one job step must be one identity: %q vs %q", victimKey(a), victimKey(b))
+	}
+
+	// A program name that is not a job step falls back to the connection triplet, and the
+	// statement is still not part of the identity.
+	c := mssql.Session{SPID: 54, Login: `CORP\svc_etl`, Host: "SQLPROD01", Program: "ETL",
+		ActiveQuery: "UPDATE STATISTICS dbo.MEASUREMENT"}
+	d := mssql.Session{SPID: 61, Login: `CORP\svc_etl`, Host: "SQLPROD01", Program: "ETL",
+		ActiveQuery: "ALTER INDEX ALL ON dbo.OTHER REBUILD"}
+	if victimKey(c) != victimKey(d) {
+		t.Errorf("one connection identity must be one offender: %q vs %q", victimKey(c), victimKey(d))
+	}
+	if victimKey(a) == victimKey(c) {
+		t.Error("a job step and a plain connection must not share an identity")
+	}
+	// A second step of the same job is a different offender: an operator disables a step,
+	// not a session, so the step is the finest identity the advice can act on.
+	e := mssql.Session{SPID: 80, Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 2)`}
+	if victimKey(a) == victimKey(e) {
+		t.Errorf("two steps of one job must not share an identity: %q", victimKey(a))
+	}
+}
+
+func TestVictimKillerRecidivistDoesNotBuyAFreshDwell(t *testing.T) {
+	killed := make(chan int, 8)
+	clk := NewManualClock(time.Unix(0, 0))
+	k := NewVictimKiller(
+		func(_ context.Context, spid int) error { killed <- spid; return nil },
+		nil, nil, clk, "SqlGoPace")
+	k.Arm(AmplifierPolicy{MinBlockedBehind: 1, After: 60 * time.Second})
+
+	// Our DDL is SPID 100. Victim 79 is directly blocked by us and has SPID 91 queued
+	// behind it, which is what makes it an amplifier.
+	snap := func(victim int) []mssql.Session {
+		return []mssql.Session{
+			{SPID: 100},
+			{SPID: victim, BlockingSPID: 100, Command: "UPDATE STATISTICS",
+				Program: `SQLAgent - TSQL JobStep (Job 0x1A2B : Step 1)`},
+			{SPID: 91, BlockingSPID: victim, Command: "SELECT"},
+		}
+	}
+
+	k.consider(context.Background(), snap(79), 100, nil) // banks 0
+	clk.Advance(60 * time.Second)
+	k.consider(context.Background(), snap(79), 100, nil) // banks 60s -> kill
+	if got := <-killed; got != 79 {
+		t.Fatalf("expected the first victim killed after its dwell, got %d", got)
+	}
+
+	// The job restarts a second later under a new SPID: the identity already paid.
+	clk.Advance(time.Second)
+	k.consider(context.Background(), snap(155), 100, nil)
+	select {
+	case got := <-killed:
+		if got != 155 {
+			t.Fatalf("expected the returning job killed, got %d", got)
+		}
+	default:
+		t.Fatal("a returning offender must be killed at once, no kill was issued")
 	}
 }
 

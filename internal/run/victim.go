@@ -41,16 +41,37 @@ type AmplifierKillEvent struct {
 	BlockedBehind int
 	WaitedMS      int64         // the victim's own wait_time, from the DMV
 	FirstEligible time.Time     // when it first met every eligibility condition
-	Waited        time.Duration // how long it was kill-eligible before we killed it
+	Waited        time.Duration // how long this identity has been kill-eligible, accumulated across sessions
 	Job           mssql.AgentJob
 }
 
 // victimEpisode is the per-SPID state of one blocking episode.
 type victimEpisode struct {
 	since      time.Time // when this victim first became kill-eligible
+	lastPoll   time.Time // previous observation of this episode; zero on its first poll
 	killed     bool      // a KILL was issued successfully
 	killedAt   time.Time // when, for the grace window
 	killFailed bool      // the KILL errored: stop suppressing, fall back to yielding
+}
+
+// sincePoll returns the time to bank for this poll: zero on the episode's first
+// observation, the inter-poll gap afterwards.
+func (e *victimEpisode) sincePoll(now time.Time) time.Duration {
+	if e.lastPoll.IsZero() {
+		return 0
+	}
+	return now.Sub(e.lastPoll)
+}
+
+// victimKey identifies the offender behind a victim session: the Agent job step when the
+// program name resolves to one, else the connection triplet. It deliberately excludes the
+// command verb and the statement text — a job that runs a different statement after a
+// restart, or the same statement against another object, is the same offender.
+func victimKey(v mssql.Session) string {
+	if hex, step, ok := mssql.ParseJobStepProgram(v.Program); ok {
+		return fmt.Sprintf("job:%s:%d", hex, step)
+	}
+	return fmt.Sprintf("sess:%s|%s|%s", v.Login, v.Host, v.Program)
 }
 
 // VictimKiller terminates maintenance statements our operation blocks that have other
@@ -75,6 +96,7 @@ type VictimKiller struct {
 	policy   AmplifierPolicy
 	armed    bool
 	sink     ReactionSink
+	rec      *recidivism // blocking debt per offender identity, so a job that restarts under a new SPID keeps its dwell
 	episodes map[int]*victimEpisode
 	jobs     map[string]mssql.AgentJob // attribution cache, keyed by "hex:step"
 }
@@ -103,6 +125,7 @@ func NewVictimKiller(
 	}
 	return &VictimKiller{
 		kill: kill, resolve: resolve, onKill: onKill, clk: clk, selfProgram: selfProgram,
+		rec:      newRecidivism(clk.Now),
 		episodes: make(map[int]*victimEpisode),
 		// jobs deliberately outlives Arm/Disarm: Agent job ids are globally unique, so
 		// an attribution cached under one manifest is still correct under the next, and
@@ -138,6 +161,7 @@ func (k *VictimKiller) Arm(p AmplifierPolicy) {
 	k.mu.Lock()
 	k.policy, k.armed = p, true
 	k.episodes = make(map[int]*victimEpisode)
+	k.rec.reset()
 	k.mu.Unlock()
 }
 
@@ -149,6 +173,7 @@ func (k *VictimKiller) Disarm() {
 	k.mu.Lock()
 	k.armed, k.sink = false, nil
 	k.episodes = make(map[int]*victimEpisode)
+	k.rec.reset()
 	k.mu.Unlock()
 }
 
@@ -183,6 +208,7 @@ func (k *VictimKiller) Suppressed(spid int) bool {
 // the narration is not yet rendered (AmplifierDetail needs the resolved Job).
 type killTarget struct {
 	ep      *victimEpisode
+	key     string // the offender identity this kill is charged to
 	spid    int
 	command string
 	kill    *AmplifierKillEvent
@@ -284,24 +310,28 @@ func (k *VictimKiller) considerLocked(sessions []mssql.Session, ddlSPID int, ign
 	}
 
 	now := k.clk.Now()
+	k.rec.prune() // before any debt is read: a quiet window restores the full dwell
 	seen := make(map[int]bool)
 	for _, v := range DirectVictims(sessions, ddlSPID) {
 		if !k.eligible(v, sessions, ddlSPID, ignore) {
 			continue
 		}
+		key := victimKey(v)
 		seen[v.SPID] = true
 		ep, ok := k.episodes[v.SPID]
 		if !ok {
 			ep = &victimEpisode{since: now}
 			k.episodes[v.SPID] = ep
 		}
-		if ep.killed || ep.killFailed || k.clk.Since(ep.since) < k.policy.After {
+		k.rec.accrue(key, ep.sincePoll(now))
+		ep.lastPoll = now
+		if ep.killed || ep.killFailed || k.rec.debt(key) < k.policy.After {
 			continue
 		}
 		ep.killed, ep.killedAt = true, now
 		targets = append(targets, killTarget{
-			ep: ep, spid: v.SPID, command: v.Command,
-			kill: killEvent(v, sessions, ep.since, now.Sub(ep.since)),
+			ep: ep, key: key, spid: v.SPID, command: v.Command,
+			kill: killEvent(v, sessions, ep.since, k.rec.debt(key)),
 		})
 	}
 	// Drop episodes for victims no longer eligible, except those inside their grace
@@ -381,11 +411,13 @@ func (k *VictimKiller) blocksUs(spid int, sessions []mssql.Session, ddlSPID int)
 	return mssql.FindSelfBlock(sessions, ddlSPID).SPID == spid
 }
 
-// killEvent builds the not-yet-attributed event for a kill about to be issued:
-// everything except Job, which attribute fills once the lock from considerLocked is
-// released. It touches no VictimKiller state, so it needs no lock itself; it is called
-// from inside considerLocked only because that is where the episode's since/waited
-// values are at hand.
+// killEvent builds the not-yet-attributed event for a kill about to be issued: everything
+// except Job, which attribute fills once the lock from considerLocked is released. waited is
+// the offender identity's accumulated debt, not this episode's elapsed time — for a job that
+// restarts under a new SPID the episode is seconds old, and the debt is what justified the
+// kill. firstEligible still dates this episode. It touches no VictimKiller state, so it needs
+// no lock itself; it is called from inside considerLocked only because that is where the
+// episode's values are at hand.
 func killEvent(v mssql.Session, sessions []mssql.Session, firstEligible time.Time, waited time.Duration) *AmplifierKillEvent {
 	stmt := v.ActiveQuery
 	if stmt == "" {
