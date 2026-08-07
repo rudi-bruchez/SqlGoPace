@@ -127,7 +127,6 @@ type BlockerKiller struct {
 	src      KillSource
 	rec      *recidivism // blocking debt per matched rule, so a returning blocker keeps its dwell
 	current  int         // SPID of the blocker in the current episode, 0 when unblocked
-	since    time.Time   // when the current blocker first blocked us
 	lastPoll time.Time   // previous observation of the current episode; zero on its first poll
 	killed   bool        // already issued KILL for the current episode
 }
@@ -145,12 +144,16 @@ func NewBlockerKiller(kill func(context.Context, int) error, onKill func(KillEve
 // It deliberately does not touch the debt: debt is banked poll by poll while the blocker is
 // observed, so there is never an unflushed remainder to fold in here.
 func (k *BlockerKiller) resetEpisode() {
-	k.current, k.since, k.lastPoll, k.killed = 0, time.Time{}, time.Time{}, false
+	k.current, k.lastPoll, k.killed = 0, time.Time{}, false
 }
 
 // sincePoll returns the time to bank for this poll: zero on an episode's first observation
 // (we do not know how long the blocker was there before we saw it, exactly as the previous
-// per-episode timer assumed), the inter-poll gap afterwards.
+// per-episode timer assumed), the inter-poll gap afterwards. lastPoll advances on every poll
+// of the episode regardless of which rule (if any) matched, so an interval where no rule
+// matched is banked nowhere; the one imprecision this leaves is a poll where the blocker
+// switches from matching rule A to matching rule B directly (no unmatched poll between them)
+// still banks that whole interval into B, since lastPoll cannot tell which rule "owned" it.
 func (k *BlockerKiller) sincePoll(now time.Time) time.Duration {
 	if k.lastPoll.IsZero() {
 		return 0
@@ -191,7 +194,7 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 	}
 	now := k.now()
 	if blocker.SPID != k.current {
-		k.current, k.since, k.lastPoll, k.killed = blocker.SPID, now, time.Time{}, false
+		k.current, k.lastPoll, k.killed = blocker.SPID, time.Time{}, false
 	}
 	for _, r := range k.src.Current() {
 		if !r.match.matches(blocker) {
@@ -222,6 +225,9 @@ func (k *BlockerKiller) consider(ctx context.Context, sessions []mssql.Session, 
 		}
 		return // first matching rule decides; don't fall through to a longer-delay rule
 	}
+	// No rule matched this poll: advance the mark anyway, so the interval we just observed
+	// is not banked into whatever rule matches next.
+	k.lastPoll = now
 }
 
 // blockerSession returns the session directly blocking ddlSPID, found from the same

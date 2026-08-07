@@ -360,3 +360,42 @@ func TestBlockerKillerReportsTheDebtAsWaited(t *testing.T) {
 		t.Errorf("Waited = %s, want the identity's debt (60s)", events[1].Waited)
 	}
 }
+
+// statementSnapshot builds a snapshot like blockedSnapshot, but keying the match on the
+// blocker's active statement rather than its login, so it can flip between polls the way a
+// blocker's ActiveQuery does across successive statements of one transaction.
+func statementSnapshot(ddlSPID, blockerSPID int, activeQuery string) []mssql.Session {
+	return []mssql.Session{
+		{SPID: ddlSPID, BlockingSPID: blockerSPID, WaitType: "LCK_M_SCH_M"},
+		{SPID: blockerSPID, ActiveQuery: activeQuery},
+	}
+}
+
+func TestBlockerKillerUnmatchedPollDoesNotBankIntoTheNextRule(t *testing.T) {
+	rec := &killRecorder{}
+	now := time.Unix(0, 0)
+	k := killerFor(t, rec, &now, []ddl.KilledSession{
+		{IgnoredSession: ddl.IgnoredSession{Statement: "^UPDATE"}, AfterSeconds: 1000},
+		{IgnoredSession: ddl.IgnoredSession{Statement: "^DELETE"}, AfterSeconds: 1000},
+	})
+
+	// Poll 1: the blocker is mid-UPDATE, matching rule A. Banks 0 (episode's first poll).
+	k.consider(context.Background(), statementSnapshot(100, 104, "UPDATE dbo.T SET x = 1"), 100)
+
+	// Poll 2, long after: the same session (same episode, SPID unchanged) is now running a
+	// statement that matches NEITHER rule. Nothing should be banked into any rule for this
+	// interval.
+	now = now.Add(10000 * time.Second)
+	k.consider(context.Background(), statementSnapshot(100, 104, "SELECT 1"), 100)
+
+	// Poll 3, one second later: the same session has moved on to a DELETE, matching rule B.
+	// Rule B's own debt is only the 1s since poll 2 - far short of its 1000s dwell - so this
+	// must not kill. Before the fix, the unmatched interval from poll 1 to poll 3 (~10001s)
+	// was banked into rule B on this poll, and it fired prematurely.
+	now = now.Add(time.Second)
+	k.consider(context.Background(), statementSnapshot(100, 104, "DELETE FROM dbo.T"), 100)
+
+	if len(rec.spids) != 0 {
+		t.Fatalf("rule B's debt must not include the interval where no rule matched, got kills %v", rec.spids)
+	}
+}
