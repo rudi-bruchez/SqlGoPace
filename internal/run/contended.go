@@ -17,16 +17,16 @@ import (
 const contendedCaptureSuffix = ".contended.yaml"
 
 type capturedObject struct {
-	obj         mssql.LockedObject
-	firstSeen   string
-	lastSeen    string
-	count       int
-	byTail      bool // upgraded by a tail-object walk
-	transient   bool
+	obj              mssql.LockedObject
+	firstSeen        string
+	lastSeen         string
+	count            int
+	byTail           bool // upgraded by a tail-object walk
+	transient        bool
 	blockedByCommand string
 	blockedBySPID    int
-	indexID     int
-	pageFromEnd int
+	indexID          int
+	pageFromEnd      int
 }
 
 // contendedCapture accumulates the distinct objects a shrink held a Sch-M lock on across

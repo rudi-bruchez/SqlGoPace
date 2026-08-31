@@ -340,8 +340,8 @@ func TestModelHumanizesWaitDurations(t *testing.T) {
 	m, _ = send(m, tui.WaitsMsg{
 		TotalMS: 775170, // 12m55s
 		Categories: []tui.WaitCategory{
-			{Name: "Data I/O", WaitMS: 395329, Tasks: 496501}, // 6m35s
-			{Name: "Transaction log", WaitMS: 2785, Tasks: 1393}, // 2.8s
+			{Name: "Data I/O", WaitMS: 395329, Tasks: 496501},     // 6m35s
+			{Name: "Transaction log", WaitMS: 2785, Tasks: 1393},  // 2.8s
 			{Name: "Page latch (tempdb)", WaitMS: 220, Tasks: 26}, // 220ms
 		},
 	})

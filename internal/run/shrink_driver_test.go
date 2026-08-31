@@ -868,10 +868,14 @@ func (s *tempdbFakeServer) FileSpace(_ context.Context, fileType string) ([]mssq
 	return out, nil
 }
 
-func (s *tempdbFakeServer) FileSizeMB(_ context.Context, file string) (int, error) { return s.sizes[file], nil }
+func (s *tempdbFakeServer) FileSizeMB(_ context.Context, file string) (int, error) {
+	return s.sizes[file], nil
+}
 
-func (s *tempdbFakeServer) LogReuse(_ context.Context) (string, string, error) { return "SIMPLE", "NOTHING", nil }
-func (s *tempdbFakeServer) ActiveLogFloorMB(_ context.Context) (int, error)    { return 0, nil }
+func (s *tempdbFakeServer) LogReuse(_ context.Context) (string, string, error) {
+	return "SIMPLE", "NOTHING", nil
+}
+func (s *tempdbFakeServer) ActiveLogFloorMB(_ context.Context) (int, error) { return 0, nil }
 func (s *tempdbFakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
 	return nil, nil
 }
