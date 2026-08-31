@@ -52,7 +52,7 @@ But the don't monitor the execution like SqlGoPace do, and they don't dynamicall
 
 
 
-Think about the spec here, and analyze needs, good ideas, possibilities, dangers, best implémentations, and ask questions if needed. Then write a first spec file in the @specs/ folder. 
+Think about the spec here, and analyze needs, good ideas, possibilities, dangers, best implementations, and ask questions if needed. Then write a first spec file in the @specs/ folder. 
 
 
 

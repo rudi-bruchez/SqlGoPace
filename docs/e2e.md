@@ -85,6 +85,10 @@ dedicated test database — never a shared/sensitive one. The footprint is small
 
 ### Required permissions for the login
 
+For the full operation-by-operation reference and ready-to-run grant templates, see
+[`permissions.md`](permissions.md) and [`permissions/`](permissions/). What follows is
+what this test suite in particular needs.
+
 - On the test database: create/drop tables and indexes, and insert — in practice
   `db_ddladmin` + `db_datawriter` (or `db_owner` on that test database).
 - **`VIEW SERVER STATE`** (server level) — the monitoring connection reads
@@ -100,6 +104,8 @@ dedicated test database — never a shared/sensitive one. The footprint is small
   lacking `db_owner`/`sysadmin` now fails **preflight** with a clear `permissions`
   check (before any DBCC is issued), not with an opaque execution-time error. The
   same gate applies to `check_db` (DBCC CHECKDB also needs `db_owner`/`sysadmin`).
+- **`shrink_tempdb`** needs `sysadmin`, and only that: its DBCC runs in tempdb, so
+  `db_owner` of the connected database does not carry. Preflight gates it separately.
 
 ## What is covered
 
