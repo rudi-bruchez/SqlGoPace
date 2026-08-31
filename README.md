@@ -58,6 +58,7 @@ operations:
 It runs this, on SQL Server 2022 Enterprise:
 
 ```sql
+-- wrapped here for reading; the tool emits it on one line
 ALTER INDEX [IX_Orders_Date] ON [dbo].[Orders] REBUILD
   WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)),
         RESUMABLE = ON, DATA_COMPRESSION = PAGE);

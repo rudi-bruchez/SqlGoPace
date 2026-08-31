@@ -16,7 +16,7 @@ Ready to execute. The plan is well-structured, test-first, and faithful to the a
 - `reorgRCSIWarning` is pure and isolated in its own file with focused unit tests.
 - Engine wiring mirrors the existing `WithADR` pattern, and the warning emission point is specified precisely (after `emitStep`, before `e.runner.Run`).
 - `IMPLICIT_TRANSACTIONS OFF` is added to the existing `harden()` statement without changing the generator or adding config knobs.
-- Version bump (0.11.0 → 0.12.0) and doc update in `docs/REORGANIZE.md` are included.
+- Version bump (0.11.0 → 0.12.0) and doc update in `docs/reference/reorganize-locking.md` are included.
 - The CRLF/gofmt warning and the build/vet/test gate are correctly stated.
 
 ## Verification against the codebase
@@ -38,7 +38,7 @@ I checked the touch points the plan relies on:
    The plan inserts the warning immediately after the `sink` block and before `waitsBefore := e.snapshotWaits(ctx)`. That is before the `prepErr` check for blocking paused resumables. If `prepErr` prevents the reorg from running, the warning has already been emitted. This is harmless but slightly misleading. A safer insertion point is just before `runErr = e.runner.Run(...)`, after all preparation. Either is acceptable; pick one and make it explicit.
 
 3. Update `README.md` if reorg behavior is documented there.
-   The design spec §5 mentions adding a short line to `README.md` if reorg behavior is user-facing there. The plan only updates `docs/REORGANIZE.md`. Check `README.md` for a reorg/maintenance section and add a one-line note if present.
+   The design spec §5 mentions adding a short line to `README.md` if reorg behavior is user-facing there. The plan only updates `docs/reference/reorganize-locking.md`. Check `README.md` for a reorg/maintenance section and add a one-line note if present.
 
 4. Refresh the `ReactionLine` doc-comment in `internal/report/report.go`.
    The comment on `ReactionLine` currently says "a pause, resume, cancel, or fallback kill". Since `warn` and `info` events are now recorded here too, update the comment alongside the `ReactionEvent.Kind` comment update.
@@ -52,7 +52,7 @@ I checked the touch points the plan relies on:
 ## Nitpicks
 
 - The plan says `make lint` may flag pre-existing CRLF/gofmt noise repo-wide. Consider running `golangci-lint` on only the modified files to reduce noise, but the stated gate (build/vet/test) is sufficient.
-- The doc replacement paragraph in `docs/REORGANIZE.md` says "As of 0.12.0...". Verify no other paragraph in that file still floats the ShrinkRunner-style driver idea; search for "follow-up" or "ShrinkRunner" and clean up any leftovers.
+- The doc replacement paragraph in `docs/reference/reorganize-locking.md` says "As of 0.12.0...". Verify no other paragraph in that file still floats the ShrinkRunner-style driver idea; search for "follow-up" or "ShrinkRunner" and clean up any leftovers.
 
 ## Conclusion
 

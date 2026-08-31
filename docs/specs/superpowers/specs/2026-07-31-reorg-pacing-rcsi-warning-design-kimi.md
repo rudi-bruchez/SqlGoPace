@@ -14,7 +14,7 @@ Approved. The revised design resolves the two blockers from the first assessment
 3. `reorgRCSIWarning` now takes the database name, so the returned message is complete.
 4. The exact emission point for the RCSI warning is specified (after `emitStep`, before `e.runner.Run`).
 5. Existing `runLoop` test call sites are explicitly called out as requiring the new `reissue` argument.
-6. Version bump and doc updates (`docs/REORGANIZE.md`, `README.md`) are included.
+6. Version bump and doc updates (`docs/reference/reorganize-locking.md`, `README.md`) are included.
 
 ## Strengths of the revised design
 
@@ -34,7 +34,7 @@ I verified the relevant touch points:
 - `MonitoredRunner.runOnce` is the right place to construct the `reissue` closure for `ddl.ReorganizeIndex` only.
 - `cmd/sqlgopace/main.go` already wires `run.WithADR(info.ADREnabled)`; adding `run.WithRCSI(info.RCSIEnabled)` is symmetric.
 - `engine.go` constructs the per-step `sink` at line 600 and appends every `ReactionEvent` to `report.ReactionLine` at line 624, so the RCSI warning reaches the `.log` sidecar automatically.
-- `docs/REORGANIZE.md` already describes the locking mechanisms and the earlier ShrinkRunner-style driver suggestion; updating it to reflect the `runLoop` refinement is a small doc task.
+- `docs/reference/reorganize-locking.md` already describes the locking mechanisms and the earlier ShrinkRunner-style driver suggestion; updating it to reflect the `runLoop` refinement is a small doc task.
 
 ## Minor points for the implementation plan
 

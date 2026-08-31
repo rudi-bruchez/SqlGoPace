@@ -50,7 +50,7 @@ guard rail solves that by **measuring our own tempdb usage** before deciding to 
 - **Material contributor** = net held by our SPID above an absolute threshold (MB) **or** above a
   share of tempdb in use (configurable). Conservative default: an absolute threshold in MB.
 
-`VIEW SERVER STATE` (already required for monitoring, see `docs/e2e.md`) is enough for these reads.
+`VIEW SERVER STATE` (already required for monitoring, see `docs/testing.md`) is enough for these reads.
 
 ## 4. The accepted blind spot: the version store (RCSI)
 

@@ -19,7 +19,7 @@
 - **Tests:** `go test -race ./internal/run/...` runs with no database. `make vet` / `go build ./...` must stay green.
 - **Repo is CRLF.** Do not reformat existing files; edit surgically. Gate on build/vet/test, not `gofmt`-the-repo.
 - **Commit trailer:** end every commit message with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
-- Reference spec: `docs/specs/superpowers/specs/2026-07-31-reorg-pacing-rcsi-warning-design.md`. Background: `docs/REORGANIZE.md`.
+- Reference spec: `docs/specs/superpowers/specs/2026-07-31-reorg-pacing-rcsi-warning-design.md`. Background: `docs/reference/reorganize-locking.md`.
 
 ---
 
@@ -35,7 +35,7 @@
 - `cmd/sqlgopace/main.go` — **modify.** Pass `run.WithRCSI(info.RCSIEnabled)` next to `run.WithADR(...)`.
 - `internal/mssql/conn.go` — **modify.** Add `SET IMPLICIT_TRANSACTIONS OFF;` to `harden()`.
 - `internal/version/VERSION` — **modify.** `0.11.0` → `0.12.0`.
-- `docs/REORGANIZE.md` — **modify.** Correct the "follow-up driver" note; document paced behavior, the RCSI warning, and the hardening.
+- `docs/reference/reorganize-locking.md` — **modify.** Correct the "follow-up driver" note; document paced behavior, the RCSI warning, and the hardening.
 
 ---
 
@@ -650,7 +650,7 @@ EOF
 
 **Files:**
 - Modify: `internal/version/VERSION`
-- Modify: `docs/REORGANIZE.md`
+- Modify: `docs/reference/reorganize-locking.md`
 
 **Interfaces:** none.
 
@@ -662,10 +662,10 @@ Set `internal/version/VERSION` to:
 0.12.0
 ```
 
-- [ ] **Step 2: Correct and extend `docs/REORGANIZE.md`**
+- [ ] **Step 2: Correct and extend `docs/reference/reorganize-locking.md`**
 
 First grep the file for leftover follow-up-driver language so none survives:
-`grep -niE "follow-up|shrinkrunner|shrink driver's shape" docs/REORGANIZE.md`. Then, under
+`grep -niE "follow-up|shrinkrunner|shrink driver's shape" docs/reference/reorganize-locking.md`. Then, under
 "How SqlGoPace generates REORGANIZE today", replace the sentence that floats a
 ShrinkRunner-style follow-up driver ("turning it into a paced, cancel-and-reissue driver
 is the natural follow-up, and would reuse the shrink driver's shape") with the shipped
@@ -701,7 +701,7 @@ Expected: green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/version/VERSION docs/REORGANIZE.md README.md
+git add internal/version/VERSION docs/reference/reorganize-locking.md README.md
 git commit -m "$(cat <<'EOF'
 docs(reorganize): document paced yielding + RCSI warning; bump to 0.12.0
 

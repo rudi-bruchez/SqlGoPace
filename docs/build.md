@@ -87,5 +87,5 @@ Combine with the `-ldflags` override above to produce versioned release artifact
 
 ## See also
 
-- [`docs/e2e.md`](testing.md) — integration / end-to-end testing (Docker or Podman, or a remote
+- [`docs/testing.md`](testing.md) — integration / end-to-end testing (Docker or Podman, or a remote
   server).

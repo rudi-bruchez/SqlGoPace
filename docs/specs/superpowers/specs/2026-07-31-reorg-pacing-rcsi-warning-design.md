@@ -10,7 +10,7 @@ in PRODDB, clustered PK `PK_MEASUREMENT`) blocking ~20 queries in `LCK` waits.
 REORGANIZE is *online* but not *lock-free*: it compacts and reorders leaf pages under
 short-term page/row X locks, and under a busy workload those locks build a blocking
 chain. The table has no LOB columns, so `LOB_COMPACTION` was irrelevant — the block
-was pure rowstore leaf-page contention. See `docs/REORGANIZE.md` for the full
+was pure rowstore leaf-page contention. See `docs/reference/reorganize-locking.md` for the full
 mechanism analysis.
 
 Two gaps surfaced:
@@ -196,7 +196,7 @@ Illustrative output:
 
 ## 3. Connection hardening: `IMPLICIT_TRANSACTIONS OFF`
 
-`docs/REORGANIZE.md` identifies `IMPLICIT_TRANSACTIONS ON` as the most likely mechanism
+`docs/reference/reorganize-locking.md` identifies `IMPLICIT_TRANSACTIONS ON` as the most likely mechanism
 behind the motivating incident: with it on, a REORGANIZE holds every lock until the
 whole operation commits, turning short-term page locks into a sustained blocking chain.
 Pacing reduces the *impact* of that; setting the option off removes the *mechanism* for
@@ -256,7 +256,7 @@ All new decision logic lands in the pure core (no database):
   change.
 - **Version bump.** Bump `internal/version/VERSION` (per project convention — no build
   flags).
-- **Docs.** Update `docs/REORGANIZE.md`: replace its "paced, cancel-and-reissue driver
+- **Docs.** Update `docs/reference/reorganize-locking.md`: replace its "paced, cancel-and-reissue driver
   is the natural follow-up … shrink driver's shape" note with the actual decision (a
   `runLoop` refinement, no new driver), and document the RCSI warning + the
   `IMPLICIT_TRANSACTIONS OFF` hardening. Add a short line to `README.md` if reorg
@@ -270,7 +270,7 @@ All new decision logic lands in the pure core (no database):
   pause/resume path.
 - No dedicated paced reorg driver: `MonitoredRunner` already monitors, so the paced
   path is a `runLoop` refinement, not a new driver. (This reconciles the earlier
-  suggestion in `docs/REORGANIZE.md` of a ShrinkRunner-style driver — unnecessary given
+  suggestion in `docs/reference/reorganize-locking.md` of a ShrinkRunner-style driver — unnecessary given
   the existing monitoring.)
 - No per-database RCSI re-detection (the engine runs only same-database manifests, so
   the detected value already applies).

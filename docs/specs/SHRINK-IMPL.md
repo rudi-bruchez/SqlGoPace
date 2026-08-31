@@ -237,7 +237,7 @@ report contains the expected fields; data + log cases.
 - `README.md` (canonical reference): document `operation: shrink` (fields, data and log
   examples), the `shrink:` block of `config.yaml`, and the behavior (automatic TRUNCATEONLY,
   FULL log refusal, per-chunk progress).
-- `docs/e2e.md`: note the required permissions/context if different (shrink requires rights on
+- `docs/testing.md`: note the required permissions/context if different (shrink requires rights on
   the database; `VIEW SERVER STATE` already required for monitoring).
 - Calibrate the defaults empirically (§14 of the design) and adjust if needed.
 

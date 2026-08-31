@@ -20,9 +20,25 @@ make build          # -> bin/sqlgopace
 Requires Go 1.26 or later. [`build.md`](build.md) covers cross-compilation and how the
 version is embedded.
 
-The binary alone is not enough to run: you also need a `config.yaml`, the compatibility
-matrix `ddl_compatibility.yaml` (ships with the repository), and a login with the right
-grants. The next three steps cover exactly that.
+The binary alone is not enough to run. You also need three things that live in the
+repository and that `go install` does not put on your disk:
+
+- `ddl_compatibility.yaml`, the version and edition option matrix, which the tool reads at
+  startup and refuses to run without;
+- `config.yaml`, for which the repository's own file is a working starting point;
+- `.env.example`, the template for your secrets.
+
+So even on the `go install` path, fetch those three:
+
+```bash
+base=https://raw.githubusercontent.com/rudi-bruchez/SqlGoPace/main
+curl -O $base/ddl_compatibility.yaml
+curl -O $base/config.yaml
+curl -o .env.example $base/.env.example
+```
+
+Cloning gets you all three and the test suite with them, which is why the clone is the
+easier path for a first run.
 
 ## 2. Create the login
 
@@ -54,6 +70,11 @@ from the environment or from `.env`.
 cp .env.example .env
 $EDITOR .env            # DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD
 ```
+
+`DB_SERVER` goes into an ODBC-style `server=` keyword, so a non-default port is a **comma**,
+not a colon: `SQLPROD01,14433`, never `SQLPROD01:14433`. A colon is read as part of the host
+name and fails with `lookup SQLPROD01:14433: no such host`. A named instance uses a
+backslash, `SQLPROD01\SQL2022`.
 
 The `config.yaml` in the repository root is a working starting point. The only thing you
 must check before a first run is the queue directories, which are relative to where you
@@ -126,7 +147,14 @@ sqlgopace --config config.yaml --dry-run --explain 01.to_run/010_rebuild.yaml
 --     online = ON  (supported by target (auto))
 --     resumable = ON  (supported by target (auto))
 --     wait_at_low_priority = ON  (supported by target (auto))
+```
+
+A line only appears for an option the resolver had a decision to make about. When one is
+dropped, the reason comes with it, message number included:
+
+```
 --     sort_in_tempdb = OFF  (omitted: SORT_IN_TEMPDB cannot be combined with RESUMABLE (Msg 11438))
+--     resumable = OFF  (omitted: RESUMABLE is not supported in tempdb (Msg 11439))
 ```
 
 ## 6. Run it

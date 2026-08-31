@@ -29,7 +29,7 @@ make e2e CONTAINER=podman COMPOSE="podman compose"
 ```
 
 These tests mutate the target database. Point the DSN at a throwaway instance,
-never at anything you care about. `docs/e2e.md` covers the login the suite needs
+never at anything you care about. `docs/testing.md` covers the login the suite needs
 and `docs/permissions.md` covers permissions generally.
 
 If your change fixes a bug that only shows when the tool runs, the fix needs an

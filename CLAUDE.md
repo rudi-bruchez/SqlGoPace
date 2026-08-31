@@ -37,7 +37,7 @@ make e2e CONTAINER=podman COMPOSE="podman compose"   # Podman instead of Docker
 ```
 
 The e2e tests **mutate the target database** (create/drop `dbo.sqlgopace_e2e`). Point the DSN
-at a throwaway DB. See `docs/e2e.md` for required login permissions (`VIEW SERVER STATE` is
+at a throwaway DB. See `docs/testing.md` for required login permissions (`VIEW SERVER STATE` is
 mandatory for monitoring).
 
 ## Conventions (non-obvious, enforced)
