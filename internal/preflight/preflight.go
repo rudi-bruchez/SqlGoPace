@@ -267,12 +267,20 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 		// advisory on how lock escalation / the tempdb version store will behave.
 		if b, ok := op.(ddl.BatchDML); ok {
 			if tableExists {
-				perm := dmlPermissionFor(b)
-				has, err := p.HasDMLPermission(ctx, b.Schema, b.Table, perm)
-				if err != nil {
-					return Report{}, fmt.Errorf("preflight dml permission %s.%s: %w", b.Schema, b.Table, err)
+				// SELECT is needed too, and unconditionally: every batch is an
+				// UPDATE/DELETE TOP (n), the key_range walk reads the key with its own
+				// SELECT MAX, and a predicate reads the columns it filters on. A login
+				// with db_datawriter but not db_datareader passes the UPDATE check and
+				// then fails mid-run with "The SELECT permission was denied", which is
+				// the opaque error this check exists to pre-empt. Measured against
+				// SQL Server 2022 CU26, with and without a where clause.
+				for _, perm := range []string{dmlPermissionFor(b), "SELECT"} {
+					has, err := p.HasDMLPermission(ctx, b.Schema, b.Table, perm)
+					if err != nil {
+						return Report{}, fmt.Errorf("preflight dml permission %s.%s: %w", b.Schema, b.Table, err)
+					}
+					rep.add(CheckBatchDMLPermission(b, perm, has))
 				}
-				rep.add(CheckBatchDMLPermission(b, perm, has))
 			}
 			rep.add(CheckBatchDMLIsolation(info, b))
 		}
