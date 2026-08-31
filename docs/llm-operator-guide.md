@@ -7,7 +7,9 @@ explain usage, and warn about what to verify first.
 
 This file is provider-agnostic: paste it into any chat, index it for RAG, or load it
 as a Claude Code skill. It is the source of truth for the manifest format; when in
-doubt defer to `README.md` (canonical user reference) and `docs/specs/`.
+doubt defer to the human documentation in [`docs/`](README.md), in particular
+[`manifests.md`](manifests.md), [`operations.md`](operations.md) and
+[`blocking-and-kills.md`](blocking-and-kills.md).
 
 ---
 
@@ -68,7 +70,7 @@ operations:                # required; at least one; run SEQUENTIALLY, in order
 
 ---
 
-## 3. Operation catalog (the only valid `operation:` values)
+## 3. Operation catalog (the only 16 valid `operation:` values)
 
 | `operation` | T-SQL | Required fields | Optional / notes |
 |---|---|---|---|
@@ -84,6 +86,8 @@ operations:                # required; at least one; run SEQUENTIALLY, in order
 | `drop_constraint` | `ALTER TABLE DROP CONSTRAINT` | `schema`, `table`, `constraint` | — |
 | `update_statistics` | `UPDATE STATISTICS` | `schema`, `table` | `statistic` (empty = all on table); at most one of `full_scan: true`, `sample_percent: 1..100`, `resample: true`. |
 | `check_db` | `DBCC CHECKDB` | `database` | Database-scoped (no schema/table). `physical_only`, `data_purity`; `options.maxdop`. |
+| `batch_update` | `UPDATE TOP (n)` in a committing loop | `schema`, `table`, one of `set`/`set_raw`, and a predicate | `where` (list of `column`/`op`/`value`, AND-ed; ops `= <> < <= > >= is null is not null`) or `where_raw`; `batch.strategy: predicate\|key_range`, `batch.key`, `batch.initial_rows`; `confirm_full_table` required with no predicate. Needs SELECT **and** UPDATE. |
+| `batch_delete` | `DELETE TOP (n)` in a committing loop | `schema`, `table`, a predicate | Same predicate and batch fields; takes no `set`. Needs SELECT **and** DELETE. |
 | `shrink` | `DBCC SHRINKFILE` (chunked) | `type` (`data`\|`log`), `targetfreespace` | `files` (`all` or a logical file name; default `all`); `targetfreespace: "10%"` or `"100MB"`. Only WALP is relevant. |
 | `shrink_tempdb` | `DBCC SHRINKFILE` (chunked, per tempdb data file) | `targetsizemb` (per-file MB) | Database-scoped (no schema/table). `flushcaches` (opt-in cache-flush escalation on persistent stall). Only WALP is relevant (2022+); resolves `ABORT_AFTER_WAIT = SELF` only — tempdb never kills a blocking session. |
 
@@ -272,9 +276,13 @@ Before a real run, verify and call out:
   not a missing table.
 - **Right database.** Confirm `database:` (or the connection's DB) is the intended one,
   especially on multi-DB servers.
-- **No resume across a kill (current limitation).** If interrupted, an offline rebuild
-  rolls back fully and is re-run from scratch on the next run; a multi-op manifest re-runs
-  from the start (idempotent but redoes completed work). See `docs/specs/crash-resumable.md`.
+- **What a re-run repeats depends on how the last one ended.** A crash, a Ctrl+C drain or
+  a closing window leaves the manifest in `02.processing/` with a resume cursor, and the next
+  run continues at the first unfinished operation; a paused resumable index build is
+  continued with `ALTER INDEX … RESUME` rather than rebuilt. A *failure* under the default
+  `on_failure: stop` is different: the manifest goes to `04.failed/` and a re-run replays it
+  from operation 1. Use `on_failure: continue` to get a recovery manifest holding only the
+  failed operations. See [`running.md`](running.md).
 - **Heaps & special indexes.** Heap rebuilds never get RESUMABLE/WALP. Columnstore/XML/
   spatial indexes use a different model and are excluded from rowstore compression.
 - **Shrink is heavy and fragments indexes.** Only suggest `shrink` to reclaim genuinely
@@ -284,7 +292,7 @@ Before a real run, verify and call out:
 
 ## 9. Recipe: natural language → manifest
 
-1. **Identify the intent** and map it to one of the 14 operations (§3). If it does not map,
+1. **Identify the intent** and map it to one of the 16 operations (§3). If it does not map,
    say so plainly.
 2. **Collect the targets**: schema, table, and index/column/constraint names. If the user
    pasted scripted DDL (e.g. `ALTER INDEX [ix] ON [dbo].[T] REBUILD WITH (DATA_COMPRESSION = PAGE)`),
@@ -364,8 +372,10 @@ operations:
 
 ## 10. Deeper references
 
-- `README.md` — canonical user reference (manifest format, flags, subcommands).
-- `ddl_compatibility.yaml` — the version × edition option matrix.
-- `maintenance_profile.yaml` + `docs/specs/MAINTENANCE.md` — the `plan` (auto-maintenance) path.
-- `docs/specs/SPECS.md`, `docs/specs/SHRINK.md`, `docs/specs/crash-resumable.md` — design details and limits.
-- `docs/e2e.md` — required login permissions for a live run.
+- [`docs/manifests.md`](manifests.md) and [`docs/operations.md`](operations.md) — the manifest format and every operation's fields.
+- [`docs/running.md`](running.md) — modes, flags, the queue, and what a re-run repeats.
+- [`docs/blocking-and-kills.md`](blocking-and-kills.md) — the reaction hierarchy and the three session-policy features.
+- [`docs/permissions.md`](permissions.md) — the grants each operation needs, with templates.
+- [`docs/shrink.md`](shrink.md) and [`docs/maintenance-planner.md`](maintenance-planner.md) — the two multi-statement drivers and the planner.
+- `ddl_compatibility.yaml` and [`docs/compatibility-matrix.md`](compatibility-matrix.md) — the version × edition option matrix.
+- [`docs/specs/`](specs/) — design documents, the source of truth for intended behaviour.

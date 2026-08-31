@@ -452,7 +452,7 @@ run report, listing the objects it held a `Sch-M` lock on while blocking others 
 confirmed tail blockers. The `.log` report carries a one-line pointer to it. `sqlgopace plan --confirmed <path>`
 reads the sidecar back into the next pre-shrink pass, prioritizing those objects' reorganizes and
 marking matching heap advisories `CONFIRMED`. Full design in
-[`docs/specs/superpowers/specs/2026-07-28-contended-object-capture-design.md`](../docs/specs/superpowers/specs/2026-07-28-contended-object-capture-design.md).
+[`docs/specs/superpowers/specs/2026-07-28-contended-object-capture-design.md`](superpowers/specs/2026-07-28-contended-object-capture-design.md).
 
 ## 10. Recovery / re-entrancy
 

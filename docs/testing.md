@@ -1,4 +1,4 @@
-# End-to-end & integration testing
+# Testing
 
 Most of SqlGoPace is unit-tested without a database (the pure DDL core, option
 resolution, reaction logic, queue, recovery decisions, report rendering). The
@@ -8,6 +8,21 @@ by **integration tests** guarded by the `integration` build tag, plus an
 **end-to-end test** that drives the real CLI run path.
 
 These tests are skipped unless `SQLGOPACE_TEST_DSN` is set.
+
+## Unit tests, no database
+
+```bash
+make test     # go test -race ./...
+make vet
+make lint     # golangci-lint, config in .golangci.yml
+gofmt -l .    # must print nothing
+```
+
+This is the suite to run while working. It needs nothing but Go, and it covers the
+generation pipeline, option resolution, the reaction and recovery decisions, the queue and
+the report rendering. [`../CONTRIBUTING.md`](../CONTRIBUTING.md) also explains how to run
+the CI workflow itself locally with `act`, which is worth doing before touching
+`.github/workflows/` or `.golangci.yml`.
 
 ## Quick start (Docker)
 
