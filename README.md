@@ -1,5 +1,6 @@
 # SqlGoPace
 
+[![Release](https://img.shields.io/github/v/release/rudi-bruchez/SqlGoPace?label=release)](https://github.com/rudi-bruchez/SqlGoPace/releases/latest)
 [![CI](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml)
 [![SQL Server](https://img.shields.io/badge/SQL%20Server-2016%2B-0078D4.svg)](https://learn.microsoft.com/en-us/sql/sql-server)
 [![Azure SQL DB](https://img.shields.io/badge/Azure%20SQL-Database-0078D4.svg)](https://learn.microsoft.com/en-us/azure/azure-sql/database/sql-database-paas-overview)
