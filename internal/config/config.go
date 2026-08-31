@@ -11,10 +11,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/joho/godotenv"
 	"gopkg.in/yaml.v3"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+	"github.com/rudi-bruchez/SqlGoPace/internal/dotenv"
 )
 
 // ErrInvalidConfig is returned for a structurally valid YAML that violates a
@@ -335,7 +335,7 @@ func Parse(data []byte) (*Config, error) {
 // Load reads a config file, expanding a best-effort .env from the working
 // directory first (existing environment variables take precedence).
 func Load(path string) (*Config, error) {
-	_ = godotenv.Load() // .env is optional
+	_ = dotenv.Load(".env") // .env is optional; a real env var wins over it
 
 	data, err := os.ReadFile(path)
 	if err != nil {
