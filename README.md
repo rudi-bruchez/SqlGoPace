@@ -1025,6 +1025,23 @@ make e2e CONTAINER=podman COMPOSE="podman compose"
 
 See [`docs/e2e.md`](docs/e2e.md) for details.
 
+## Contributing
+
+Pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build and
+test commands, how to run the suite against a real server, and the conventions that
+are not obvious from the code: manifest-driven rather than raw SQL, no query timeout,
+measured claims, and never committing an identifier from a real engagement.
+
+For a security problem, see [`SECURITY.md`](SECURITY.md) rather than opening an issue.
+It also describes what privileges the tool holds and where its trust boundary sits,
+which is worth reading before you point it at a production server.
+
+[`CHANGELOG.md`](CHANGELOG.md) records notable changes.
+
 ## License
 
-MIT.
+MIT. See [`LICENSE`](LICENSE).
+
+`docs/ShrinkDriver.ps1` is not part of SqlGoPace: it is Microsoft's own
+`Invoke-ShrinkDriver` sample, kept here as the reference the shrink driver was
+designed against, under its own MIT licence and with its authorship header intact.
