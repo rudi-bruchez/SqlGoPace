@@ -53,6 +53,9 @@ func cli(stdout, stderr io.Writer, args []string) error {
 	if len(args) > 0 && args[0] == "plan" {
 		return runPlan(stdout, stderr, args[1:])
 	}
+	if len(args) > 0 && args[0] == "init" {
+		return runInit(stdout, stderr, args[1:])
+	}
 
 	fs := flag.NewFlagSet("sqlgopace", flag.ContinueOnError)
 	fs.SetOutput(stderr)

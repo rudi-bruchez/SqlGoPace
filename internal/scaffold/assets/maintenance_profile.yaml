@@ -1,0 +1,65 @@
+# maintenance_profile.yaml
+# Decision rules for SqlGoPace's maintenance mode (see docs/specs/MAINTENANCE.md §5).
+# Thresholds and policy are data, not code: tuning these never requires a rebuild.
+# Object overrides match a glob on "schema.table" and the first match wins.
+
+index:
+  page_count_floor: 1000           # skip indexes smaller than this (Ola default)
+  reorganize_from_percent: 5       # frag 5–30%  → REORGANIZE
+  rebuild_from_percent: 30         # frag > 30%  → REBUILD
+  rebuild_max_size_mb: 51200       # 50 GB; above this a REBUILD is downgraded per rebuild_over_ceiling
+  rebuild_over_ceiling: reorganize # reorganize | skip
+  lob_compaction: true             # WITH (LOB_COMPACTION = ON) on REORGANIZE
+
+compression:
+  enabled: true
+  page_min_extra_gain_percent: 10  # PAGE must save ≥10% more than ROW, else ROW
+  min_gain_percent: 5              # below this saving vs current → NONE (no rebuild for compression)
+  write_intensive_ratio: 0.30      # writes / total access above this → cap at write_intensive_compression
+  write_intensive_compression: row # row | none — cap applied to hot objects
+  activity_floor: 1000             # min total access since restart before write_ratio is trusted
+  per_partition: true              # decide each partition independently
+  # Restrict which objects the compression heuristic may change. Globs match a whole
+  # table ("schema.table") or a single index ("schema.table.index"); exclude wins.
+  # This governs ONLY compression — fragmented objects are still reorganized/rebuilt,
+  # and an explicit `compression:` override below is always honored. Leave both empty
+  # to consider every eligible object.
+  objects:
+    include: []                    # allowlist: empty = all; e.g. ["dbo.BigFact", "dbo.Orders.IX_Orders_Date"]
+    exclude: []                    # denylist: e.g. ["dbo.HOT_*", "dbo.Orders.PK_Orders"]
+
+heap:
+  enabled: true
+  min_size_mb: 10                  # skip heaps smaller than this
+  max_size_mb: 10000               # skip heaps larger than this (needs a maintenance window)
+  forwarded_record_percent: 10     # rebuild when forwarded_record_count / record_count ≥ this
+  fragmentation_percent: 15        # OR avg_fragmentation_in_percent ≥ this
+  free_space_deviation_percent: 30 # OR (100 − avg_page_space_used_in_percent) ≥ this
+  online: null                     # null = auto (matrix); true/false to force
+
+statistics:
+  enabled: true
+  sample: fullscan                 # fullscan | { percent: 30 }
+  modification_percent: null       # null = dynamic (sqrt(1000*rows)); else update at this % of rows
+
+checkdb:
+  enabled: true
+  databases: []                    # empty = the connection's database only
+  physical_only: false
+  data_purity: false
+  maxdop: null                     # null = server default
+
+# Server-wide scope, consulted only with --all-databases (multi-database mode, §17).
+# Globs on database name; exclude wins. Empty include = all eligible user databases.
+scope:
+  databases:
+    include: ["*"]
+    exclude: []                    # e.g. ["*_archive", "*_test"]
+
+overrides:
+  - match: "dbo.AUDIT_*"
+    rebuild: forbid                # never REBUILD these; REORGANIZE only
+  - match: "dbo.STAGING"
+    skip: true                     # exclude entirely from maintenance
+  - match: "dbo.DISPATCH"
+    compression: page              # pin compression; bypass the gain/write-intensity heuristic

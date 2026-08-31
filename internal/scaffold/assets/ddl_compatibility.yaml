@@ -1,0 +1,91 @@
+# ddl_compatibility.yaml
+# DDL option compatibility matrix by version (ProductMajorVersion) and edition.
+#
+# Resolution: an option is APPLICABLE for an operation if
+#   target_major >= min_major  AND  target_tier ∈ editions
+# Dependencies are expressed via `requires` (e.g. resumable requires online).
+#
+# Edition tiers (derived from SERVERPROPERTY('EngineEdition')):
+#   2 -> standard | 3 -> enterprise (Enterprise/Developer/Evaluation) | 4 -> express
+#   5 -> azure (SQL Database) | 8 -> azure (Managed Instance)   <- evergreen, pseudo-major 9999
+# Unsupported editions: 6/9/11/12 (Synapse / SQL Edge / Fabric).
+
+major_to_year:
+  13: 2016
+  14: 2017
+  15: 2019
+  16: 2022
+  17: 2025
+
+azure_pseudo_major: 9999          # applied when EngineEdition ∈ {5, 8}
+
+commands:
+
+  rebuild_index:                  # ALTER INDEX ... REBUILD
+    online:               { min_major: 9,  editions: [enterprise, azure] }                       # 2005
+    wait_at_low_priority: { min_major: 12, editions: [enterprise, azure], requires: [online] }   # 2014
+    resumable:            { min_major: 14, editions: [enterprise, azure], requires: [online] }   # 2017
+    sort_in_tempdb:       { min_major: 9,  editions: [enterprise, standard, azure] }
+    data_compression:     { min_major: 10, editions: [enterprise, azure] }                       # 2008
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
+
+  create_index:                   # CREATE [UNIQUE] INDEX
+    online:               { min_major: 9,  editions: [enterprise, azure] }                       # 2005
+    resumable:            { min_major: 15, editions: [enterprise, azure], requires: [online] }   # 2019
+    wait_at_low_priority: { min_major: 16, editions: [enterprise, azure], requires: [online] }   # 2022
+    sort_in_tempdb:       { min_major: 9,  editions: [enterprise, standard, azure] }
+    data_compression:     { min_major: 10, editions: [enterprise, azure] }
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
+
+  alter_column:                   # ALTER TABLE ALTER COLUMN
+    online:               { min_major: 13, editions: [enterprise, azure] }                       # 2016
+    # WAIT_AT_LOW_PRIORITY is NOT supported with ONLINE ALTER COLUMN, on any version.
+
+  add_column:                     # ALTER TABLE ADD <column>
+    # No injectable option. Speed depends on whether it is metadata-only (constant default,
+    # Enterprise edition, table type/compression) — assessed at preflight, never injected.
+    {}
+
+  add_constraint:                 # ALTER TABLE ADD CONSTRAINT (PRIMARY KEY / UNIQUE)
+    online:               { min_major: 13, editions: [enterprise, azure] }
+    resumable:            { min_major: 16, editions: [enterprise, azure], requires: [online] }   # 2022
+
+  drop_index:        {}
+  drop_column:       {}
+  drop_constraint:   {}
+
+  reorganize_index:  {}             # ALTER INDEX ... REORGANIZE: always online, no injectable options
+                                    # (LOB_COMPACTION is a rule-driven switch, not version-gated)
+
+  update_statistics: {}             # UPDATE STATISTICS: FULLSCAN/SAMPLE come from the rules, not the matrix
+
+  check_db:                         # DBCC CHECKDB
+    maxdop:               { min_major: 12, editions: [enterprise, standard, azure] }   # DBCC ... MAXDOP, 2014
+    # NO_INFOMSGS / ALL_ERRORMSGS / PHYSICAL_ONLY / DATA_PURITY are behavioural switches, not capabilities.
+
+  rebuild_heap:                     # ALTER TABLE ... REBUILD (heap)
+    online:               { min_major: 13, editions: [enterprise, azure] }             # ONLINE heap rebuild, 2016
+    data_compression:     { min_major: 10, editions: [enterprise, azure] }
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
+    # NB: no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap rebuild, on any version.
+
+  shrink_data:                      # DBCC SHRINKFILE on a data file (.mdf/.ndf)
+    # WAIT_AT_LOW_PRIORITY for shrink is 2022+ and, unlike online-index WALP, is NOT
+    # Enterprise-gated: DBCC SHRINKFILE runs on every edition. No `requires: [online]`
+    # either — DBCC has no ONLINE clause. Applies to data files only (Sch-M on IAM pages).
+    wait_at_low_priority: { min_major: 16, editions: [enterprise, standard, express, azure] }  # 2022
+
+  shrink_log:        {}             # DBCC SHRINKFILE on a log file: no injectable option.
+                                    # WALP does not apply to log files (VLF truncation, no IAM Sch-M).
+
+  shrink_tempdb:                    # DBCC SHRINKFILE on a tempdb data file
+    # Same WAIT_AT_LOW_PRIORITY gating as shrink_data (2022+, all editions). ABORT_AFTER_WAIT
+    # is always SELF for tempdb, regardless of policy — enforced in resolve.go, not the matrix.
+    wait_at_low_priority: { min_major: 16, editions: [enterprise, standard, express, azure] }  # 2022
+
+  batch_update:                     # chunked UPDATE (run in batches by the runtime driver)
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, express, azure] }  # OPTION (MAXDOP n)
+    # No ONLINE/RESUMABLE/WAIT_AT_LOW_PRIORITY: those are index/table DDL options, not DML.
+
+  batch_delete:                     # chunked DELETE (run in batches by the runtime driver)
+    maxdop:               { min_major: 9,  editions: [enterprise, standard, express, azure] }  # OPTION (MAXDOP n)

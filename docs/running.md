@@ -29,6 +29,23 @@ recording every statement, decision and reaction.
 A run opens one engine per database the queue targets, sequentially, so at most one heavy
 DDL runs server-wide at a time.
 
+## Setting up a directory
+
+`init` writes everything a run needs into the current directory, or into `--dir`:
+
+```bash
+sqlgopace init
+```
+
+That is `config.yaml`, `ddl_compatibility.yaml`, `maintenance_profile.yaml`, a
+`.env.example`, the four queue directories, and an example manifest disabled by a leading
+dot. The templates are compiled into the binary, so a downloaded executable is enough; no
+clone, no network.
+
+It never overwrites: an existing file is reported and left alone, which makes it safe to
+re-run against a directory you have already configured. `--force` restores the shipped
+template over what is there.
+
 ## Modes
 
 ```bash

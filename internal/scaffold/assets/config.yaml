@@ -1,0 +1,122 @@
+# config.yaml — SqlGoPace configuration
+# Secrets (passwords, etc.) are NEVER stored in plaintext here: they come from the .env file
+# and are injected via ${VARIABLE}. See .env.example.
+
+database:
+  # The connection string references environment variables (.env). For Windows / Azure AD auth:
+  # remove user id/password and add "trusted connection" / the auth mode appropriate for the driver.
+  # The app version is appended to "app name" automatically (e.g. SqlGoPace/0.1.0), so the running
+  # build is visible server-side in sys.dm_exec_sessions.program_name.
+  connection_string: "server=${DB_SERVER};database=${DB_NAME};user id=${DB_USER};password=${DB_PASSWORD};encrypt=true;trustServerCertificate=true;app name=SqlGoPace"
+  login_timeout_seconds: 15      # connection only — NOT a query timeout
+  # Driver query timeout = 0 (infinite): no global timeout on a DDL statement.
+  # Duration control is delegated to monitoring (blocking / log), never a fixed timer.
+
+directories:
+  to_run:     "./01.to_run"
+  processing: "./02.processing"
+  done:       "./03.done"
+  failed:     "./04.failed"
+
+monitoring:
+  blocking_poll_seconds: 10
+  log_poll_seconds: 60
+  progress_poll_seconds: 30
+  log_max_size_bytes: 53687091200   # 50 GB — absolute ceiling (bounded by the log files' max_size)
+  log_max_percent: 80               # secondary
+  blocking_timeout_minutes: 1       # delay before reacting when our DDL blocks other sessions
+  log_drain_timeout_minutes: 30     # give up if the log does not drain
+  max_retry_attempts: 1            # Standard: a blocked offline rebuild is quarantined fast (2 attempts, not 4)
+  kill_grace_seconds: 30            # delay before an explicit KILL if the Go cancellation does not take effect
+  reconnect_timeout_minutes: 2      # wait this long for the server to come back before classifying an interruption
+  checkpoint_between_operations: false  # only has an effect under SIMPLE recovery model
+
+preflight:
+  require_data_free_space: true     # requires ≈ the object's size free in the filegroup
+  check_tempdb: true
+  ag_send_queue_warn: true          # warns but does not block (configurable)
+
+options_override:
+  online:               { force: null }   # true / false / null(auto)
+  resumable:            { force: null }
+  wait_at_low_priority: { force: null }
+  maxdop:               { force: null }
+  sort_in_tempdb:       { force: null }
+  allow_abort_blockers: false        # DANGEROUS: allows ABORT_AFTER_WAIT = BLOCKERS
+  wait_max_duration_minutes: 1       # MAX_DURATION for WAIT_AT_LOW_PRIORITY
+
+notifications:
+  webhook_url: "${WEBHOOK_URL}"      # empty = disabled
+  on_events: [cancel, fail, pause, abort, run_failure]
+  # Optional email channel. Shares on_events with the webhook. Empty host = disabled.
+  # email:
+  #   host: "smtp.internal.example"
+  #   port: 25
+  #   from: "sqlgopace@example.com"
+  #   to: ["dba-team@example.com"]
+  #   username: ""            # empty = anonymous relay
+  #   password: "${SMTP_PASS}"
+  #   starttls: false
+
+history:
+  enabled: true
+  destination: "sqlite://./sqlgopace_history.db"
+
+# Tuning for the `shrink` operation (DBCC SHRINKFILE). Entirely OPTIONAL: omit the
+# whole block and every field below takes its default. Global only (never per-manifest)
+# — these depend on the instance's storage and SLA. They are starting points and bounds
+# the driver's dynamic calibration varies, so usually left untouched.
+shrink:
+  target_chunks:         1000   # aim to finish in ~this many chunks: initial step = reclaim / target_chunks
+  max_step_pct_of_file:     5    # per-file chunk ceiling as a percent of the file (0 disables)
+  initial_step_small_mb:  100   # legacy tier (used only when target_chunks <= 0): reclaim < 5 GB
+  initial_step_medium_mb: 250   # legacy tier: 5–50 GB
+  initial_step_large_mb:  500   # legacy tier: > 50 GB
+  min_step_mb:             50    # chunk floor
+  max_step_mb:           8192    # absolute chunk ceiling
+  target_batch_seconds:     5    # aim each chunk at a few seconds
+  max_no_progress:          3    # consecutive no-gain chunks before a clean stop
+  no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
+  no_progress_backoff_max_seconds: 300   # backoff ceiling
+  self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
+  log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
+
+# Tuning for batched DML (`batch_update` / `batch_delete`). Entirely OPTIONAL: omit the
+# whole block and every field takes its default. Global only — starting points and bounds
+# the driver's adaptive sizing varies. escalation_cap_rows is the batch ceiling applied
+# when the database has RCSI off, to stay below the ~5000-lock table-escalation threshold
+# that would otherwise freeze readers.
+batch_dml:
+  initial_small_rows:    1000    # estimated table < 100k rows
+  initial_medium_rows:   5000    # 100k–1M rows
+  initial_large_rows:   20000    # > 1M rows
+  min_rows:               100    # batch floor
+  max_rows:            100000    # batch ceiling (RCSI on)
+  escalation_cap_rows:   4000    # batch ceiling when RCSI is off
+  target_batch_seconds:     5    # aim each batch at a few seconds
+  self_wait_timeout_minutes: 5   # max total wait while stopped under pressure before a clean stop
+
+# Selective blocker-kill policy. When enabled, sessions that block a running operation and
+# match a manifest's kill_blocking_sessions rule are KILLed once they have blocked for the
+# rule's delay (after_seconds; 0 = on sight). Killing is destructive, so it is OFF by
+# default; preflight WARNS (does not fail) if the login lacks ALTER ANY CONNECTION. The
+# match rules live per-manifest (hot-reloadable; the TUI's "X" key appends to them without a
+# restart). This is finer-grained than allow_abort_blockers, works on every edition, and —
+# unlike WAIT_AT_LOW_PRIORITY — needs no SQL 2022.
+kill_blockers:
+  enabled: true                # master arm; kills only happen when true
+  default_after_seconds: 60    # delay applied to a rule that sets no after_seconds
+
+# Terminate maintenance statements this run's operation blocks once other sessions
+# have queued behind them. An online REORGANIZE stops being online the moment a
+# Sch-M request (UPDATE STATISTICS, ALTER INDEX, TRUNCATE TABLE, ...) queues behind
+# it: every reader arriving afterwards queues behind that request rather than
+# barging past. Off by default. Requires ALTER ANY CONNECTION, and SELECT on
+# msdb.dbo.sysjobs to name the SQL Agent job (optional; attribution degrades without it).
+kill_amplifying_maintenance:
+  enabled: false
+  min_blocked_behind: 1   # sessions queued behind the victim before it counts as an amplifier
+  after_seconds: 60       # how long it must stay eligible before the KILL
+  commands: []            # empty = the built-in allow-list; a non-empty list REPLACES it
+
+matrix_file: "./ddl_compatibility.yaml"

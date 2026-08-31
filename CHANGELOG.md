@@ -51,6 +51,13 @@ history, so a report can always name the build that produced it.
 
 ### Added
 
+- `sqlgopace init` scaffolds a working directory: `config.yaml`, the
+  compatibility matrix, the maintenance profile, a `.env.example`, the four queue
+  directories and a disabled example manifest. The templates are embedded in the
+  binary, so a downloaded executable is self-sufficient; installing used to mean
+  fetching three YAML files by hand before anything could run. It never
+  overwrites without `--force`, since an edited `config.yaml` is the one thing in
+  the directory that cannot be regenerated.
 - A documentation tree under `docs/`, split by the question a reader arrives with:
   getting started, the manifest format, the operations, running, configuration,
   blocking and kills, shrink, the maintenance planner and the compatibility

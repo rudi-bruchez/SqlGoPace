@@ -129,13 +129,23 @@ sqlgopace --config config.yaml --dry-run --explain 01.to_run/010_rebuild.yaml
 
 ## Install
 
+Grab the archive for your platform from the
+[releases page](https://github.com/rudi-bruchez/SqlGoPace/releases), or build it yourself:
+
 ```bash
 go install github.com/rudi-bruchez/SqlGoPace/cmd/sqlgopace@latest
 ```
 
-Requires Go 1.26 or later. Running it also needs a `config.yaml`, the compatibility matrix
-that ships with the repository, and a login holding `VIEW SERVER STATE` plus the grants for
-the operations you use.
+Then lay down a working directory. The configuration templates and the compatibility matrix
+are compiled into the binary, so this needs no network and no clone:
+
+```bash
+mkdir sqlgopace && cd sqlgopace
+sqlgopace init
+```
+
+Building from source requires Go 1.26 or later. Running against a server also needs a login
+holding `VIEW SERVER STATE` plus the grants for the operations you use.
 
 [Getting started](docs/getting-started.md) walks the whole path, login included, in about
 fifteen minutes.

@@ -1,0 +1,29 @@
+# Example manifest — see docs/specs/SPECS.md §1 for the full schema.
+# One file = one logical task = a list of operations executed SEQUENTIALLY.
+# Options left empty (online / resumable / wait_at_low_priority / maxdop / sort_in_tempdb)
+# are injected automatically based on version + edition + matrix (ddl_compatibility.yaml).
+
+description: "Recompress DISPATCH indexes + add a tracking column"
+database: MYDB          # optional: otherwise the database from the connection string
+
+operations:
+
+  # 1) Index rebuild with PAGE compression.
+  #    The tool will inject ONLINE / RESUMABLE / WAIT_AT_LOW_PRIORITY if the target supports them.
+  - operation: rebuild_index
+    schema: dbo
+    table: DISPATCH
+    index: IX_DISPATCH        # or "ALL" to rebuild every index on the table
+    data_compression: PAGE
+    options:
+      maxdop: 4              # explicit override for THIS operation
+
+  # 2) Add a NOT NULL column with a constant default.
+  #    On Enterprise this is a metadata-only operation (reported at preflight, see §1.4).
+  - operation: add_column
+    schema: dbo
+    table: DISPATCH
+    column: PROCESSED
+    type: BIT
+    nullable: false
+    default: 0

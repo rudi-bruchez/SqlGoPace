@@ -5,6 +5,13 @@ deciding which index to point it at.
 
 ## 1. Install
 
+Download the archive for your platform from the
+[releases page](https://github.com/rudi-bruchez/SqlGoPace/releases), unpack it, and put
+`sqlgopace` somewhere on your `PATH`. Builds are published for Linux, macOS and Windows,
+on Intel and ARM, with a `sha256` checksum file next to them.
+
+With a Go toolchain, `go install` works too:
+
 ```bash
 go install github.com/rudi-bruchez/SqlGoPace/cmd/sqlgopace@latest
 ```
@@ -17,30 +24,30 @@ cd SqlGoPace
 make build          # -> bin/sqlgopace
 ```
 
-Requires Go 1.26 or later. [`build.md`](build.md) covers cross-compilation and how the
-version is embedded.
+Building from source requires Go 1.26 or later. [`build.md`](build.md) covers
+cross-compilation and how the version is embedded.
 
-The binary alone is not enough to run. You also need three things that live in the
-repository and that `go install` does not put on your disk:
+## 2. Initialize a working directory
 
-- `ddl_compatibility.yaml`, the version and edition option matrix, which the tool reads at
-  startup and refuses to run without;
-- `config.yaml`, for which the repository's own file is a working starting point;
-- `.env.example`, the template for your secrets.
-
-So even on the `go install` path, fetch those three:
+The tool reads its compatibility matrix and its configuration from disk at startup, and
+refuses to run without them. `init` writes them, along with the queue directories, into
+whatever directory you point it at:
 
 ```bash
-base=https://raw.githubusercontent.com/rudi-bruchez/SqlGoPace/main
-curl -O $base/ddl_compatibility.yaml
-curl -O $base/config.yaml
-curl -o .env.example $base/.env.example
+mkdir sqlgopace && cd sqlgopace
+sqlgopace init
 ```
 
-Cloning gets you all three and the test suite with them, which is why the clone is the
-easier path for a first run.
+That leaves you with `config.yaml`, `ddl_compatibility.yaml`, `maintenance_profile.yaml`,
+a `.env.example` to copy, the four queue directories, and a disabled example manifest. The
+templates are compiled into the binary, so this works offline and on a machine that has
+never seen the repository.
 
-## 2. Create the login
+Re-running `init` is safe: anything already present is reported and left alone. Use
+`--force` when you do want the shipped template back, and `--dir` to initialize somewhere
+other than the current directory.
+
+## 3. Create the login
 
 Every run needs `VIEW SERVER STATE` at server level, because the monitoring connection
 reads server-scoped DMVs on every poll. Beyond that, grant only the tier your manifests
@@ -60,7 +67,7 @@ Batched DML, shrink, `check_db` and the kill features each need more.
 [`permissions.md`](permissions.md) states what and why, with ready-to-run templates in
 [`permissions/`](permissions/) and a script that reports what an existing login can do.
 
-## 3. Configure
+## 4. Configure
 
 Two files. `config.yaml` holds policy and paths; `.env` holds secrets and is gitignored.
 The connection string never carries a password directly: it references `${VAR}`, expanded
@@ -71,14 +78,14 @@ cp .env.example .env
 $EDITOR .env            # DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD
 ```
 
-`DB_SERVER` goes into an ODBC-style `server=` keyword, so a non-default port is a **comma**,
+`DB_SERVER` goes into an ODBC-style `server=` keyword, so a non-default port is a comma,
 not a colon: `SQLPROD01,14433`, never `SQLPROD01:14433`. A colon is read as part of the host
 name and fails with `lookup SQLPROD01:14433: no such host`. A named instance uses a
 backslash, `SQLPROD01\SQL2022`.
 
-The `config.yaml` in the repository root is a working starting point. The only thing you
-must check before a first run is the queue directories, which are relative to where you
-launch the binary:
+The `config.yaml` that `init` wrote is a working starting point. The queue directories it
+names are relative to where you launch the binary, which is the one thing to check if you
+plan to run from elsewhere:
 
 ```yaml
 directories:
@@ -88,16 +95,12 @@ directories:
   failed:     "./04.failed"
 ```
 
-Create them:
-
-```bash
-mkdir -p 01.to_run 02.processing 03.done 04.failed
-```
+`init` created those four; the engine also creates them at startup if they are missing.
 
 Every other section has a sensible default. [`configuration.md`](configuration.md) is the
 full reference when you need it.
 
-## 4. Write a manifest
+## 5. Write a manifest
 
 A manifest is one logical task: an ordered list of operations run in sequence. Drop it in
 `01.to_run/`. The name orders the queue, so number your files.
@@ -133,7 +136,7 @@ ORDER BY t.name;
 [`manifests.md`](manifests.md) is the format reference and
 [`operations.md`](operations.md) lists every operation with its fields.
 
-## 5. Look before you leap
+## 6. Look before you leap
 
 Never run a manifest you have not read as T-SQL first. The dry run renders exactly what
 would execute, takes no lock, and touches nothing:
@@ -170,7 +173,7 @@ dropped, the reason comes with it, message number included:
 --     resumable = OFF  (omitted: RESUMABLE is not supported in tempdb (Msg 11439))
 ```
 
-## 6. Run it
+## 7. Run it
 
 ```bash
 sqlgopace --config config.yaml
