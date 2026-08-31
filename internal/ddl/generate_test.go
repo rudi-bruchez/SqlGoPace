@@ -25,11 +25,22 @@ func TestGenerate(t *testing.T) {
 			res: ddl.ResolvedOptions{
 				Online: true, Resumable: true, WaitAtLowPriority: true,
 				AbortAfterWait: "SELF", MaxDurationMinutes: 1,
-				SortInTempDB: true, MaxDOP: intPtr(4),
+				MaxDOP: intPtr(4),
 			},
 			want: "ALTER INDEX [IX_DISPATCH] ON [dbo].[DISPATCH] REBUILD WITH " +
 				"(ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)), " +
-				"RESUMABLE = ON, MAXDOP = 4, SORT_IN_TEMPDB = ON, DATA_COMPRESSION = PAGE);",
+				"RESUMABLE = ON, MAXDOP = 4, DATA_COMPRESSION = PAGE);",
+		},
+		{
+			// SORT_IN_TEMPDB renders only where RESUMABLE is off: the two together are
+			// refused at compile time (Msg 11438), so Resolve never pairs them.
+			name: "rebuild_index sort_in_tempdb without resumable",
+			op: ddl.RebuildIndex{
+				Schema: "dbo", Table: "DISPATCH", Index: "IX_DISPATCH",
+			},
+			res: ddl.ResolvedOptions{Online: true, SortInTempDB: true, MaxDOP: intPtr(4)},
+			want: "ALTER INDEX [IX_DISPATCH] ON [dbo].[DISPATCH] REBUILD WITH " +
+				"(ONLINE = ON, MAXDOP = 4, SORT_IN_TEMPDB = ON);",
 		},
 		{
 			name: "rebuild_index no options",

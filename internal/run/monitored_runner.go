@@ -199,7 +199,13 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 		// stopped on its own (paused for a resumable op, rolled back otherwise)
 	case <-time.After(r.killGrace):
 		sink(ReactionEvent{Kind: "kill", Detail: "abort did not stop the statement within the grace period"})
-		_ = r.exec.Kill(context.Background(), r.exec.SPID())
+		// The context is detached on purpose: the one the statement ran on was just
+		// canceled, so a KILL issued on it would fail instantly. A failed KILL is
+		// narrated rather than swallowed — the wait below is unbounded, and an operator
+		// watching a run that never returns deserves to know the fallback did not land.
+		if kerr := r.exec.Kill(context.Background(), r.exec.SPID()); kerr != nil {
+			sink(ReactionEvent{Kind: "warn", Detail: "fallback KILL failed: " + kerr.Error() + "; waiting for the statement to stop on its own"})
+		}
 		<-done
 	}
 	return action, nil

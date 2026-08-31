@@ -100,9 +100,9 @@ value.
 ```yaml
     options:
       online: true             # true | false | (omit = auto)
-      resumable: true          # requires online
+      resumable: true          # requires online; refused in tempdb (Msg 11439)
       wait_at_low_priority: true   # requires online
-      sort_in_tempdb: true
+      sort_in_tempdb: true     # cannot be combined with resumable (Msg 11438)
       maxdop: 2
       ignore_blocking: true    # reaction policy, NOT a T-SQL option (see below)
 ```
@@ -188,6 +188,13 @@ what is legal and injects it. Key gates for `rebuild_index` (the common case):
 | `resumable` | 2017 | Enterprise, Azure | online |
 | `data_compression` | 2008 | Enterprise, Azure | — |
 | `maxdop`, `sort_in_tempdb` | 2005/2008 | Enterprise, **Standard**, Azure | — |
+
+Two restrictions are database- or combination-scoped rather than version-scoped, so they
+are not in the table and the resolver applies them on top of it. `resumable` is refused
+outright in `tempdb` (Msg 11439), on every version and edition, while `online` alone is
+accepted there. And `sort_in_tempdb` cannot be combined with `resumable` (Msg 11438,
+severity 15, so the batch fails at compile time): the resolver keeps `resumable` and drops
+the sort, recording the reason in the decision trail.
 
 The most important consequence is in §8.
 

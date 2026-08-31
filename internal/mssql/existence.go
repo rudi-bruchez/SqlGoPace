@@ -28,6 +28,17 @@ func (c *Conn) HasElevatedDBAccess(ctx context.Context) (bool, error) {
 	return c.existsScalar(ctx, elevatedAccessSQL)
 }
 
+const sysadminSQL = `
+SELECT CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1 THEN 1 ELSE 0 END;`
+
+// IsSysadmin reports whether the current login is a member of the sysadmin server
+// role. shrink_tempdb needs it specifically: DBCC SHRINKFILE runs in tempdb, and
+// tempdb is recreated from model at every restart, so a role membership granted
+// there does not survive one. See preflight.CheckTempdbShrinkRights.
+func (c *Conn) IsSysadmin(ctx context.Context) (bool, error) {
+	return c.existsScalar(ctx, sysadminSQL)
+}
+
 const alterAnyConnectionSQL = `
 SELECT CASE WHEN IS_SRVROLEMEMBER('sysadmin') = 1
               OR IS_SRVROLEMEMBER('processadmin') = 1

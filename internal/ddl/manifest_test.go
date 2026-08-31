@@ -2,6 +2,7 @@ package ddl_test
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -430,5 +431,41 @@ operations:
 func TestShrinkTempdbValidateRejectsNonPositive(t *testing.T) {
 	if err := (ddl.ShrinkTempdb{TargetSizeMB: 0}).Validate(); !errors.Is(err, ddl.ErrInvalidManifest) {
 		t.Fatalf("Validate() error = %v, want ErrInvalidManifest", err)
+	}
+}
+
+// TestManifestRejectsOutOfRangeMaxDOP pins the bounds measured against SQL Server 2022
+// CU26: 0..32767 is accepted, and anything outside is refused with Msg 304 (the index
+// option) or Msg 102 (the batched-DML query hint, where a negative is not even
+// grammatical). Caught at load, so an unrunnable manifest never reaches the server.
+func TestManifestRejectsOutOfRangeMaxDOP(t *testing.T) {
+	const body = `
+description: maxdop bounds
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: MEASUREMENT
+    index: PK_MEASUREMENT
+    options:
+      maxdop: %d
+`
+	for _, tc := range []struct {
+		maxdop  int
+		wantErr bool
+	}{
+		{-1, true},
+		{0, false},
+		{1, false},
+		{32767, false},
+		{32768, true},
+		{999999, true},
+	} {
+		_, err := ddl.ParseManifest(strings.NewReader(fmt.Sprintf(body, tc.maxdop)))
+		if tc.wantErr && err == nil {
+			t.Errorf("maxdop %d: ParseManifest() error = nil, want a rejection (SQL Server refuses it)", tc.maxdop)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("maxdop %d: ParseManifest() error = %v, want nil", tc.maxdop, err)
+		}
 	}
 }

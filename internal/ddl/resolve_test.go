@@ -341,3 +341,94 @@ func TestResolveShrinkLogHasNoWALP(t *testing.T) {
 		t.Errorf("Resolve(shrink_log) decisions = %v, want none", decisions)
 	}
 }
+
+// TestResolveTempdbDropsResumable pins the tempdb restriction: SQL Server refuses a
+// resumable index build there with Msg 11439 on every version and edition, while
+// ONLINE alone is accepted. Reproduced against SQL Server 2022 CU26 in a container.
+func TestResolveTempdbDropsResumable(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+
+	for _, db := range []string{"tempdb", "TempDB", " tempdb "} {
+		target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise, Database: db}
+
+		got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+		if got.Resumable {
+			t.Errorf("database %q: Resumable = true, want false (Msg 11439)", db)
+		}
+		if !got.Online {
+			t.Errorf("database %q: Online = false, want true (ONLINE is accepted in tempdb)", db)
+		}
+		if v, ok := decisionValue(decisions, "resumable"); !ok || v != "OFF" {
+			t.Errorf("database %q: decision[resumable] = %q (present=%t), want OFF", db, v, ok)
+		}
+	}
+}
+
+func TestResolveUserDatabaseKeepsResumable(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise, Database: "PRODDB"}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if !got.Resumable {
+		t.Errorf("Resumable = false, want true (the tempdb restriction must not leak to user databases)")
+	}
+}
+
+func TestTargetInDatabase(t *testing.T) {
+	base := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise, Database: "PRODDB"}
+
+	if got := base.InDatabase("tempdb").Database; got != "tempdb" {
+		t.Errorf("InDatabase(%q).Database = %q, want tempdb", "tempdb", got)
+	}
+	if got := base.InDatabase("").Database; got != "PRODDB" {
+		t.Errorf("InDatabase(\"\").Database = %q, want the connection's own database PRODDB", got)
+	}
+	if base.Database != "PRODDB" {
+		t.Errorf("InDatabase mutated its receiver: Database = %q", base.Database)
+	}
+}
+
+// TestResolveNeverPairsResumableWithSortInTempdb pins Msg 11438: "The SORT_IN_TEMPDB
+// option cannot be set to 'ON' when the RESUMABLE option is set to 'ON'". It is raised
+// at severity 15, so the batch fails at compile time and nothing runs. Reproduced
+// against SQL Server 2022 CU26 in a container.
+func TestResolveNeverPairsResumableWithSortInTempdb(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise, Database: "PRODDB"}
+
+	// sort_in_tempdb is opt-in, so it only reaches ON through an explicit force —
+	// here the global config policy, which is how an operator hits this in practice.
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{SortInTempDB: boolPtr(true)})
+
+	if !got.Resumable {
+		t.Errorf("Resumable = false, want true (RESUMABLE is the option worth keeping)")
+	}
+	if got.SortInTempDB {
+		t.Errorf("SortInTempDB = true, want false (Msg 11438 kills the batch at compile time)")
+	}
+	if v, ok := decisionValue(decisions, "sort_in_tempdb"); !ok || v != "OFF" {
+		t.Errorf("decision[sort_in_tempdb] = %q (present=%t), want OFF", v, ok)
+	}
+}
+
+// TestResolveKeepsSortInTempdbWhenResumableIsOff is the other half: with no conflict,
+// an explicitly forced sort_in_tempdb survives.
+func TestResolveKeepsSortInTempdbWhenResumableIsOff(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise, Database: "PRODDB"}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{SortInTempDB: boolPtr(true), Resumable: boolPtr(false)})
+
+	if got.Resumable {
+		t.Errorf("Resumable = true, want false (forced off)")
+	}
+	if !got.SortInTempDB {
+		t.Errorf("SortInTempDB = false, want true (no conflict once RESUMABLE is off)")
+	}
+}

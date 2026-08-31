@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -355,5 +356,22 @@ func TestLoadShippedConfig(t *testing.T) {
 	}
 	if cfg.MatrixFile == "" {
 		t.Errorf("MatrixFile is empty, want a path")
+	}
+}
+
+func TestConfigRejectsOutOfRangeMaxDOP(t *testing.T) {
+	for _, tc := range []struct {
+		maxdop  int
+		wantErr bool
+	}{{-1, true}, {0, false}, {32767, false}, {32768, true}} {
+		body := strings.Replace(validYAML, "maxdop: { force: 4 }",
+			fmt.Sprintf("maxdop: { force: %d }", tc.maxdop), 1)
+		_, err := config.Parse([]byte(body))
+		if tc.wantErr && err == nil {
+			t.Errorf("maxdop %d: Parse() error = nil, want a rejection", tc.maxdop)
+		}
+		if !tc.wantErr && err != nil {
+			t.Errorf("maxdop %d: Parse() error = %v, want nil", tc.maxdop, err)
+		}
 	}
 }

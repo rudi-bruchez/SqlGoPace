@@ -261,7 +261,7 @@ func TestPlanShrinkConfirmedIgnoredForLogShrinkWarns(t *testing.T) {
 }
 
 // TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns is the pre_reorganize:false
-// analogue of the above.
+// analog of the above.
 func TestPlanShrinkConfirmedIgnoredForPreReorganizeOffWarns(t *testing.T) {
 	p := dataShrinkProfile(t, "  pre_reorganize: false\n")
 	var logbuf bytes.Buffer

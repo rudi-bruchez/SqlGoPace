@@ -297,8 +297,28 @@ func (m *Manifest) Validate() error {
 		if err := op.Validate(); err != nil {
 			return fmt.Errorf("operation %d: %w", i, err)
 		}
+		if err := validateMaxDOP(overridesOf(op).MaxDOP); err != nil {
+			return fmt.Errorf("operation %d: %w", i, err)
+		}
 	}
 	return nil
+}
+
+// MaxDOPCeiling is the largest degree of parallelism SQL Server accepts. Outside
+// 0..MaxDOPCeiling both forms the generator emits are refused: the index option with
+// Msg 304 ("out of range for index/statistics option 'MAXDOP'"), and the batched-DML
+// query hint with Msg 304 above the ceiling and Msg 102 below zero, the negative sign
+// not even being grammatical there. Zero is legal and means "all available processors".
+// Measured against SQL Server 2022 CU26.
+const MaxDOPCeiling = 32767
+
+// validateMaxDOP rejects a degree of parallelism the server would refuse, so an
+// unrunnable manifest is caught at load rather than at the statement that fails.
+func validateMaxDOP(md *int) error {
+	if md == nil || (*md >= 0 && *md <= MaxDOPCeiling) {
+		return nil
+	}
+	return fmt.Errorf("maxdop must be in 0..%d, got %d: %w", MaxDOPCeiling, *md, ErrInvalidManifest)
 }
 
 // UnmarshalYAML decodes the manifest, dispatching each operation to its concrete
@@ -310,7 +330,7 @@ func (m *Manifest) UnmarshalYAML(value *yaml.Node) error {
 		OnFailure              string           `yaml:"on_failure"`
 		Intent                 string           `yaml:"intent"`
 		IgnoreBlockedSessions  []IgnoredSession `yaml:"ignore_blocked_sessions"`
-		KillBlockingSessions    []KilledSession  `yaml:"kill_blocking_sessions"`
+		KillBlockingSessions   []KilledSession  `yaml:"kill_blocking_sessions"`
 		AbortBlockingResumable bool             `yaml:"abort_blocking_resumable"`
 		Window                 *Window          `yaml:"window"`
 		Operations             []yaml.Node      `yaml:"operations"`
@@ -886,11 +906,11 @@ func (o CheckDB) Validate() error {
 // Like check_db it is file/database-scoped, so its Target carries the file name in
 // Name and never a schema.table (see ObjectRef and the check_db target convention).
 type Shrink struct {
-	Type               string          `yaml:"type"`                        // "data" | "log"
-	Files              string          `yaml:"files"`                       // "all" | logical file name; defaults to "all"
-	EmptyFile          bool            `yaml:"emptyfile,omitempty"`         // reserved for Phase 2; must be false in v1
-	TargetFreeSpace    string          `yaml:"targetfreespace"`             // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
-	Options            OptionOverrides `yaml:"options"`                     // only WaitAtLowPriority is relevant
+	Type               string          `yaml:"type"`                           // "data" | "log"
+	Files              string          `yaml:"files"`                          // "all" | logical file name; defaults to "all"
+	EmptyFile          bool            `yaml:"emptyfile,omitempty"`            // reserved for Phase 2; must be false in v1
+	TargetFreeSpace    string          `yaml:"targetfreespace"`                // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
+	Options            OptionOverrides `yaml:"options"`                        // only WaitAtLowPriority is relevant
 	IdentifyTailObject bool            `yaml:"identify_tail_object,omitempty"` // run the tail-object walk at shrink start
 }
 

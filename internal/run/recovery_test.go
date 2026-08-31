@@ -1,11 +1,13 @@
 package run
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -57,10 +59,11 @@ func TestMatchesOrphan(t *testing.T) {
 type fakeRecoveryProbe struct {
 	id  mssql.SessionIdentity
 	ops []mssql.ResumableOp
+	err error // when set, every read through this probe fails
 }
 
 func (f fakeRecoveryProbe) SessionIdentity(context.Context, int) (mssql.SessionIdentity, error) {
-	return f.id, nil
+	return f.id, f.err
 }
 func (f fakeRecoveryProbe) ResumableOps(context.Context) ([]mssql.ResumableOp, error) {
 	return f.ops, nil
@@ -305,5 +308,63 @@ func TestRecovererIdleOrphanRestarts(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dirs.ToRun, name)); err != nil {
 		t.Errorf("idle-orphan manifest should be requeued to to_run: %v", err)
+	}
+}
+
+// TestRecoverContinuesPastAnUnreadableOrphan pins the sweep's isolation: one orphan
+// whose server state cannot be read must not strand the orphans behind it, nor throw
+// away what the pass already reconciled. A failing Recover aborts the whole run before
+// the engine starts, so the blast radius of one bad read was the entire queue.
+func TestRecoverContinuesPastAnUnreadableOrphan(t *testing.T) {
+	root := t.TempDir()
+	dirs := Dirs{
+		ToRun:      filepath.Join(root, "01.to_run"),
+		Processing: filepath.Join(root, "02.processing"),
+		Done:       filepath.Join(root, "03.done"),
+		Failed:     filepath.Join(root, "04.failed"),
+	}
+	for _, d := range []string{dirs.ToRun, dirs.Processing, dirs.Done, dirs.Failed} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+	}
+	// Read in name order, so the unreadable one comes first and the good one after it.
+	orphans := map[string]State{
+		"005_bad.yaml":  {SPID: 57, Database: "DB_BAD", LoginTime: "2026-06-10T12:00:00"},
+		"010_good.yaml": {SPID: 58, Database: "DB_OK", LoginTime: "2026-06-10T12:00:00"},
+	}
+	for name, st := range orphans {
+		if err := os.WriteFile(filepath.Join(dirs.Processing, name), []byte("x"), 0o644); err != nil {
+			t.Fatalf("write manifest: %v", err)
+		}
+		if err := WriteState(filepath.Join(dirs.Processing, name+stateSuffix), st); err != nil {
+			t.Fatalf("write state: %v", err)
+		}
+	}
+
+	connected := fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}
+	var out bytes.Buffer
+	r := NewRecoverer(dirs, connected, &out, WithRecoveryProbes("CONN",
+		func(_ context.Context, db string) (RecoveryProbe, func(), error) {
+			if db == "DB_BAD" {
+				return fakeRecoveryProbe{err: errors.New("connection reset")}, func() {}, nil
+			}
+			return fakeRecoveryProbe{id: mssql.SessionIdentity{Exists: false}}, func() {}, nil
+		}))
+
+	sum, err := r.Recover(context.Background())
+	if err != nil {
+		t.Fatalf("Recover() error = %v, want nil: one unreadable orphan must not fail the sweep", err)
+	}
+	if sum.Requeued != 1 {
+		t.Errorf("sum = %+v, want Requeued 1 (the readable orphan is still reconciled)", sum)
+	}
+	if !strings.Contains(out.String(), "005_bad.yaml") {
+		t.Errorf("narration does not name the skipped orphan:\n%s", out.String())
+	}
+	// The unreadable one stays put: nothing is requeued while we cannot tell whether
+	// its session is still live.
+	if _, err := os.Stat(filepath.Join(dirs.Processing, "005_bad.yaml")); err != nil {
+		t.Errorf("unreadable orphan left processing: %v", err)
 	}
 }

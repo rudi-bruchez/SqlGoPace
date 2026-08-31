@@ -16,6 +16,12 @@ linters:
   settings:
     misspell:
       locale: US
+      # "compresion" is a deliberate typo: it is the fixture that proves a misspelled
+      # manifest key is rejected rather than silently dropped, and the comment that
+      # explains why. It lives inside a raw string literal, where a nolint directive
+      # cannot be placed.
+      ignore-rules:
+        - compresion
     revive:
       rules:
         - name: exported
@@ -36,7 +42,6 @@ linters:
       - third_party$
       - builtin$
       - examples$
-      - ^tmp/ # throwaway dev helpers, not product code
 issues:
   max-issues-per-linter: 0
   max-same-issues: 0

@@ -129,19 +129,59 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 	if len(manifests) == 0 {
 		return errors.New("no manifest files given")
 	}
-	target, expander, cleanup, err := dryRunSession(ctx, stdout, visited, assumeVersion, assumeEdition, cfg)
+	base, expander, cleanup, err := dryRunSession(ctx, stdout, visited, assumeVersion, assumeEdition, cfg)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 
+	// Expanding "ALTER INDEX ALL" means reading sys.indexes, which only ever sees the
+	// connection's own database. A real run opens one engine per database the queue
+	// targets (spec §17.6), so expanding every manifest over the single DSN connection
+	// would render another database's index list: the operator reviews one plan and the
+	// run executes a different one, which defeats the point of a dry run. Resolve a
+	// connection per named database, as the run does, and reuse it across manifests.
+	extra := map[string]*mssql.Conn{}
+	defer func() {
+		for _, c := range extra {
+			_ = c.Close()
+		}
+	}()
+
 	policy := policyOf(cfg)
 	for _, path := range manifests {
-		if err := dryRunManifest(ctx, stdout, path, target, matrix, policy, explain, expander); err != nil {
+		manifest, err := ddl.LoadManifestFile(path)
+		if err != nil {
+			return err
+		}
+		ex := expander
+		if expander != nil && manifest.Database != "" && !strings.EqualFold(manifest.Database, base.Database) {
+			c, cerr := dryRunConn(ctx, cfg, manifest.Database, extra)
+			if cerr != nil {
+				return fmt.Errorf("%s: connect to database %q: %w", path, manifest.Database, cerr)
+			}
+			ex = c
+		}
+		if err := dryRunManifest(ctx, stdout, path, manifest, base.InDatabase(manifest.Database), matrix, policy, explain, ex); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// dryRunConn returns a connection in database db, opening one on first use and
+// caching it so a queue of manifests for the same database opens one connection.
+func dryRunConn(ctx context.Context, cfg *config.Config, db string, cache map[string]*mssql.Conn) (*mssql.Conn, error) {
+	key := strings.ToLower(db)
+	if c, ok := cache[key]; ok {
+		return c, nil
+	}
+	c, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version())
+	if err != nil {
+		return nil, err
+	}
+	cache[key] = c
+	return c, nil
 }
 
 // runEngine connects, detects the target, and runs every queued manifest with
@@ -516,13 +556,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		stepSink = fwd.step
 	}
 	shrinkRunner := run.NewShrinkRunner(conn, conn, sampler, run.System, run.ShrinkRunnerConfig{
-		Tuning:            shrinkTuning(cfg.Shrink),
-		PollInterval:      cfg.Monitoring.BlockingPoll(),
-		LogPollInterval:   cfg.Monitoring.LogPoll(),
-		BlockingTimeout:   cfg.Monitoring.BlockingTimeout(),
-		LogDrainTimeout:   cfg.Monitoring.LogDrainTimeout(),
-		KillGrace:         cfg.Monitoring.KillGrace(),
-		SQLMajorVersion:   info.MajorVersion,
+		Tuning:          shrinkTuning(cfg.Shrink),
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+		SQLMajorVersion: info.MajorVersion,
 	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	// shrink_tempdb always executes over a connection whose database context is
 	// tempdb, regardless of which database this engine otherwise targets. Blocking()/
@@ -544,13 +584,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	tempdbSampler.SetKiller(blockerKiller)
 	tempdbSampler.SetVictimKiller(victimKiller)
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
-		Tuning:            shrinkTuning(cfg.Shrink),
-		PollInterval:      cfg.Monitoring.BlockingPoll(),
-		LogPollInterval:   cfg.Monitoring.LogPoll(),
-		BlockingTimeout:   cfg.Monitoring.BlockingTimeout(),
-		LogDrainTimeout:   cfg.Monitoring.LogDrainTimeout(),
-		KillGrace:         cfg.Monitoring.KillGrace(),
-		SQLMajorVersion:   info.MajorVersion,
+		Tuning:          shrinkTuning(cfg.Shrink),
+		PollInterval:    cfg.Monitoring.BlockingPoll(),
+		LogPollInterval: cfg.Monitoring.LogPoll(),
+		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
+		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
+		KillGrace:       cfg.Monitoring.KillGrace(),
+		SQLMajorVersion: info.MajorVersion,
 	}, run.WithShrinkProgress(shrinkProgress), run.WithShrinkStop(drain))
 	batchRunner := run.NewBatchDMLRunner(conn, conn, sampler, run.System, run.BatchDMLRunnerConfig{
 		Tuning:          batchTuning(cfg.BatchDML),
@@ -1248,6 +1288,10 @@ func dryRunSession(ctx context.Context, log io.Writer, visited map[string]bool, 
 	offline := visited["assume-version"] || visited["assume-edition"]
 	if offline || cfg == nil {
 		t, err := offlineTarget(assumeVersion, assumeEdition)
+		if err == nil {
+			fmt.Fprintln(log, "-- offline dry run: no database context, so restrictions that depend on one are not applied "+
+				"(RESUMABLE is refused in tempdb); a manifest naming its database still gets them")
+		}
 		return t, nil, noop, err
 	}
 
@@ -1292,18 +1336,15 @@ func visitedFlags(fs *flag.FlagSet) map[string]bool {
 
 // dryRunManifest loads, optionally expands ALL rebuilds, plans, and renders one
 // manifest to w. expander is nil for an offline dry-run.
-func dryRunManifest(ctx context.Context, w io.Writer, path string, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool, expander run.IndexExpander) error {
-	manifest, err := ddl.LoadManifestFile(path)
-	if err != nil {
-		return err
-	}
+func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl.Manifest, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool, expander run.IndexExpander) error {
+	var err error
 	if expander != nil {
 		manifest, err = run.ExpandAll(ctx, expander, manifest)
 		if err != nil {
 			return err
 		}
 	}
-	planned, err := ddl.Plan(manifest, target, matrix, policy)
+	planned, err := ddl.Plan(manifest, target.InDatabase(manifest.Database), matrix, policy)
 	if err != nil {
 		return err
 	}

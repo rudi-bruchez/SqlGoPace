@@ -5,7 +5,7 @@ SELECT
     @last_page_id = size - 1
 FROM sys.database_files
 WHERE type = 0
-AND file_id = 1;    -- fichiers de données
+AND file_id = 1;    -- data files
 
 SET @page_id = @last_page_id;
 --SELECT @file_id, @page_id

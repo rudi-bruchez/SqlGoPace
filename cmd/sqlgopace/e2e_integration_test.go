@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -225,5 +226,89 @@ func TestE2ERebuildIndex(t *testing.T) {
 	}
 	if _, err := os.Stat(donePath + ".log"); err != nil {
 		t.Errorf("run log not written: %v", err)
+	}
+}
+
+// TestE2EDryRunExpandsAllInTheManifestDatabase pins a defect an external reviewer
+// found and that only shows when the tool is run: expanding "index: ALL" reads
+// sys.indexes, which sees only the connection's own database. A real run opens one
+// engine per database the queue targets (spec §17.6), so a dry run over the single
+// DSN connection rendered another database's index list — the operator reviewed one
+// plan and the run executed a different one.
+//
+// The test connects to the DSN's database (tempdb under the Makefile default) and
+// dry-runs a manifest that names master, where the seeded index exists under a name
+// that exists nowhere else.
+func TestE2EDryRunExpandsAllInTheManifestDatabase(t *testing.T) {
+	dsn := e2eDSN(t)
+	ctx := context.Background()
+
+	conn, err := mssql.Open(ctx, dsn, "test")
+	if err != nil {
+		t.Fatalf("open setup connection: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Same table name in both databases, different index names: only an expansion
+	// that read the right database can produce the right one.
+	const (
+		inMaster = "IX_sqlgopace_xdb_master_only"
+		inDSNDB  = "IX_sqlgopace_xdb_connected_only"
+	)
+	for _, s := range []struct{ db, index string }{{"master", inMaster}, {"", inDSNDB}} {
+		c := conn
+		if s.db != "" {
+			c, err = mssql.OpenDatabase(ctx, dsn, s.db, "test")
+			if err != nil {
+				t.Fatalf("open %s: %v", s.db, err)
+			}
+			defer func() { _ = c.Close() }()
+		}
+		if err := c.ExecDDL(ctx, `IF OBJECT_ID('dbo.sqlgopace_xdb') IS NOT NULL DROP TABLE dbo.sqlgopace_xdb;
+			CREATE TABLE dbo.sqlgopace_xdb (id int NOT NULL PRIMARY KEY, a int NULL);`); err != nil {
+			t.Fatalf("seed table in %q: %v", s.db, err)
+		}
+		if err := c.ExecDDL(ctx, "CREATE INDEX "+s.index+" ON dbo.sqlgopace_xdb(a);"); err != nil {
+			t.Fatalf("seed index in %q: %v", s.db, err)
+		}
+		db := s.db
+		t.Cleanup(func() {
+			cc := conn
+			if db != "" {
+				var cerr error
+				if cc, cerr = mssql.OpenDatabase(context.Background(), dsn, db, "test"); cerr != nil {
+					return
+				}
+				defer func() { _ = cc.Close() }()
+			}
+			_ = cc.ExecDDL(context.Background(), "IF OBJECT_ID('dbo.sqlgopace_xdb') IS NOT NULL DROP TABLE dbo.sqlgopace_xdb;")
+		})
+	}
+
+	root := t.TempDir()
+	manifest := filepath.Join(root, "010_all.yaml")
+	if err := os.WriteFile(manifest, []byte(`
+description: cross-database ALL expansion
+database: master
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: sqlgopace_xdb
+    index: ALL
+`), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	cfgPath := writeE2EConfig(t, root, dsn)
+
+	var out bytes.Buffer
+	if err := cli(&out, &out, []string{"--config", cfgPath, "--dry-run", manifest}); err != nil {
+		t.Fatalf("cli(dry-run) error = %v\n--- output ---\n%s", err, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, inMaster) {
+		t.Errorf("plan does not name %s, so ALL was not expanded in the manifest's database:\n%s", inMaster, got)
+	}
+	if strings.Contains(got, inDSNDB) {
+		t.Errorf("plan names %s: ALL was expanded against the connection's database, not the manifest's:\n%s", inDSNDB, got)
 	}
 }

@@ -534,7 +534,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
-	planned, err := ddl.Plan(manifest, e.target, e.matrix, e.policy)
+	// A manifest naming its own database is resolved against that one, not against
+	// whatever the connection happens to sit in: some options are database-scoped.
+	planned, err := ddl.Plan(manifest, e.target.InDatabase(manifest.Database), e.matrix, e.policy)
 	if err != nil {
 		rep.Error = "plan: " + err.Error()
 		return e.finalize(ctx, name, rep, start, false)
@@ -580,7 +582,6 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// Arm the amplifying-victim killer for this manifest, if wired. Disarm when the
 	// manifest is done so a later manifest does not inherit its episode state, and
 	// clear the TUI's conflicting-jobs line at the same moment.
-	amplifiers := &amplifierCapture{}
 	if e.victims != nil {
 		e.victims.Arm(e.victimPolicy)
 		defer func() {
@@ -591,298 +592,343 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		}()
 	}
 
-	var failedOps []ddl.Operation
-	captured := &blockerCapture{}
-	contended := &contendedCapture{}
-	// cursor is the crash-resume watermark: the number of leading operations durably
-	// done. It is advanced and persisted after each completed operation (below), so a
-	// crash — not just a drain — resumes at the next operation instead of replaying.
-	cursor := resumeFrom
-	for i, step := range planned {
-		// Graceful stop: the operation in flight has finished (we are at the top of the
-		// loop); stop before starting the next one and leave the manifest for recovery.
-		if e.draining() {
-			return e.finalizeDrained(ctx, name, rep, start, cursor, len(planned), failedOps)
-		}
-		opStart := e.clk.Now()
-		caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
-
-		// Manifest-level progress: the started event is emitted now; a finished event
-		// derived from it is emitted at each terminal outcome below.
-		stepEv := StepEvent{Index: i + 1, Total: len(planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
-
-		// Resume cursor: operations before it were completed in a previous drained or
-		// interrupted run of this manifest, so skip them (near-zero cost) — before the
-		// window check, so a resumed manifest does not read the server clock once per
-		// already-done operation.
-		if i < resumeFrom {
-			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, resumeSkipReason))
-			continue
-		}
-		if open, err := e.windowOpen(ctx, manifest.Window); err != nil || !open {
-			return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", cursor, len(planned))), failedOps)
-		}
-		// intent: compression — a rebuild whose target compression already holds is a no-op,
-		// unless this operation left its own paused resumable, which must be resumed/finished
-		// rather than skipped (skipping would orphan it paused on the server). Emitting only
-		// the finished event keeps a re-run's log to one line per skipped operation.
-		if reason, skip := e.skipSatisfied(ctx, manifest.Intent, step.Operation); skip && !ownsPausedResumable(st.Paused, i, step.Operation) {
-			rep.Operations = append(rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
-			e.advanceCursor(name, &cursor, i)
-			continue
-		}
-		e.emitStep(stepEv)
-
-		// The sink is called from the runner (this goroutine) and from the held-through
-		// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
-		var (
-			reactions   []report.ReactionLine
-			peakBlocked int
-			reactionMu  sync.Mutex
-		)
-		sink := func(ev ReactionEvent) {
-			if ev.Tail != nil {
-				e.captureTail(contended, name, manifest.Database, *ev.Tail)
-			}
-			if ev.Amplifier != nil {
-				amplifiers.add(*ev.Amplifier, e.now())
-				e.flushAmplifiers(name, amplifiers)
-				if e.amplifierSink != nil {
-					e.amplifierSink(amplifiers.jobs())
-				}
-			}
-			detail := ev.Detail
-			if isInterruption(ev.Kind) {
-				if pct, ok := e.operationPercent(ctx); ok {
-					detail = fmt.Sprintf("%s (at %.0f%%)", detail, pct)
-				}
-			}
-			// On a yield/escalation, snapshot the sessions we are blocking: fold the
-			// count into the narration and track the operation's peak for the report.
-			capture := ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort"
-			var blocked int
-			if capture {
-				blocked = e.captureBlockers(ctx, ignore, captured, name)
-				if blocked > 0 {
-					if _, isShrink := step.Operation.(ddl.Shrink); isShrink && e.session != nil {
-						e.captureContended(ctx, e.session.SPID(), contended, name, manifest.Database)
-					}
-					detail = fmt.Sprintf("%s; blocking %d session(s)", detail, blocked)
-				}
-			}
-			reactionMu.Lock()
-			reactions = append(reactions, report.ReactionLine{Kind: ev.Kind, At: e.now(), Detail: detail})
-			fmt.Fprintf(e.out, "-- %s %s: %s\n", ev.Kind, opTarget(step.Operation), detail)
-			if blocked > peakBlocked {
-				peakBlocked = blocked
-			}
-			reactionMu.Unlock()
-			if capture {
-				e.notify(ctx, ev.Kind, name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
-			}
-		}
-		// The victim killer emits kills on this operation's sink, from the pump
-		// goroutine. Each iteration overwrites it before any kill can occur, and
-		// Disarm clears it at the end of the manifest.
-		e.victims.SetSink(sink)
-		// The blocker killer emits its cap escalation on the same per-operation sink,
-		// from the same pump goroutine, and is cleared by SetSource(nil) at the end of
-		// the manifest.
-		e.killer.SetSink(sink)
-		waitsBefore := e.snapshotWaits(ctx)
-
-		// Narrate, once each, the ignored sessions we hold the lock through, so the run
-		// log shows we are deliberately blocking them (otherwise it is a silent non-event).
-		holdCtx, stopHold := context.WithCancel(ctx)
-		holdDone := make(chan struct{})
-		go func() { defer close(holdDone); e.narrateHeld(holdCtx, ignore, sink) }()
-
-		// Resumable conflict handling before running the operation:
-		//   - an operation this manifest recorded as leaving its own paused resumable
-		//     continues with ALTER INDEX … RESUME (reusing the server-side progress) instead
-		//     of a fresh REBUILD, which SQL Server rejects while a resumable is paused;
-		//   - otherwise a stale/foreign paused resumable on the target index would block a
-		//     fresh REBUILD (Msg 10637): clear it with ABORT when the manifest opts in, else
-		//     fail the operation early with an actionable message.
-		// Ownership is matched by the recorded identity (op index + target), not the cursor
-		// position, so a continue-on-failure gap that freezes the cursor before the paused op
-		// no longer misclassifies the manifest's own paused resumable as foreign — and a
-		// foreign paused resumable is never adopted, whatever the cursor.
-		stmt := step.SQL
-		var prepErr error
-		switch {
-		case ownsPausedResumable(st.Paused, i, step.Operation):
-			// Our own paused resumable from a previous run: continue it whatever the current
-			// resolve says about resumability (a fresh REBUILD would be rejected while it is
-			// paused). If nothing is actually paused now, resumeStatement declines and the
-			// planned REBUILD runs (a clean restart).
-			if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
-				stmt = resume
-				sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
-			}
-		case e.blockingResumable(ctx, step.Operation):
-			prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, manifest.AbortBlockingResumable)
-		}
-
-		var (
-			runErr        error
-			shrinkResults []ShrinkResult
-			batchResult   *BatchDMLResult
-		)
-		if prepErr != nil {
-			runErr = prepErr
-		} else {
-			// Advisory: a reorganize_index against an RCSI-off database blocks readers on
-			// its page locks. Emitted through the sink so it lands in the run's .log and TUI.
-			// manifest.Database is empty for a no-database manifest, which runs on the
-			// engine's connected database (e.database). The helper self-gates to reorg only.
-			db := manifest.Database
-			if db == "" {
-				db = e.database
-			}
-			if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
-				sink(ReactionEvent{Kind: "warn", Detail: msg})
-			}
-			if msg, ok := asyncStatsAdvisory(step.Operation, db, e.asyncStats); ok {
-				sink(ReactionEvent{Kind: "warn", Detail: msg})
-			}
-			switch op := step.Operation.(type) {
-			case ddl.Shrink:
-				if e.shrink != nil {
-					// Shrink is multi-statement and built at run time; route to the driver,
-					// passing the resolved options (only WALP is meaningful for a shrink).
-					shrinkResults, runErr = e.shrink.Run(ctx, op, step.Options, ignore, sink)
-				} else {
-					runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
-				}
-			case ddl.ShrinkTempdb:
-				if e.tempdbShrink != nil {
-					// shrink_tempdb is likewise a multi-statement, run-time-built loop; route
-					// to the tempdb driver rather than the OpRunner.
-					shrinkResults, runErr = e.tempdbShrink.RunTempdb(ctx, op, step.Options, ignore, sink)
-				} else {
-					runErr = fmt.Errorf("shrink_tempdb requires a tempdb shrink runner (not configured)")
-				}
-			case ddl.BatchDML:
-				if e.batchDML != nil {
-					// Batched DML is a per-batch loop built at run time; route to its driver.
-					// The watermark sidecar lets a key_range walk resume after a crash; it is
-					// removed once the walk completes (a crash — or a graceful stop, which
-					// returns ErrStopped — skips that, preserving resume).
-					store := e.watermarkStore(name, i)
-					var br BatchDMLResult
-					br, runErr = e.batchDML.Run(ctx, op, step.Options, ignore, store, sink)
-					batchResult = &br
-					// Clear the watermark only on true completion; on any failure keep it so a
-					// manual re-run resumes mid-table (a graceful stop and a crash already
-					// preserve it — the walk is idempotent, so a resume never double-applies).
-					if op.Batch.IsKeyRange() && runErr == nil {
-						store.clear()
-					}
-				} else {
-					runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
-				}
-			default:
-				runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
-			}
-		}
-		// Stop the narrator; it is joined, so it appends nothing past this point. The
-		// pump goroutine is not joined (monitored_runner.go only stops sampling), and
-		// the victim killer emits kills on this same sink from it — a kill decided just
-		// before the statement finished can still be mid-flight here. So the report
-		// state is read under reactionMu, on a copy, exactly as sink() writes it.
-		stopHold()
-		<-holdDone
-		waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
-		reactionMu.Lock()
-		opReactions := append([]report.ReactionLine(nil), reactions...)
-		opPeakBlocked := peakBlocked
-		reactionMu.Unlock()
-
-		opRep := report.OperationReport{
-			Index:          i + 1,
-			CommandType:    step.Operation.CommandType(),
-			Target:         opTarget(step.Operation),
-			SQL:            stmt, // the statement actually executed (RESUME when continuing a paused resumable)
-			Options:        optionDecisions(step.Decisions),
-			Reactions:      opReactions,
-			PeakBlocked:    opPeakBlocked,
-			ContendedCount: contended.len(),
-			Waits:          waitLines,
-			WaitTotalMS:    waitTotal,
-			Shrink:         shrinkReport(shrinkResults),
-			BatchDML:       batchDMLReport(batchResult),
-			DurationMS:     e.msSince(opStart),
-		}
-		if opRep.ContendedCount > 0 {
-			opRep.ContendedFile = name + contendedCaptureSuffix
-		}
-		if runErr != nil {
-			opRep.Error = runErr.Error()
-			// A resumable operation left PAUSED is a clean interruption, not a failure:
-			// keep the manifest and sidecar in processing so the next run continues it via
-			// ALTER INDEX … RESUME. Two ways to get here: an operator graceful stop
-			// (ErrStopped), or a session loss / server restart that resumableInterruption
-			// confirms left a paused resumable. A pre-run rejection (prepErr, a blocking
-			// resumable the manifest did not opt in to clear) is a deterministic failure and
-			// is excluded from the resumableInterruption path.
-			stopped := errors.Is(runErr, ErrStopped)
-			if stopped || (prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation)) {
-				// Record which operation left its own paused resumable, so the next run resumes
-				// it by identity rather than cursor position. Only a resumable index rebuild
-				// leaves one; shrink/batch ErrStopped resume differently (free-space/watermark)
-				// and have caps.Resumable false.
-				if caps.Resumable {
-					ref := step.Operation.Target()
-					rec := &PausedResumable{Op: i, Schema: ref.Schema, Table: ref.Table, Index: ref.Name}
-					e.updateSidecar(name, func(s *State) { s.Paused = rec })
-				}
-				opRep.Outcome = "interrupted"
-				e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
-				rep.Operations = append(rep.Operations, opRep)
-				if stopped {
-					rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i, step.Operation.CommandType())
-				} else {
-					rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
-				}
-				return e.finalizeInterrupted(ctx, name, rep, start)
-			}
-			opRep.Outcome = "failed"
-			e.emitStep(stepEv.finished("failed", opDuration(opRep)))
-			rep.Operations = append(rep.Operations, opRep)
-			if !manifest.Continue() {
-				rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
-				return e.finalize(ctx, name, rep, start, false)
-			}
-			// continue-on-failure: quarantine the failed op and keep going.
-			failedOps = append(failedOps, step.Operation)
-			fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
-			continue
-		}
-		// A shrink can finish without error yet stop short of target (it stalled or timed
-		// out with work preserved). That is not a clean success: record it as a distinct
-		// INCOMPLETE outcome so it is never mistaken for done, and route the manifest to
-		// failed for review. Terminal for the manifest (like a non-continue failure).
-		if isShrinkOp(step.Operation) && shrinkStoppedShort(shrinkResults) {
-			opRep.Outcome = "incomplete"
-			e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
-			rep.Operations = append(rep.Operations, opRep)
-			rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
-				i, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
-			return e.finalizeIncomplete(ctx, name, rep, start)
-		}
-		opRep.Outcome = "success"
-		e.emitStep(stepEv.finished("success", opDuration(opRep)))
-		rep.Operations = append(rep.Operations, opRep)
-		// This operation completed, so clear any paused-resumable record it carried (a RESUME
-		// that finished): the server no longer holds it.
-		if st.Paused != nil && st.Paused.Op == i {
-			e.updateSidecar(name, func(s *State) { s.Paused = nil })
-			st.Paused = nil
-		}
-		e.advanceCursor(name, &cursor, i)
+	r := &manifestRun{
+		name:       name,
+		manifest:   manifest,
+		planned:    planned,
+		rep:        rep,
+		start:      start,
+		st:         st,
+		resumeFrom: resumeFrom,
+		ignore:     ignore,
+		captured:   &blockerCapture{},
+		contended:  &contendedCapture{},
+		amplifiers: &amplifierCapture{},
+		// cursor is the crash-resume watermark: the number of leading operations durably
+		// done. It is advanced and persisted after each completed operation, so a crash —
+		// not just a drain — resumes at the next operation instead of replaying.
+		cursor: resumeFrom,
 	}
-	return e.finalizeAll(ctx, name, manifest, rep, start, failedOps)
+	for i, step := range planned {
+		if out := e.runStep(ctx, r, i, step); out != nil {
+			return *out
+		}
+	}
+	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps)
+}
+
+// manifestRun is the state one manifest carries across its operations: what the
+// report has accumulated, how far the resume cursor has advanced, which operations
+// were quarantined, and the captures the reaction sink writes into. It exists so the
+// per-operation body can live in runStep without a dozen parameters.
+type manifestRun struct {
+	name       string
+	manifest   *ddl.Manifest
+	planned    []ddl.PlannedOperation
+	rep        *report.RunReport
+	start      time.Time
+	st         State
+	resumeFrom int
+	cursor     int
+	ignore     IgnoreSource
+	failedOps  []ddl.Operation
+	captured   *blockerCapture
+	contended  *contendedCapture
+	amplifiers *amplifierCapture
+}
+
+// endRun marks an outcome as terminal for the manifest, so runStep's nil return can
+// mean "carry on" without ever handing back an outcome the caller must know to ignore.
+func endRun(o runOutcome) *runOutcome { return &o }
+
+// runStep runs one planned operation of r. It returns nil when the manifest should
+// carry on to the next operation, and the manifest's final outcome when this operation
+// ended the run: drained, window closed, interrupted, failed without continue-on-failure,
+// or a shrink that stopped short of its target.
+func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.PlannedOperation) *runOutcome {
+	// Graceful stop: the operation in flight has finished (we are at the top of the
+	// loop); stop before starting the next one and leave the manifest for recovery.
+	if e.draining() {
+		return endRun(e.finalizeDrained(ctx, r.name, r.rep, r.start, r.cursor, len(r.planned), r.failedOps))
+	}
+	opStart := e.clk.Now()
+	caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: r.ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
+
+	// Manifest-level progress: the started event is emitted now; a finished event
+	// derived from it is emitted at each terminal outcome below.
+	stepEv := StepEvent{Index: i + 1, Total: len(r.planned), Command: step.Operation.CommandType(), Target: opTarget(step.Operation), StartedAt: opStart}
+
+	// Resume cursor: operations before it were completed in a previous drained or
+	// interrupted run of this manifest, so skip them (near-zero cost) — before the
+	// window check, so a resumed manifest does not read the server clock once per
+	// already-done operation.
+	if i < r.resumeFrom {
+		r.rep.Operations = append(r.rep.Operations, e.recordSkipped(stepEv, step, opStart, resumeSkipReason))
+		return nil // carry on to the next operation
+	}
+	if open, err := e.windowOpen(ctx, r.manifest.Window); err != nil || !open {
+		return endRun(e.finalizeWindowClosed(ctx, r.name, r.rep, r.start, windowStopReason(err, fmt.Sprintf("after operation %d/%d", r.cursor, len(r.planned))), r.failedOps))
+	}
+	// intent: compression — a rebuild whose target compression already holds is a no-op,
+	// unless this operation left its own paused resumable, which must be resumed/finished
+	// rather than skipped (skipping would orphan it paused on the server). Emitting only
+	// the finished event keeps a re-run's log to one line per skipped operation.
+	if reason, skip := e.skipSatisfied(ctx, r.manifest.Intent, step.Operation); skip && !ownsPausedResumable(r.st.Paused, i, step.Operation) {
+		r.rep.Operations = append(r.rep.Operations, e.recordSkipped(stepEv, step, opStart, reason))
+		e.advanceCursor(r.name, &r.cursor, i)
+		return nil // carry on to the next operation
+	}
+	e.emitStep(stepEv)
+
+	// The sink is called from the runner (this goroutine) and from the held-through
+	// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
+	var (
+		reactions   []report.ReactionLine
+		peakBlocked int
+		reactionMu  sync.Mutex
+	)
+	sink := func(ev ReactionEvent) {
+		if ev.Tail != nil {
+			e.captureTail(r.contended, r.name, r.manifest.Database, *ev.Tail)
+		}
+		if ev.Amplifier != nil {
+			r.amplifiers.add(*ev.Amplifier, e.now())
+			e.flushAmplifiers(r.name, r.amplifiers)
+			if e.amplifierSink != nil {
+				e.amplifierSink(r.amplifiers.jobs())
+			}
+		}
+		detail := ev.Detail
+		if isInterruption(ev.Kind) {
+			if pct, ok := e.operationPercent(ctx); ok {
+				detail = fmt.Sprintf("%s (at %.0f%%)", detail, pct)
+			}
+		}
+		// On a yield/escalation, snapshot the sessions we are blocking: fold the
+		// count into the narration and track the operation's peak for the report.
+		capture := ev.Kind == "pause" || ev.Kind == "cancel" || ev.Kind == "abort"
+		var blocked int
+		if capture {
+			blocked = e.captureBlockers(ctx, r.ignore, r.captured, r.name)
+			if blocked > 0 {
+				if _, isShrink := step.Operation.(ddl.Shrink); isShrink && e.session != nil {
+					e.captureContended(ctx, e.session.SPID(), r.contended, r.name, r.manifest.Database)
+				}
+				detail = fmt.Sprintf("%s; blocking %d session(s)", detail, blocked)
+			}
+		}
+		reactionMu.Lock()
+		reactions = append(reactions, report.ReactionLine{Kind: ev.Kind, At: e.now(), Detail: detail})
+		fmt.Fprintf(e.out, "-- %s %s: %s\n", ev.Kind, opTarget(step.Operation), detail)
+		if blocked > peakBlocked {
+			peakBlocked = blocked
+		}
+		reactionMu.Unlock()
+		if capture {
+			e.notify(ctx, ev.Kind, r.name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
+		}
+	}
+	// The victim killer emits kills on this operation's sink, from the pump
+	// goroutine. Each iteration overwrites it before any kill can occur, and
+	// Disarm clears it at the end of the manifest.
+	e.victims.SetSink(sink)
+	// The blocker killer emits its cap escalation on the same per-operation sink,
+	// from the same pump goroutine, and is cleared by SetSource(nil) at the end of
+	// the manifest.
+	e.killer.SetSink(sink)
+	waitsBefore := e.snapshotWaits(ctx)
+
+	// Narrate, once each, the ignored sessions we hold the lock through, so the run
+	// log shows we are deliberately blocking them (otherwise it is a silent non-event).
+	holdCtx, stopHold := context.WithCancel(ctx)
+	holdDone := make(chan struct{})
+	go func() { defer close(holdDone); e.narrateHeld(holdCtx, r.ignore, sink) }()
+
+	// Resumable conflict handling before running the operation:
+	//   - an operation this manifest recorded as leaving its own paused resumable
+	//     continues with ALTER INDEX … RESUME (reusing the server-side progress) instead
+	//     of a fresh REBUILD, which SQL Server rejects while a resumable is paused;
+	//   - otherwise a stale/foreign paused resumable on the target index would block a
+	//     fresh REBUILD (Msg 10637): clear it with ABORT when the manifest opts in, else
+	//     fail the operation early with an actionable message.
+	// Ownership is matched by the recorded identity (op index + target), not the cursor
+	// position, so a continue-on-failure gap that freezes the cursor before the paused op
+	// no longer misclassifies the manifest's own paused resumable as foreign — and a
+	// foreign paused resumable is never adopted, whatever the cursor.
+	stmt := step.SQL
+	var prepErr error
+	switch {
+	case ownsPausedResumable(r.st.Paused, i, step.Operation):
+		// Our own paused resumable from a previous run: continue it whatever the current
+		// resolve says about resumability (a fresh REBUILD would be rejected while it is
+		// paused). If nothing is actually paused now, resumeStatement declines and the
+		// planned REBUILD runs (a clean restart).
+		if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
+			stmt = resume
+			sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
+		}
+	case e.blockingResumable(ctx, step.Operation):
+		prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, r.manifest.AbortBlockingResumable)
+	}
+
+	var (
+		runErr        error
+		shrinkResults []ShrinkResult
+		batchResult   *BatchDMLResult
+	)
+	if prepErr != nil {
+		runErr = prepErr
+	} else {
+		// Advisory: a reorganize_index against an RCSI-off database blocks readers on
+		// its page locks. Emitted through the sink so it lands in the run's .log and TUI.
+		// manifest.Database is empty for a no-database manifest, which runs on the
+		// engine's connected database (e.database). The helper self-gates to reorg only.
+		db := r.manifest.Database
+		if db == "" {
+			db = e.database
+		}
+		if msg, ok := reorgRCSIWarning(step.Operation, db, e.rcsi); ok {
+			sink(ReactionEvent{Kind: "warn", Detail: msg})
+		}
+		if msg, ok := asyncStatsAdvisory(step.Operation, db, e.asyncStats); ok {
+			sink(ReactionEvent{Kind: "warn", Detail: msg})
+		}
+		switch op := step.Operation.(type) {
+		case ddl.Shrink:
+			if e.shrink != nil {
+				// Shrink is multi-statement and built at run time; route to the driver,
+				// passing the resolved options (only WALP is meaningful for a shrink).
+				shrinkResults, runErr = e.shrink.Run(ctx, op, step.Options, r.ignore, sink)
+			} else {
+				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			}
+		case ddl.ShrinkTempdb:
+			if e.tempdbShrink != nil {
+				// shrink_tempdb is likewise a multi-statement, run-time-built loop; route
+				// to the tempdb driver rather than the OpRunner.
+				shrinkResults, runErr = e.tempdbShrink.RunTempdb(ctx, op, step.Options, r.ignore, sink)
+			} else {
+				runErr = fmt.Errorf("shrink_tempdb requires a tempdb shrink runner (not configured)")
+			}
+		case ddl.BatchDML:
+			if e.batchDML != nil {
+				// Batched DML is a per-batch loop built at run time; route to its driver.
+				// The watermark sidecar lets a key_range walk resume after a crash; it is
+				// removed once the walk completes (a crash — or a graceful stop, which
+				// returns ErrStopped — skips that, preserving resume).
+				store := e.watermarkStore(r.name, i)
+				var br BatchDMLResult
+				br, runErr = e.batchDML.Run(ctx, op, step.Options, r.ignore, store, sink)
+				batchResult = &br
+				// Clear the watermark only on true completion; on any failure keep it so a
+				// manual re-run resumes mid-table (a graceful stop and a crash already
+				// preserve it — the walk is idempotent, so a resume never double-applies).
+				if op.Batch.IsKeyRange() && runErr == nil {
+					store.clear()
+				}
+			} else {
+				runErr = e.runner.Run(ctx, step.Operation, step.SQL, caps, sink)
+			}
+		default:
+			runErr = e.runner.Run(ctx, step.Operation, stmt, caps, sink)
+		}
+	}
+	// Stop the narrator; it is joined, so it appends nothing past this point. The
+	// pump goroutine is not joined (monitored_runner.go only stops sampling), and
+	// the victim killer emits kills on this same sink from it — a kill decided just
+	// before the statement finished can still be mid-flight here. So the report
+	// state is read under reactionMu, on a copy, exactly as sink() writes it.
+	stopHold()
+	<-holdDone
+	waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
+	reactionMu.Lock()
+	opReactions := append([]report.ReactionLine(nil), reactions...)
+	opPeakBlocked := peakBlocked
+	reactionMu.Unlock()
+
+	opRep := report.OperationReport{
+		Index:          i + 1,
+		CommandType:    step.Operation.CommandType(),
+		Target:         opTarget(step.Operation),
+		SQL:            stmt, // the statement actually executed (RESUME when continuing a paused resumable)
+		Options:        optionDecisions(step.Decisions),
+		Reactions:      opReactions,
+		PeakBlocked:    opPeakBlocked,
+		ContendedCount: r.contended.len(),
+		Waits:          waitLines,
+		WaitTotalMS:    waitTotal,
+		Shrink:         shrinkReport(shrinkResults),
+		BatchDML:       batchDMLReport(batchResult),
+		DurationMS:     e.msSince(opStart),
+	}
+	if opRep.ContendedCount > 0 {
+		opRep.ContendedFile = r.name + contendedCaptureSuffix
+	}
+	if runErr != nil {
+		opRep.Error = runErr.Error()
+		// A resumable operation left PAUSED is a clean interruption, not a failure:
+		// keep the manifest and sidecar in processing so the next run continues it via
+		// ALTER INDEX … RESUME. Two ways to get here: an operator graceful stop
+		// (ErrStopped), or a session loss / server restart that resumableInterruption
+		// confirms left a paused resumable. A pre-run rejection (prepErr, a blocking
+		// resumable the manifest did not opt in to clear) is a deterministic failure and
+		// is excluded from the resumableInterruption path.
+		stopped := errors.Is(runErr, ErrStopped)
+		if stopped || (prepErr == nil && caps.Resumable && e.resumableInterruption(ctx, step.Operation)) {
+			// Record which operation left its own paused resumable, so the next run resumes
+			// it by identity rather than cursor position. Only a resumable index rebuild
+			// leaves one; shrink/batch ErrStopped resume differently (free-space/watermark)
+			// and have caps.Resumable false.
+			if caps.Resumable {
+				ref := step.Operation.Target()
+				rec := &PausedResumable{Op: i, Schema: ref.Schema, Table: ref.Table, Index: ref.Name}
+				e.updateSidecar(r.name, func(s *State) { s.Paused = rec })
+			}
+			opRep.Outcome = "interrupted"
+			e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
+			r.rep.Operations = append(r.rep.Operations, opRep)
+			if stopped {
+				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i, step.Operation.CommandType())
+			} else {
+				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
+			}
+			return endRun(e.finalizeInterrupted(ctx, r.name, r.rep, r.start))
+		}
+		opRep.Outcome = "failed"
+		e.emitStep(stepEv.finished("failed", opDuration(opRep)))
+		r.rep.Operations = append(r.rep.Operations, opRep)
+		if !r.manifest.Continue() {
+			r.rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
+			return endRun(e.finalize(ctx, r.name, r.rep, r.start, false))
+		}
+		// continue-on-failure: quarantine the failed op and keep going.
+		r.failedOps = append(r.failedOps, step.Operation)
+		fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
+		return nil // carry on to the next operation
+	}
+	// A shrink can finish without error yet stop short of target (it stalled or timed
+	// out with work preserved). That is not a clean success: record it as a distinct
+	// INCOMPLETE outcome so it is never mistaken for done, and route the manifest to
+	// failed for review. Terminal for the manifest (like a non-continue failure).
+	if isShrinkOp(step.Operation) && shrinkStoppedShort(shrinkResults) {
+		opRep.Outcome = "incomplete"
+		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
+		r.rep.Operations = append(r.rep.Operations, opRep)
+		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
+			i, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
+		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
+	}
+	opRep.Outcome = "success"
+	e.emitStep(stepEv.finished("success", opDuration(opRep)))
+	r.rep.Operations = append(r.rep.Operations, opRep)
+	// This operation completed, so clear any paused-resumable record it carried (a RESUME
+	// that finished): the server no longer holds it.
+	if r.st.Paused != nil && r.st.Paused.Op == i {
+		e.updateSidecar(r.name, func(s *State) { s.Paused = nil })
+		r.st.Paused = nil
+	}
+	e.advanceCursor(r.name, &r.cursor, i)
+	return nil
 }
 
 // ignoreSource builds the run's ignore matcher from the manifest rules. With live

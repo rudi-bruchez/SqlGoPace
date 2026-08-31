@@ -187,7 +187,13 @@ func (r *Recoverer) Recover(ctx context.Context) (RecoverySummary, error) {
 		}
 		facts, err := factsWith(ctx, probe, st)
 		if err != nil {
-			return RecoverySummary{}, err
+			// Same treatment as an unreachable database above: one orphan we cannot read
+			// the server about must not abandon the sweep, which would strand every
+			// orphan after it and discard what this pass already reconciled. Leaving it
+			// in processing is the conservative outcome — a later run reconsiders it, and
+			// nothing is requeued while we cannot tell whether the session is still live.
+			fmt.Fprintf(r.out, "recovery: %s — cannot read server state: %v; left in processing\n", manifest, err)
+			continue
 		}
 
 		switch action := DecideRecovery(facts); action {

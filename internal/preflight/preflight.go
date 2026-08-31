@@ -146,6 +146,18 @@ func CheckElevatedRights(hasAccess bool) Check {
 	return Check{"permissions", Pass, "db_owner or sysadmin"}
 }
 
+// CheckTempdbShrinkRights verifies the login can shrink tempdb. db_owner in the
+// connected database is not the right question and not enough: DBCC SHRINKFILE runs
+// in tempdb, which is recreated from model at every restart, so a membership granted
+// there does not survive one. In practice that leaves sysadmin.
+func CheckTempdbShrinkRights(isSysadmin bool) Check {
+	if !isSysadmin {
+		return Check{"tempdb shrink permission", Fail,
+			"shrink_tempdb runs DBCC SHRINKFILE in tempdb, which requires sysadmin; db_owner in the connected database is not enough"}
+	}
+	return Check{"tempdb shrink permission", Pass, "sysadmin"}
+}
+
 // CheckKillPermission warns (never fails) when the blocker-kill policy is armed but the
 // connected login cannot KILL another session. A missing grant would make every auto-kill a
 // silent no-op, so it is surfaced — but it does not block the run, which is otherwise valid.
@@ -200,6 +212,7 @@ type Prober interface {
 	ColumnExists(ctx context.Context, schema, table, column string) (bool, error)
 	ConstraintExists(ctx context.Context, schema, table, constraint string) (bool, error)
 	HasElevatedDBAccess(ctx context.Context) (bool, error)
+	IsSysadmin(ctx context.Context) (bool, error)
 	HasAlterAnyConnection(ctx context.Context) (bool, error)
 	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
 }
@@ -246,6 +259,22 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 		rep.add(CheckElevatedRights(access))
 	}
 
+	// shrink_tempdb is the one elevated operation the check above answers the wrong
+	// question for: it probes db_owner in the connected database, while the DBCC runs
+	// in tempdb. A db_owner of a user database passed, then failed mid-operation with
+	// "User 'guest' does not have permission to run DBCC shrinkfile for database
+	// 'tempdb'" (Msg 7983). Measured against SQL Server 2022 CU26.
+	if slices.ContainsFunc(m.Operations, func(op ddl.Operation) bool {
+		_, ok := op.(ddl.ShrinkTempdb)
+		return ok
+	}) {
+		sa, err := p.IsSysadmin(ctx)
+		if err != nil {
+			return Report{}, fmt.Errorf("preflight sysadmin: %w", err)
+		}
+		rep.add(CheckTempdbShrinkRights(sa))
+	}
+
 	// When the blocker-kill policy is armed, advise (warn only) if the login cannot KILL.
 	if killArmed {
 		hasPerm, err := p.HasAlterAnyConnection(ctx)
@@ -267,12 +296,20 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 		// advisory on how lock escalation / the tempdb version store will behave.
 		if b, ok := op.(ddl.BatchDML); ok {
 			if tableExists {
-				perm := dmlPermissionFor(b)
-				has, err := p.HasDMLPermission(ctx, b.Schema, b.Table, perm)
-				if err != nil {
-					return Report{}, fmt.Errorf("preflight dml permission %s.%s: %w", b.Schema, b.Table, err)
+				// SELECT is needed too, and unconditionally: every batch is an
+				// UPDATE/DELETE TOP (n), the key_range walk reads the key with its own
+				// SELECT MAX, and a predicate reads the columns it filters on. A login
+				// with db_datawriter but not db_datareader passes the UPDATE check and
+				// then fails mid-run with "The SELECT permission was denied", which is
+				// the opaque error this check exists to pre-empt. Measured against
+				// SQL Server 2022 CU26, with and without a where clause.
+				for _, perm := range []string{dmlPermissionFor(b), "SELECT"} {
+					has, err := p.HasDMLPermission(ctx, b.Schema, b.Table, perm)
+					if err != nil {
+						return Report{}, fmt.Errorf("preflight dml permission %s.%s: %w", b.Schema, b.Table, err)
+					}
+					rep.add(CheckBatchDMLPermission(b, perm, has))
 				}
-				rep.add(CheckBatchDMLPermission(b, perm, has))
 			}
 			rep.add(CheckBatchDMLIsolation(info, b))
 		}

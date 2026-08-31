@@ -89,7 +89,7 @@ func TestNotifyRunFailureDeliversOnCancelledContext(t *testing.T) {
 		t.Fatalf("calls = %+v, want one run_failure", n.calls)
 	}
 	if !n.calls[0].ctxAlive {
-		t.Error("notifier received a cancelled context; delivery would fail before it starts")
+		t.Error("notifier received a canceled context; delivery would fail before it starts")
 	}
 }
 

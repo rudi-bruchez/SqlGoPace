@@ -1,5 +1,8 @@
 # SqlGoPace
 
+[![CI](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 SqlGoPace is a high-performance, resilient DDL task runner for Microsoft SQL Server
 written in Go. It is designed for demanding database migrations and schema
 refactoring — heavy `ALTER COLUMN`, `ALTER INDEX`, `CREATE INDEX`, table rebuilds,
@@ -130,10 +133,20 @@ left assuming explicit `UPDATE STATISTICS` is handled too.
 Requires Go 1.26+.
 
 ```bash
+go install github.com/rudi-bruchez/SqlGoPace/cmd/sqlgopace@latest
+```
+
+Or from a clone:
+
+```bash
 go build -o bin/sqlgopace ./cmd/sqlgopace
 # or
 make build
 ```
+
+Running it needs more than the binary: a `config.yaml`, the compatibility matrix
+`ddl_compatibility.yaml`, and a login with the right grants. See Configuration and
+Permissions below.
 
 ### Versioning
 
@@ -145,7 +158,7 @@ build produced it.
 
 ```bash
 $ sqlgopace --version
-sqlgopace 0.1.0
+sqlgopace 0.16.0
 ```
 
 A release pipeline can override the version without editing the file:
@@ -155,6 +168,35 @@ go build -ldflags "-X github.com/rudi-bruchez/SqlGoPace/internal/version.overrid
 ```
 
 See [`docs/build.md`](docs/build.md) for the full build, versioning, and cross-compilation guide.
+
+## Permissions
+
+Every run needs `VIEW SERVER STATE` at server level: the monitoring connection reads
+server-scoped DMVs on every poll, and without them the sampling loop fails even on a
+rebuild that blocks nobody. Beyond that, the grants are per tier, and most queues need
+only the first one.
+
+| You run | You need, in the target database | Plus, at server level |
+|---|---|---|
+| Index, column, constraint and statistics operations | `db_ddladmin` | — |
+| `batch_update`, `batch_delete` | `db_datareader` + `db_datawriter` | — |
+| `shrink`, `check_db` | `db_owner` | — |
+| `shrink_tempdb` | — | `sysadmin` |
+| Killing blockers or amplifying victims | — | `ALTER ANY CONNECTION` |
+
+SqlGoPace fails preflight with the missing grant named, rather than letting a statement
+fail after the manifest has been claimed. The kill capability is the exception: it warns,
+because a run that cannot kill a blocker is still a valid run.
+
+`db_datareader` is not needed for the DDL tier, `update_statistics WITH FULLSCAN`
+included, so granting it there widens the login for nothing. Batched DML does need it:
+every batch is an `UPDATE`/`DELETE TOP (n)`, and SQL Server wants `SELECT` for the `TOP`
+and for any predicate column.
+
+See [`docs/permissions.md`](docs/permissions.md) for the operation-by-operation
+reference, [`docs/permissions/`](docs/permissions/) for ready-to-run T-SQL templates per
+tier, and [`docs/permissions/99-verify.sql`](docs/permissions/99-verify.sql) to report
+what an existing login can actually run.
 
 ## Configuration
 
@@ -986,6 +1028,23 @@ make e2e CONTAINER=podman COMPOSE="podman compose"
 
 See [`docs/e2e.md`](docs/e2e.md) for details.
 
+## Contributing
+
+Pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md) covers the build and
+test commands, how to run the suite against a real server, and the conventions that
+are not obvious from the code: manifest-driven rather than raw SQL, no query timeout,
+measured claims, and never committing an identifier from a real engagement.
+
+For a security problem, see [`SECURITY.md`](SECURITY.md) rather than opening an issue.
+It also describes what privileges the tool holds and where its trust boundary sits,
+which is worth reading before you point it at a production server.
+
+[`CHANGELOG.md`](CHANGELOG.md) records notable changes.
+
 ## License
 
-MIT.
+MIT. See [`LICENSE`](LICENSE).
+
+`docs/ShrinkDriver.ps1` is not part of SqlGoPace: it is Microsoft's own
+`Invoke-ShrinkDriver` sample, kept here as the reference the shrink driver was
+designed against, under its own MIT licence and with its authorship header intact.
