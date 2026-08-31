@@ -18,11 +18,11 @@ yours.
 
 ## Read these first
 
-- [`docs/running.md`](../../../docs/running.md) — modes, flags, the queue, stopping a run,
+- [`docs/running.md`](../../../docs/running.md), for modes, flags, the queue, stopping a run,
   and what a re-run repeats after each kind of ending.
-- [`docs/blocking-and-kills.md`](../../../docs/blocking-and-kills.md) — the reaction
+- [`docs/blocking-and-kills.md`](../../../docs/blocking-and-kills.md), for the reaction
   hierarchy and the three session-policy features.
-- [`docs/permissions.md`](../../../docs/permissions.md) — when a failure is a missing grant.
+- [`docs/permissions.md`](../../../docs/permissions.md), for when a failure is a missing grant.
 
 ## Before running anything
 

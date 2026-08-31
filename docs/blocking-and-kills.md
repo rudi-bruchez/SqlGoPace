@@ -8,10 +8,10 @@ your DDL and the rest of the workload get in each other's way, who gives way?
 When the running DDL causes pressure, SqlGoPace escalates from gentlest to harshest and
 stops at the first mechanism the target supports:
 
-1. `WAIT_AT_LOW_PRIORITY` — yield to existing sessions.
-2. `RESUMABLE` pause and resume — pause an index operation and continue it later, rather
-   than rolling it back.
-3. `KILL` — last resort, after a grace period, with bounded retries.
+1. `WAIT_AT_LOW_PRIORITY`, which yields to existing sessions.
+2. `RESUMABLE` pause and resume, which continues an index operation later rather than
+   rolling it back.
+3. `KILL`, a last resort, after a grace period, with bounded retries.
 
 Which of these are even eligible is decided by
 [`ddl_compatibility.yaml`](compatibility-matrix.md), keyed by major version and edition
@@ -108,14 +108,14 @@ and appendable from the console with `x`, but nothing is ever killed unless the 
 allows it:
 
 ```yaml
-# config.yaml — the master arm. Off by default; killing a session is destructive.
+# config.yaml: the master arm. Off by default; killing a session is destructive.
 kill_blockers:
   enabled: true
   default_after_seconds: 60   # applied to a rule that sets no after_seconds
 ```
 
 ```yaml
-# the manifest — who may be killed, and after how long they have blocked us
+# the manifest: who may be killed, and after how long they have blocked us
 kill_blocking_sessions:
   - login_name: "^svc_dashboard$"    # a read-only dashboard: kill it quickly
     after_seconds: 30
@@ -275,7 +275,7 @@ optional.
 A run that kills at least one amplifying victim writes `<manifest>.amplifiers.yaml`: one
 entry per kill, plus a trailing comment block with one deduplicated `sp_update_job` statement
 per distinct job terminated. It is deliberately a separate file from `.blocked.yaml`, whose
-whole purpose is "paste this into `ignore_blocked_sessions`" — an amplifier is the exact
+whole purpose is "paste this into `ignore_blocked_sessions`", and an amplifier is the exact
 opposite instruction.
 
 ## Permissions

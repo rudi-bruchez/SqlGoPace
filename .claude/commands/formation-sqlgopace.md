@@ -35,35 +35,37 @@ verifies, sets the bar.*
 ## Deliverables (under `formation/`, default all three)
 
 1. `formation.md` — trainer guide: why this project is a good case study, audience+objectives, a
-   **session timeline through-line** table (`demande → action → compétence`), one section per module,
+   **session timeline through-line** table (request, action, skill acquired), one section per module,
    antipatterns, a prompt cheat-sheet, an artifacts annex, a timed agenda.
 2. `slides/` — one **Marp** deck per module (`marp: true`, theme, paginate, header/footer; `---`
    separators; lead slides for key messages; ≤ ~6 bullets/slide) + a `slides/README.md` (order + render
    commands).
-3. `exercices.md` — one exercise per module (**Énoncé → Déroulé attendu → Corrigé/points de validation
-   → Variante**) + a self-assessment grid.
+3. `exercices.md`, one exercise per module (statement, expected walkthrough, solution and
+   validation points, variant) plus a self-assessment grid.
 
 ## Module set (keep these 8, same order in guide/slides/exercises)
 
-1. **Contexte & mémoire** — lectures ciblées, `@fichier`, mémoires projet survivant aux phases.
-2. **Workflow piloté par la spec** — converger la spec avant de coder ; **garder la spec honnête**
-   (corriger la spec quand la meilleure implémentation diverge — M5 colonnes, M7 matérialiser-vs-in-memory).
-3. **Relecteur critique… et faillible** *(cœur)* — *trust but verify* avec source (le bug RESUMABLE
-   mono-partition vérifié via le MCP Microsoft Learn) ; trier un avis externe (Gemini/Mistral).
-4. **Piloter le modèle** — décisions pas souhaits ; `AskUserQuestion` « questions d'abord » ; fournir
-   un script comme source ; interruption ; cadence par phases.
-5. **Outillage du harnais** — appels parallèles ; `Edit` chirurgical vs `Write` ; outils dédiés/différés
-   (`ToolSearch` → WebFetch, MCP) ; boucle build/test/vet/gofmt.
-6. **Skills & plugins** — `/claude-hud:setup` (HUD de consommation de tokens) ; une skill = une barre
-   de qualité ; cette commande elle-même.
-7. **Qualité, sécurité, cohérence** — sauvegarde+vérif BOM avant d'écrire un fichier ; tests
-   golden/round-trip ; migration **additive** (`IF NOT EXISTS`) ; **étendre sans casser** (wrappers) ;
-   secrets via `.env`.
-8. **Élégance & idiome** *(capstone)* — sum types, interface étroite côté consommateur, données-pas-code,
-   extraction pure testable (`reactionEvent`), réutiliser plutôt que refactorer (`--auto`), **savoir
-   s'arrêter** (périmètre borné), `gofmt`/`vet` propres.
+1. **Context and memory**: targeted reading, `@file`, project memories that survive across phases.
+2. **Spec-driven workflow**: converge the spec before coding, and **keep the spec honest** by
+   correcting it when the best implementation diverges (M5 columns, M7 materialise versus in-memory).
+3. **The critical, fallible reviewer** *(the core module)*: trust but verify, against a source (the
+   single-partition RESUMABLE bug, checked through the Microsoft Learn MCP); triaging an external
+   opinion (Gemini, Mistral).
+4. **Steering the model**: decisions rather than wishes; `AskUserQuestion` and asking first; supplying
+   a script as the source; interrupting; pacing by phases.
+5. **Harness tooling**: parallel calls; surgical `Edit` versus `Write`; dedicated and deferred tools
+   (`ToolSearch`, WebFetch, MCP); the build, test, vet and gofmt loop.
+6. **Skills and plugins**: `/claude-hud:setup` (the token-consumption HUD); one skill as one quality
+   bar; this command itself.
+7. **Quality, safety, consistency**: back up and check the BOM before writing a file; golden and
+   round-trip tests; **additive** migration (`IF NOT EXISTS`); **extend without breaking** (wrappers);
+   secrets through `.env`.
+8. **Elegance and idiom** *(capstone)*: sum types, a narrow consumer-side interface, data rather than
+   code, testable pure extraction (`reactionEvent`), reusing rather than refactoring (`--auto`),
+   **knowing when to stop** (a bounded scope), a clean `gofmt` and `vet`.
 
-Keep a module only if it has a **real** illustration in the inputs; drop or mark "non illustré" otherwise.
+Keep a module only if it has a **real** illustration in the inputs; otherwise drop it, or mark it as
+not illustrated.
 
 ## Conventions
 

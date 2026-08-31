@@ -45,12 +45,14 @@ mandatory for monitoring).
 - **Idiomatic Go, KISS.** Write plain, idiomatic Go that reads like the surrounding code; favour
   the simplest thing that works over cleverness or premature abstraction. Don't add layers,
   interfaces, generics, or options the current need doesn't justify.
-- **English only** — all code, comments, identifiers, file names, and committed docs are in
-  English, **including the design docs under `docs/specs/`**. The training material under
-  `formation/` is the only exception (it is delivered in French). Two raw AI research dumps
-  kept as historical source material — `docs/specs/gemini-shrink.md` and `docs/specs/SQL Server Shrink -
-  Document de référence technique - Perplexity.md` — remain in French deliberately; they are
-  inputs to a decision already made, not specs.
+- **English only, with no exception in the repository.** All code, comments, identifiers, file
+  names, and committed docs are in English, **including the design docs under `docs/specs/`**.
+  The two raw AI research dumps kept as historical source material
+  (`docs/specs/gemini-shrink.md`, `docs/specs/shrink-reference-perplexity.md`) were translated
+  in the 2026-08-31 documentation pass; they are inputs to decisions already made, not specs,
+  and they carry a header saying so. The only French thing the project produces is the
+  *delivered* training material under `formation/` (gitignored), which is written in French
+  because it is taught in French; the command that generates it is in English.
 - **Manifest-driven, never raw SQL.** Adding a DDL capability means adding an `operation` type
   end-to-end (parse → resolve → generate → plan), not parsing user SQL.
 - **No query timeout.** Operation duration is governed by the monitoring loop and the reaction

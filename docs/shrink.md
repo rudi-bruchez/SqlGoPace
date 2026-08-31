@@ -33,7 +33,7 @@ rollback, and it is re-entrant: re-running toward the same target resumes where 
 | `files` | `all` | A logical file name from `sys.database_files.name`, or `all` to shrink every file of that type one at a time, never two of a filegroup in parallel. |
 | `targetfreespace` | required | Free space wanted in the final file: a percent of used space (`N%` gives final ≈ used × (1 + N/100)) or an absolute `N MB` (final ≈ used + N). Always clamped to the floor the file can actually reach: its used space, or the active VLFs for a log. |
 | `identify_tail_object` | false | Name the object owning the file's last allocated page up front. See below. |
-| `emptyfile` | — | Reserved for a future release; `true` is rejected. |
+| `emptyfile` | n/a | Reserved for a future release; `true` is rejected. |
 
 `options.wait_at_low_priority` is auto by default. On SQL Server 2022 and later it is
 injected for data shrinks so the schema-modify lock waits at low priority instead of

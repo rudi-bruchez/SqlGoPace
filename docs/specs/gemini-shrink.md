@@ -1,27 +1,39 @@
 > From: https://gemini.google.com/app/67cf4f9a5fd85308
+>
+> Raw research transcript, kept as historical source material for the shrink driver's
+> design. It is an input to a decision already made, not a specification, and it is not
+> maintained. Translated from the original French.
 
 # you asked
 
-Y a-t-il un moyen d'évaluer combien de temps va prendre un shrink d'un fichier de base de données dans sql server ? Et combien de pages il devra déplacer ?
+Is there a way to estimate how long a shrink of a SQL Server database file will take? And
+how many pages it will have to move?
 
 ---
 
 # gemini response
 
-C'est une excellente question, et c'est un défi bien connu des administrateurs de bases de données (DBA). Pour être tout à fait franc : **il est extrêmement difficile d'estimer précisément le temps ou le nombre exact de pages à déplacer avant de lancer l'opération.**
+That is an excellent question, and a well-known challenge for database administrators. To be
+completely frank: **it is extremely difficult to estimate precisely either the time or the
+exact number of pages to move before starting the operation.**
 
-Cependant, il existe des méthodes pour suivre l'avancement une fois l'opération lancée, et des moyens d'estimer la quantité de données concernées. Voici comment vous pouvez aborder le problème.
+There are, however, methods for following progress once the operation is under way, and ways
+to estimate the volume of data involved. Here is how you can approach the problem.
 
 ---
 
-### 1. Évaluer le temps nécessaire (Pendant l'exécution)
+### 1. Estimating the time needed (during execution)
 
-Avant de lancer le *shrink*, le temps dépend de trop de variables : la vitesse de votre sous-système disque (I/O), la fragmentation interne, la présence de données LOB (Large Objects), et les verrous posés par d'autres requêtes actives.
+Before starting the shrink, the duration depends on too many variables: the speed of your
+disk subsystem (I/O), internal fragmentation, the presence of LOB data (Large Objects), and
+the locks held by other active queries.
 
-Une fois que vous avez lancé le `DBCC SHRINKFILE` ou `DBCC SHRINKDATABASE`, SQL Server expose sa progression via les vues de gestion dynamique (DMV). Vous pouvez utiliser la requête suivante pour voir le pourcentage d'avancement et le temps restant estimé :
+Once you have started `DBCC SHRINKFILE` or `DBCC SHRINKDATABASE`, SQL Server exposes its
+progress through the dynamic management views (DMVs). You can use the following query to see
+the percentage complete and the estimated time remaining:
 
 ```sql
-SELECT 
+SELECT
     session_id,
     command,
     status,
@@ -32,168 +44,243 @@ SELECT
     wait_time,
     blocking_session_id
 FROM sys.dm_exec_requests
-WHERE command IN ('DbccFilesCompact', 'DbccSpaceReclaim') -- Commandes internes pour le shrink
+WHERE command IN ('DbccFilesCompact', 'DbccSpaceReclaim') -- internal commands for the shrink
    OR command LIKE 'DBCC%';
 ```
 
-> **Attention :** Le `estimated_completion_time` (temps restant) est calculé en temps réel par SQL Server. Il peut fluctuer énormément. Si le moteur tombe sur une section du fichier très fragmentée ou des objets LOB, le temps estimé peut soudainement bondir.
+> **Caution:** `estimated_completion_time` is computed in real time by SQL Server. It can
+> fluctuate enormously. If the engine reaches a heavily fragmented section of the file, or
+> LOB objects, the estimated time can suddenly jump.
 
 ---
 
-### 2. Estimer le nombre de pages à déplacer (Avant l'exécution)
+### 2. Estimating the number of pages to move (before execution)
 
-Pour comprendre pourquoi c'est difficile à prévoir, il faut comprendre comment fonctionne le *shrink* : SQL Server prend les pages de données situées **à la fin du fichier** physique et les déplace vers les **espaces vides (non alloués) situés au début du fichier**.
+To understand why this is hard to predict, you have to understand how the shrink works: SQL
+Server takes the data pages located **at the end** of the physical file and moves them into
+the **empty (unallocated) space at the beginning of the file**.
 
-* **Le scénario idéal :** Si votre fichier fait 100 Go, que 50 Go sont utilisés, et que toutes ces données sont parfaitement entassées au début du fichier, le *shrink* déplacera **0 page**. Il se contentera de couper la fin du fichier.
-* **Le scénario catastrophe :** Si les 50 Go de données sont éparpillés jusqu'à la toute fin du fichier de 100 Go, le moteur devra lire et réécrire une quantité massive de pages pour tasser les données vers le début.
+* **The ideal case:** if your file is 100 GB, 50 GB are used, and all that data is perfectly
+  packed at the beginning of the file, the shrink will move **zero pages**. It will simply
+  cut off the end of the file.
+* **The disaster case:** if the 50 GB of data are scattered all the way to the very end of
+  the 100 GB file, the engine will have to read and rewrite a massive number of pages to
+  pack the data toward the beginning.
 
-Vous ne pouvez pas facilement compter les pages qui seront déplacées sans analyser physiquement l'emplacement de chaque extension, mais vous pouvez **estimer l'espace libre et l'espace utilisé** en pages (1 page = 8 Ko) pour connaître la limite théorique.
+You cannot easily count the pages that will be moved without physically analysing the
+location of every extent, but you can **estimate the free space and the used space** in
+pages (1 page = 8 KB) to know the theoretical limit.
 
-Utilisez cette requête pour analyser vos fichiers :
+Use this query to analyse your files:
 
 ```sql
-SELECT 
-    name AS NomFichier,
-    physical_name AS CheminPhysique,
-    size AS TailleTotale_Pages,
-    CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT) AS PagesUtilisees,
-    size - CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT) AS PagesVides,
-    (size/128.0) AS TailleTotale_MB,
-    (CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT)/128.0) AS EspaceUtilise_MB,
-    ((size - CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT))/128.0) AS EspaceVide_MB
+SELECT
+    name AS file_name,
+    physical_name AS physical_path,
+    size AS total_size_pages,
+    CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT) AS used_pages,
+    size - CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT) AS free_pages,
+    (size / 128.0) AS total_size_mb,
+    (CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT) / 128.0) AS used_space_mb,
+    ((size - CAST(FILEPROPERTY(name, 'SpaceUsed') AS INT)) / 128.0) AS free_space_mb
 FROM sys.database_files;
 ```
 
-Si vous décidez de réduire la taille du fichier au plus près de l'`EspaceUtilise_MB`, la différence entre l'emplacement de la dernière page allouée et la taille cible déterminera le volume de pages à déplacer.
+If you decide to reduce the file size as close as possible to `used_space_mb`, the distance
+between the position of the last allocated page and the target size determines the volume of
+pages to be moved.
 
 ---
 
-### ⚠️ Conseils de prudence (Rappel amical)
+### ⚠️ A word of caution (a friendly reminder)
 
-Puisque nous parlons de *shrink*, il est de mon devoir de vous rappeler quelques réalités de cette opération :
+Since we are talking about shrink, it is my duty to remind you of a few realities of this
+operation:
 
-* **Fragmentation massive :** Le *shrink* (contrairement à la reconstruction d'index) déplace les pages dans le désordre pour combler les trous. Cela génère une fragmentation quasi-totale (proche de 100%) de vos index.
-* **Activité du journal de transactions :** Chaque mouvement de page est loggué. Un *shrink* lourd va faire gonfler votre fichier journal (`.ldf`), ce qui peut annuler le gain d'espace si le journal est sur le même disque.
-* **Croissance future :** Si la base est amenée à regrossir dans les mois qui viennent, réduire le fichier est contre-productif, car SQL Server devra à nouveau allouer de l'espace sur le disque (ce qui coûte en performances).
+* **Massive fragmentation:** unlike an index rebuild, the shrink moves pages out of order to
+  fill holes. This produces near-total fragmentation (close to 100%) of your indexes.
+* **Transaction log activity:** every page move is logged. A heavy shrink will inflate your
+  log file (`.ldf`), which can cancel out the space gained if the log sits on the same disk.
+* **Future growth:** if the database is going to grow again over the coming months, shrinking
+  the file is counterproductive, because SQL Server will have to allocate the space on disk
+  all over again, at a performance cost.
 
-Si vous devez absolument le faire (par exemple, après avoir purgé des millions de lignes d'historique que vous ne remplacerez pas), il est souvent recommandé de le faire par **petits incréments** (par exemple, réduire de 5 Go en 5 Go) plutôt que de lancer une énorme opération d'un coup, afin de pouvoir l'interrompre proprement si nécessaire.
-
----
-
-# you asked
-
-Detaille le fonctionnement de https://dbatools.io/Invoke-DbaDbShrink/
-
----
-
-# gemini response
-
-La commande `Invoke-DbaDbShrink` fait partie du célèbre module PowerShell **dbatools**. C'est un "wrapper" (une surcouche intelligente) autour des commandes natives SQL Server `DBCC SHRINKDATABASE` et `DBCC SHRINKFILE`. 
-
-Au lieu de simplement lancer un *shrink* brut (qui est souvent une opération risquée et aveugle en T-SQL), `Invoke-DbaDbShrink` ajoute des mécanismes de contrôle, de mesure et de sécurité très prisés par les administrateurs de bases de données (DBA).
-
-Voici comment cette commande fonctionne en détail et ce qui la rend supérieure à une simple requête SQL.
-
-### 1. Le fonctionnement en coulisses (L'algorithme de la commande)
-
-Lorsque vous lancez `Invoke-DbaDbShrink`, le script PowerShell effectue plusieurs actions séquentiellement :
-
-1. **Mise à jour des statistiques d'espace (`DBCC UPDATEUSAGE`) :** Par défaut, la commande commence par forcer la mise à jour des compteurs d'espace de la base de données. Cela garantit que les calculs d'espace libre et utilisé sont parfaitement exacts avant de prendre la moindre décision (désactivable via `-ExcludeUpdateUsage`).
-2. **Analyse de la fragmentation initiale :** Avant de toucher aux fichiers, l'outil interroge les vues de gestion dynamique (DMV) pour mesurer la fragmentation moyenne et maximale de vos index. Cela servira de point de comparaison (désactivable via `-ExcludeIndexStats` pour gagner du temps).
-3. **Exécution du Shrink :** La commande génère et exécute dynamiquement le code T-SQL nécessaire en fonction des paramètres que vous avez choisis (voir ci-dessous).
-4. **Analyse de la fragmentation finale :** Une fois l'opération terminée, l'outil recalcule la fragmentation de vos index pour vous montrer l'impact exact du *shrink* (qui, généralement, fragmente massivement les données).
-5. **Génération d'un rapport :** La commande renvoie un objet PowerShell complet listant ce qui a été fait, l'espace gagné et le temps écoulé.
-
-### 2. Les fonctionnalités et paramètres clés
-
-C'est ici que `Invoke-DbaDbShrink` brille vraiment par rapport au SQL natif :
-
-* **Le "Chunking" ou découpage (`-StepSize`) :** C'est la fonctionnalité la plus importante. Si vous demandez de réduire un fichier de 50 Go d'un coup, SQL Server va générer une transaction massive, saturer le CPU, potentiellement bloquer d'autres requêtes et faire exploser la taille du journal des transactions (T-Log).
-  Avec `-StepSize 25MB` ou `-StepSize 1GB`, `dbatools` va effectuer le *shrink* par petits morceaux (boucles successives). Cela réduit la pression sur le système, permet de suivre la progression via une barre de progression PowerShell, et évite la saturation du journal.
-
-* **Ciblage de l'espace libre (`-PercentFreeSpace`) :**
-  Au lieu de vider complètement le fichier et de laisser 0 octet d'espace libre, vous pouvez lui dire `-PercentFreeSpace 15`. L'outil calculera dynamiquement à quelle taille réduire le fichier pour qu'il conserve 15% d'espace libre, permettant ainsi à la base de respirer et de grossir un peu sans déclencher d'auto-growth immédiat.
-
-* **Ciblage des fichiers (`-FileType`) :**
-  Vous pouvez cibler spécifiquement les fichiers de données (`Data`), les fichiers journaux (`Log`), ou les deux (`All`). C'est très utile pour ne réduire que le fichier `.ldf` après un gros incident, sans toucher aux données.
-
-* **Méthodes de réduction (`-ShrinkMethod`) :**
-  Il supporte les options natives :
-  * `TruncateOnly` : Coupe simplement l'espace vide à la fin du fichier et le rend à l'OS. Cela ne déplace aucune page de données, c'est instantané et cela ne crée aucune fragmentation.
-  * `EmptyFile` : Vide un fichier de données pour pouvoir le supprimer (déplace son contenu vers les autres fichiers du même groupe).
-  * `NoTruncate` : Tasse les données au début du fichier mais ne rend pas l'espace à l'OS.
-
-* **Gestion des blocages (SQL Server 2022+) :**
-  Si vous êtes sur une instance récente, vous pouvez utiliser `-WaitAtLowPriority`. Au lieu d'entrer en conflit avec les utilisateurs actifs pour verrouiller des objets, le *shrink* patientera en arrière-plan avec une priorité basse. Vous pouvez même lui dire de s'auto-annuler si l'attente est trop longue (`-AbortAfterWait Self`) ou de tuer les sessions bloquantes (`Blockers`).
-
-### 3. Ce que l'outil vous retourne (Outputs)
-
-À la fin de l'opération, au lieu d'un simple message "Commande réussie", `Invoke-DbaDbShrink` renvoie un objet PowerShell extrêmement riche contenant (entre autres) :
-* `InitialSize` et `FinalSize` (Taille avant/après).
-* `InitialAvailable` et `FinalAvailable` (Espace vide avant/après).
-* L'heure de début, de fin, et la durée totale (`Elapsed`).
-* `InitialAverageFragmentation` et `FinalAverageFragmentation` (Montrant visuellement à quel point le *shrink* a détruit l'organisation de vos index).
-
-### En résumé
-
-`Invoke-DbaDbShrink` transforme une opération lourde, aveugle et dangereuse en un processus contrôlé, morcelé, mesurable et automatisable. C'est aujourd'hui la méthode recommandée par la communauté d'administration SQL si vous êtes **absolument obligé** de faire un *shrink* de vos fichiers de base de données.
+If you absolutely must do it, for instance after purging millions of rows of history you will
+not replace, it is often recommended to proceed in **small increments** (say 5 GB at a time)
+rather than launching one enormous operation, so that you can stop it cleanly if you need to.
 
 ---
 
 # you asked
 
-Y a-t-il une bonne façon d'estimer le stepsize Le plus efficace?
+Explain in detail how https://dbatools.io/Invoke-DbaDbShrink/ works
 
 ---
 
 # gemini response
 
-C'est la véritable question complexe. Il n'existe pas de formule mathématique universelle pour le `StepSize`, car ce qui est "efficace" n'est pas seulement ce qui va le plus vite, mais ce qui **maintient la stabilité de l'instance** pendant l'opération.
+The `Invoke-DbaDbShrink` command is part of the well-known **dbatools** PowerShell module. It
+is a wrapper, an intelligent layer, around the native SQL Server commands `DBCC
+SHRINKDATABASE` and `DBCC SHRINKFILE`.
 
-Lorsqu'on conçoit des routines d'archivage massif ou de maintenance lourde de bases de données, le choix du *step size* se résume en réalité à un exercice d'équilibrage entre la pression sur les I/O, le verrouillage, et surtout, la gestion du journal de transactions (Write-Ahead Logging).
+Rather than simply issuing a raw shrink, which is often a risky and blind operation in T-SQL,
+`Invoke-DbaDbShrink` adds control, measurement and safety mechanisms that database
+administrators value highly.
 
-Voici la méthode architecturale pour estimer la taille de bloc la plus efficace pour votre environnement.
+Here is how the command works in detail, and what makes it better than a plain SQL query.
 
-### 1. Le goulot d'étranglement principal : Le T-Log
+### 1. What happens behind the scenes (the command's algorithm)
 
-C'est la règle d'or du *shrink* : **le déplacement des pages est entièrement loggué**. 
-Déplacer 1 Go de données depuis la fin du fichier vers le début va générer au minimum 1 Go (souvent un peu plus à cause de l'overhead) d'écritures dans le fichier `.ldf`.
+When you run `Invoke-DbaDbShrink`, the PowerShell script performs several steps in sequence:
 
-Si vous choisissez un `StepSize` trop grand, voici ce qui se passe :
-1. La transaction devient massive.
-2. Le journal des transactions se remplit plus vite que le processus de *Checkpoint* (en mode SIMPLE) ou que vos sauvegardes de log (en mode FULL) ne peuvent le vider.
-3. Le `.ldf` subit un *Auto-Growth*, créant de nouveaux VLF (*Virtual Log Files*), et potentiellement une fragmentation physique du journal au niveau du stockage.
-4. L'opération s'effondre en performances à cause des attentes `WRITELOG`.
+1. **Updating the space statistics (`DBCC UPDATEUSAGE`):** by default the command begins by
+   forcing an update of the database's space counters. This guarantees that the free-space and
+   used-space calculations are exact before any decision is taken. It can be disabled with
+   `-ExcludeUpdateUsage`.
+2. **Measuring the initial fragmentation:** before touching the files, the tool queries the
+   DMVs to measure the average and maximum fragmentation of your indexes. This serves as the
+   point of comparison. It can be disabled with `-ExcludeIndexStats` to save time.
+3. **Running the shrink:** the command generates and executes the necessary T-SQL dynamically,
+   according to the parameters you chose (see below).
+4. **Measuring the final fragmentation:** once the operation is finished, the tool recomputes
+   your index fragmentation to show you the exact impact of the shrink, which generally
+   fragments the data massively.
+5. **Producing a report:** the command returns a complete PowerShell object listing what was
+   done, the space reclaimed and the time elapsed.
 
-**L'approche d'estimation :** Le `StepSize` idéal doit générer un volume de transaction inférieur à la quantité d'espace libre actuel dans votre journal, ou au moins inférieur à la taille de votre *Auto-Growth* du journal, pour laisser le temps au mécanisme de troncature de faire son travail entre deux boucles.
+### 2. The key features and parameters
 
-### 2. L'Overhead vs. Le Débit I/O
+This is where `Invoke-DbaDbShrink` really shines compared to native SQL:
 
-Il y a un point de bascule capacitaire à trouver :
-* **Trop petit (ex: 5 Mo ou 10 Mo) :** L'overhead de l'exécution de la commande, de l'analyse des pages, et des allers-retours de la boucle d'exécution (que ce soit via PowerShell ou une boucle `WHILE` en T-SQL) consomme plus de CPU que le déplacement de données lui-même.
-* **Trop grand (ex: 5 Go ou 10 Go) :** Le sous-système disque est saturé par les files d'attente de lecture/écriture, générant des attentes `PAGEIOLATCH_EX` intenses qui vont impacter toutes les autres requêtes sur la même LUN/grappe de disques.
+* **Chunking (`-StepSize`):** the most important feature. If you ask to reduce a 50 GB file in
+  one go, SQL Server will generate a massive transaction, saturate the CPU, potentially block
+  other queries, and blow up the size of the transaction log.
+  With `-StepSize 25MB` or `-StepSize 1GB`, dbatools performs the shrink in small pieces
+  (successive loops). This reduces the pressure on the system, allows progress to be followed
+  through a PowerShell progress bar, and avoids saturating the log.
 
-### 3. Comment calibrer le StepSize (Méthodologie)
+* **Targeting free space (`-PercentFreeSpace`):** rather than emptying the file completely and
+  leaving zero bytes of free space, you can tell it `-PercentFreeSpace 15`. The tool computes
+  dynamically what size to reduce the file to so that it keeps 15% free, letting the database
+  breathe and grow a little without triggering an immediate auto-growth.
 
-Puisque les systèmes de stockage varient (du vieux SAN aux baies NVMe direct-attach), la meilleure méthode reste empirique, mais guidée :
+* **Targeting files (`-FileType`):** you can specifically target data files (`Data`), log
+  files (`Log`), or both (`All`). This is very useful for shrinking only the `.ldf` after a
+  large incident, without touching the data.
 
-**Étape A : Établir une ligne de base (La zone refuge)**
-En général, la communauté s'accorde pour dire que le point de départ sécuritaire se situe entre **50 MB et 500 MB**. 
-* **250 MB** est souvent considéré comme le *sweet spot* pour démarrer sur du matériel moderne. Cela déplace environ 32 000 pages par itération, ce qui est traité en quelques secondes sans saturer le tampon.
+* **Shrink methods (`-ShrinkMethod`):** it supports the native options:
+  * `TruncateOnly`: simply cuts the empty space off the end of the file and returns it to the
+    OS. It moves no data pages, is instantaneous, and creates no fragmentation.
+  * `EmptyFile`: empties a data file so it can be removed, moving its content into the other
+    files of the same filegroup.
+  * `NoTruncate`: packs the data toward the beginning of the file but does not return the
+    space to the OS.
 
-**Étape B : Le test de charge (Monitorer les Wait Stats)**
-Lancez le processus avec un `StepSize` de 250 MB et surveillez vos DMV :
+* **Blocking management (SQL Server 2022 and later):** on a recent instance you can use
+  `-WaitAtLowPriority`. Instead of competing with active users for object locks, the shrink
+  waits in the background at low priority. You can even tell it to cancel itself if the wait
+  is too long (`-AbortAfterWait Self`) or to kill the blocking sessions (`Blockers`).
+
+### 3. What the tool returns
+
+At the end of the operation, instead of a bare "command completed successfully" message,
+`Invoke-DbaDbShrink` returns a very rich PowerShell object containing, among other things:
+
+* `InitialSize` and `FinalSize`, the size before and after.
+* `InitialAvailable` and `FinalAvailable`, the free space before and after.
+* The start time, the end time and the total duration (`Elapsed`).
+* `InitialAverageFragmentation` and `FinalAverageFragmentation`, showing visually how far the
+  shrink destroyed the organisation of your indexes.
+
+### In summary
+
+`Invoke-DbaDbShrink` turns a heavy, blind and dangerous operation into a controlled, chunked,
+measurable and automatable process. It is today the method recommended by the SQL
+administration community if you are **absolutely obliged** to shrink your database files.
+
+---
+
+# you asked
+
+Is there a good way to estimate the most effective step size?
+
+---
+
+# gemini response
+
+That is the genuinely hard question. There is no universal formula for `StepSize`, because
+what counts as "effective" is not merely what goes fastest, but what **keeps the instance
+stable** while the operation runs.
+
+When you design massive archiving routines or heavy database maintenance, choosing the step
+size really comes down to balancing I/O pressure, locking, and above all the management of
+the transaction log (write-ahead logging).
+
+Here is the architectural method for estimating the most effective chunk size for your
+environment.
+
+### 1. The main bottleneck: the transaction log
+
+This is the golden rule of the shrink: **moving pages is fully logged.**
+Moving 1 GB of data from the end of the file to the beginning generates at least 1 GB of
+writes to the `.ldf`, and usually somewhat more because of the overhead.
+
+If you pick a `StepSize` that is too large, here is what happens:
+
+1. The transaction becomes massive.
+2. The transaction log fills faster than the checkpoint process (in SIMPLE recovery) or your
+   log backups (in FULL) can empty it.
+3. The `.ldf` undergoes an auto-growth, creating new VLFs (virtual log files) and potentially
+   physical fragmentation of the log at the storage level.
+4. The operation collapses in performance under `WRITELOG` waits.
+
+**The estimation approach:** the ideal `StepSize` should generate a transaction volume smaller
+than the free space currently available in your log, or at least smaller than your log's
+auto-growth increment, to leave the truncation mechanism time to do its work between two
+iterations.
+
+### 2. Overhead versus I/O throughput
+
+There is a tipping point to find:
+
+* **Too small (say 5 MB or 10 MB):** the overhead of running the command, analysing the pages,
+  and the round trips of the loop, whether through PowerShell or a T-SQL `WHILE`, consumes
+  more CPU than moving the data does.
+* **Too large (say 5 GB or 10 GB):** the disk subsystem is saturated by read and write
+  queues, generating intense `PAGEIOLATCH_EX` waits that will affect every other query on the
+  same LUN or disk group.
+
+### 3. How to calibrate the step size (methodology)
+
+Since storage systems vary, from an old SAN to direct-attached NVMe, the best method remains
+empirical, but guided:
+
+**Step A: establish a baseline (the safe zone).**
+The community generally agrees that a safe starting point lies between **50 MB and 500 MB**.
+
+* **250 MB** is often considered the sweet spot to start from on modern hardware. It moves
+  about 32,000 pages per iteration, which is processed in a few seconds without saturating the
+  buffer.
+
+**Step B: the load test (monitor the wait statistics).**
+Start the process with a `StepSize` of 250 MB and watch your DMVs:
+
 ```sql
--- Surveillez la croissance du journal pendant l'itération
-SELECT database_id, log_space_in_bytes_since_last_backup 
+-- Watch the log growing during the iteration
+SELECT database_id, log_space_in_bytes_since_last_backup
 FROM sys.dm_db_log_stats(DB_ID());
 ```
-Si vous remarquez que vos attentes `WRITELOG` ou `PAGEIOLATCH_EX` s'envolent au-delà de 20-30 ms de latence moyenne, votre I/O ne suit pas, il faut réduire le *step size* (ex: 100 MB).
 
-**Étape C : Ajuster en fonction du mode de récupération**
-* **Mode SIMPLE :** Vous pouvez vous permettre un `StepSize` légèrement plus grand (ex: 500 MB), car le *checkpoint* implicite à la fin de chaque "chunk" tronquera le journal presque immédiatement.
-* **Mode FULL :** Le journal ne se vide qu'à la sauvegarde du log. Si votre sauvegarde tourne toutes les 15 minutes, vous devez calculer combien de gigaoctets de *shrink* votre disque de log peut encaisser en 15 minutes sans saturer.
+If you notice your `WRITELOG` or `PAGEIOLATCH_EX` waits climbing beyond 20 to 30 ms of average
+latency, your I/O is not keeping up and you should reduce the step size, to 100 MB for
+instance.
+
+**Step C: adjust for the recovery model.**
+
+* **SIMPLE recovery:** you can afford a slightly larger `StepSize`, say 500 MB, because the
+  implicit checkpoint at the end of each chunk truncates the log almost immediately.
+* **FULL recovery:** the log only empties when the log is backed up. If your backup runs every
+  fifteen minutes, you have to work out how many gigabytes of shrink your log disk can absorb
+  in fifteen minutes without saturating.
 
 ---
-
-Êtes-vous en train de calibrer ces paramètres pour une tâche de maintenance ponctuelle, ou cherchez-vous à standardiser cette valeur pour l'intégrer dans un utilitaire d'archivage et de maintenance automatisé récurrent ?

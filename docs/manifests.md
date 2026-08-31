@@ -89,7 +89,7 @@ window:
 ```
 
 - `end` earlier than `start` is an overnight window crossing midnight, for example
-  `22:00`–`05:00`. `days` selects the day the window opens.
+  `22:00` to `05:00`. `days` selects the day the window opens.
 - Outside the window the manifest is deferred: left in `01.to_run`, not run. Schedule the
   process itself (cron, Task Scheduler) to launch during the window.
 - If the window closes mid-run, the current operation finishes, then the run stops and the

@@ -1,12 +1,12 @@
 ---
 name: sqlgopace-operator
 description: >-
-  Write and review SqlGoPace manifests — the YAML that drives its DDL runner for SQL Server.
+  Write and review SqlGoPace manifests, the YAML that drives its DDL runner for SQL Server.
   Use when the user describes a SQL Server DDL or maintenance operation in natural language
   (compress or recompress indexes, rebuild or reorganize an index, add / alter / drop a
   column or constraint, create or drop an index, update statistics, run DBCC CHECKDB, shrink
   a data or log file or tempdb, or update/delete a large number of rows in batches) and needs
-  a manifest written, reviewed, or explained — or asks what an operation will do and what to
+  a manifest written, reviewed, or explained, or asks what an operation will do and what to
   check before running it. Triggers include "compress these indexes", "make a sqlgopace
   manifest", "how do I … with sqlgopace", "rebuild/shrink/checkdb on <db>", "delete these
   rows without filling the log". For running a manifest and watching it, use
@@ -20,17 +20,17 @@ will do, and name what to verify before it runs.
 
 ## Read these first
 
-- [`docs/operations.md`](../../../docs/operations.md) — the 16 operations with their exact
+- [`docs/operations.md`](../../../docs/operations.md), the 16 operations with their exact
   fields. Use it rather than recalling T-SQL.
-- [`docs/manifests.md`](../../../docs/manifests.md) — top-level fields, `intent`, `window`,
+- [`docs/manifests.md`](../../../docs/manifests.md), top-level fields, `intent`, `window`,
   per-operation `options`, and the sidecar files a run writes.
-- [`docs/llm-operator-guide.md`](../../../docs/llm-operator-guide.md) — the same ground
+- [`docs/llm-operator-guide.md`](../../../docs/llm-operator-guide.md), the same ground
   written for an assistant, with worked examples and a checklist of warnings.
 
 ## The method
 
-1. **Map the request to an operation.** If it does not map — raw SQL, creating a table,
-   a `MERGE`, anything not in the sixteen — say so plainly. SqlGoPace runs only the
+1. **Map the request to an operation.** If it does not map (raw SQL, creating a table,
+   a `MERGE`, anything not in the sixteen), say so plainly. SqlGoPace runs only the
    operation types it knows, and that is the property everything else depends on.
 2. **Ask what you cannot infer.** Which database. Whether a `rebuild_index` is meant to
    recompress or to defragment, because that decides `intent` and therefore whether a re-run

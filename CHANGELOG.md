@@ -51,6 +51,16 @@ history, so a report can always name the build that produced it.
 
 ### Added
 
+- A documentation tree under `docs/`, split by the question a reader arrives with:
+  getting started, the manifest format, the operations, running, configuration,
+  blocking and kills, shrink, the maintenance planner and the compatibility
+  matrix, with `docs/README.md` as the map. The README is 174 lines instead of
+  1050 and carries the pitch, one worked example and the links.
+- `batch_update` and `batch_delete` are documented for the first time. They were
+  implemented, tested and reachable, and appeared in no user-facing document.
+- A second Claude Code skill, `sqlgopace-run`, for executing a manifest and
+  reading what came back. Writing a manifest and running one against production
+  are different jobs with different failure modes.
 - `docs/permissions.md`, an operation-by-operation reference for the grants each
   operation needs, measured against SQL Server 2022 CU26 with restricted logins
   rather than inferred.
@@ -68,6 +78,13 @@ history, so a report can always name the build that produced it.
   `Engine.runStep`, with the state that outlives one operation in a `manifestRun`
   value. No behaviour change: the moved body is byte for byte the original.
 - CI fails on unformatted code.
+- The repository is entirely in English. The two raw research documents that had
+  been kept in French deliberately are translated, and the header of each now says
+  what it is and that it is not maintained. One bibliography entry was dropped
+  with them: a dead presigned S3 URL carrying an AWS access key id.
+- `specs/` moved to `docs/specs/`, and the internal plans to
+  `docs/specs/superpowers/`, so `docs/` holds documentation and the design
+  material sits under it rather than beside the program.
 - The lint job runs again. It had been red for weeks because the action resolved
   golangci-lint within the v1 line, built with an older Go than this module
   targets, against a v2 configuration; it now pins a v2-aware action and binary.
