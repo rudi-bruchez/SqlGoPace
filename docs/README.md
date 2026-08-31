@@ -38,8 +38,10 @@ page that matches the question you arrived with.
 |---|---|
 | [LLM operator guide](llm-operator-guide.md) | A self-contained brief for a chat or agent that writes manifests on an operator's behalf. Paste it into a conversation or index it for retrieval. |
 
-The repository also ships a Claude Code skill in [`../.claude/skills/`](../.claude/skills/)
-that loads the same knowledge automatically.
+The repository also ships two Claude Code skills that load the same knowledge
+automatically: [`sqlgopace-operator`](../.claude/skills/sqlgopace-operator/SKILL.md) writes
+and reviews manifests, and [`sqlgopace-run`](../.claude/skills/sqlgopace-run/SKILL.md)
+executes one and reads what came back.
 
 ## Deeper material
 

@@ -5,6 +5,9 @@
 --
 -- For a Windows or Microsoft Entra login, skip the CREATE LOGIN below and create it
 -- the way your environment does; only the GRANT matters here.
+--
+-- The password must not contain the login name. With CHECK_POLICY on, SQL Server refuses
+-- that with Msg 33064, whose wording suggests a complexity problem rather than the real one.
 
 :setvar LOGIN "sqlgopace"
 :setvar PASSWORD "CHANGE_ME"

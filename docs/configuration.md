@@ -21,6 +21,23 @@ database:
 appended to `app name` automatically, so `sys.dm_exec_sessions.program_name` shows which
 build is connected.
 
+## Two different questions
+
+This page answers "what happens if the key is absent". That is not the same as "what the
+repository's `config.yaml` sets", and in three places they differ on purpose, because the
+shipped file is deliberately more cautious than the bare default:
+
+| Key | Default when absent | The shipped `config.yaml` |
+|---|---|---|
+| `preflight.require_data_free_space` | false | **true** |
+| `preflight.check_tempdb` | false | **true** |
+| `preflight.ag_send_queue_warn` | false | **true** |
+| `history.enabled` | false | **true**, writing `./sqlgopace_history.db` |
+
+If you copied that file, those are the values you have. It is the recommended starting
+point, and `require_data_free_space: true` in particular can fail a first run's preflight,
+which is the intended behaviour rather than a fault.
+
 ## Sections
 
 | Section | Purpose |
@@ -166,6 +183,11 @@ for atypical storage.
 
 ```yaml
 shrink:
+  # The three initial_step_*_mb keys are the previous, tiered model. They are consulted
+  # only when target_chunks is zero or less, and the shipped config.yaml still carries them.
+  initial_step_small_mb:     100  # reclaim under 5 GB
+  initial_step_medium_mb:    250  # 5 to 50 GB
+  initial_step_large_mb:     500  # over 50 GB
   target_chunks:            1000  # aim to finish in about this many chunks
   max_step_pct_of_file:        5  # per-file ceiling, as a percent of the file (0 disables)
   min_step_mb:                50  # floor: below this, per-loop overhead dominates

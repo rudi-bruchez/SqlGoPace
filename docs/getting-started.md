@@ -117,6 +117,19 @@ That is the whole file. Notice what is absent: no `ONLINE`, no `RESUMABLE`, no
 and injects the options that target actually supports. You write the intent; it writes
 the T-SQL.
 
+Point it at an index you actually have, though: preflight verifies the object exists before
+anything runs, and a manifest naming a table that is not there fails with
+`table [dbo].[Orders] does not exist`. If you need a candidate:
+
+```sql
+SELECT TOP 5 s.name AS [schema], t.name AS [table], i.name AS [index]
+FROM sys.indexes i
+JOIN sys.tables t  ON t.object_id = i.object_id
+JOIN sys.schemas s ON s.schema_id = t.schema_id
+WHERE i.type_desc = 'NONCLUSTERED' AND i.is_disabled = 0
+ORDER BY t.name;
+```
+
 [`manifests.md`](manifests.md) is the format reference and
 [`operations.md`](operations.md) lists every operation with its fields.
 

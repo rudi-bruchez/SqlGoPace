@@ -34,7 +34,7 @@ raw SQL and never the `WITH (...)` clause.
 - **Never hand-write `WITH (...)` options** (ONLINE/RESUMABLE/WALP/MAXDOP/SORT_IN_TEMPDB).
   The engine injects them from the matrix. Only set them under `options:` when the user
   explicitly wants to **override** the automatic choice.
-- **Never invent an operation type.** Only the 14 in §3 exist. If the request needs
+- **Never invent an operation type.** Only the 16 in §3 exist. If the request needs
   something else (e.g. `MERGE`, data updates, creating a table), say it is out of scope.
 - **No raw SQL.** A capability that has no `operation:` type cannot be expressed.
 - **Always recommend a `--dry-run --explain` first** (§7) before a real run.
@@ -237,12 +237,12 @@ existing index is `ALTER INDEX … REBUILD WITH (DATA_COMPRESSION = …)`. So:
 1. **Dry-run + explain** (renders the final T-SQL, executes nothing; shows why each
    option was injected):
    ```bash
-   sqlgopace -config config.yaml -dry-run -explain 01.to_run/030_compress_mydb_indexes.yaml
+   sqlgopace --config config.yaml --dry-run --explain 01.to_run/030_compress_mydb_indexes.yaml
    ```
    For an offline preview without a connection, add `-assume-version 15 -assume-edition standard`.
 2. **Run the queue** (processes everything in `01.to_run/`, one-shot, then exits):
    ```bash
-   sqlgopace -config config.yaml
+   sqlgopace --config config.yaml
    ```
    Add `--tui` for the interactive incident console (watch/kill blockers, pause/kill DDL, or press
    `i` on a blocked session to ignore it — writes an `ignore_blocked_sessions` rule into the

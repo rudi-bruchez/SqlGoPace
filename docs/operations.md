@@ -3,8 +3,10 @@
 Every value `operation:` accepts, with its fields. Field names are exact YAML keys, and an
 unknown operation or field is rejected at parse time rather than silently ignored.
 
-All of them accept an `options:` block unless noted; see
-[`manifests.md`](manifests.md#per-operation-options).
+Six of them take no `options:` block at all, because they have no injectable option:
+`reorganize_index`, `add_column`, `drop_index`, `drop_column`, `drop_constraint` and
+`update_statistics`. Adding one is rejected at parse time with `unknown field "options"`.
+For the other ten, see [`manifests.md`](manifests.md#per-operation-options).
 
 ## At a glance
 
@@ -22,8 +24,8 @@ All of them accept an `options:` block unless noted; see
 | [`drop_constraint`](#drop_constraint) | `ALTER TABLE … DROP CONSTRAINT` | `schema`, `table`, `constraint` |
 | [`update_statistics`](#update_statistics) | `UPDATE STATISTICS` | `schema`, `table` |
 | [`check_db`](#check_db) | `DBCC CHECKDB` | `database` |
-| [`batch_update`](#batch_update-and-batch_delete) | `UPDATE TOP (n)` in a loop | `schema`, `table`, a SET, a predicate |
-| [`batch_delete`](#batch_update-and-batch_delete) | `DELETE TOP (n)` in a loop | `schema`, `table`, a predicate |
+| [`batch_update`](#batch_update-and-batch_delete) | `UPDATE TOP (n)` in a loop | `schema`, `table`, a SET, and a predicate or `confirm_full_table` |
+| [`batch_delete`](#batch_update-and-batch_delete) | `DELETE TOP (n)` in a loop | `schema`, `table`, and a predicate or `confirm_full_table` |
 | [`shrink`](#shrink) | `DBCC SHRINKFILE`, chunked | `type`, `targetfreespace` |
 | [`shrink_tempdb`](#shrink_tempdb) | `DBCC SHRINKFILE` per tempdb data file | `targetsizemb` |
 

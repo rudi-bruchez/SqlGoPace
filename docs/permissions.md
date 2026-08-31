@@ -75,7 +75,8 @@ For an unattended queue that rebuilds and recompresses indexes, which is the com
 case, this is the whole list:
 
 ```sql
--- master
+-- master. The password must not contain the login name: with CHECK_POLICY on,
+-- SQL Server rejects that with Msg 33064, which reads like a plain complexity failure.
 CREATE LOGIN [sqlgopace] WITH PASSWORD = N'<strong password>';
 GRANT VIEW SERVER STATE TO [sqlgopace];
 
