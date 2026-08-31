@@ -60,7 +60,7 @@ manifest**, explain usage, and warn about what to verify before running.
 If the request is "decide what needs rebuild/reorg/compress/stats/checkdb based on the
 database's real state" (not a hand-listed set of objects), point them to the **`plan`
 subcommand** + `maintenance_profile.yaml`, which generates reviewable manifests into
-`01.to_run/`. See `specs/MAINTENANCE.md`.
+`01.to_run/`. See `docs/specs/MAINTENANCE.md`.
 
 ## Do not execute
 

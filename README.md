@@ -353,7 +353,7 @@ is safe:
 manifest default; then unset). This replaces the old `skip_if_satisfied` manifest flag,
 which applied to every operation uniformly and could not tell a defrag rebuild from a
 compression rebuild; a manifest still carrying `skip_if_satisfied:` now fails to load.
-See `specs/OPERATION-INTENT.md` for the full design.
+See `docs/specs/OPERATION-INTENT.md` for the full design.
 
 ### `window` (optional)
 
@@ -907,7 +907,7 @@ and generates the maintenance work itself — fragmentation-driven `REORGANIZE`/
 compression (`ROW`/`PAGE`, chosen on measured gain and write-intensity), heap rebuilds (forwarded
 records), `UPDATE STATISTICS`, and `DBCC CHECKDB` — instead of you hand-writing the manifests. The
 rules live in `maintenance_profile.yaml` (thresholds, per-object overrides). See
-[`specs/MAINTENANCE.md`](specs/MAINTENANCE.md) for the full design.
+[`docs/specs/MAINTENANCE.md`](docs/specs/MAINTENANCE.md) for the full design.
 
 It runs cheap-first: one metadata sweep selects candidates, and the expensive reads
 (`sp_estimate_data_compression_savings`, sampled `dm_db_index_physical_stats`) run only over the
@@ -938,7 +938,7 @@ sqlgopace --config config.yaml --auto --all-databases
 
 Crash recovery is database-aware: each in-flight operation records the database it ran in, and a later
 run reconciles it against that database (an orphan whose database is unreachable — e.g. now an AG
-secondary — is left for a future run). See [`specs/MAINTENANCE.md`](specs/MAINTENANCE.md) §17.
+secondary — is left for a future run). See [`docs/specs/MAINTENANCE.md`](docs/specs/MAINTENANCE.md) §17.
 
 ```bash
 # Analyse and print the manifests it would write (no files, no locks):

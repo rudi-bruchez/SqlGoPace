@@ -139,7 +139,7 @@ type HeapRules struct {
 
 // ShrinkRules drives the plan subcommand's optional pre-shrink pass: it emits a
 // reorganize→shrink manifest for the connected database and a heap advisory. The
-// section is inert unless Enabled. See docs/superpowers/specs/2026-07-28-pre-shrink-
+// section is inert unless Enabled. See docs/specs/superpowers/specs/2026-07-28-pre-shrink-
 // reorganize-design.md.
 type ShrinkRules struct {
 	Enabled                       bool    `yaml:"enabled"`

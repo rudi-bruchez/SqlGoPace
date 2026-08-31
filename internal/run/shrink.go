@@ -285,7 +285,7 @@ func (r *ShrinkRunner) resolveFiles(ctx context.Context, op ddl.Shrink) ([]mssql
 // Phase 0 runs TRUNCATEONLY on all files (free tails returned to the OS first), then
 // Phase 1 runs the shared chunkLoop per file. The per-file target is clamped to the
 // file's used space. It reuses this runner's exec/reader, which the wiring binds to a
-// tempdb-scoped connection. See specs/TEMPDB-SHRINK.md.
+// tempdb-scoped connection. See docs/specs/TEMPDB-SHRINK.md.
 func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink) ([]ShrinkResult, error) {
 	files, err := r.resolveFiles(ctx, ddl.Shrink{Type: "data", Files: "all"})
 	if err != nil {

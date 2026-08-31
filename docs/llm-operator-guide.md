@@ -7,7 +7,7 @@ explain usage, and warn about what to verify first.
 
 This file is provider-agnostic: paste it into any chat, index it for RAG, or load it
 as a Claude Code skill. It is the source of truth for the manifest format; when in
-doubt defer to `README.md` (canonical user reference) and `specs/`.
+doubt defer to `README.md` (canonical user reference) and `docs/specs/`.
 
 ---
 
@@ -274,7 +274,7 @@ Before a real run, verify and call out:
   especially on multi-DB servers.
 - **No resume across a kill (current limitation).** If interrupted, an offline rebuild
   rolls back fully and is re-run from scratch on the next run; a multi-op manifest re-runs
-  from the start (idempotent but redoes completed work). See `specs/crash-resumable.md`.
+  from the start (idempotent but redoes completed work). See `docs/specs/crash-resumable.md`.
 - **Heaps & special indexes.** Heap rebuilds never get RESUMABLE/WALP. Columnstore/XML/
   spatial indexes use a different model and are excluded from rowstore compression.
 - **Shrink is heavy and fragments indexes.** Only suggest `shrink` to reclaim genuinely
@@ -366,6 +366,6 @@ operations:
 
 - `README.md` — canonical user reference (manifest format, flags, subcommands).
 - `ddl_compatibility.yaml` — the version × edition option matrix.
-- `maintenance_profile.yaml` + `specs/MAINTENANCE.md` — the `plan` (auto-maintenance) path.
-- `specs/SPECS.md`, `specs/SHRINK.md`, `specs/crash-resumable.md` — design details and limits.
+- `maintenance_profile.yaml` + `docs/specs/MAINTENANCE.md` — the `plan` (auto-maintenance) path.
+- `docs/specs/SPECS.md`, `docs/specs/SHRINK.md`, `docs/specs/crash-resumable.md` — design details and limits.
 - `docs/e2e.md` — required login permissions for a live run.

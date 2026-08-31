@@ -75,7 +75,7 @@ reaction hierarchy, never by a fixed timer. Do not wrap the executing DDL in a
 `context.WithTimeout`.
 
 English only, in code, comments, identifiers, file names and committed docs, the
-design documents under `specs/` included. US spelling.
+design documents under `docs/specs/` included. US spelling.
 
 The version lives in `internal/version/VERSION` and is embedded with `go:embed`.
 Bump that file, do not add build flags.
@@ -119,7 +119,7 @@ silence.
 
 ## Where the design lives
 
-`specs/` holds the design documents and is the source of truth for intended
+`docs/specs/` holds the design documents and is the source of truth for intended
 behaviour: `SPECS.md` for the engine, `MAINTENANCE.md` for the `plan`
 subcommand, `SHRINK.md` for the shrink driver. Read the relevant one before
 changing engine, planner or reaction semantics. `CLAUDE.md` carries the same

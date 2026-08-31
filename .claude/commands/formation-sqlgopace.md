@@ -21,7 +21,7 @@ verifies, sets the bar.*
 2. The **existing `formation/` materials** (`formation.md`, `slides/`, `exercices.md`) — treat them as
    the prior tailored version: refresh and extend, don't discard their accurate specifics.
 3. The repo **artifacts** (open them to quote exact paths/snippets):
-   - `specs/MAINTENANCE.md` (the maintenance-mode spec: §2 archi decision, §4.0 cheap inventory,
+   - `docs/specs/MAINTENANCE.md` (the maintenance-mode spec: §2 archi decision, §4.0 cheap inventory,
      §5/§5.4 rules+formulas, §15 frictions, §16 golden path),
    - `maintenance_profile.yaml`, `ddl_compatibility.yaml` (data-not-code),
    - `internal/maint/{profile,decide}.go`, `internal/ddl/{resolve,render,manifest}.go`,

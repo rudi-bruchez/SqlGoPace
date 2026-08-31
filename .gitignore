@@ -38,7 +38,7 @@ sqlgopace_history.db-*
 # The whole to_run queue is ignored except the generic example manifest the tests load.
 01.to_run/*
 !01.to_run/.010_example_rebuild.yaml
-specs/to-compress.txt
+docs/specs/to-compress.txt
 
 # Built binaries (make build -> bin/)
 bin/

@@ -1,7 +1,7 @@
 // Command sqlgopace runs demanding DDL operations against Microsoft SQL Server
 // while monitoring their impact on locking and the transaction log.
 //
-// See specs/SPECS.md for the full behavior and specs/IMPLEMENTATION.md for the
+// See docs/specs/SPECS.md for the full behavior and docs/specs/IMPLEMENTATION.md for the
 // implementation plan. So far only offline planning (--dry-run / --explain) is
 // wired, optionally connecting to detect the real target; execution and
 // monitoring are added in later phases.

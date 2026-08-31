@@ -949,7 +949,7 @@ func (o Shrink) Validate() error {
 // ShrinkTempdb shrinks every tempdb data file to a common absolute size. It is a
 // dedicated operation (not a Shrink variant): tempdb is always database_id 2, has
 // no schema.table target, and the runtime driver adds tempdb-specific escalation
-// (see specs/TEMPDB-SHRINK.md). Like check_db it is database-scoped.
+// (see docs/specs/TEMPDB-SHRINK.md). Like check_db it is database-scoped.
 type ShrinkTempdb struct {
 	TargetSizeMB int             `yaml:"targetsizemb"`          // common absolute target per data file, MB
 	FlushCaches  bool            `yaml:"flushcaches,omitempty"` // opt-in cache-flush escalation on persistent stall
@@ -1025,7 +1025,7 @@ func (b BatchSpec) validate() error {
 // small, individually-committed batches so it never escalates to a table lock or
 // blows up the transaction log. Like Shrink it does not fit the "one operation =
 // one statement" model: a dedicated runtime driver builds the per-batch SQL and
-// runs its own loop (see specs/BATCH-DML.md). It is table-scoped (no named object,
+// runs its own loop (see docs/specs/BATCH-DML.md). It is table-scoped (no named object,
 // like rebuild_heap). Verb is carried by the discriminator, not a YAML field.
 type BatchDML struct {
 	Verb             string             `yaml:"-"` // "update" | "delete"

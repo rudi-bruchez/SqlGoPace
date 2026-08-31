@@ -131,7 +131,7 @@ ALTER INDEX <index> ON <schema>.<table> REORGANIZE [WITH (LOB_COMPACTION = ON)];
 field is set (a rule-driven switch, not a version-gated capability — see the comment
 on `reorganize_index` in `ddl_compatibility.yaml`). It is not injected automatically.
 Reorganize is emitted one op per index by the planner (density-selected — see
-`docs/superpowers/specs/2026-07-28-pre-shrink-reorganize-design.md`).
+`docs/specs/superpowers/specs/2026-07-28-pre-shrink-reorganize-design.md`).
 
 As of 0.12.0, SqlGoPace paces a reorganize_index directly in `MonitoredRunner`'s
 `runLoop` (no separate driver): under blocking pressure it cancels the statement

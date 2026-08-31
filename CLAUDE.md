@@ -46,9 +46,9 @@ mandatory for monitoring).
   the simplest thing that works over cleverness or premature abstraction. Don't add layers,
   interfaces, generics, or options the current need doesn't justify.
 - **English only** — all code, comments, identifiers, file names, and committed docs are in
-  English, **including the design docs under `specs/`**. The training material under
+  English, **including the design docs under `docs/specs/`**. The training material under
   `formation/` is the only exception (it is delivered in French). Two raw AI research dumps
-  kept as historical source material — `specs/gemini-shrink.md` and `specs/SQL Server Shrink -
+  kept as historical source material — `docs/specs/gemini-shrink.md` and `docs/specs/SQL Server Shrink -
   Document de référence technique - Perplexity.md` — remain in French deliberately; they are
   inputs to a decision already made, not specs.
 - **Manifest-driven, never raw SQL.** Adding a DDL capability means adding an `operation` type
@@ -58,7 +58,7 @@ mandatory for monitoring).
 - **Secrets via `${VAR}`** from `.env` (gitignored); never put credentials in `config.yaml`.
 - **Never commit client identifiers.** Real database names, server/host names, table and index
   names, logins, domains, and company names from a client engagement must not appear anywhere
-  in the repo — not in code, tests, docs, `specs/`, or `docs/superpowers/` designs and plans.
+  in the repo — not in code, tests, docs, `docs/specs/`, or `docs/specs/superpowers/` designs and plans.
   Findings from a live campaign are exactly where these leak in, because a DMV screenshot or a
   blocking chain is the most convincing motivation to quote. Anonymize at the moment of writing,
   not in a later cleanup pass: once committed, the name is in the history. Use neutral
@@ -154,7 +154,7 @@ which `--version` produced each run.
 
 ## Where the specs live
 
-`specs/` holds the design docs: `SPECS.md` (core engine), `MAINTENANCE.md` (the `plan`
+`docs/specs/` holds the design docs: `SPECS.md` (core engine), `MAINTENANCE.md` (the `plan`
 subcommand / maintenance planner, including multi-database mode §17), `IMPLEMENTATION.md`,
 and `SHRINK.md` (the shrink driver — now implemented; see the `ShrinkRunner` notes above). These
 are the source of truth for intended behaviour —

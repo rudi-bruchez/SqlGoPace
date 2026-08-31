@@ -1,5 +1,5 @@
 # maintenance_profile.yaml
-# Decision rules for SqlGoPace's maintenance mode (see specs/MAINTENANCE.md §5).
+# Decision rules for SqlGoPace's maintenance mode (see docs/specs/MAINTENANCE.md §5).
 # Thresholds and policy are data, not code: tuning these never requires a rebuild.
 # Object overrides match a glob on "schema.table" and the first match wins.
 
