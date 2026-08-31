@@ -35,7 +35,13 @@ jobs:
         with:
           go-version: '1.26'
           cache: true
-      - uses: golangci/golangci-lint-action@v6
+      # v6 of the action resolves "latest" within the golangci-lint v1 line, which is
+      # built with an older Go than this module targets. That combination refuses to
+      # start ("the Go language version used to build golangci-lint is lower than the
+      # targeted Go version") and had kept this job red for weeks. The config here is
+      # schema v2, so the action and the binary must be v2-aware, and the version is
+      # pinned rather than floating: a silently resolved upgrade is what broke it.
+      - uses: golangci/golangci-lint-action@v9
         with:
-          version: latest
+          version: v2.13.2
 

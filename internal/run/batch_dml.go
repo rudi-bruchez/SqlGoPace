@@ -425,7 +425,7 @@ func (r *BatchDMLRunner) runBatch(ctx context.Context, stmt string, caps Capabil
 	case <-time.After(r.killGr):
 		sink(ReactionEvent{Kind: "kill", Detail: "abort did not stop the batch within the grace period"})
 		// The context is detached on purpose: the one the statement ran on was just
-		// cancelled, so a KILL issued on it would fail instantly. A failed KILL is
+		// canceled, so a KILL issued on it would fail instantly. A failed KILL is
 		// narrated rather than swallowed — the wait below is unbounded, and an operator
 		// watching a run that never returns deserves to know the fallback did not land.
 		if kerr := r.exec.Kill(context.Background(), r.exec.SPID()); kerr != nil {

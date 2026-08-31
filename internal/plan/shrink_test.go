@@ -157,7 +157,7 @@ func TestAnalyzePreShrinkIndexIgnoresEmptyPartitionDensity(t *testing.T) {
 	}
 }
 
-// TestAnalyzePreShrinkHeapIgnoresEmptyPartitionDensity is the heap analogue of the
+// TestAnalyzePreShrinkHeapIgnoresEmptyPartitionDensity is the heap analog of the
 // above: an empty partition's density=0 must not force a spuriously dense-below-
 // threshold heap advisory.
 func TestAnalyzePreShrinkHeapIgnoresEmptyPartitionDensity(t *testing.T) {

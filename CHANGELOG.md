@@ -68,6 +68,11 @@ history, so a report can always name the build that produced it.
   `Engine.runStep`, with the state that outlives one operation in a `manifestRun`
   value. No behaviour change: the moved body is byte for byte the original.
 - CI fails on unformatted code.
+- The lint job runs again. It had been red for weeks because the action resolved
+  golangci-lint within the v1 line, built with an older Go than this module
+  targets, against a v2 configuration; it now pins a v2-aware action and binary.
+  The nine findings it had stopped reporting are fixed: eight US-spelling slips,
+  and one deliberate typo in a fixture that is now exempted where it lives.
 
 ### Removed
 
