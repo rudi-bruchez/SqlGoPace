@@ -52,7 +52,7 @@ exists. The ETA gives four days, and four days *if unblocked*, because the run h
 panel attributes the rest: two and a quarter hours of data I/O, four minutes of locking,
 under a minute and a half of transaction log. Nothing here is inferred from a timer.
 
-## The idea, in one file
+## The idea
 
 You write this:
 
