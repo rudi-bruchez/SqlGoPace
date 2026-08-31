@@ -41,6 +41,20 @@ mechanism available.
 - **Unattended or watched.** Drain a queue silently from cron, or open an incident console
   and act on blockers by keystroke.
 
+## What it looks like while it works
+
+![The SqlGoPace incident console during a shrink](docs/sqlgopace-screenshot01.png)
+
+A real run, seven hours in: a 14.04 TB data file heading for 7.85 TB, ninety chunks done,
+averaging four and a half minutes each. Two numbers on that screen are the reason the tool
+exists. The ETA gives four days, and four days *if unblocked*, because the run has spent
+11m41s of its life waiting on other sessions and it counts that separately. And the waits
+panel attributes the rest: two and a quarter hours of data I/O, four minutes of locking,
+under a minute and a half of transaction log. Nothing here is inferred from a timer.
+
+The three highlighted names are placeholders. The server, database and login of the run this
+was captured from are not yours to see.
+
 ## The idea, in one file
 
 You write this:
