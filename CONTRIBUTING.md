@@ -37,6 +37,28 @@ integration test, not a unit test that models the bug. Several defects in this
 repository's history passed a green unit suite and were found by driving the
 tool.
 
+## Running CI locally
+
+The workflow can be run on your machine with [act](https://github.com/nektos/act),
+which is worth doing before a push when you have touched `.github/workflows/` or
+`.golangci.yml`: a broken lint job is invisible from a green local `make test`, and
+this repository once spent three weeks red for exactly that reason.
+
+With Podman, start its Docker-compatible socket first:
+
+```bash
+systemctl --user start podman.socket
+export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/podman/podman.sock"
+
+act pull_request -j lint       -P ubuntu-latest=catthehacker/ubuntu:act-latest
+act pull_request -j build-test -P ubuntu-latest=catthehacker/ubuntu:act-latest
+```
+
+The runner image is about 1.7 GB on first use. Each job then takes under a minute.
+This exercises the real actions, so it catches what running the underlying commands
+by hand cannot: an action version that refuses to start, or a linter binary that
+does not match the configuration schema.
+
 ## Conventions that are not obvious
 
 Plain idiomatic Go, and the simplest thing that works. No layer, interface,
