@@ -58,6 +58,11 @@ history, so a report can always name the build that produced it.
   fetching three YAML files by hand before anything could run. It never
   overwrites without `--force`, since an edited `config.yaml` is the one thing in
   the directory that cannot be regenerated.
+- A release workflow. Pushing a `vX.Y.Z` tag cross-compiles Linux, macOS and
+  Windows on Intel and ARM, publishes the archives with a `sha256` checksum file,
+  and refuses to release when the tag and `internal/version/VERSION` disagree.
+  Before publishing it unpacks the Linux archive, runs `init` from it and renders
+  a dry run, so what is verified is the artifact a user downloads.
 - A documentation tree under `docs/`, split by the question a reader arrives with:
   getting started, the manifest format, the operations, running, configuration,
   blocking and kills, shrink, the maintenance planner and the compatibility

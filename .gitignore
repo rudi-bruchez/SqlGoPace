@@ -42,6 +42,7 @@ docs/specs/to-compress.txt
 
 # Built binaries (make build -> bin/)
 bin/
+dist/
 
 # Editor/IDE
 # .idea/

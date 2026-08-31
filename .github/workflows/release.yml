@@ -1,0 +1,101 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (must already exist)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.26'
+          cache: true
+
+      # The tag and internal/version/VERSION must agree, or the release would
+      # ship binaries that report a version nobody can find. Cheaper to fail here
+      # than to discover it in a support thread.
+      - name: Check the tag matches VERSION
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          file="v$(cat internal/version/VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "$file" ]; then
+            echo "tag $tag does not match internal/version/VERSION ($file)"; exit 1
+          fi
+          echo "version=${tag#v}" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: go test -race ./...
+
+      # Cross-compilation is free in Go, so one runner builds every target. A
+      # build matrix would spend five checkouts and five toolchain downloads to
+      # produce the same five binaries.
+      - name: Build
+        run: |
+          set -eu
+          mkdir -p dist
+          ldflags="-s -w -X github.com/rudi-bruchez/SqlGoPace/internal/version.override=${version}"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            os="${target%/*}"; arch="${target#*/}"
+            name="sqlgopace_${version}_${os}_${arch}"
+            # Written as an if, not "[ ... ] && bin=...": under set -e the latter
+            # aborts the script on every non-Windows target.
+            bin="sqlgopace"
+            if [ "$os" = "windows" ]; then bin="sqlgopace.exe"; fi
+            echo "building $name"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" \
+              go build -trimpath -ldflags "$ldflags" -o "dist/$bin" ./cmd/sqlgopace
+            # The binary carries its own config templates (sqlgopace init), so an
+            # archive needs nothing but the executable and the legal text.
+            cp LICENSE README.md dist/
+            if [ "$os" = "windows" ]; then
+              (cd dist && zip -q "${name}.zip" "$bin" LICENSE README.md)
+            else
+              (cd dist && tar czf "${name}.tar.gz" "$bin" LICENSE README.md)
+            fi
+            rm -f "dist/$bin"
+          done
+          rm -f dist/LICENSE dist/README.md
+          (cd dist && sha256sum * > "sqlgopace_${version}_checksums.txt")
+          ls -l dist
+
+      # Smoke-test the artifact that most users will download, rather than the
+      # tree it was built from: unpack the linux/amd64 archive and check the
+      # binary reports the tagged version and can scaffold a working directory.
+      - name: Verify the linux archive
+        run: |
+          set -eu
+          tmp=$(mktemp -d)
+          tar xzf "dist/sqlgopace_${version}_linux_amd64.tar.gz" -C "$tmp"
+          got=$("$tmp/sqlgopace" --version)
+          [ "$got" = "sqlgopace ${version}" ] || { echo "got '$got', want 'sqlgopace ${version}'"; exit 1; }
+          work=$(mktemp -d)
+          "$tmp/sqlgopace" init --dir "$work"
+          cp "$work/01.to_run/.010_example_rebuild.yaml" "$work/01.to_run/010_rebuild.yaml"
+          (cd "$work" && "$tmp/sqlgopace" --dry-run --assume-version 16 01.to_run/010_rebuild.yaml) | grep -q 'ALTER INDEX'
+          echo "archive verified"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "$tag" \
+              --generate-notes
+          fi

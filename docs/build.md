@@ -29,7 +29,7 @@ make clean    # remove bin/ and coverage output
 
 ## Versioning
 
-The version is **not** a hard-coded constant. It lives in a single file that is embedded
+The version is not a hard-coded constant. It lives in a single file that is embedded
 into the binary at build time:
 
 ```
@@ -84,6 +84,35 @@ GOOS=windows GOARCH=amd64 go build -o bin/sqlgopace.exe ./cmd/sqlgopace
 ```
 
 Combine with the `-ldflags` override above to produce versioned release artifacts.
+
+## Releasing
+
+Releases are cut by pushing a tag. `.github/workflows/release.yml` cross-compiles every
+target on one runner, packages each with `LICENSE` and `README.md`, writes a `sha256`
+checksum file, and creates the GitHub release with generated notes.
+
+```bash
+# 1. bump the version and commit it
+$EDITOR internal/version/VERSION        # 0.16.0 -> 0.17.0
+git commit -am "chore(version): bump to 0.17.0"
+
+# 2. tag and push
+git tag v0.17.0
+git push origin main --tags
+```
+
+The tag must match `internal/version/VERSION`, prefixed with `v`. The workflow checks this
+first and fails the release rather than publishing binaries that report a version nobody
+can find. `workflow_dispatch` re-runs the build for an existing tag, which is how you
+recover from a failure after the tag is already public.
+
+Targets built: `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64`,
+`windows/amd64`. Archives carry the binary alone, since `sqlgopace init` writes the
+configuration templates from the executable itself.
+
+Before publishing, the workflow unpacks the Linux archive it just built, checks the binary
+reports the tagged version, runs `init` into a temporary directory and renders a dry run
+from it. What is verified is the artifact a user downloads, not the tree it came from.
 
 ## See also
 
