@@ -436,6 +436,11 @@ func (c *Config) validate() error {
 	if strings.TrimSpace(c.MatrixFile) == "" {
 		return fmt.Errorf("matrix_file is required: %w", ErrInvalidConfig)
 	}
+	// A forced maxdop reaches every operation, so an out-of-range one here fails the
+	// whole queue one statement at a time rather than a single manifest.
+	if md := c.OptionsOverride.MaxDOP.Force; md != nil && (*md < 0 || *md > ddl.MaxDOPCeiling) {
+		return fmt.Errorf("options_override.maxdop must be in 0..%d, got %d: %w", ddl.MaxDOPCeiling, *md, ErrInvalidConfig)
+	}
 	if c.Shrink.MinStepMB > c.Shrink.MaxStepMB {
 		return fmt.Errorf("shrink.min_step_mb (%d) must be <= max_step_mb (%d): %w",
 			c.Shrink.MinStepMB, c.Shrink.MaxStepMB, ErrInvalidConfig)

@@ -297,8 +297,28 @@ func (m *Manifest) Validate() error {
 		if err := op.Validate(); err != nil {
 			return fmt.Errorf("operation %d: %w", i, err)
 		}
+		if err := validateMaxDOP(overridesOf(op).MaxDOP); err != nil {
+			return fmt.Errorf("operation %d: %w", i, err)
+		}
 	}
 	return nil
+}
+
+// MaxDOPCeiling is the largest degree of parallelism SQL Server accepts. Outside
+// 0..MaxDOPCeiling both forms the generator emits are refused: the index option with
+// Msg 304 ("out of range for index/statistics option 'MAXDOP'"), and the batched-DML
+// query hint with Msg 304 above the ceiling and Msg 102 below zero, the negative sign
+// not even being grammatical there. Zero is legal and means "all available processors".
+// Measured against SQL Server 2022 CU26.
+const MaxDOPCeiling = 32767
+
+// validateMaxDOP rejects a degree of parallelism the server would refuse, so an
+// unrunnable manifest is caught at load rather than at the statement that fails.
+func validateMaxDOP(md *int) error {
+	if md == nil || (*md >= 0 && *md <= MaxDOPCeiling) {
+		return nil
+	}
+	return fmt.Errorf("maxdop must be in 0..%d, got %d: %w", MaxDOPCeiling, *md, ErrInvalidManifest)
 }
 
 // UnmarshalYAML decodes the manifest, dispatching each operation to its concrete
