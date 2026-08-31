@@ -534,7 +534,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
-	planned, err := ddl.Plan(manifest, e.target, e.matrix, e.policy)
+	// A manifest naming its own database is resolved against that one, not against
+	// whatever the connection happens to sit in: some options are database-scoped.
+	planned, err := ddl.Plan(manifest, e.target.InDatabase(manifest.Database), e.matrix, e.policy)
 	if err != nil {
 		rep.Error = "plan: " + err.Error()
 		return e.finalize(ctx, name, rep, start, false)

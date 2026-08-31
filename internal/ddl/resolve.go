@@ -1,11 +1,26 @@
 package ddl
 
-import "strconv"
+import (
+	"strconv"
+	"strings"
+)
 
 // Target carries the resolution-relevant facts about the destination server.
 type Target struct {
 	MajorVersion int
 	Tier         Tier
+	Database     string // the database the operation runs in; a few options are database-scoped
+}
+
+// InDatabase returns t retargeted at the database a manifest names, keeping the
+// connection's own database when the manifest is database-agnostic. Resolution
+// needs it because option eligibility is not decided by version and edition
+// alone: RESUMABLE is rejected in tempdb whatever the engine (Msg 11439).
+func (t Target) InDatabase(name string) Target {
+	if name != "" {
+		t.Database = name
+	}
+	return t
 }
 
 // Policy holds the global option settings sourced from config.yaml.
@@ -95,6 +110,14 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 		resumable, resReason, resRel = false, "omitted: RESUMABLE is not supported with ALTER INDEX ALL", true
 	}
 
+	// RESUMABLE is refused outright in tempdb — "Resumable Online Index Build is not
+	// supported in tempdb" (Msg 11439) — on every version and edition. ONLINE alone is
+	// fine there, so only RESUMABLE comes off. Drop it before the ONLINE dependency,
+	// for the same reason as the two cases around it.
+	if resumable && strings.EqualFold(strings.TrimSpace(t.Database), "tempdb") {
+		resumable, resReason, resRel = false, "omitted: RESUMABLE is not supported in tempdb (Msg 11439)", true
+	}
+
 	// RESUMABLE is likewise not permitted when rebuilding a single partition: that
 	// syntax accepts only SORT_IN_TEMPDB / MAXDOP / DATA_COMPRESSION / XML_COMPRESSION
 	// plus ONLINE / WAIT_AT_LOW_PRIORITY. Drop it before the ONLINE dependency so we
@@ -134,6 +157,17 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 		} else {
 			walp, walpReason = false, "omitted: requires online, which is off"
 		}
+	}
+
+	// SORT_IN_TEMPDB and RESUMABLE are mutually exclusive: "The SORT_IN_TEMPDB option
+	// cannot be set to 'ON' when the RESUMABLE option is set to 'ON'" (Msg 11438). It is
+	// severity 15, raised at compile time, so the batch dies before any work happens and
+	// no TRY/CATCH intercepts it. RESUMABLE is the one worth keeping: it is a rung of the
+	// reaction hierarchy (pause and resume under pressure), where SORT_IN_TEMPDB only
+	// moves the sort space — and moving it into tempdb is what the tempdb guard spends
+	// its time defending against. The sort comes off, and the decision trail says so.
+	if resumable && sort {
+		sort, sortReason, sortRel = false, "omitted: SORT_IN_TEMPDB cannot be combined with RESUMABLE (Msg 11438)", true
 	}
 
 	res := ResolvedOptions{

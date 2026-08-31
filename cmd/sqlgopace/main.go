@@ -1303,7 +1303,7 @@ func dryRunManifest(ctx context.Context, w io.Writer, path string, target ddl.Ta
 			return err
 		}
 	}
-	planned, err := ddl.Plan(manifest, target, matrix, policy)
+	planned, err := ddl.Plan(manifest, target.InDatabase(manifest.Database), matrix, policy)
 	if err != nil {
 		return err
 	}

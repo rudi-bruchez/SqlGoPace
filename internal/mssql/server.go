@@ -41,7 +41,7 @@ func (s ServerInfo) Supported() bool { return s.Tier() != ddl.TierUnknown }
 
 // Target returns the option-resolution target for this server.
 func (s ServerInfo) Target() ddl.Target {
-	return ddl.Target{MajorVersion: s.MajorVersion, Tier: s.Tier()}
+	return ddl.Target{MajorVersion: s.MajorVersion, Tier: s.Tier(), Database: s.Database}
 }
 
 // ContextInfoLiteral renders a 16-byte run marker as a T-SQL varbinary literal
