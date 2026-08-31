@@ -250,6 +250,7 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 
 	caps := r.opCaps(res, ignore)
 	var stallWaited time.Duration
+	var watermarkWarned bool
 	for {
 		// Graceful stop: the watermark is persisted after each committed batch (below), so
 		// stopping between batches lets the next run resume from the last saved key.
@@ -291,7 +292,13 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 		result.Batches++
 		result.FinalRows = size
 		watermark, hasWM = next, true
-		_ = wm.Save(ctx, watermark) // best-effort; a resume redoes from the last saved point
+		// Best-effort: a resume redoes from the last saved point. Warned once rather
+		// than per batch — the failure is almost always the same one repeating, and a
+		// run that quietly stops checkpointing is how a resume redoes hours of work.
+		if serr := wm.Save(ctx, watermark); serr != nil && !watermarkWarned {
+			watermarkWarned = true
+			sink(ReactionEvent{Kind: "warn", Detail: "watermark save failed: " + serr.Error() + "; a resume will redo from the last saved point"})
+		}
 		stallWaited = 0
 		r.emitProgress(op, result.Rows, est, size, perSec(rows, elapsed))
 		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)
@@ -417,7 +424,13 @@ func (r *BatchDMLRunner) runBatch(ctx context.Context, stmt string, caps Capabil
 		// stopped on its own after the cancel (the batch rolled back)
 	case <-time.After(r.killGr):
 		sink(ReactionEvent{Kind: "kill", Detail: "abort did not stop the batch within the grace period"})
-		_ = r.exec.Kill(context.Background(), r.exec.SPID())
+		// The context is detached on purpose: the one the statement ran on was just
+		// cancelled, so a KILL issued on it would fail instantly. A failed KILL is
+		// narrated rather than swallowed — the wait below is unbounded, and an operator
+		// watching a run that never returns deserves to know the fallback did not land.
+		if kerr := r.exec.Kill(context.Background(), r.exec.SPID()); kerr != nil {
+			sink(ReactionEvent{Kind: "warn", Detail: "fallback KILL failed: " + kerr.Error() + "; waiting for the batch to stop on its own"})
+		}
 		<-done
 	}
 	return true, 0, nil

@@ -737,7 +737,13 @@ func (r *ShrinkRunner) cancelAndAwait(cancelExec context.CancelFunc, done <-chan
 	case <-done:
 	case <-time.After(r.killGr):
 		sink(ReactionEvent{Kind: "kill", Detail: killReason})
-		_ = r.exec.Kill(context.Background(), r.exec.SPID())
+		// The context is detached on purpose: the one the statement ran on was just
+		// cancelled, so a KILL issued on it would fail instantly. A failed KILL is
+		// narrated rather than swallowed — the wait below is unbounded, and an operator
+		// watching a run that never returns deserves to know the fallback did not land.
+		if kerr := r.exec.Kill(context.Background(), r.exec.SPID()); kerr != nil {
+			sink(ReactionEvent{Kind: "warn", Detail: "fallback KILL failed: " + kerr.Error() + "; waiting for the chunk to stop on its own"})
+		}
 		<-done
 	}
 }
