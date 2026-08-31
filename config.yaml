@@ -47,7 +47,7 @@ options_override:
 
 notifications:
   webhook_url: "${WEBHOOK_URL}"      # empty = disabled
-  on_events: [cancel, fail, pause, log_full, abort]
+  on_events: [cancel, fail, pause, abort, run_failure]
   # Optional email channel. Shares on_events with the webhook. Empty host = disabled.
   # email:
   #   host: "smtp.internal.example"

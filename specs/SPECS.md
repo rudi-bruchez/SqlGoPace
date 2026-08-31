@@ -687,8 +687,15 @@ The `<name>.state.json` sidecar (§11) is deleted at the end of a successful run
 
 ## 14. Notifications
 
-Webhook / Slack / e-mail (configurable) on the events: **cancel**, **fail**, **pause**, **log full**,
-**abort**. In production, the team must be alerted live, not discover the `.log` the next day.
+Webhook and/or e-mail (configurable) on the events: **cancel**, **fail**, **pause**, **abort**,
+**incomplete**, **interrupted**, and **run_failure**. In production, the team must be alerted live,
+not discover the `.log` the next day.
+
+`run_failure` is the run-level event: it fires when the run stops for a reason no manifest report
+covers (unreachable server, unsupported edition, crash recovery refused, an engine that never
+started). It is suppressed for an operator interruption and for a manifest failure, which already
+have their own event. A killed process cannot report itself — that stays the job of an external
+watchdog on the exit code.
 
 ---
 
@@ -772,7 +779,7 @@ options_override:
 
 notifications:
   webhook_url: ""                    # empty = disabled
-  on_events: [cancel, fail, pause, log_full, abort]
+  on_events: [cancel, fail, pause, abort, run_failure]
 
 history:
   enabled: true

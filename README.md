@@ -201,7 +201,17 @@ shrink:
 
 `notifications` fires a webhook and/or an email for the events in `on_events`: `fail` (hard
 error), `incomplete` (a shrink stopped short of target, work preserved), `interrupted`
-(Ctrl+C/drain), and the reaction events `pause` / `cancel` / `abort`.
+(Ctrl+C/drain), `run_failure` (the run itself stopped, see below), and the reaction events
+`pause` / `cancel` / `abort`.
+
+`run_failure` reports what no manifest can: the run stopped for a reason outside any manifest
+— the server is unreachable, the target edition is unsupported, crash recovery could not
+reconcile the queue, an engine failed to start. Without it those exits show up only on stderr
+and in the exit code, so an unattended run fails silently. It never doubles up with the
+per-manifest events: an operator interruption arrives as `interrupted`, and a manifest that
+failed as `fail`. Two exits stay silent by construction: a crashed or killed **process** (nothing
+is left running to send anything) and a `config.yaml` that cannot be read (the channel settings
+live in it). Keep an external watchdog — service manager, scheduled task — on the exit code.
 
 The `email` sub-block adds an SMTP channel that shares the same `on_events` filter as the
 webhook. It is disabled when `host` is empty; `port` defaults to `25`; `username` empty means
@@ -211,7 +221,7 @@ an anonymous relay (no auth); `password` is only used when `username` is set and
 ```yaml
 notifications:
   webhook_url: ""
-  on_events: [fail, incomplete, interrupted]
+  on_events: [fail, incomplete, interrupted, run_failure]
   email:
     host: "smtp.internal.example"   # empty → email disabled
     port: 25                         # default 25

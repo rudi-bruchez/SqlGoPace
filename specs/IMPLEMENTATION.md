@@ -241,7 +241,7 @@ Each phase is independently buildable and testable. Phases 1–2 require **no da
 - `runlog`: write `<name>.log` with a JSON block (slog JSON handler to a buffer) **and** a human
   summary. Move file to `03.done/` or `04.failed/`; delete sidecar on success.
 - `history`: SQLite persistence (durations, retries, pauses, blockers, injected options, result).
-- `notify`: webhook on `cancel|fail|pause|log_full|abort`.
+- `notify`: webhook and email on `cancel|fail|pause|abort|run_failure`.
 - `main`: map outcomes to exit codes (0/1/2/3/4 per SPECS §16).
 - **Tests:** golden `.log` output; history round-trip; notify with httptest server.
 

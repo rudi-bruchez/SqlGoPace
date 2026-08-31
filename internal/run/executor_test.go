@@ -63,6 +63,95 @@ type superviseResult struct {
 	err      error
 }
 
+// awaitTimeout bounds every rendezvous with a goroutine under test. A stuck
+// goroutine then fails its own test in seconds, instead of running out the
+// package's ten-minute timeout and burying the cause in a process-wide dump.
+const awaitTimeout = 5 * time.Second
+
+// observedClock is a ManualClock that reports every Now(), so a test can advance
+// it only once the goroutine under test has taken its timer baseline from it.
+// The sample channel does not order those two: its rendezvous returns as soon as
+// the sample is handed over, while supervise and waitForRelief read the clock
+// afterwards. An advance that lands first makes the baseline the advanced time,
+// so the deadline can never elapse and the goroutine blocks on the next sample
+// for good.
+type observedClock struct {
+	*ManualClock
+	lateBaseline time.Duration // widens that window, so a test does not pass on scheduler luck
+	reads        chan struct{}
+}
+
+func newObservedClock() *observedClock {
+	return &observedClock{ManualClock: NewManualClock(testStart), reads: make(chan struct{}, 1)}
+}
+
+func (c *observedClock) Now() time.Time {
+	if c.lateBaseline > 0 {
+		time.Sleep(c.lateBaseline)
+	}
+	now := c.ManualClock.Now()
+	select {
+	case c.reads <- struct{}{}:
+	default: // only the first read is an ordering point; later ones need no room
+	}
+	return now
+}
+
+// awaitBaseline blocks until the goroutine under test has read the clock. Only
+// then may the test move it.
+func (c *observedClock) awaitBaseline(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.reads:
+	case <-time.After(awaitTimeout):
+		t.Fatal("the goroutine under test never read the clock")
+	}
+}
+
+// sendSample hands a monitoring sample to the goroutine under test.
+func sendSample(t *testing.T, samples chan Sample, s Sample) {
+	t.Helper()
+	select {
+	case samples <- s:
+	case <-time.After(awaitTimeout):
+		t.Fatalf("no goroutine took sample %+v", s)
+	}
+}
+
+// sendDone reports the statement's completion to the goroutine under test.
+func sendDone(t *testing.T, done chan error, err error) {
+	t.Helper()
+	select {
+	case done <- err:
+	case <-time.After(awaitTimeout):
+		t.Fatalf("no goroutine took done = %v", err)
+	}
+}
+
+// awaitSupervise returns supervise's result.
+func awaitSupervise(t *testing.T, out <-chan superviseResult) superviseResult {
+	t.Helper()
+	select {
+	case res := <-out:
+		return res
+	case <-time.After(awaitTimeout):
+		t.Fatal("supervise never returned")
+		return superviseResult{}
+	}
+}
+
+// awaitRelief returns waitForRelief's result.
+func awaitRelief(t *testing.T, out <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-out:
+		return err
+	case <-time.After(awaitTimeout):
+		t.Fatal("waitForRelief never returned")
+		return nil
+	}
+}
+
 // runSupervise starts supervise in a goroutine and returns its result channel.
 func runSupervise(clk Clock, caps Capabilities, samples chan Sample, done chan error) <-chan superviseResult {
 	out := make(chan superviseResult, 1)
@@ -78,10 +167,10 @@ func TestSuperviseContinuesUntilDone(t *testing.T) {
 	done := make(chan error)
 	out := runSupervise(NewManualClock(testStart), Capabilities{}, samples, done)
 
-	samples <- Sample{} // no pressure
-	done <- nil
+	sendSample(t, samples, Sample{}) // no pressure
+	sendDone(t, done, nil)
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Continue || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Continue, nil)", got.action, got.err)
 	}
@@ -90,14 +179,15 @@ func TestSuperviseContinuesUntilDone(t *testing.T) {
 func TestSuperviseCancelOnSustainedBlocking(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	out := runSupervise(clk, Capabilities{}, samples, done) // not resumable
 
-	samples <- Sample{BlockingOthers: true} // starts the blocking timer
+	sendSample(t, samples, Sample{BlockingOthers: true}) // starts the blocking timer
+	clk.awaitBaseline(t)
 	clk.Advance(90 * time.Second)
-	samples <- Sample{BlockingOthers: true} // 90s >= 60s, not resumable -> cancel
+	sendSample(t, samples, Sample{BlockingOthers: true}) // 90s >= 60s, not resumable -> cancel
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Cancel || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Cancel, nil)", got.action, got.err)
 	}
@@ -106,14 +196,15 @@ func TestSuperviseCancelOnSustainedBlocking(t *testing.T) {
 func TestSupervisePauseOnSustainedBlockingResumable(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	out := runSupervise(clk, Capabilities{Resumable: true}, samples, done)
 
-	samples <- Sample{BlockingOthers: true}
+	sendSample(t, samples, Sample{BlockingOthers: true})
+	clk.awaitBaseline(t)
 	clk.Advance(90 * time.Second)
-	samples <- Sample{BlockingOthers: true} // pressure + resumable -> pause
+	sendSample(t, samples, Sample{BlockingOthers: true}) // pressure + resumable -> pause
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Pause || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Pause, nil)", got.action, got.err)
 	}
@@ -122,15 +213,16 @@ func TestSupervisePauseOnSustainedBlockingResumable(t *testing.T) {
 func TestSuperviseIgnoreBlockingHoldsLock(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	out := runSupervise(clk, Capabilities{IgnoreBlocking: true}, samples, done)
 
-	samples <- Sample{BlockingOthers: true} // starts the (suppressed) blocking timer
+	sendSample(t, samples, Sample{BlockingOthers: true}) // starts the (suppressed) blocking timer
+	clk.awaitBaseline(t)
 	clk.Advance(90 * time.Second)
-	samples <- Sample{BlockingOthers: true} // well past timeout, but ignore_blocking -> no reaction
-	done <- nil                             // the statement finishes on its own
+	sendSample(t, samples, Sample{BlockingOthers: true}) // well past timeout, but ignore_blocking -> no reaction
+	sendDone(t, done, nil)                               // the statement finishes on its own
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Continue || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — ignore_blocking holds the lock", got.action, got.err)
 	}
@@ -139,15 +231,16 @@ func TestSuperviseIgnoreBlockingHoldsLock(t *testing.T) {
 func TestSuperviseMaxBlockCapYieldsThroughIgnored(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	// ignore_blocking would hold the lock forever, but max_block caps it.
 	out := runSupervise(clk, Capabilities{IgnoreBlocking: true, MaxBlock: 5 * time.Minute}, samples, done)
 
-	samples <- Sample{Blocking: true} // blocking only an ignored session (no BlockingOthers)
+	sendSample(t, samples, Sample{Blocking: true}) // blocking only an ignored session (no BlockingOthers)
+	clk.awaitBaseline(t)
 	clk.Advance(6 * time.Minute)
-	samples <- Sample{Blocking: true} // 6m >= 5m cap -> yield even though it is ignored
+	sendSample(t, samples, Sample{Blocking: true}) // 6m >= 5m cap -> yield even though it is ignored
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Cancel || !got.pressure.Capped {
 		t.Errorf("supervise() = (%v, capped=%v), want (Cancel, capped=true)", got.action, got.pressure.Capped)
 	}
@@ -156,15 +249,16 @@ func TestSuperviseMaxBlockCapYieldsThroughIgnored(t *testing.T) {
 func TestSuperviseMaxBlockCapNotReachedHoldsLock(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	out := runSupervise(clk, Capabilities{IgnoreBlocking: true, MaxBlock: 30 * time.Minute}, samples, done)
 
-	samples <- Sample{Blocking: true}
+	sendSample(t, samples, Sample{Blocking: true})
+	clk.awaitBaseline(t)
 	clk.Advance(5 * time.Minute)
-	samples <- Sample{Blocking: true} // 5m < 30m cap -> still holding
-	done <- nil                       // statement finishes on its own
+	sendSample(t, samples, Sample{Blocking: true}) // 5m < 30m cap -> still holding
+	sendDone(t, done, nil)                         // statement finishes on its own
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Continue || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — under the cap", got.action, got.err)
 	}
@@ -173,13 +267,13 @@ func TestSuperviseMaxBlockCapNotReachedHoldsLock(t *testing.T) {
 func TestSuperviseIgnoreBlockingStillHonorsLog(t *testing.T) {
 	samples := make(chan Sample)
 	done := make(chan error)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
 	out := runSupervise(clk, Capabilities{IgnoreBlocking: true}, samples, done) // not resumable
 
 	// Blocking is ignored, but transaction-log pressure must still stop the op.
-	samples <- Sample{BlockingOthers: true, LogOverCap: true}
+	sendSample(t, samples, Sample{BlockingOthers: true, LogOverCap: true})
 
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Cancel || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Cancel, nil) — log pressure is still honored", got.action, got.err)
 	}
@@ -196,7 +290,7 @@ func TestSuperviseContextCancel(t *testing.T) {
 	}()
 
 	cancel()
-	got := <-out
+	got := awaitSupervise(t, out)
 	if got.action != Continue || !errors.Is(got.err, context.Canceled) {
 		t.Errorf("supervise() = (%v, %v), want (Continue, context.Canceled)", got.action, got.err)
 	}
@@ -208,8 +302,8 @@ func TestSuperviseStopPausesResumable(t *testing.T) {
 	draining := func() bool { return true } // a graceful stop is requested
 	out := runSupervise(NewManualClock(testStart), Capabilities{Resumable: true, Stop: draining}, samples, done)
 
-	samples <- Sample{} // the stop is observed on a monitoring poll (so a cancel could precede it)
-	got := <-out
+	sendSample(t, samples, Sample{}) // the stop is observed on a monitoring poll (so a cancel could precede it)
+	got := awaitSupervise(t, out)
 	if got.action != Stop || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Stop, nil)", got.action, got.err)
 	}
@@ -223,9 +317,9 @@ func TestSuperviseStopIgnoredWhenNotResumable(t *testing.T) {
 
 	// A non-resumable operation cannot be paused, so the stop is ignored (even across a
 	// poll) and the op runs to completion (the drain stops the run at the next boundary).
-	samples <- Sample{}
-	done <- nil
-	got := <-out
+	sendSample(t, samples, Sample{})
+	sendDone(t, done, nil)
+	got := awaitSupervise(t, out)
 	if got.action != Continue || got.err != nil {
 		t.Errorf("supervise() = (%v, %v), want (Continue, nil) — stop ignored for a non-resumable op", got.action, got.err)
 	}
@@ -675,24 +769,28 @@ func TestWaitForReliefReturnsWhenClear(t *testing.T) {
 	samples := make(chan Sample)
 	out := runRelief(NewManualClock(testStart), time.Hour, samples, func(ReactionEvent) {})
 
-	samples <- Sample{LogOverCap: true} // still under pressure
-	samples <- Sample{}                 // cleared
-	if err := <-out; err != nil {
+	sendSample(t, samples, Sample{LogOverCap: true}) // still under pressure
+	sendSample(t, samples, Sample{})                 // cleared
+	if err := awaitRelief(t, out); err != nil {
 		t.Errorf("waitForRelief() = %v, want nil", err)
 	}
 }
 
 func TestWaitForReliefDrainTimeout(t *testing.T) {
 	samples := make(chan Sample)
-	clk := NewManualClock(testStart)
+	clk := newObservedClock()
+	// Take the baseline late on purpose: the abort must fire because the advance
+	// below waits for it, not because the scheduler happened to get there first.
+	clk.lateBaseline = 50 * time.Millisecond
 	var events []ReactionEvent
 	out := runRelief(clk, 30*time.Minute, samples, func(ev ReactionEvent) { events = append(events, ev) })
 
-	samples <- Sample{LogOverCap: true, LogReuseWait: "LOG_BACKUP"} // starts the drain timer
+	sendSample(t, samples, Sample{LogOverCap: true, LogReuseWait: "LOG_BACKUP"}) // starts the drain timer
+	clk.awaitBaseline(t)
 	clk.Advance(31 * time.Minute)
-	samples <- Sample{LogOverCap: true, LogReuseWait: "LOG_BACKUP"} // 31m >= 30m -> abort
+	sendSample(t, samples, Sample{LogOverCap: true, LogReuseWait: "LOG_BACKUP"}) // 31m >= 30m -> abort
 
-	err := <-out
+	err := awaitRelief(t, out)
 	if !errors.Is(err, ErrLogDrainTimeout) {
 		t.Errorf("waitForRelief() = %v, want ErrLogDrainTimeout", err)
 	}

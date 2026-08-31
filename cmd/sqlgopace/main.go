@@ -150,7 +150,12 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 // first analyses the database and writes the generated maintenance manifests into
 // the queue, then processes the queue — one unattended command, no review pause.
 func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix,
-	useTUI bool, auto autoConfig) error {
+	useTUI bool, auto autoConfig) (err error) {
+	// Report any error that stops the run itself; per-manifest outcomes keep their
+	// own events. See notifyRunFailure for what qualifies. A defer is the one shape
+	// none of the returns below can bypass.
+	defer func() { notifyRunFailure(ctx, stdout, notifiers(cfg), err) }()
+
 	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
 	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
 	if err != nil {
@@ -370,7 +375,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		return runErr
 	}
 	if total.Failed > 0 {
-		return fmt.Errorf("%d manifest(s) failed", total.Failed)
+		return fmt.Errorf("%d %w", total.Failed, errManifestsFailed)
 	}
 	return nil
 }
@@ -590,17 +595,9 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	if fwd != nil {
 		opts = append(opts, run.WithOpListSink(fwd.ops)) // operations panel (TUI only)
 	}
-	opts = append(opts,
-		run.WithNotifier(report.NewNotifier(cfg.Notifications.WebhookURL, cfg.Notifications.OnEvents)),
-		run.WithNotifier(report.NewEmailNotifier(report.EmailConfig{
-			Host:     cfg.Notifications.Email.Host,
-			Port:     cfg.Notifications.Email.Port,
-			From:     cfg.Notifications.Email.From,
-			To:       cfg.Notifications.Email.To,
-			Username: cfg.Notifications.Email.Username,
-			Password: cfg.Notifications.Email.Password,
-			StartTLS: cfg.Notifications.Email.StartTLS,
-		}, cfg.Notifications.OnEvents)))
+	for _, n := range notifiers(cfg) {
+		opts = append(opts, run.WithNotifier(n))
+	}
 	if history != nil {
 		opts = append(opts, run.WithHistory(history))
 	}
