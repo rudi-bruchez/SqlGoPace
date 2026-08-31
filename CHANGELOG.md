@@ -13,7 +13,7 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
-## [Unreleased]
+## [0.16.0] - 2026-08-31
 
 ### Fixed
 
@@ -109,4 +109,4 @@ history, so a report can always name the build that produced it.
   the repository and that `abort-resumable` has superseded.
 - `docs/login.sql`, superseded by `docs/permissions/`.
 
-[Unreleased]: https://github.com/rudi-bruchez/SqlGoPace/compare/main...HEAD
+[0.16.0]: https://github.com/rudi-bruchez/SqlGoPace/releases/tag/v0.16.0
