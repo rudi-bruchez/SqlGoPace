@@ -1,5 +1,8 @@
 # SqlGoPace
 
+[![CI](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 SqlGoPace is a high-performance, resilient DDL task runner for Microsoft SQL Server
 written in Go. It is designed for demanding database migrations and schema
 refactoring — heavy `ALTER COLUMN`, `ALTER INDEX`, `CREATE INDEX`, table rebuilds,
