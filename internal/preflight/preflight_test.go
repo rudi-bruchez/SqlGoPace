@@ -134,6 +134,7 @@ type fakeProber struct {
 	indexExists    bool
 	elevatedAccess bool
 	alterAnyConn   bool
+	sysadmin       bool
 	dmlPermission  bool
 	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
 }
@@ -158,6 +159,9 @@ func (f fakeProber) ConstraintExists(context.Context, string, string, string) (b
 func (f fakeProber) HasElevatedDBAccess(context.Context) (bool, error) {
 	return f.elevatedAccess, nil
 }
+func (f fakeProber) IsSysadmin(context.Context) (bool, error) {
+	return f.sysadmin, nil
+}
 func (f fakeProber) HasAlterAnyConnection(context.Context) (bool, error) {
 	return f.alterAnyConn, nil
 }
@@ -175,6 +179,7 @@ func healthyProber() fakeProber {
 		tableExists:    true,
 		indexExists:    true,
 		elevatedAccess: true,
+		sysadmin:       true,
 	}
 }
 
@@ -350,6 +355,44 @@ func TestRunBatchDMLRequiresSelect(t *testing.T) {
 		}
 		if rep.HasFailure() {
 			t.Errorf("Run() failed with both permissions granted:\n%v", rep.Checks)
+		}
+	})
+}
+
+// TestRunShrinkTempdbRequiresSysadmin pins the second permission gap of the same
+// family as the batched-DML one: the elevated-rights probe asks whether the login is
+// db_owner in the connected database, but DBCC SHRINKFILE for shrink_tempdb runs in
+// tempdb. A db_owner of a user database passed preflight and then failed mid-operation
+// with Msg 7983, "User 'guest' does not have permission to run DBCC shrinkfile for
+// database 'tempdb'". Measured against SQL Server 2022 CU26. tempdb is recreated from
+// model at every restart, so a membership granted there does not survive one, which
+// leaves sysadmin.
+func TestRunShrinkTempdbRequiresSysadmin(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{ddl.ShrinkTempdb{TargetSizeMB: 100}}}
+
+	t.Run("db_owner without sysadmin fails", func(t *testing.T) {
+		p := healthyProber()
+		p.elevatedAccess = true // db_owner in the connected database
+		p.sysadmin = false
+
+		rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() passed for a non-sysadmin; the run would fail on the first DBCC:\n%v", rep.Checks)
+		}
+	})
+
+	t.Run("sysadmin passes", func(t *testing.T) {
+		rep, err := preflight.Run(context.Background(), healthyProber(), info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if rep.HasFailure() {
+			t.Errorf("Run() failed for a sysadmin:\n%v", rep.Checks)
 		}
 	})
 }
