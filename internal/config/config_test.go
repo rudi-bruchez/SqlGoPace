@@ -375,3 +375,22 @@ func TestConfigRejectsOutOfRangeMaxDOP(t *testing.T) {
 		}
 	}
 }
+
+// TestKillDelayAndLoginTimeoutDefault pins two keys that were declared, documented and
+// shipped in config.yaml, and defaulted nowhere. A kill rule that sets no after_seconds
+// inherits kill_blockers.default_after_seconds, so leaving that at zero made a config
+// saying only "enabled: true" kill on the first poll a rule matched. login_timeout_seconds
+// was inert in a different way: it was never read at all, so setting it changed nothing.
+func TestKillDelayAndLoginTimeoutDefault(t *testing.T) {
+	body := strings.Replace(validYAML, "login_timeout_seconds: 15", "", 1)
+	cfg, err := config.Parse([]byte(body))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if got := cfg.KillBlockers.DefaultAfter(); got != 60*time.Second {
+		t.Errorf("KillBlockers.DefaultAfter() = %v, want 60s: a rule with no after_seconds must not kill on sight", got)
+	}
+	if got := cfg.Database.LoginTimeout(); got != 15*time.Second {
+		t.Errorf("Database.LoginTimeout() = %v, want 15s", got)
+	}
+}

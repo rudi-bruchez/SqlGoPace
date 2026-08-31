@@ -176,7 +176,7 @@ func dryRunConn(ctx context.Context, cfg *config.Config, db string, cache map[st
 	if c, ok := cache[key]; ok {
 		return c, nil
 	}
-	c, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version())
+	c, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
 	if err != nil {
 		return nil, err
 	}
@@ -197,7 +197,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	defer func() { notifyRunFailure(ctx, stdout, notifiers(cfg), err) }()
 
 	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
 	if err != nil {
 		return err
 	}
@@ -237,7 +237,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	// (recorded in its sidecar); other databases are reached via OpenDatabase.
 	recoverer := run.NewRecoverer(dirs, conn, stdout,
 		run.WithRecoveryProbes(info.Database, func(rctx context.Context, db string) (run.RecoveryProbe, func(), error) {
-			c, oerr := mssql.OpenDatabase(rctx, cfg.Database.ConnectionString, db, version.Version())
+			c, oerr := mssql.OpenDatabase(rctx, cfg.Database.ConnectionString, db, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
 			if oerr != nil {
 				return nil, nil, oerr
 			}
@@ -331,7 +331,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			}
 			break
 		}
-		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString)
+		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString, cfg.Database.LoginTimeout())
 		if cerr != nil {
 			fmt.Fprintf(stdout, "-- skip database %s: %v\n", db, cerr)
 			runErr = cerr
@@ -571,7 +571,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// -- reusing the primary sampler would watch the (idle) primary session and never
 	// see the tempdb DBCC SHRINKFILE blocking anyone. DMV reads are instance-wide, so
 	// probing stays on conn (avoids adding query load to the connection running the DBCC).
-	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version())
+	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
 	if err != nil {
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
@@ -708,11 +708,11 @@ func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
 // the already-open base connection when the target is the connected database;
 // otherwise it opens a fresh connection (and detects its server facts). reused is
 // true when the base connection was returned (the caller must not close it).
-func connForDatabase(ctx context.Context, base *mssql.Conn, baseInfo mssql.ServerInfo, db, dsn string) (conn *mssql.Conn, info mssql.ServerInfo, reused bool, err error) {
+func connForDatabase(ctx context.Context, base *mssql.Conn, baseInfo mssql.ServerInfo, db, dsn string, loginTimeout time.Duration) (conn *mssql.Conn, info mssql.ServerInfo, reused bool, err error) {
 	if strings.EqualFold(db, baseInfo.Database) {
 		return base, baseInfo, true, nil
 	}
-	conn, err = mssql.OpenDatabase(ctx, dsn, db, version.Version())
+	conn, err = mssql.OpenDatabase(ctx, dsn, db, version.Version(), mssql.WithLoginTimeout(loginTimeout))
 	if err != nil {
 		return nil, mssql.ServerInfo{}, false, err
 	}
@@ -1295,7 +1295,7 @@ func dryRunSession(ctx context.Context, log io.Writer, visited map[string]bool, 
 		return t, nil, noop, err
 	}
 
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version())
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
 	if err != nil {
 		return ddl.Target{}, nil, noop, err
 	}

@@ -360,6 +360,17 @@ func (c *Config) applyDefaults() {
 	if c.Monitoring.LogDrainTimeoutMinutes <= 0 {
 		c.Monitoring.LogDrainTimeoutMinutes = 30
 	}
+	// Without this, a kill rule that sets no after_seconds inherits a zero delay, which
+	// makes it fire on the first poll it matches: kill on sight, from a config that only
+	// said "enabled: true". The shipped config.yaml carries 60; so does the default now.
+	if c.KillBlockers.DefaultAfterSeconds <= 0 {
+		c.KillBlockers.DefaultAfterSeconds = 60
+	}
+	// The driver applies its own 15s dial timeout, so an unset value was never a hang. It
+	// did mean the documented key had no effect at all: setting 60 changed nothing.
+	if c.Database.LoginTimeoutSeconds <= 0 {
+		c.Database.LoginTimeoutSeconds = 15
+	}
 	if c.Monitoring.KillGraceSeconds <= 0 {
 		c.Monitoring.KillGraceSeconds = 30
 	}

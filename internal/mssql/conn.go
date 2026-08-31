@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	mssqldb "github.com/microsoft/go-mssqldb"
 	"github.com/microsoft/go-mssqldb/msdsn"
@@ -25,24 +26,41 @@ type Conn struct {
 // program_name), pins a dedicated execution connection, hardens its session, and
 // records its SPID. The driver applies no query timeout: long DDL is bounded by
 // monitoring and context cancellation, never a fixed timer.
-func Open(ctx context.Context, dsn, version string) (*Conn, error) {
-	return open(ctx, dsn, "", version)
+func Open(ctx context.Context, dsn, version string, opts ...Option) (*Conn, error) {
+	return open(ctx, dsn, "", version, opts...)
 }
 
 // OpenDatabase connects like Open but targets a specific database, reusing the
 // server and credentials from the base DSN with the catalog overridden. It is how
 // multi-database maintenance reaches each database in its own context, rather than
 // issuing USE on a pooled connection (the pool trap, SPECS §3 / spec §17.2).
-func OpenDatabase(ctx context.Context, dsn, database, version string) (*Conn, error) {
-	return open(ctx, dsn, database, version)
+func OpenDatabase(ctx context.Context, dsn, database, version string, opts ...Option) (*Conn, error) {
+	return open(ctx, dsn, database, version, opts...)
+}
+
+// Option adjusts a connection before it is opened.
+type Option func(*msdsn.Config)
+
+// WithLoginTimeout bounds how long a connection attempt may take. A value of zero or
+// less leaves the driver's own default in place. This is a connection timeout and never
+// a query timeout: SqlGoPace puts no timer on an executing statement.
+func WithLoginTimeout(d time.Duration) Option {
+	return func(c *msdsn.Config) {
+		if d > 0 {
+			c.DialTimeout = d
+		}
+	}
 }
 
 // open is the shared connection setup. A non-empty database overrides the DSN's
 // catalog so the pinned execution connection lands in that database.
-func open(ctx context.Context, dsn, database, version string) (*Conn, error) {
+func open(ctx context.Context, dsn, database, version string, opts ...Option) (*Conn, error) {
 	cfg, err := msdsn.Parse(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse connection string: %w", err)
+	}
+	for _, o := range opts {
+		o(&cfg)
 	}
 	// The base is what program_name is built from, and therefore what self-exclusion
 	// must key off — not the AppNamePrefix constant, which is only the fallback when
