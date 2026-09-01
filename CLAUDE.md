@@ -75,6 +75,24 @@ mandatory for monitoring).
 - **Simplify after building.** After a feature lands (and tests pass), run a `/simplify` pass over
   the diff before committing — collapse the layers/duplication that accrete during development.
   KISS is easier to enforce in cleanup than to maintain while building.
+- **Docs and CHANGELOG move with the code, every session.** Before committing, walk the whole
+  documentation surface a change touches — not just the file that was easiest to spot. In
+  practice that means: `CHANGELOG.md` (a new `## [x.y.z]` section whenever `internal/version/
+  VERSION` is bumped — the project moves the minor for a behaviour change, not only for a
+  feature), the **living** design doc under `docs/specs/` (`SHRINK.md`, `MAINTENANCE.md`,
+  `SPECS.md` — these state intended behaviour, so a stale one silently becomes a lie), the
+  operator-facing page in `docs/` (`shrink.md`, `configuration.md`, `running.md`, …), and
+  `config.yaml` **plus its embedded twin** `internal/scaffold/assets/config.yaml`, which a test
+  pins byte-for-byte. When a default or a semantic changes, say so as a migration note: an
+  operator whose `config.yaml` sets the old value explicitly needs to be told to revisit it.
+  Two categories are deliberately **not** updated: the raw AI research dumps
+  (`docs/specs/gemini-shrink.md`, `docs/specs/shrink-reference-perplexity.md`) and the
+  implementation plans (`docs/specs/*-IMPL.md`, `docs/specs/superpowers/`), which are historical
+  records of a decision, not statements of current behaviour. Supersede a living spec in place
+  with a short note saying what changed and why the old rationale no longer holds — future
+  readers need the reasoning that was abandoned, not just the rule that replaced it. The same pass
+  covers `docs/specs/TODO.md` — see the backlog section below; anything you deliberately left
+  undone goes there, with its reasoning, before the session ends.
 - **Lint config is golangci-lint v2** (`.golangci.yml`, `version: "2"`). errcheck/govet/staticcheck/
   ineffassign/unused are in the v2 default set and are not listed. Comments/identifiers use **US
   spelling** (normalized in 46cf1f4).
@@ -161,3 +179,22 @@ subcommand / maintenance planner, including multi-database mode §17), `IMPLEMEN
 and `SHRINK.md` (the shrink driver — now implemented; see the `ShrinkRunner` notes above). These
 are the source of truth for intended behaviour —
 consult the relevant spec before changing engine, planner, or reaction semantics.
+
+## The backlog — `docs/specs/TODO.md`
+
+**Read it when the user asks what to work on next, and whenever a session opens in an area it
+covers.** It is the one place recording work that is known, wanted, and not done: designed
+iterations awaiting implementation, and follow-ups deliberately scoped out of a change that
+shipped. Each entry says *why* it was deferred — that reasoning is what decides whether it is
+still the right call, so quote it when proposing the work rather than just the title.
+
+It also carries a **Shipped** section naming the evidence in the tree for each finished item.
+Check it before proposing anything: the file was once stale enough to list four implemented
+features as "not coded yet", which is how an assistant ends up offering to rebuild what already
+exists.
+
+**Keep it current, in both directions.** When you defer something while building — a
+special case left alone, a sibling that shares the defect you just fixed, a test you chose not to
+write — add it with its reasoning before the session ends, or it is lost. When work lands, move
+its entry to *Shipped* with the file that proves it, rather than deleting the line. Take the same
+care with client identifiers here as everywhere else.

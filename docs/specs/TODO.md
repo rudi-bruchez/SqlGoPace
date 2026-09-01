@@ -1,66 +1,108 @@
-# TODO — iterations to design / implement
+# TODO — the live backlog
 
-Index of iteration specs awaiting brainstorming and then implementation. All in
-**DRAFT**: none is coded yet. Dated 2026-06-17.
+What is worth doing next, and what has already been done so nobody proposes it again.
 
-## Iterations
+Two kinds of entry live here. **Iterations** are designed features with a spec of their own,
+awaiting brainstorming then implementation. **Follow-ups** are deliberate scoping decisions taken
+while shipping something else — small, known, and easy to lose. Each one records *why* it was
+deferred, because that reasoning is what decides whether it is still the right call.
 
-- [ ] **[Resume after interruption / metadata skip](crash-resumable.md)** — a Ctrl+C / kill
-  / crash does not resume where it stopped (recovery replays the manifest from the beginning).
-  Proposes: a real `ALTER INDEX … RESUME` where possible, and above all the **metadata skip**
-  (`sys.partitions`: rebuild only if compression ≠ target) for a cheap idempotent re-run.
+Keep this file honest: when work ships, move its entry to *Shipped* with the evidence rather than
+deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
+re-implementing what already exists.
 
-- [ ] **[Manifest progress (i/N counter, elapsed time, blocked sessions)](progress-tui.md)** — no
-  readable progress tracking today. Proposes: an **"operation i/N"** counter, **elapsed time**
-  for the current op, **number of blocked sessions** (already in the TUI, to be surfaced on stdout too).
-  Centerpiece: a **step sink** from the engine → stdout & TUI.
+Status last verified against the tree at v0.17.0 (2026-09-01).
 
-- [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow/act on a run from another
-  process. Proposes: `--serve :port` (SSE broadcast hub) + `--connect host:port` (reuses the
-  TUI). The real cost = **security** of remote actions (KILL). Converges with the step sink from
-  `progress-tui.md`.
+## Follow-ups deferred from shipped work
 
-- [ ] **[Graceful stop / drain](graceful-stop.md)** — a TUI command (and ideally Ctrl+C 1×) that
-  stops **after the current statement** (no rollback), writes a **resume point** (cursor
-  in the `State` sidecar, or a dedicated control file) and resumes at the next op. The missing link
-  between `pause` (mid-statement) and `kill` (brutal).
+- [ ] **A batch DML cut short by the supervisor retries at the same size.**
+  `internal/run/batch_dml.go:204` and `:279` — when `runBatch` returns `stopped`, the loop calls
+  `handleStop` and `continue`s, skipping `AdjustBatchRows` entirely. So a batch that was cut short
+  for blocking other sessions is retried unchanged, gets cut short again, and burns the whole
+  `self_wait_timeout_minutes` budget (5 min default) before giving up — **without ever having tried
+  a smaller batch**. Bounded, so not a hang, but the operation is not adaptive where it claims to
+  be. Fix: halve `size` in the stop branch before `continue`, roughly three lines and one test.
+  This is the same defect class fixed for shrink in v0.17.0 — the supervisor's verdict never
+  reaching the controller — in its other failure mode.
+  *Deferred because:* batch DML is not in use on the current engagement. Do it in a session that
+  touches `batch_update` / `batch_delete` anyway.
 
-- [ ] **[Batched DML: chunked `UPDATE`/`DELETE`](BATCH-DML.md)** — extends SqlGoPace to bulk DML
-  (setting a column to a value across a whole table, purging a table) by **splitting it into a loop of
-  batches** to avoid lock escalation (~5000 → table X lock) and log blowup.
-  Modeled on the **shrink driver** (chunked loop, adaptive calibration, reused reactions).
-  `set_raw`/`where_raw` escape hatch behind a guard; crash resume (self-limiting predicate, then
-  a `key_range` cursor). **This is where the RCSI check earns its keep**: it decides how much escalation
-  hurts (readers frozen if RCSI is off vs tempdb version store if it is on).
+- [ ] **`AdjustBatchRows` still runs the pre-v0.17.0 law, dead band included.**
+  `internal/run/batch_calc.go:46`. Growth requires latency < 5 ms while reduction starts at 10 ms
+  (WRITELOG) or 20 ms (PAGEIOLATCH_EX), so a batch sustaining anything in between is frozen at its
+  initial size and never climbs toward `max_rows`.
+  *Deferred because:* the failure that made this urgent for shrink **cannot happen here**. The
+  shrink ratchet came from a growth gate (`elapsed < target`) that a multi-GB chunk could never
+  satisfy; a DML batch is sized in rows and calibrated toward ~5 s, so its gate is reachable and
+  the size does not walk down to the floor. Freezing at a *sane* initial size (1000/5000/20000 by
+  table size) is a throughput loss, not a degradation. Note this is **not** a call to port AIMD:
+  the duration objective is legitimate for DML, which holds locks for a batch's whole duration and
+  has no per-invocation restart cost the way `DBCC SHRINKFILE` does.
 
-- [ ] **[tempdb guard (alert + self-attributed stop)](TEMPDB-GUARD.md)** — tempdb is shared by
-  the whole instance (blast radius = every database). Proposes: **preflight no-start** if tempdb is
-  already above the threshold; a **runtime alert** (TUI + log) on threshold; and above all a **stop conditioned
-  on self-attribution** — we only stop (pause→cancel) if tempdb is full **AND** it is *us*
-  (`sys.dm_db_session_space_usage` per SPID), otherwise alert only (stopping for someone else's fault
-  frees nothing). Cross-cutting: serves `SORT_IN_TEMPDB` rebuilds, shrink, batched DML. The RCSI
-  version store = an accepted blind spot (alert only).
+- [ ] **`WaitDeltas.BlockingSeconds` is never populated and can go.**
+  `internal/run/shrink_calc.go:82`, read only by `AdjustBatchRows`. `waitDeltas`
+  (`internal/run/shrink.go:1051`) fills only the two latency fields, so the blocking clause in the
+  batch DML law is inert — a maintainer reading it believes DML throttles when it blocks others,
+  and it cannot. Delete the field and `blockingReduceSeconds` once the two entries above are done;
+  doing it before would only move the dead code.
 
-- [ ] **[Wait observability (live TUI + log)](WAIT-OBSERVABILITY.md)** — surface **in real
-  time in the TUI** (and already summarized in the `.log`) our session's waits via
-  `sys.dm_exec_session_wait_stats`. **Observability, not reaction**: waits explain the
-  "why", they drive nothing (blocking/log already have dedicated reads; the WRITELOG/PAGEIOLATCH
-  throttle already exists per driver). Reuses the existing `SessionWaits`/`DiffWaits`/`CategorizeWaits`
-  — what's new is the **live panel** (sliding delta). Converges with the step sink from
-  `progress-tui.md`.
+- [ ] **Real cumulative blocking time per chunk, if `stopped` proves too coarse.**
+  `supervise` (`internal/run/executor.go:214`) tracks `blockingStart` as a *current streak*, reset
+  on every clear, so a per-chunk total means changing its return type — which `MonitoredRunner`
+  shares. The boolean `stopped` was chosen instead in v0.17.0 as a sufficient, already-computed
+  proxy. Revisit only if field evidence shows the shrink backing off too late or too coarsely.
 
-## Dependencies / suggested order
+## Iterations still to design / implement
 
-1. `progress-tui.md` first — the **step sink** it introduces is reused by `remote-tui.md`
-   (same message hub).
-2. `remote-tui.md` next — builds on that hub.
-3. `crash-resumable.md` is independent — can be done separately; start with the **metadata skip**
-   (small, big win) before the real RESUME.
-4. `graceful-stop.md` shares the **operation cursor** with `crash-resumable.md` (same
-   `ResumeFromOp` field in `State`) — design them together.
+- [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another
+  process. Proposes `--serve :port` (SSE broadcast hub) plus `--connect host:port` (reuses the
+  TUI). The real cost is the **security** of remote actions (KILL). Builds on the step sink, which
+  now exists (`internal/run/step.go`).
+
+- [ ] **[tempdb guard (alert + self-attributed stop)](TEMPDB-GUARD.md)** — tempdb is shared by the
+  whole instance, so the blast radius is every database. Proposes a **preflight no-start** when
+  tempdb is already over threshold, a **runtime alert**, and above all a **stop conditioned on
+  self-attribution**: only stop (pause → cancel) when tempdb is full *and it is us*
+  (`sys.dm_db_session_space_usage` per SPID), otherwise alert only — stopping for someone else's
+  fault frees nothing. Partially covered today: `preflight.check_tempdb` exists, and the shrink
+  driver has a tempdb cache-flush escalation. The self-attribution read is what is missing.
+
+- [ ] **[Wait observability — the live panel](WAIT-OBSERVABILITY.md)** — the `.log` already
+  summarizes our session's waits; what is missing is the **live TUI panel** showing the sliding
+  delta from `sys.dm_exec_session_wait_stats`. **Observability, not reaction**: waits explain the
+  "why" and drive nothing, since blocking and log already have dedicated reads and the
+  WRITELOG/PAGEIOLATCH throttle already exists per driver. Reuses `SessionWaits` / `DiffWaits` /
+  `CategorizeWaits`; `internal/tui` does not read them yet.
+
+## Shipped
+
+Kept so the entries above are not re-proposed. Each names the evidence in the tree.
+
+- [x] **Batched DML** ([BATCH-DML.md](BATCH-DML.md)) — `internal/run/batch_dml.go`,
+  `batch_calc.go`; `batch_update` / `batch_delete` documented in `docs/operations.md`. See the
+  follow-ups above for what its controller still owes.
+- [x] **Graceful stop / drain** ([graceful-stop.md](graceful-stop.md)) — `internal/run/drain.go`.
+- [x] **Resume after interruption / metadata skip** ([crash-resumable.md](crash-resumable.md)) —
+  `internal/run/skip.go`. The `skip_if_satisfied` flag it proposed was superseded by the
+  per-operation `intent` field (`docs/manifests.md:75`).
+- [x] **Manifest progress / step sink** ([progress-tui.md](progress-tui.md)) —
+  `internal/run/step.go` feeding stdout and the TUI.
+- [x] **Shrink stepsize AIMD** (v0.17.0) — `internal/run/shrink_calc.go`; the rules live in the
+  *Superseded* block of [SHRINK.md](SHRINK.md) §7.2, the diagnosis and rejected alternatives in
+  [shrink-stepsize-aimd.md](shrink-stepsize-aimd.md).
+
+## Suggested order
+
+1. The batch DML stop-branch follow-up is the cheapest real gain here — three lines, and it makes
+   an operation adaptive that currently is not. Take it the next time batch DML is in scope.
+2. `remote-tui.md` is unblocked now that the step sink exists.
+3. `TEMPDB-GUARD.md` is cross-cutting (it serves `SORT_IN_TEMPDB` rebuilds, shrink and batched DML
+   alike), so it is the one whose value grows with every driver added.
+4. `WAIT-OBSERVABILITY.md` is the smallest of the three iterations and depends on nothing.
 
 ## Context
 
-Specs born from the compression trial `01.to_run/030_compress_exampledb_indexes.yaml` (74 PAGE indexes
-on `EXAMPLEDB`, Standard edition → offline rebuilds). See also `docs/llm-operator-guide.md` and the
-`.claude/skills/sqlgopace-operator/` skill (LLM help for using the tool).
+The original specs were born from the compression trial
+`01.to_run/030_compress_exampledb_indexes.yaml` (74 PAGE indexes on `EXAMPLEDB`, Standard edition,
+so offline rebuilds). See also `docs/llm-operator-guide.md` and the
+`.claude/skills/sqlgopace-operator/` skill.
