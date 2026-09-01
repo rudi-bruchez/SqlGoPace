@@ -15,6 +15,34 @@ history, so a report can always name the build that produced it.
 
 ## [0.18.0] - 2026-09-01
 
+### Added
+
+- `preflight.require_data_free_space` now does what it has always claimed to do. A rebuild
+  materializes the new index before dropping the old one, so it needs roughly the object's
+  own size free; the check sums the database's `ROWS` file free space and compares it
+  against each `rebuild_index` / `rebuild_heap` target sized from
+  `sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild, not the
+  sum, because each releases its temporary copy before the next begins. An object whose
+  size cannot be read reports 0 and never fails a run. `create_index` is not checked — the
+  index does not exist yet, so there is nothing to size — and the check does not model file
+  autogrowth, so it can fail conservatively on a database whose files could still grow.
+
+### Removed
+
+- **`preflight.check_tempdb` and `preflight.ag_send_queue_warn` are gone.** Neither ever
+  did anything. All three `preflight` keys were parsed into `PreflightConfig` and then read
+  by nothing: no tempdb-space check and no Availability Group send-queue check existed
+  anywhere in `internal/preflight`, while `docs/configuration.md` described both as working
+  and the shipped `config.yaml` set both to `true`. `require_data_free_space` has been
+  implemented rather than removed (above); the other two are deleted rather than left as
+  promises.
+
+  **Migration:** configuration is parsed with `KnownFields(true)`, so a `config.yaml` still
+  carrying either key **fails to load** with `field check_tempdb not found`. Delete the two
+  lines. Nothing is lost — they never had an effect. If you relied on the *documented*
+  behaviour of either, note that you never had it; `docs/specs/TODO.md` tracks the tempdb
+  guard as unstarted work, corrected there from a claim that it was partially covered.
+
 ### Fixed
 
 - A shrink now honours `options.max_block_minutes`. `resolveShrink` built its

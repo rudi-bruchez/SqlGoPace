@@ -116,6 +116,46 @@ func CheckBlocking(sessions []mssql.Session) Check {
 	return Check{"blocking", Pass, "no pre-existing blocking"}
 }
 
+// CheckDataFreeSpace verifies the database's data files have room to build a second copy
+// of the object. A rebuild materializes the new index before dropping the old, so it needs
+// roughly the object's own size free; running out mid-rebuild wastes the entire operation,
+// which is exactly what preflight exists to prevent. needMB of 0 means the size could not
+// be read, and an unknown size never fails a run.
+func CheckDataFreeSpace(target string, needMB, freeMB int) Check {
+	switch {
+	case needMB <= 0:
+		return Check{"data free space", Pass, fmt.Sprintf("%s: size unknown, not checked (%d MB free in data files)", target, freeMB)}
+	case freeMB < needMB:
+		return Check{"data free space", Fail, fmt.Sprintf("%s needs ~%d MB free, data files have %d MB", target, needMB, freeMB)}
+	default:
+		return Check{"data free space", Pass, fmt.Sprintf("%s: %d MB free, ~%d MB needed", target, freeMB, needMB)}
+	}
+}
+
+// rebuiltObject reports the object an operation rebuilds in place, and whether it is such
+// an operation. Only a rebuild needs room for a second copy of something that already
+// exists: create_index cannot be sized in advance (the index is not there yet) and is
+// deliberately not checked, and the remaining operations are metadata-only.
+func rebuiltObject(op ddl.Operation) (schema, table, index string, ok bool) {
+	switch o := op.(type) {
+	case ddl.RebuildIndex:
+		return o.Schema, o.Table, o.Index, true
+	case ddl.RebuildHeap:
+		return o.Schema, o.Table, "", true // empty index = the heap itself
+	default:
+		return "", "", "", false
+	}
+}
+
+// rebuiltObjectLabel names the object for the check detail, distinguishing a heap (which
+// has no index name) from a named index.
+func rebuiltObjectLabel(schema, table, index string) string {
+	if index == "" {
+		return fmt.Sprintf("%s.%s (heap)", schema, table)
+	}
+	return fmt.Sprintf("%s.%s.%s", schema, table, index)
+}
+
 // requiresElevatedRights reports whether an operation needs db_owner or sysadmin:
 // DBCC SHRINKFILE (shrink, shrink_tempdb) and DBCC CHECKDB (check_db) all do. Lesser
 // DDL rights (db_ddladmin, ALTER on a table) are not enough for these.
@@ -215,14 +255,20 @@ type Prober interface {
 	IsSysadmin(ctx context.Context) (bool, error)
 	HasAlterAnyConnection(ctx context.Context) (bool, error)
 	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
+	FileSpace(ctx context.Context, fileType string) ([]mssql.FileSpace, error)
+	IndexSizeMB(ctx context.Context, schema, table, index string) (int, error)
 }
 
 var _ Prober = (*mssql.Conn)(nil)
 
-// Thresholds are the log-pressure limits sourced from config.
+// Thresholds are the limits and toggles sourced from config.
 type Thresholds struct {
 	LogMaxBytes   int64
 	LogMaxPercent int
+	// RequireDataFreeSpace enables the data-free-space check: every index rebuild is
+	// verified to have roughly its own size free in the database's data files before
+	// the manifest runs. Off leaves the check out of the report entirely.
+	RequireDataFreeSpace bool
 }
 
 // Run gathers server facts and builds the preflight report for a manifest. killArmed
@@ -284,7 +330,32 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 		rep.add(CheckKillPermission(hasPerm))
 	}
 
+	// A rebuild materializes a second copy of the object before dropping the original, so
+	// the data files need roughly the object's own size free. The file read is done once
+	// per manifest; the peak requirement is the largest single rebuild, not their sum,
+	// because each one releases its temporary copy before the next begins.
+	dataFreeMB := 0
+	if th.RequireDataFreeSpace {
+		files, err := p.FileSpace(ctx, "ROWS")
+		if err != nil {
+			return Report{}, fmt.Errorf("preflight data file space: %w", err)
+		}
+		for _, f := range files {
+			dataFreeMB += f.FreeMB
+		}
+	}
+
 	for _, op := range m.Operations {
+		if th.RequireDataFreeSpace {
+			if schema, table, index, ok := rebuiltObject(op); ok {
+				sizeMB, err := p.IndexSizeMB(ctx, schema, table, index)
+				if err != nil {
+					return Report{}, fmt.Errorf("preflight object size: %w", err)
+				}
+				rep.add(CheckDataFreeSpace(rebuiltObjectLabel(schema, table, index), sizeMB, dataFreeMB))
+			}
+		}
+
 		tableExists, targetExists, err := objectExistence(ctx, p, op)
 		if err != nil {
 			return Report{}, err

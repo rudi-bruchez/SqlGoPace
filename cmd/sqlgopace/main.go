@@ -459,8 +459,9 @@ func amplifierDwellWarning(cfg *config.Config) string {
 // own lifecycle.
 func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, conn *mssql.Conn, info mssql.ServerInfo, dirs run.Dirs, engineOut io.Writer, history *report.History, fwd *tuiForwarder, drain func() bool, extra ...run.EngineOption) (*run.Engine, *mssql.Conn, error) {
 	thresholds := preflight.Thresholds{
-		LogMaxBytes:   cfg.Monitoring.LogMaxSizeBytes,
-		LogMaxPercent: cfg.Monitoring.LogMaxPercent,
+		LogMaxBytes:          cfg.Monitoring.LogMaxSizeBytes,
+		LogMaxPercent:        cfg.Monitoring.LogMaxPercent,
+		RequireDataFreeSpace: cfg.Preflight.RequireDataFreeSpace,
 	}
 	killArmed := cfg.KillBlockers.Enabled ||
 		cfg.KillAmplifyingMaintenance.Enabled ||

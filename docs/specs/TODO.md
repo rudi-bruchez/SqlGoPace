@@ -77,8 +77,12 @@ Status last verified against the tree at v0.17.0 (2026-09-01).
   tempdb is already over threshold, a **runtime alert**, and above all a **stop conditioned on
   self-attribution**: only stop (pause → cancel) when tempdb is full *and it is us*
   (`sys.dm_db_session_space_usage` per SPID), otherwise alert only — stopping for someone else's
-  fault frees nothing. Partially covered today: `preflight.check_tempdb` exists, and the shrink
-  driver has a tempdb cache-flush escalation. The self-attribution read is what is missing.
+  fault frees nothing. Covered today only by the shrink driver's tempdb cache-flush escalation:
+  the self-attribution read is missing, and so is any preflight tempdb check at all.
+  **Correction (v0.18.0):** this entry used to claim `preflight.check_tempdb` existed. It never
+  did — the key was parsed into `PreflightConfig`, never read, and no tempdb-space check was ever
+  written. The key has been removed rather than left as a promise, so a tempdb guard starts from
+  nothing here, not from "partially covered".
 
 - [ ] **[Wait observability — the live panel](WAIT-OBSERVABILITY.md)** — the `.log` already
   summarizes our session's waits; what is missing is the **live TUI panel** showing the sliding

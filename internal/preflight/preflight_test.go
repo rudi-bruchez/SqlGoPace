@@ -42,6 +42,31 @@ func TestCheckLog(t *testing.T) {
 	}
 }
 
+// An offline rebuild materializes the new index before dropping the old one, so it needs
+// roughly the object's own size free in the data files. Running out mid-rebuild wastes the
+// whole operation, which is what preflight exists to prevent.
+func TestCheckDataFreeSpace(t *testing.T) {
+	tests := []struct {
+		name   string
+		needMB int
+		freeMB int
+		want   preflight.Severity
+	}{
+		{"room to spare", 100, 500, preflight.Pass},
+		{"exactly enough", 100, 100, preflight.Pass},
+		{"short", 500, 100, preflight.Fail},
+		{"unknown size does not fail", 0, 100, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, tt.freeMB).Severity
+			if got != tt.want {
+				t.Errorf("CheckDataFreeSpace(need=%d, free=%d) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckBlocking(t *testing.T) {
 	none := []mssql.Session{{SPID: 51, BlockingSPID: 0}}
 	if got := preflight.CheckBlocking(none).Severity; got != preflight.Pass {
@@ -137,6 +162,15 @@ type fakeProber struct {
 	sysadmin       bool
 	dmlPermission  bool
 	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
+	dataFreeMB     int
+	indexSizeMB    int
+}
+
+func (f fakeProber) FileSpace(context.Context, string) ([]mssql.FileSpace, error) {
+	return []mssql.FileSpace{{Name: "data", TypeDesc: "ROWS", FreeMB: f.dataFreeMB}}, nil
+}
+func (f fakeProber) IndexSizeMB(context.Context, string, string, string) (int, error) {
+	return f.indexSizeMB, nil
 }
 
 func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) { return f.logSpace, nil }
@@ -393,6 +427,48 @@ func TestRunShrinkTempdbRequiresSysadmin(t *testing.T) {
 		}
 		if rep.HasFailure() {
 			t.Errorf("Run() failed for a sysadmin:\n%v", rep.Checks)
+		}
+	})
+}
+
+// The data-free-space check is config-gated: on, an index rebuild that cannot fit a second
+// copy of itself in the data files fails preflight rather than running out of room hours in;
+// off, the check is absent from the report entirely.
+func TestRunDataFreeSpace(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+	shortOfRoom := func() fakeProber {
+		p := healthyProber()
+		p.indexSizeMB = 5000
+		p.dataFreeMB = 100
+		return p
+	}
+
+	t.Run("enabled and short of room fails", func(t *testing.T) {
+		th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
+
+		rep, err := preflight.Run(context.Background(), shortOfRoom(), info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() passed a rebuild needing 5000 MB with 100 MB free:\n%v", rep.Checks)
+		}
+	})
+
+	t.Run("disabled omits the check", func(t *testing.T) {
+		th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+
+		rep, err := preflight.Run(context.Background(), shortOfRoom(), info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		for _, c := range rep.Checks {
+			if c.Name == "data free space" {
+				t.Errorf("Run() emitted %q with require_data_free_space off", c.Name)
+			}
 		}
 	})
 }

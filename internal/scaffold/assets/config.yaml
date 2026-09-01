@@ -32,9 +32,7 @@ monitoring:
   checkpoint_between_operations: false  # only has an effect under SIMPLE recovery model
 
 preflight:
-  require_data_free_space: true     # requires ≈ the object's size free in the filegroup
-  check_tempdb: true
-  ag_send_queue_warn: true          # warns but does not block (configurable)
+  require_data_free_space: true     # fail a rebuild without ≈ its own size free in the data files
 
 options_override:
   online:               { force: null }   # true / false / null(auto)

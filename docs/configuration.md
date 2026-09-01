@@ -30,8 +30,6 @@ shipped file is deliberately more cautious than the bare default:
 | Key | Default when absent | The shipped `config.yaml` |
 |---|---|---|
 | `preflight.require_data_free_space` | false | **true** |
-| `preflight.check_tempdb` | false | **true** |
-| `preflight.ag_send_queue_warn` | false | **true** |
 | `history.enabled` | false | **true**, writing `./sqlgopace_history.db` |
 
 If you copied that file, those are the values you have. It is the recommended starting
@@ -101,9 +99,17 @@ A poll interval of zero is rejected rather than accepted as a spin loop.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `require_data_free_space` | false | Fail if the data file has no room for the operation. |
-| `check_tempdb` | false | Check tempdb space when `SORT_IN_TEMPDB` will be injected. |
-| `ag_send_queue_warn` | false | Warn on a large Availability Group send queue. |
+| `require_data_free_space` | false | Fail an index rebuild that does not have roughly its own size free in the database's data files. |
+
+A rebuild materializes the new index before dropping the old one, so it needs room for a
+second copy of the object. The check sums the free space of the database's `ROWS` files and
+compares it against the size of each `rebuild_index` / `rebuild_heap` target, read from
+`sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild rather than
+their sum, because each one releases its temporary copy before the next begins.
+
+Two limits are worth knowing. It does not account for file autogrowth, so a database whose
+files can still grow on a volume with room may fail this check conservatively. And
+`create_index` is not checked: the index does not exist yet, so there is nothing to size.
 
 ## `options_override`
 
