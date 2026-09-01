@@ -418,23 +418,37 @@ func (m Model) waitsBody() string {
 	return b.String()
 }
 
+// killConfirmBody is the prompt behind the `x` key. It has to state the direction, not
+// just the identity: this session is waiting on OUR operation, so killing it frees
+// nothing we are waiting for — it only discards that session's work. The open
+// transaction count is the part an operator most needs and least has: killing a session
+// mid-transaction rolls it back.
+func killConfirmBody(bl Blocker) string {
+	txn := "no open transaction"
+	if bl.OpenTransactions > 0 {
+		txn = fmt.Sprintf("%d open transaction(s) — killing rolls them back", bl.OpenTransactions)
+	}
+	return alertStyle.Render(fmt.Sprintf(
+		"kill SPID %d (%s on %s, app %s)? it is waiting on us, so this frees nothing; %s   [y] kill  [any] cancel",
+		bl.SPID, bl.Login, bl.Host, bl.Program, txn))
+}
+
 // helpBody is the footer: the normal shortcut line, or the active criterion sub-prompt.
 // The normal line lists only shortcuts that do something in the current state — the
 // blocker keys appear only when a session is actually blocked, [b] only when there is
 // suspension history to review — so the footer never advertises a no-op.
 func (m Model) helpBody() string {
+	if m.mode == modeKillConfirm && m.cursor < len(m.blockers) {
+		return killConfirmBody(m.blockers[m.cursor])
+	}
 	if m.inCriterionMode() && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
-		verb := "ignore"
-		if m.mode == modeKillCriterion {
-			verb = "kill+auto-kill"
-		}
-		return fmt.Sprintf("%s SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
-			verb, bl.SPID, bl.Program, bl.Login, bl.Host)
+		return fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",
+			bl.SPID, bl.Program, bl.Login, bl.Host)
 	}
 	var keys []string
 	if len(m.blockers) > 0 {
-		keys = append(keys, "[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill", "[X] kill+auto")
+		keys = append(keys, "[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill")
 	}
 	if len(m.suspension.Blockers) > 0 {
 		keys = append(keys, "[b] blockers")

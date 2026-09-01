@@ -13,6 +13,26 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.24.0] - 2026-09-01
+
+### Changed
+
+- The incident console's `x` key now asks for confirmation, and the prompt names the login,
+  host, application and open transaction count. The list `x` acts on is the sessions waiting
+  *on* the DDL — the ones it is holding up — so killing one frees nothing and only discards
+  that session's work, rolling back anything it had open. It fired on a single keystroke with
+  no confirmation, ungated by `kill_blockers`, and with none of the six conditions
+  `kill_amplifying_maintenance` requires before killing a victim automatically.
+
+### Removed
+
+- The console's `X` ("kill + auto-kill") key. It appended to `kill_blocking_sessions`, which
+  `BlockerKiller` only ever matches against the session blocking *us*; a session we are
+  blocking can never be that, so the rule was inert by construction while leaving the operator
+  believing recurrences were handled. `docs/blocking-and-kills.md` uses that exact mix-up as
+  its worked example of getting the direction backwards. **Migration:** to arm a kill rule
+  against a session that blocks the DDL, use the roster (`b`), which writes a rule that can
+  actually fire. Rules already written by `X` never did anything and can be deleted.
 ## [0.23.0] - 2026-09-01
 
 ### Changed

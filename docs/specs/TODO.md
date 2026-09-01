@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.23.0 (2026-09-01).
+Status last verified against the tree at v0.24.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,7 +37,7 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1–5 and 8 are done; two remain (6 and 7).**
+Ordered as the review ordered them. **1–6 and 8 are done; only 7 remains.**
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
@@ -107,12 +107,23 @@ Ordered as the review ordered them. **1–5 and 8 are done; two remain (6 and 7)
   filter closes the CATASTROPHIC part (a bare command can no longer touch a colleague's
   build); owner-defaulting would make the common case shorter to type, which is a usability
   gain rather than a safety one.
-- [ ] **6. Fix the TUI `x` / `X` semantics** (finding 5). `blockerGate.persistent`
-  (`cmd/sqlgopace/main.go:841`) filters `s.BlockedBy(ddlSPID)` — sessions **our DDL is
-  blocking**, i.e. victims — and feeds them to the TUI as "blockers". `x` kills one on a single
-  keystroke, unconfirmed, ungated by `kill_blockers`, with no amplifier test; `X` then writes
-  the rule into `kill_blocking_sessions`, which structurally can never match a victim. This is
-  the direction error `docs/blocking-and-kills.md` uses as its own cautionary tale.
+- [x] **6. Fix the TUI `x` / `X` semantics** — done in 0.24.0. `x` opens a confirmation naming
+  the login, host, application and **open transaction count**, and stating that the session is
+  waiting on us so the kill frees nothing; only `y` proceeds. `X` is removed, along with
+  `ActionKillBlockerAuto` and `killBlockerAuto`, because the rule it wrote could never fire.
+  *Left undone, deliberately:* the review also proposed restricting `x` to victims passing
+  `IsAmplifyingCommand`. Not done — that is the automated killer's criterion, and making the
+  *manual* key strictly narrower than the operator's own judgement would block the legitimate
+  case where they know something the allow-list does not. The prompt gives them what they were
+  missing (what it is, and what killing it costs) rather than deciding for them. Revisit if a
+  real incident shows the prompt is not enough.
+  *Also left undone:* renaming `tui.Blocker` → `Victim` through the console, which the review
+  called the fix that stops the next person re-introducing this. 158 occurrences across seven
+  files, and `blocker` legitimately means the other direction in the roster, `blockerGate` and
+  `BlockerKiller` — a blind rename would corrupt those. Worth its own commit; the type comment
+  now states the direction in the strongest terms available. Note the old comment already said
+  "one session blocked by the running DDL" and the bug happened anyway, which is the argument
+  for doing the rename.
 - [ ] **7. Report a stopped-short batch as incomplete, not done** (finding 8). Reuse the shrink
   path; today a half-finished purge is filed as complete and made unresumable.
 - [x] **8. Correct the false claims** — done in 0.19.0. `README.md` no longer says "no raw

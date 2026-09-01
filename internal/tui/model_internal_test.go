@@ -25,7 +25,7 @@ func TestFormatElapsed(t *testing.T) {
 }
 
 func TestHelpBodyGatesShortcutsOnState(t *testing.T) {
-	blockerKeys := []string{"[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill", "[X] kill+auto"}
+	blockerKeys := []string{"[↑/↓] select", "[enter] sql", "[i] ignore", "[x] kill"}
 
 	// No blockers and no suspension history: only the always-valid keys, none of the
 	// blocker keys and no [b] blockers.

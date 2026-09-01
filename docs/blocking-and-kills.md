@@ -173,6 +173,12 @@ cost nothing to keep waiting. The ingestion login in the same capture, an `INSER
 open transactions, was correctly left out of both lists, and `options.max_block_minutes`
 kept backstopping the run.
 
+The console used to make this same mistake for you. Its `X` key — on the blocked list, i.e.
+on victims — wrote a `kill_blocking_sessions` rule, which `BlockerKiller` only ever matches
+against the session blocking us. The rule could not fire, and said nothing about it. It was
+removed in 0.24.0; `x` now confirms first and names the open transaction count, and the
+roster (`b`) is where a kill rule against a real blocker is armed.
+
 ## Killing amplifying maintenance victims
 
 `ALTER INDEX … REORGANIZE` is an online operation: it takes only `Sch-S` plus short-lived

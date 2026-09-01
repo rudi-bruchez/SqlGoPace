@@ -53,7 +53,13 @@ func (s Status) String() string {
 	}
 }
 
-// Blocker is one session blocked by the running DDL.
+// Blocker is one session blocked BY the running DDL — a session waiting on us, not one
+// we are waiting on. The name is the wrong way round and has caused harm: it is what led
+// the `x` key to be built as "kill the thing in our way" when the list holds the things
+// we are in the way of. Killing one of these frees nothing.
+//
+// The sessions actually blocking us are the roster (`b`), which is what feeds
+// kill_blocking_sessions.
 type Blocker struct {
 	SPID     int
 	Login    string
@@ -62,6 +68,9 @@ type Blocker struct {
 	WaitType string
 	WaitMS   int64
 	Query    string
+	// OpenTransactions is shown in the kill confirmation: killing a session with open
+	// transactions rolls them back, and the operator should see that before deciding.
+	OpenTransactions int
 }
 
 // WaitCategory is one category of waits accumulated by the running DDL.
@@ -243,10 +252,6 @@ const (
 	// manifest (so the DDL holds its lock through it). Criterion/Value/SPID carry the
 	// chosen match.
 	ActionIgnoreBlocker
-	// ActionKillBlockerAuto kills the selected blocking session now AND adds a kill rule
-	// for it to the running manifest, so a recurrence is auto-killed without a restart.
-	// Criterion/Value/SPID carry the chosen match (the inverse of ActionIgnoreBlocker).
-	ActionKillBlockerAuto
 	// ActionArmKillRule appends a kill_blocking_sessions rule (Criterion/Value) to the running
 	// manifest without killing now: a session that later blocks the DDL and matches the rule is
 	// terminated by the armed BlockerKiller. Emitted from the blocker roster.
@@ -261,9 +266,9 @@ const (
 // Action is an operator intent, dispatched to the host via the action channel.
 type Action struct {
 	Kind ActionKind
-	SPID int // set for ActionKillBlocker, ActionIgnoreBlocker, and ActionKillBlockerAuto
+	SPID int // set for ActionKillBlocker and ActionIgnoreBlocker
 
-	// Criterion and Value carry the match for ActionIgnoreBlocker / ActionKillBlockerAuto:
+	// Criterion and Value carry the match for ActionIgnoreBlocker:
 	// Criterion is "session_id" | "app_name" | "login_name" | "host_name"; Value is the
 	// observed attribute (empty for session_id, which uses SPID).
 	Criterion string
@@ -275,9 +280,9 @@ type Action struct {
 type inputMode int
 
 const (
-	modeNormal        inputMode = iota
-	modeCriterion               // ignore-this-session prompt (from "i")
-	modeKillCriterion           // kill-and-remember prompt (from "X")
+	modeNormal      inputMode = iota
+	modeCriterion             // ignore-this-session prompt (from "i")
+	modeKillConfirm           // "really kill this session?" prompt (from "x")
 )
 
 // Model is the incident console state.
@@ -543,6 +548,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.mode == modeKillConfirm {
+		return m.handleKillConfirmKey(msg)
+	}
 	if m.inCriterionMode() {
 		return m.handleCriterionKey(msg)
 	}
@@ -577,12 +585,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.rosterOpen = true
 		m.rosterCursor = 0
 	case "x":
+		// Confirm first. This kills a session that is waiting on us: it frees nothing,
+		// and rolls back whatever the session had open. The automated equivalent
+		// (kill_amplifying_maintenance) requires six conditions before killing a victim;
+		// one keystroke required none of them.
 		if len(m.blockers) > 0 {
-			m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
-		}
-	case "X":
-		if len(m.blockers) > 0 {
-			m.mode = modeKillCriterion
+			m.mode = modeKillConfirm
 		}
 	case "k":
 		m.emit(Action{Kind: ActionKillDDL})
@@ -599,24 +607,39 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// inCriterionMode reports whether a match-criterion sub-prompt is open (ignore or kill).
-func (m Model) inCriterionMode() bool {
-	return m.mode == modeCriterion || m.mode == modeKillCriterion
+// inCriterionMode reports whether the match-criterion sub-prompt is open.
+func (m Model) inCriterionMode() bool { return m.mode == modeCriterion }
+
+// handleKillConfirmKey answers the "really kill this session?" prompt. Only "y"
+// confirms; every other key dismisses it, so a stray keystroke cannot kill anything.
+func (m Model) handleKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.cursor >= len(m.blockers) { // the selection vanished while prompting
+		m.mode = modeNormal
+		return m, nil
+	}
+	if msg.String() == "y" {
+		m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
+	}
+	m.mode = modeNormal
+	return m, nil
 }
 
-// handleCriterionKey handles the match-criterion sub-prompt shared by "ignore this session
-// by …" (modeCriterion) and "kill + remember this session by …" (modeKillCriterion): it
-// emits the corresponding action for the selected blocker and chosen criterion, then returns
-// to normal mode. Esc/q cancels; any other key keeps the prompt open.
+// handleCriterionKey handles the "ignore this session by …" sub-prompt: it emits the
+// ignore action for the selected session and chosen criterion, then returns to normal
+// mode. Esc/q cancels; any other key keeps the prompt open.
+//
+// It used to serve a second prompt, "kill + remember" from the `X` key, which wrote its
+// rule into kill_blocking_sessions. BlockerKiller only ever matches that list against the
+// session blocking us, and a session we are blocking can never be that, so the rule was
+// inert by construction — while leaving the operator believing recurrences were handled.
+// docs/blocking-and-kills.md uses that exact mix-up as its worked example of getting it
+// backwards. The roster (`b`) is the working path for arming a rule against a real blocker.
 func (m Model) handleCriterionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.cursor >= len(m.blockers) { // the selection vanished while prompting
 		m.mode = modeNormal
 		return m, nil
 	}
-	kind := ActionIgnoreBlocker
-	if m.mode == modeKillCriterion {
-		kind = ActionKillBlockerAuto
-	}
+	const kind = ActionIgnoreBlocker
 	bl := m.blockers[m.cursor]
 	switch msg.String() {
 	case "esc", "q":

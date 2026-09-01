@@ -442,7 +442,8 @@ func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", actions)
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58}, {SPID: 61}}})
-	_, _ = send(m, key("x")) // kill selected (first) blocker; model not needed after
+	m, _ = send(m, key("x")) // opens the confirmation
+	_, _ = send(m, key("y"))
 
 	a, ok := drain(t, actions)
 	if !ok {
@@ -461,31 +462,11 @@ func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 	// A poll drops SPID 51 and reorders: SPID 52 is now at index 0. The cursor must follow
 	// the identity, so `x` still targets 52 — not whatever now sits at the old index 1.
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 52}, {SPID: 53}}})
-	_, _ = send(m, key("x"))
+	m, _ = send(m, key("x"))
+	_, _ = send(m, key("y"))
 	a, ok := drain(t, actions)
 	if !ok || a.Kind != tui.ActionKillBlocker || a.SPID != 52 {
 		t.Errorf("kill = %+v ok=%t, want KillBlocker SPID 52 (selection tracked by identity)", a, ok)
-	}
-}
-
-func TestModelKillBlockerAutoAction(t *testing.T) {
-	actions := make(chan tui.Action, 4)
-	m := tui.New("op", actions)
-	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
-		{SPID: 104, Login: "SVC_RPT", Host: "rpt01", Program: "Reporting"},
-	}})
-	m, _ = send(m, key("X")) // open the kill+remember criterion prompt
-	// The prompt should ask which criterion to match on.
-	if !strings.Contains(m.View(), "kill+auto-kill SPID 104") {
-		t.Fatalf("expected kill criterion prompt, view:\n%s", m.View())
-	}
-	_, _ = send(m, key("l")) // remember by login
-	a, ok := drain(t, actions)
-	if !ok {
-		t.Fatalf("no action emitted")
-	}
-	if a.Kind != tui.ActionKillBlockerAuto || a.SPID != 104 || a.Criterion != "login_name" || a.Value != "SVC_RPT" {
-		t.Errorf("action = %+v, want KillBlockerAuto SPID 104 login_name=SVC_RPT", a)
 	}
 }
 
@@ -574,5 +555,81 @@ func TestModelLogMsgShownAsNotice(t *testing.T) {
 	m, _ = send(m, tui.LogMsg{Line: "ignoring SPID 53 by app_name"})
 	if v := m.View(); !strings.Contains(v, "ignoring SPID 53 by app_name") {
 		t.Errorf("LogMsg should appear in the view:\n%s", v)
+	}
+}
+
+// TestKillNeedsConfirmation pins the gate on `x`. The list it acts on is the sessions
+// our DDL is *blocking* — our victims, not our aggressors — so killing one frees
+// nothing and simply destroys a user's work. It used to fire on one keystroke, with
+// no confirmation and no information beyond a SPID.
+func TestKillNeedsConfirmation(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{
+		{SPID: 58, Login: "APP_USER", Host: "APP01", Program: "OrderEntry",
+			Query: "SELECT * FROM dbo.MEASUREMENT", OpenTransactions: 2},
+	}})
+
+	m, _ = send(m, key("x"))
+	if a, ok := drain(t, actions); ok {
+		t.Fatalf("x emitted %+v without confirmation", a)
+	}
+
+	view := m.View()
+	for _, want := range []string{"58", "APP_USER", "OrderEntry", "2"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("confirmation prompt does not show %q; the operator cannot judge the kill:\n%s", want, view)
+		}
+	}
+	// The direction has to be stated. "blocked" is what this session is, not what it does.
+	if !strings.Contains(strings.ToLower(view), "waiting on") {
+		t.Errorf("confirmation prompt does not say the session is waiting on us:\n%s", view)
+	}
+
+	_, _ = send(m, key("y"))
+	a, ok := drain(t, actions)
+	if !ok || a.Kind != tui.ActionKillBlocker || a.SPID != 58 {
+		t.Errorf("after confirming, action = %+v ok=%t, want KillBlocker SPID 58", a, ok)
+	}
+}
+
+// TestKillConfirmationCancels: any key but the confirmation dismisses the prompt.
+func TestKillConfirmationCancels(t *testing.T) {
+	for _, k := range []string{"n", "esc", "q"} {
+		t.Run(k, func(t *testing.T) {
+			actions := make(chan tui.Action, 4)
+			m := tui.New("op", actions)
+			m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58}}})
+			m, _ = send(m, key("x"))
+			m, _ = send(m, key(k))
+			if a, ok := drain(t, actions); ok {
+				t.Errorf("%q after the prompt emitted %+v, want nothing", k, a)
+			}
+			if strings.Contains(m.View(), "kill SPID") {
+				t.Errorf("prompt still open after %q:\n%s", k, m.View())
+			}
+		})
+	}
+}
+
+// TestKillAndRememberIsGone: `X` wrote its rule into kill_blocking_sessions, which
+// BlockerKiller only ever matches against the session blocking *us*. A session we are
+// blocking can never be that, so the rule was inert by construction and left the
+// operator believing recurrences were handled. The roster (`b`) is the working path
+// for arming a rule against a real blocker.
+func TestKillAndRememberIsGone(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("op", actions)
+	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 104, Login: "SVC_RPT"}}})
+	m, _ = send(m, key("X"))
+
+	if a, ok := drain(t, actions); ok {
+		t.Errorf("X emitted %+v, want nothing", a)
+	}
+	if strings.Contains(m.View(), "kill+auto-kill") {
+		t.Errorf("the kill+remember prompt is still reachable:\n%s", m.View())
+	}
+	if strings.Contains(m.View(), "[X]") {
+		t.Errorf("the footer still offers [X]:\n%s", m.View())
 	}
 }

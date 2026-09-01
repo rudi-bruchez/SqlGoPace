@@ -966,6 +966,7 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 					blockers = append(blockers, tui.Blocker{
 						SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
 						WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
+						OpenTransactions: s.OpenTransactions,
 					})
 				}
 				program.Send(tui.BlockersMsg{Blockers: blockers})
@@ -1171,8 +1172,6 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 				}
 			case tui.ActionIgnoreBlocker:
 				ignoreBlocker(program, current, a)
-			case tui.ActionKillBlockerAuto:
-				killBlockerAuto(ctx, program, conn, current, a)
 			case tui.ActionArmKillRule:
 				armKillRule(program, current, a)
 			case tui.ActionDisarmKillRule:
@@ -1203,38 +1202,9 @@ func ignoreBlocker(program *tui.Program, current *currentManifest, a tui.Action)
 	program.Send(tui.LogMsg{Line: fmt.Sprintf("ignoring SPID %d by %s — added to manifest; holding the lock", a.SPID, a.Criterion)})
 }
 
-// killBlockerAuto kills the selected blocker now and writes a one-criterion kill rule into
-// the running manifest (after_seconds = 0, kill on sight). The engine hot-reloads it
-// (WithLiveReload), so a recurrence is auto-killed without a restart. Both effects are the
-// inverse of ignoreBlocker; the outcome is echoed to the console. The kill takes effect
-// regardless of whether kill_blockers is armed in config — it is an explicit operator act —
-// but the auto-kill rule only fires later if the killer is armed.
-func killBlockerAuto(ctx context.Context, program *tui.Program, conn *mssql.Conn, current *currentManifest, a tui.Action) {
-	rule, ok := ddl.KilledSessionFor(a.Criterion, a.Value, a.SPID)
-	if !ok {
-		program.Send(tui.LogMsg{Line: "kill: nothing to match on for that session"})
-		return
-	}
-	if err := conn.Kill(ctx, a.SPID); err != nil {
-		program.Send(tui.LogMsg{Line: fmt.Sprintf("kill SPID %d: %v", a.SPID, err)})
-		// Still record the rule below: a failed kill now should not prevent auto-kill later.
-	}
-	path := current.get()
-	if path == "" {
-		program.Send(tui.LogMsg{Line: "kill: no manifest is running (killed once, not remembered)"})
-		return
-	}
-	if err := ddl.AppendKilledSession(path, rule); err != nil {
-		program.Send(tui.LogMsg{Line: "kill: " + err.Error()})
-		return
-	}
-	program.Send(tui.LogMsg{Line: fmt.Sprintf("killed SPID %d and auto-killing by %s — added to manifest", a.SPID, a.Criterion)})
-}
-
 // armKillRule appends a kill_blocking_sessions rule (by login/host) to the running manifest
 // without killing anyone now — a session that later blocks the DDL and matches is terminated by
-// the armed BlockerKiller. It is killBlockerAuto without the immediate KILL: the roster arms
-// recurrences, it does not act on a live session.
+// the armed BlockerKiller. The roster arms recurrences; it does not act on a live session.
 func armKillRule(program *tui.Program, current *currentManifest, a tui.Action) {
 	editKillRule(program, current, a, "arm", "armed", "added to", ddl.AppendKilledSession)
 }

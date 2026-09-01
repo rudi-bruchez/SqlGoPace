@@ -106,8 +106,9 @@ progress, the sessions it is blocking, the sessions blocking it, and the reactio
 
 | Key | Action |
 |---|---|
-| `x` | Kill the selected blocker. |
 | `i` | Ignore the selected session: writes an `ignore_blocked_sessions` rule into the running manifest, hot-reloaded. |
+| `x` | Kill the selected session, after a confirmation. |
+| `b` | The blocker roster: the sessions that have blocked *us*, and where a kill rule is armed. |
 | `k` | Kill the running DDL. |
 | `p` | Pause the operation. |
 | `d` | Drain: finish the current operation, then stop cleanly. |
@@ -115,6 +116,18 @@ progress, the sessions it is blocking, the sessions blocking it, and the reactio
 Pressing `i` asks which criterion to match on, so the rule it writes is durable
 (`app_name`, `login_name`, `host_name`) rather than tied to a session id that will not
 exist tomorrow.
+
+**Read the direction before pressing `x`.** The selectable list is the sessions *waiting on*
+the DDL — the ones it is holding up. Killing one of them frees nothing the operation is
+waiting for; it only discards that session's work, and rolls back whatever it had open. The
+confirmation names the login, the application and the open transaction count for exactly that
+reason. `i` is usually the right key: it lets the operation hold its lock through a session
+you have decided can wait.
+
+To act on a session that is blocking *you*, use `b` — the roster — which arms a
+`kill_blocking_sessions` rule that `BlockerKiller` can actually match. There used to be an
+`X` key on the blocked list that wrote into that same list from the wrong side; the rule it
+produced could never fire, and it has been removed.
 
 ## Stopping a run
 
