@@ -33,8 +33,6 @@ monitoring:
   checkpoint_between_operations: false
 preflight:
   require_data_free_space: true
-  check_tempdb: true
-  ag_send_queue_warn: true
 options_override:
   online: { force: true }
   resumable: { force: null }

@@ -91,3 +91,35 @@ func (c *Conn) IndexCompression(ctx context.Context, schema, table, index string
 	}
 	return out, rows.Err()
 }
+
+// indexSizeMBSQL sums the used pages of one index (or the heap, when @index is empty)
+// across all its partitions. used_page_count is in 8-KB pages, so /128 = MB. A missing
+// object yields no rows, which the caller reads as "size unknown".
+const indexSizeMBSQL = `
+SELECT CAST(CEILING(SUM(ps.used_page_count) / 128.0) AS INT) AS used_mb
+FROM sys.dm_db_partition_stats ps
+JOIN sys.indexes i
+  ON i.object_id = ps.object_id AND i.index_id = ps.index_id
+WHERE ps.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND ((@index = N'' AND i.index_id = 0) OR i.name = @index)
+  AND (@partition = 0 OR ps.partition_number = @partition);`
+
+// IndexSizeMB returns the used size in MB of [schema].[table]'s index, or of the heap
+// when index is empty, summed across partitions. It returns 0 when the object cannot be
+// measured (no such object, or no allocated pages); callers treat 0 as "size unknown"
+// and must not fail a run on it.
+func (c *Conn) IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error) {
+	// 0 means "every partition": partition numbers start at 1, so it cannot collide.
+	part := 0
+	if partition != nil {
+		part = *partition
+	}
+	var mb sql.NullInt64
+	err := c.pool.QueryRowContext(ctx, indexSizeMBSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index),
+		sql.Named("partition", part)).Scan(&mb)
+	if err != nil {
+		return 0, fmt.Errorf("index size %s.%s.%s: %w", schema, table, index, err)
+	}
+	return int(mb.Int64), nil
+}

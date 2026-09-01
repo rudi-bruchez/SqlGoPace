@@ -24,14 +24,12 @@ build is connected.
 ## Two different questions
 
 This page answers "what happens if the key is absent". That is not the same as "what the
-repository's `config.yaml` sets", and in three places they differ on purpose, because the
+repository's `config.yaml` sets", and in two places they differ on purpose, because the
 shipped file is deliberately more cautious than the bare default:
 
 | Key | Default when absent | The shipped `config.yaml` |
 |---|---|---|
 | `preflight.require_data_free_space` | false | **true** |
-| `preflight.check_tempdb` | false | **true** |
-| `preflight.ag_send_queue_warn` | false | **true** |
 | `history.enabled` | false | **true**, writing `./sqlgopace_history.db` |
 
 If you copied that file, those are the values you have. It is the recommended starting
@@ -101,9 +99,49 @@ A poll interval of zero is rejected rather than accepted as a spin loop.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `require_data_free_space` | false | Fail if the data file has no room for the operation. |
-| `check_tempdb` | false | Check tempdb space when `SORT_IN_TEMPDB` will be injected. |
-| `ag_send_queue_warn` | false | Warn on a large Availability Group send queue. |
+| `require_data_free_space` | false | Fail an index rebuild that does not have roughly its own size free in the database's data files. |
+
+A rebuild materializes the new index before dropping the old one, so it needs room for a
+second copy of the object. The check sums the free space of the database's `ROWS` files and
+compares it against the size of each `rebuild_index` / `rebuild_heap` target, read from
+`sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild rather than
+their sum, because each one releases its temporary copy before the next begins.
+
+Autogrowth counts as headroom. A file that can still grow is not out of room, so the check
+adds `max_size − size` to the free space before deciding, and a file with no cap (it grows
+until the disk fills) can never be proven short — those cases **warn** rather than pass
+silently, because the growth itself is a blocking zero-fill unless instant file
+initialization applies. Only a rebuild that cannot fit *and* cannot grow fails.
+
+Three limits remain. **`create_index` is not checked**, because the index does not exist yet
+and there is nothing to size. **Filegroups are not modelled**: the check sums free space
+across every `ROWS` file in the database, so on a multi-filegroup database it can pass a
+rebuild whose own filegroup is full while another has room. And **the size read is
+optional** — it needs `VIEW DEFINITION` (see [Permissions](permissions.md)); without it the
+object reports as unknown size and the check passes rather than failing the run.
+
+### The `file growth` check
+
+Read on every run, independent of `require_data_free_space`, and **advisory only** — it
+never fails a manifest, and a growth setting it cannot read is reported as unread rather
+than assumed. It covers both data and log files, and warns when:
+
+- **a file grows by a percentage.** The increment scales with the file, so it gets larger
+  exactly as the file gets harder to grow. Microsoft's guidance is to set a fixed number of
+  megabytes instead. The warning names what one growth event would cost at the file's
+  current size, which is the number that makes the setting feel real: 10% of a 14 TB file is
+  a 1.4 TB blocking allocation.
+- **a file has autogrowth disabled and this manifest shrinks that kind of file.** The shrink
+  hands back space the file will not be able to reclaim, so the reclaimed headroom is
+  one-way. The two directions are not interchangeable: a `type: log` shrink is judged against
+  the log file, and a log that cannot grow after a shrink is how a database ends up refusing
+  writes with error 9002. Reported only for a file type the manifest actually shrinks, since
+  a fixed-size file is a legitimate choice otherwise.
+
+There is deliberately no warning for a growth increment that is merely "too large".
+Microsoft's own guidance is inconsistent on the threshold — one page suggests roughly an
+eighth of the file as a testing rule of thumb, another recommends no more than 100 MB for
+large files — so the check reports the increment and leaves the judgement to the operator.
 
 ## `options_override`
 

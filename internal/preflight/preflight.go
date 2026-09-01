@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -116,6 +117,126 @@ func CheckBlocking(sessions []mssql.Session) Check {
 	return Check{"blocking", Pass, "no pre-existing blocking"}
 }
 
+// CheckDataFreeSpace verifies the database's data files have room to build a second copy
+// of the object. A rebuild materializes the new index before dropping the old, so it needs
+// roughly the object's own size free; running out mid-rebuild wastes the entire operation,
+// which is exactly what preflight exists to prevent. needMB of 0 means the size could not
+// be read, and an unknown size never fails a run.
+// Free space inside the files is not the whole answer: a file that can still autogrow has
+// headroom that counts too, and ignoring it fails runs that would have succeeded. Relying
+// on growth is a warning rather than a pass, because the growth itself is a blocking
+// zero-fill unless instant file initialization applies.
+//
+// DataSpace carries what is known about the data files. GrowthKnown is false when the
+// autogrowth read failed, in which case a shortfall cannot be judged either way and must
+// not fail the run.
+type DataSpace struct {
+	FreeMB      int
+	Growth      []mssql.FileGrowth
+	GrowthKnown bool
+}
+
+func CheckDataFreeSpace(target string, needMB int, sp DataSpace) Check {
+	const name = "data free space"
+	freeMB := sp.FreeMB
+	switch {
+	case needMB <= 0:
+		return Check{name, Pass, fmt.Sprintf("%s: size unknown, not checked (%d MB free in data files)", target, freeMB)}
+	case freeMB >= needMB:
+		return Check{name, Pass, fmt.Sprintf("%s: %d MB free, ~%d MB needed", target, freeMB, needMB)}
+	case !sp.GrowthKnown:
+		return Check{name, Warn, fmt.Sprintf(
+			"%s needs ~%d MB, data files have %d MB free, and their autogrowth could not be read — cannot tell whether it fits",
+			target, needMB, freeMB)}
+	}
+
+	headroomMB := 0
+	for _, f := range sp.Growth {
+		// A file with no cap can grow until the disk fills, which the catalog cannot see.
+		// We cannot prove the run will fail, so we must not fail it.
+		if f.Unlimited() {
+			return Check{name, Warn, fmt.Sprintf(
+				"%s needs ~%d MB, data files have %d MB free; %q grows until the disk fills, so expect an autogrowth of ~%d MB",
+				target, needMB, freeMB, f.Name, f.NextGrowthMB())}
+		}
+		if mb, ok := f.HeadroomMB(); ok {
+			headroomMB += mb
+		}
+	}
+	if headroomMB >= needMB-freeMB {
+		return Check{name, Warn, fmt.Sprintf(
+			"%s needs ~%d MB, data files have %d MB free; autogrowth can add %d MB more, so the rebuild will grow the files",
+			target, needMB, freeMB, headroomMB)}
+	}
+	return Check{name, Fail, fmt.Sprintf(
+		"%s needs ~%d MB free, data files have %d MB and can grow by only %d MB more",
+		target, needMB, freeMB, headroomMB)}
+}
+
+// growthOf reads one file type's autogrowth, reporting ok=false rather than an error: every
+// consumer of it is advisory, so a failed read degrades the advice instead of the run.
+func growthOf(ctx context.Context, p Prober, fileType string) ([]mssql.FileGrowth, bool) {
+	g, err := p.FileGrowths(ctx, fileType)
+	if err != nil {
+		return nil, false
+	}
+	return g, true
+}
+
+// rebuiltObject reports the object an operation rebuilds in place, and whether it is such
+// an operation. Only a rebuild needs room for a second copy of something that already
+// exists: create_index cannot be sized in advance (the index is not there yet) and is
+// deliberately not checked, and the remaining operations are metadata-only.
+//
+// partition is carried through because `REBUILD PARTITION = n` rebuilds one partition and
+// needs room for that partition alone. Sizing the whole index there would fail a
+// partitioned rebuild of a large table that has ample room for the partition in hand.
+func rebuiltObject(op ddl.Operation) (schema, table, index string, partition *int, ok bool) {
+	switch o := op.(type) {
+	case ddl.RebuildIndex:
+		return o.Schema, o.Table, o.Index, o.Partition, true
+	case ddl.RebuildHeap:
+		return o.Schema, o.Table, "", nil, true // empty index = the heap itself
+	default:
+		return "", "", "", nil, false
+	}
+}
+
+// rebuiltObjectLabel names the object for the check detail, distinguishing a heap (which
+// has no index name) from a named index, and naming the partition when only one is rebuilt.
+func rebuiltObjectLabel(schema, table, index string, partition *int) string {
+	name := fmt.Sprintf("%s.%s.%s", schema, table, index)
+	if index == "" {
+		name = fmt.Sprintf("%s.%s (heap)", schema, table)
+	}
+	if partition != nil {
+		name += fmt.Sprintf(" partition %d", *partition)
+	}
+	return name
+}
+
+// shrunkFileTypes reports which file types the manifest shrinks, keyed by the same
+// type_desc the catalog uses. Disabled autogrowth only matters for a file the run is about
+// to take space away from, and the two directions are not interchangeable: a log shrink on
+// a log that cannot grow is how a database ends up refusing writes with error 9002, and no
+// amount of data-file headroom helps. shrink_tempdb is excluded — tempdb is recreated from
+// model at every restart, so its file settings do not persist.
+func shrunkFileTypes(m *ddl.Manifest) map[string]bool {
+	out := make(map[string]bool, 2)
+	for _, op := range m.Operations {
+		sh, ok := op.(ddl.Shrink)
+		if !ok {
+			continue
+		}
+		if sh.CommandType() == "shrink_log" {
+			out[mssql.FileTypeLog] = true
+		} else {
+			out[mssql.FileTypeRows] = true
+		}
+	}
+	return out
+}
+
 // requiresElevatedRights reports whether an operation needs db_owner or sysadmin:
 // DBCC SHRINKFILE (shrink, shrink_tempdb) and DBCC CHECKDB (check_db) all do. Lesser
 // DDL rights (db_ddladmin, ALTER on a table) are not enough for these.
@@ -215,14 +336,21 @@ type Prober interface {
 	IsSysadmin(ctx context.Context) (bool, error)
 	HasAlterAnyConnection(ctx context.Context) (bool, error)
 	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
+	FileSpace(ctx context.Context, fileType string) ([]mssql.FileSpace, error)
+	FileGrowths(ctx context.Context, fileType string) ([]mssql.FileGrowth, error)
+	IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error)
 }
 
 var _ Prober = (*mssql.Conn)(nil)
 
-// Thresholds are the log-pressure limits sourced from config.
+// Thresholds are the limits and toggles sourced from config.
 type Thresholds struct {
 	LogMaxBytes   int64
 	LogMaxPercent int
+	// RequireDataFreeSpace enables the data-free-space check: every index rebuild is
+	// verified to have roughly its own size free in the database's data files before
+	// the manifest runs. Off leaves the check out of the report entirely.
+	RequireDataFreeSpace bool
 }
 
 // Run gathers server facts and builds the preflight report for a manifest. killArmed
@@ -284,7 +412,50 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 		rep.add(CheckKillPermission(hasPerm))
 	}
 
+	// A rebuild materializes a second copy of the object before dropping the original, so
+	// the data files need roughly the object's own size free. The file read is done once
+	// per manifest; the peak requirement is the largest single rebuild, not their sum,
+	// because each one releases its temporary copy before the next begins.
+	// Autogrowth is read unconditionally: it is one small catalog query, it advises on
+	// every run rather than only when a rebuild is short of room, and the free-space check
+	// below needs it to count headroom rather than fail conservatively.
+	// The growth read is advisory and must never abort a manifest: sys.database_files is
+	// readable with less than the documented VIEW SERVER STATE on some logins, and a check
+	// that only ever warns cannot be allowed to fail a run through its own error path.
+	dataGrowth, growthKnown := growthOf(ctx, p, mssql.FileTypeRows)
+	logGrowth, logKnown := growthOf(ctx, p, mssql.FileTypeLog)
+	if growthKnown && logKnown {
+		rep.add(CheckFileGrowth(append(dataGrowth, logGrowth...), shrunkFileTypes(m)))
+	} else {
+		rep.add(Check{"file growth", Warn, "autogrowth settings could not be read; growth is not being advised on"})
+	}
+
+	dataFreeMB := 0
+	if th.RequireDataFreeSpace {
+		files, err := p.FileSpace(ctx, mssql.FileTypeRows)
+		if err != nil {
+			return Report{}, fmt.Errorf("preflight data file space: %w", err)
+		}
+		for _, f := range files {
+			dataFreeMB += f.FreeMB
+		}
+	}
+
 	for _, op := range m.Operations {
+		if th.RequireDataFreeSpace {
+			if schema, table, index, partition, ok := rebuiltObject(op); ok {
+				// A size we cannot read is reported as unknown (0), never as a failed run:
+				// sys.dm_db_partition_stats also wants VIEW DEFINITION, which the documented
+				// VIEW SERVER STATE does not imply, so a legitimate login can be refused it.
+				sizeMB, err := p.IndexSizeMB(ctx, schema, table, index, partition)
+				if err != nil {
+					sizeMB = 0
+				}
+				rep.add(CheckDataFreeSpace(rebuiltObjectLabel(schema, table, index, partition), sizeMB,
+					DataSpace{FreeMB: dataFreeMB, Growth: dataGrowth, GrowthKnown: growthKnown}))
+			}
+		}
+
 		tableExists, targetExists, err := objectExistence(ctx, p, op)
 		if err != nil {
 			return Report{}, err
@@ -387,4 +558,33 @@ func objectExistence(ctx context.Context, p Prober, op ddl.Operation) (table, ta
 		return false, false, fmt.Errorf("check target %q: %w", ref.Name, err)
 	}
 	return table, target, nil
+}
+
+// CheckFileGrowth advises on autogrowth settings that will hurt later. It never fails a
+// run: a bad growth setting is a reason to tell the operator, not a reason to refuse.
+//
+// Percentage growth is called out because the increment scales with the file, so it grows
+// as the file does — Microsoft's guidance is to set a fixed number of megabytes instead.
+// Growth is also a blocking operation that zero-fills the new space unless instant file
+// initialization applies. For data files that needs the SE_MANAGE_VOLUME_NAME privilege; for
+// log files it applies only from SQL Server 2022, and then only to growth events of 64 MB or
+// less — which a percentage increment on a large log will exceed immediately.
+//
+// Disabled growth is only reported for a file type this manifest shrinks, where it is the
+// dangerous combination: the shrink removes headroom the file will not be able to reclaim.
+func CheckFileGrowth(files []mssql.FileGrowth, shrunk map[string]bool) Check {
+	var notes []string
+	for _, f := range files {
+		switch {
+		case f.IsPercent:
+			notes = append(notes, fmt.Sprintf("%s grows by %d%% (~%d MB at its current size; prefer a fixed increment)",
+				f.Name, f.Growth, f.NextGrowthMB()))
+		case shrunk[f.TypeDesc] && f.GrowthDisabled():
+			notes = append(notes, fmt.Sprintf("%s has autogrowth disabled; a shrink removes space it cannot reclaim", f.Name))
+		}
+	}
+	if len(notes) > 0 {
+		return Check{"file growth", Warn, strings.Join(notes, "; ")}
+	}
+	return Check{"file growth", Pass, fmt.Sprintf("%d file(s) with usable autogrowth settings", len(files))}
 }

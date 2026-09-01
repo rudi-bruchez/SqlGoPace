@@ -22,6 +22,21 @@ Without it the sampling loop fails, and it fails on a quiet rebuild that blocks
 nobody, because the loop runs regardless. There is no mode of SqlGoPace that does
 not need it.
 
+### One optional grant, for `require_data_free_space`
+
+`VIEW DEFINITION` on the database, or membership that implies it.
+
+The data-free-space check sizes each rebuild from `sys.dm_db_partition_stats`, which
+Microsoft documents as requiring **`VIEW DATABASE STATE` *and* `VIEW DEFINITION`** (on
+SQL Server 2022 and later, `VIEW DATABASE PERFORMANCE STATE` and `VIEW SECURITY
+DEFINITION`). `VIEW SERVER STATE` implies the state half and **not** the definition
+half, so a login that satisfies every other requirement on this page can still be
+refused this one read.
+
+It is deliberately optional. Without the grant the check reports the object's size as
+unknown and passes, and the autogrowth advisory reports that it could not read the
+settings — neither fails the run. Nothing else in the tool needs it.
+
 ## By operation
 
 | Operation | In the target database | At server level |

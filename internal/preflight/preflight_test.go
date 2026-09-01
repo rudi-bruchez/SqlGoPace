@@ -2,6 +2,8 @@ package preflight_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -39,6 +41,112 @@ func TestCheckLog(t *testing.T) {
 				t.Errorf("CheckLog() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// An offline rebuild materializes the new index before dropping the old one, so it needs
+// roughly the object's own size free in the data files. Running out mid-rebuild wastes the
+// whole operation, which is what preflight exists to prevent.
+func TestCheckDataFreeSpace(t *testing.T) {
+	tests := []struct {
+		name   string
+		needMB int
+		freeMB int
+		want   preflight.Severity
+	}{
+		{"room to spare", 100, 500, preflight.Pass},
+		{"exactly enough", 100, 100, preflight.Pass},
+		{"short", 500, 100, preflight.Fail},
+		{"unknown size does not fail", 0, 100, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB,
+				preflight.DataSpace{FreeMB: tt.freeMB, GrowthKnown: true}).Severity
+			if got != tt.want {
+				t.Errorf("CheckDataFreeSpace(need=%d, free=%d) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
+			}
+		})
+	}
+}
+
+// Free space inside the files is not the whole story: a file that can still grow has
+// headroom the check must count, or it fails runs that would have succeeded. Relying on
+// growth is a Warn rather than a Pass, because the growth itself is a blocking zero-fill.
+func TestCheckDataFreeSpaceCountsGrowthHeadroom(t *testing.T) {
+	capped := func(sizeMB, maxMB int) mssql.FileGrowth {
+		return mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: sizeMB, Growth: 65536, MaxSizeMB: maxMB}
+	}
+	unlimited := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 65536, MaxSizeMB: -1}
+	noGrowth := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}
+
+	tests := []struct {
+		name   string
+		needMB int
+		freeMB int
+		growth []mssql.FileGrowth
+		want   preflight.Severity
+	}{
+		{"short but growth covers it", 500, 100, []mssql.FileGrowth{capped(1000, 2000)}, preflight.Warn},
+		{"short and growth is unlimited", 500, 100, []mssql.FileGrowth{unlimited}, preflight.Warn},
+		{"short and growth is disabled", 500, 100, []mssql.FileGrowth{noGrowth}, preflight.Fail},
+		{"short and the cap is too low", 5000, 100, []mssql.FileGrowth{capped(1000, 1200)}, preflight.Fail},
+		{"enough free space ignores growth", 50, 100, []mssql.FileGrowth{noGrowth}, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB,
+				preflight.DataSpace{FreeMB: tt.freeMB, Growth: tt.growth, GrowthKnown: true}).Severity
+			if got != tt.want {
+				t.Errorf("CheckDataFreeSpace(need=%d, free=%d, growth) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
+			}
+		})
+	}
+}
+
+// Autogrowth settings are advisory: a bad one is a reason to tell the operator, never a
+// reason to refuse to run. Percentage growth is Microsoft's own named anti-pattern because
+// the increment scales with the file, and growth is a blocking zero-fill without instant
+// file initialization. Growth disabled matters most when a shrink is about to remove the
+// headroom that cannot then be reclaimed.
+func TestCheckFileGrowth(t *testing.T) {
+	fixed := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, Growth: 65536, MaxSizeMB: -1} // 512 MB
+	percent := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, IsPercent: true, Growth: 10, MaxSizeMB: -1}
+	fixedSize := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, Growth: 0, MaxSizeMB: 0}
+
+	tests := []struct {
+		name      string
+		files     []mssql.FileGrowth
+		shrunk    map[string]bool
+		want      preflight.Severity
+	}{
+		{"fixed increment is fine", []mssql.FileGrowth{fixed}, nil, preflight.Pass},
+		{"percentage growth warns", []mssql.FileGrowth{percent}, nil, preflight.Warn},
+		{"growth disabled alone is fine", []mssql.FileGrowth{fixedSize}, nil, preflight.Pass},
+		{"growth disabled warns when its type is shrunk", []mssql.FileGrowth{fixedSize}, map[string]bool{"ROWS": true}, preflight.Warn},
+		{"growth disabled is ignored when another type is shrunk", []mssql.FileGrowth{fixedSize}, map[string]bool{"LOG": true}, preflight.Pass},
+		{"one bad file among good ones warns", []mssql.FileGrowth{fixed, percent}, nil, preflight.Warn},
+		{"no files is not a finding", nil, nil, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckFileGrowth(tt.files, tt.shrunk).Severity
+			if got != tt.want {
+				t.Errorf("CheckFileGrowth(shrunk=%v) = %v, want %v", tt.shrunk, got, tt.want)
+			}
+		})
+	}
+}
+
+// The warning has to carry the number that makes it actionable: what one growth event
+// would actually cost at the file's current size.
+func TestCheckFileGrowthReportsEventSize(t *testing.T) {
+	percent := mssql.FileGrowth{Name: "PRODDB", TypeDesc: "ROWS", SizeMB: 14_500_000, IsPercent: true, Growth: 10, MaxSizeMB: -1}
+
+	got := preflight.CheckFileGrowth([]mssql.FileGrowth{percent}, nil)
+
+	if !strings.Contains(got.Detail, "1450000") {
+		t.Errorf("CheckFileGrowth detail = %q, want it to name the 1450000 MB growth event", got.Detail)
 	}
 }
 
@@ -137,6 +245,39 @@ type fakeProber struct {
 	sysadmin       bool
 	dmlPermission  bool
 	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
+	dataFreeMB     int
+	growth         []mssql.FileGrowth
+	growthByType   map[string][]mssql.FileGrowth
+	growthErr      error
+	indexSizeErr   error
+	indexSizeMB    int
+	indexSizeByPartition map[int]int
+}
+
+func (f fakeProber) FileSpace(context.Context, string) ([]mssql.FileSpace, error) {
+	return []mssql.FileSpace{{Name: "data", TypeDesc: "ROWS", FreeMB: f.dataFreeMB}}, nil
+}
+func (f fakeProber) FileGrowths(_ context.Context, fileType string) ([]mssql.FileGrowth, error) {
+	if f.growthErr != nil {
+		return nil, f.growthErr
+	}
+	if f.growthByType != nil {
+		return f.growthByType[fileType], nil
+	}
+	if fileType == mssql.FileTypeRows {
+		return f.growth, nil
+	}
+	return nil, nil
+}
+
+func (f fakeProber) IndexSizeMB(_ context.Context, _, _, _ string, partition *int) (int, error) {
+	if f.indexSizeErr != nil {
+		return 0, f.indexSizeErr
+	}
+	if partition != nil {
+		return f.indexSizeByPartition[*partition], nil
+	}
+	return f.indexSizeMB, nil
 }
 
 func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) { return f.logSpace, nil }
@@ -395,4 +536,187 @@ func TestRunShrinkTempdbRequiresSysadmin(t *testing.T) {
 			t.Errorf("Run() failed for a sysadmin:\n%v", rep.Checks)
 		}
 	})
+}
+
+// The data-free-space check is config-gated: on, an index rebuild that cannot fit a second
+// copy of itself in the data files fails preflight rather than running out of room hours in;
+// off, the check is absent from the report entirely.
+func TestRunDataFreeSpace(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+	shortOfRoom := func() fakeProber {
+		p := healthyProber()
+		p.indexSizeMB = 5000
+		p.dataFreeMB = 100
+		return p
+	}
+
+	t.Run("enabled and short of room fails", func(t *testing.T) {
+		th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
+
+		rep, err := preflight.Run(context.Background(), shortOfRoom(), info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		if !rep.HasFailure() {
+			t.Errorf("Run() passed a rebuild needing 5000 MB with 100 MB free:\n%v", rep.Checks)
+		}
+	})
+
+	t.Run("disabled omits the check", func(t *testing.T) {
+		th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+
+		rep, err := preflight.Run(context.Background(), shortOfRoom(), info, manifest, th, false)
+		if err != nil {
+			t.Fatalf("Run() error = %v", err)
+		}
+		for _, c := range rep.Checks {
+			if c.Name == "data free space" {
+				t.Errorf("Run() emitted %q with require_data_free_space off", c.Name)
+			}
+		}
+	})
+}
+
+// Growth advice is always available, independent of require_data_free_space: percentage
+// growth hurts any long operation, not just a rebuild that is short of room.
+func TestRunWarnsOnPercentGrowth(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+
+	p := healthyProber()
+	p.growth = []mssql.FileGrowth{
+		{Name: "PRODDB", TypeDesc: "ROWS", SizeMB: 100_000, IsPercent: true, Growth: 10, MaxSizeMB: -1},
+	}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("growth advice must never fail a run:\n%v", rep.Checks)
+	}
+	var found bool
+	for _, c := range rep.Checks {
+		if c.Name == "file growth" {
+			found = true
+			if c.Severity != preflight.Warn {
+				t.Errorf("file growth check = %v, want Warn for percentage growth", c.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("Run() emitted no file growth check:\n%v", rep.Checks)
+	}
+}
+
+// REBUILD PARTITION = n rebuilds one partition, so it needs room for that partition, not for
+// the whole index. Sizing the whole index would fail a partitioned rebuild of a large table
+// that has ample room for the partition actually being rebuilt.
+func TestRunSizesRebuildByPartition(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
+	partition := 37
+
+	p := healthyProber()
+	p.dataFreeMB = 500
+	p.indexSizeMB = 5000                            // the whole index does not fit
+	p.indexSizeByPartition = map[int]int{37: 100}   // the one partition does
+	p.growth = []mssql.FileGrowth{{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}}
+
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT", Partition: &partition},
+	}}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("a partitioned rebuild was sized as the whole index and failed:\n%v", rep.Checks)
+	}
+}
+
+// A log shrink removes headroom from the LOG file, so that is the file whose autogrowth
+// matters. Advising on the data files there is both irrelevant and a miss: a log file that
+// cannot grow, after a shrink, is how a database ends up refusing writes with error 9002.
+func TestRunChecksLogGrowthForALogShrink(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+
+	p := healthyProber()
+	p.elevatedAccess = true
+	p.growthByType = map[string][]mssql.FileGrowth{
+		mssql.FileTypeRows: {{Name: "PRODDB", TypeDesc: "ROWS", SizeMB: 1000, Growth: 65536, MaxSizeMB: -1}},
+		mssql.FileTypeLog:  {{Name: "PRODDB_log", TypeDesc: "LOG", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}},
+	}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.Shrink{Type: "log", Files: "PRODDB_log", TargetFreeSpace: "10%"},
+	}}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, c := range rep.Checks {
+		if c.Name == "file growth" {
+			if c.Severity != preflight.Warn || !strings.Contains(c.Detail, "PRODDB_log") {
+				t.Errorf("file growth = %v %q, want Warn naming the log file", c.Severity, c.Detail)
+			}
+			return
+		}
+	}
+	t.Errorf("Run() emitted no file growth check:\n%v", rep.Checks)
+}
+
+// The growth read is advisory. A login without the permission it needs must not have its
+// manifest aborted by it — the documented requirement is VIEW SERVER STATE, which does not
+// imply the VIEW DEFINITION that sys.dm_db_partition_stats also wants.
+func TestRunSurvivesAGrowthReadFailure(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
+
+	p := healthyProber()
+	p.growthErr = errors.New("VIEW DEFINITION permission was denied")
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() returned an error for an advisory read: %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("an unreadable growth setting failed the run:\n%v", rep.Checks)
+	}
+	if !rep.HasWarning() {
+		t.Errorf("Run() should warn when autogrowth could not be read:\n%v", rep.Checks)
+	}
+}
+
+// The size read wants VIEW DEFINITION, which the documented VIEW SERVER STATE does not
+// imply. A login that lacks it must get "size unknown", not a failed manifest — the check's
+// own contract is that an unreadable size never fails a run.
+func TestRunSurvivesAnObjectSizeReadFailure(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
+
+	p := healthyProber()
+	p.indexSizeErr = errors.New("The SELECT permission was denied on the object 'dm_db_partition_stats'")
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() returned an error for an unreadable object size: %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("an unreadable object size failed the run:\n%v", rep.Checks)
+	}
 }

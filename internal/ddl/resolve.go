@@ -244,10 +244,24 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 		// No MAX_DURATION for shrink WALP: the engine uses a fixed ~1-minute wait.
 	}
 
+	// The per-operation safety cap is a reaction policy, not a T-SQL option, so it is
+	// resolved regardless of the matrix: ShrinkRunner.runChunk reads it as
+	// blockCap(res.MaxBlockMinutes) to yield after this long even through an
+	// allow-listed blocker. Dropping it here silently means "no cap".
+	if ov.MaxBlockMinutes != nil && *ov.MaxBlockMinutes > 0 {
+		res.MaxBlockMinutes = *ov.MaxBlockMinutes
+	}
+
 	var decisions []Decision
 	if relevant {
 		decisions = append(decisions, Decision{
 			Option: "wait_at_low_priority", Value: onOff(walp), Reason: reason,
+		})
+	}
+	if res.MaxBlockMinutes > 0 {
+		decisions = append(decisions, Decision{
+			Option: "max_block_minutes", Value: strconv.Itoa(res.MaxBlockMinutes),
+			Reason: "set by override: yield after this long even if the blocker is ignored (safety cap)",
 		})
 	}
 	return res, decisions

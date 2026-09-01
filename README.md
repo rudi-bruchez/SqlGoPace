@@ -1,5 +1,6 @@
 # SqlGoPace
 
+[![Status](https://img.shields.io/badge/status-beta-orange.svg)](#beta-read-this-before-you-point-it-at-production)
 [![Release](https://img.shields.io/github/v/release/rudi-bruchez/SqlGoPace?label=release)](https://github.com/rudi-bruchez/SqlGoPace/releases/latest)
 [![CI](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rudi-bruchez/SqlGoPace/actions/workflows/ci.yml)
 [![SQL Server](https://img.shields.io/badge/SQL%20Server-2016%2B-0078D4.svg)](https://learn.microsoft.com/en-us/sql/sql-server)
@@ -14,6 +15,22 @@ SqlGoPace is a resilient DDL task runner. You declare the operation; it writes t
 picks the options your server actually supports, watches locking and transaction-log
 pressure while the statement runs, and reacts to trouble with the least destructive
 mechanism available.
+
+## Beta: read this before you point it at production
+
+> [!WARNING]
+> **SqlGoPace is beta software.** It executes long-running, destructive DDL against live
+> databases, it can hold locks that block your workload, and — when you arm the policy — it
+> can `KILL` other sessions. It is used in production by its author, and that is the whole
+> of its production track record.
+>
+> **Take a backup you have actually tested restoring before running it on anything you care
+> about.** Rehearse on a copy of the database first. `--dry-run --explain` renders exactly
+> what would execute and takes no lock, so use it before every new manifest.
+>
+> Read [Blocking, yielding and kills](docs/blocking-and-kills.md) before enabling any kill
+> policy, and treat `shrink` with particular care: it is slow, it fragments indexes, and it
+> is rarely the right answer to a full disk.
 
 ## In short
 

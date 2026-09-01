@@ -13,6 +13,51 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.18.0] - 2026-09-01
+
+### Fixed
+
+- A shrink now honours `options.max_block_minutes`. `resolveShrink` never read the
+  override, so the value was parsed, validated and then dropped: `runChunk` saw
+  `blockCap(0)`, which means no cap. The generic DDL path and batched DML resolved it
+  correctly; only the shrink path did not. This is the backstop that bounds an
+  allow-listed blocker, so a shrink carrying an `ignore_blocked_sessions` list had no
+  backstop at all, and one that quietly tolerated such a blocker will now yield at the
+  configured minute. The value is resolved for all three shrink command types, and applied
+  by `shrink_data` and `shrink_tempdb`, which run chunked through `runChunk`. `shrink_log`
+  issues a single statement outside that path and stays uncapped; that gap is recorded in
+  `docs/specs/TODO.md`. The 0.17.0 entry below describes a chunk "cut short for blocking other
+  sessions past `max_block_minutes`"; that path could not fire, and the chunks it observed
+  were cut short by `monitoring.blocking_timeout_minutes`.
+- `--explain` reports a shrink's `max_block_minutes`, as it already did for index DDL and
+  batched DML. Its absence is why the dropped value went unnoticed.
+
+### Added
+
+- `preflight.require_data_free_space` is implemented. It sizes each `rebuild_index` /
+  `rebuild_heap` target from `sys.dm_db_partition_stats` and compares it against the
+  database's `ROWS` free space plus `max_size - size`: a rebuild builds the new index
+  before dropping the old, so it needs roughly the object's own size. The peak requirement
+  is the largest single rebuild, not their sum. An unreadable size never fails a run, and
+  `create_index` is not checked because it cannot be sized before it exists. A rebuild
+  that fits only by growing warns rather than passes, since the growth is a blocking
+  zero-fill without instant file initialization.
+- A `file growth` preflight check, advisory and never fatal. It warns on percentage
+  autogrowth, naming what one event costs at the file's current size, and on a data file
+  that cannot grow when the manifest contains a shrink. There is deliberately no
+  "increment too large" warning: Microsoft's guidance contradicts itself on the threshold,
+  so the increment is reported and the judgement left to the operator.
+
+### Removed
+
+- `preflight.check_tempdb` and `preflight.ag_send_queue_warn`. Neither ever did anything:
+  all three `preflight` keys were parsed into `PreflightConfig` and read by nothing, while
+  `docs/configuration.md` described them as working and the shipped `config.yaml` set them
+  to `true`. Configuration is parsed with `KnownFields(true)`, so a `config.yaml` still
+  carrying either key fails to load with `field check_tempdb not found` — delete the two
+  lines. `docs/specs/TODO.md` tracked the tempdb guard as partially covered on the strength
+  of the phantom key, and is corrected to unstarted.
+
 ## [0.17.0] - 2026-09-01
 
 ### Fixed

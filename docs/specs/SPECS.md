@@ -764,8 +764,6 @@ monitoring:
 
 preflight:
   require_data_free_space: true     # requires ≈ the object's size free in the filegroup
-  check_tempdb: true
-  ag_send_queue_warn: true          # warns but does not block (configurable)
 
 options_override:
   online:               { force: null }   # true / false / null(auto)

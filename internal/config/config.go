@@ -154,9 +154,9 @@ func (m MonitoringConfig) ReconnectTimeout() time.Duration {
 
 // PreflightConfig toggles individual pre-flight checks.
 type PreflightConfig struct {
+	// RequireDataFreeSpace fails preflight when an index rebuild does not have roughly
+	// its own size free in the database's data files.
 	RequireDataFreeSpace bool `yaml:"require_data_free_space"`
-	CheckTempDB          bool `yaml:"check_tempdb"`
-	AGSendQueueWarn      bool `yaml:"ag_send_queue_warn"`
 }
 
 // forceBool is a tri-state override: nil means "auto".

@@ -85,6 +85,13 @@ mandatory for monitoring).
   `config.yaml` **plus its embedded twin** `internal/scaffold/assets/config.yaml`, which a test
   pins byte-for-byte. When a default or a semantic changes, say so as a migration note: an
   operator whose `config.yaml` sets the old value explicitly needs to be told to revisit it.
+- **Write CHANGELOG entries sober and short.** One bullet per change, a few lines, in the style
+  of the `0.16.0` section: what changed, the symptom or mechanism that made it wrong, and what
+  an operator must do. No sub-paragraphs under a bullet, no bold headings inside one, no essay
+  on the reasoning — that belongs in the spec or the commit message. Facts earn their space
+  (a message number, a symbol, a measured figure); restating the docs or explaining why a
+  decision was hard does not. A migration note is the one thing never to cut: if a config or
+  manifest stops loading, say so and name the key.
   Two categories are deliberately **not** updated: the raw AI research dumps
   (`docs/specs/gemini-shrink.md`, `docs/specs/shrink-reference-perplexity.md`) and the
   implementation plans (`docs/specs/*-IMPL.md`, `docs/specs/superpowers/`), which are historical
@@ -136,8 +143,9 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   `MonitoredRunner`. The engine routes `ddl.Shrink` ops to whatever satisfies `ShrinkDriver`
   (wired via `WithShrinkRunner`; `*ShrinkRunner` is the production impl) — `processOne` branches on
   `step.Operation.(ddl.Shrink)`. `shrink_calc.go` holds the pure step-size math (`InitialStepMB`,
-  `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting (only
-  `WAIT_AT_LOW_PRIORITY` is meaningful for a shrink). Reads come through the narrow `ShrinkReader`
+  `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting
+  (`WAIT_AT_LOW_PRIORITY`, plus the `max_block_minutes` safety cap — applied by the chunked
+  path only, so `shrink_log` is uncapped). Reads come through the narrow `ShrinkReader`
   interface (`*mssql.Conn` in prod, fakes in tests).
 - **`recovery.go`** (`Recoverer`) reconciles anything left in `02.processing/` after a crash
   (adopt a live op, resume a paused resumable, or requeue). Database-aware: each in-flight op
@@ -153,7 +161,8 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   only package that issues SQL directly; everything DB-specific lives here behind interfaces the
   core consumes.
 - **`internal/config`** — `config.yaml` parsing + `${VAR}` env injection.
-- **`internal/preflight`** — pre-run checks (free space, tempdb, AG send-queue). Database- and
+- **`internal/preflight`** — pre-run checks (server, log, blocking, permissions, data free
+  space, file autogrowth). Database- and
   file-scoped operations (`check_db`, `shrink`) have empty `Schema`/`Table`, so they **skip the
   `schema.table` existence check** in both `CheckOperation` and `objectExistence` — the engine
   validates the database/file at run time (fixed in 028602a; was failing with `table [].[] does

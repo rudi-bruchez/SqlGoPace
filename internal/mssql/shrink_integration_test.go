@@ -73,3 +73,41 @@ func TestIntegrationLogReuseAndFloor(t *testing.T) {
 		t.Errorf("ActiveLogFloorMB() = %d, want >= 0", floor)
 	}
 }
+
+// TestFileGrowthsIntegration verifies the growth read against a real catalog: the unit
+// conversions are the risky part, because growth's meaning depends on is_percent_growth
+// and max_size carries sentinels (-1 = until the disk fills, 0 = no growth) that must
+// survive the page-to-MB conversion unchanged.
+func TestFileGrowthsIntegration(t *testing.T) {
+	conn, ctx := openTestConn(t)
+
+	got, err := conn.FileGrowths(ctx, mssql.FileTypeRows)
+	if err != nil {
+		t.Fatalf("FileGrowths(ROWS): %v", err)
+	}
+	if len(got) == 0 {
+		t.Fatal("FileGrowths(ROWS) returned no files; every database has at least one")
+	}
+	for _, f := range got {
+		if f.Name == "" || f.TypeDesc != "ROWS" {
+			t.Errorf("FileGrowths returned %+v, want a named ROWS file", f)
+		}
+		if f.SizeMB <= 0 {
+			t.Errorf("%s SizeMB = %d, want > 0", f.Name, f.SizeMB)
+		}
+		if f.MaxSizeMB < -1 {
+			t.Errorf("%s MaxSizeMB = %d; only -1 and 0 are sentinels, anything lower is a bad conversion", f.Name, f.MaxSizeMB)
+		}
+		// Microsoft documents percentage growth as "a whole number percentage" without an
+		// upper bound, so only a negative value is provably wrong.
+		if f.IsPercent && f.Growth < 0 {
+			t.Errorf("%s percentage growth = %d, want a non-negative whole percentage", f.Name, f.Growth)
+		}
+		// A capped file must not report negative headroom.
+		if mb, ok := f.HeadroomMB(); ok && mb < 0 {
+			t.Errorf("%s HeadroomMB = %d, want >= 0", f.Name, mb)
+		}
+		t.Logf("%s: size=%d MB percent=%t growth=%d next=%d MB max=%d MB",
+			f.Name, f.SizeMB, f.IsPercent, f.Growth, f.NextGrowthMB(), f.MaxSizeMB)
+	}
+}
