@@ -196,6 +196,28 @@ evidence about CWE-89 here.
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
+  `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and
+  `rebuild_heap`. Two separate problems, found while verifying the Standard-edition warning
+  added to the README in 0.25.0:
+  1. **It gates nothing.** `data_compression` is a manifest field, not a resolved option:
+     `generateRebuildIndex` passes `o.DataCompression` straight into `withClause`
+     (`internal/ddl/generate.go`), and `Resolve` never reads the matrix entry. Verified by
+     planning the same manifest against `TierStandard` and `TierEnterprise` — both emit
+     `DATA_COMPRESSION = PAGE`. So the live Standard-edition compression work is unaffected;
+     this is not a bug in the field, it is an entry that does nothing.
+  2. **The fact it states is wrong.** Microsoft Learn's *Editions and supported features of
+     SQL Server 2016* lists Data compression as Yes for Enterprise, Standard, Web and Express,
+     footnoted "Applies to SQL Server 2016 (13.x) SP1 as part of creating a Common
+     Programmability Surface Area (CPSA) across editions". So the correct gate would be
+     `min_major: 13` for Standard/Express (10 for Enterprise), not enterprise-only.
+  *Deferred because:* deciding between the two fixes needs a call the matrix's own rule
+  frames — `CLAUDE.md` says the matrix carries version × edition gates *only*. Either wire
+  `data_compression` through `Resolve` so the gate is real (and then it must be correct, which
+  means SP1-aware and would refuse compression on Standard below 2016 SP1 — a behaviour
+  change), or delete the entry as documentation masquerading as a gate. Deleting is the
+  smaller, more honest change; wiring it is the one that would catch an operator asking for
+  compression on 2014 Standard.
 - [ ] **`shrink_log` ignores `max_block_minutes`.** v0.18.0 made `resolveShrink` resolve the
   cap, and `shrink_data` / `shrink_tempdb` apply it because both run chunked through
   `runChunk` (`internal/run/shrink.go:489`), which builds
