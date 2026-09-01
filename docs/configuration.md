@@ -107,9 +107,34 @@ compares it against the size of each `rebuild_index` / `rebuild_heap` target, re
 `sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild rather than
 their sum, because each one releases its temporary copy before the next begins.
 
-Two limits are worth knowing. It does not account for file autogrowth, so a database whose
-files can still grow on a volume with room may fail this check conservatively. And
-`create_index` is not checked: the index does not exist yet, so there is nothing to size.
+Autogrowth counts as headroom. A file that can still grow is not out of room, so the check
+adds `max_size − size` to the free space before deciding, and a file with no cap (it grows
+until the disk fills) can never be proven short — those cases **warn** rather than pass
+silently, because the growth itself is a blocking zero-fill unless instant file
+initialization applies. Only a rebuild that cannot fit *and* cannot grow fails.
+
+One limit remains: `create_index` is not checked, because the index does not exist yet and
+there is nothing to size.
+
+### The `file growth` check
+
+Read on every run, independent of `require_data_free_space`, and **advisory only** — it
+never fails a manifest. It warns when:
+
+- **a data file grows by a percentage.** The increment scales with the file, so it gets
+  larger exactly as the file gets harder to grow. Microsoft's guidance is to set a fixed
+  number of megabytes instead. The warning names what one growth event would cost at the
+  file's current size, which is the number that makes the setting feel real: 10% of a
+  14 TB file is a 1.4 TB blocking allocation.
+- **a data file has autogrowth disabled while the manifest contains a shrink.** The shrink
+  hands back space the file will not be able to reclaim, so the reclaimed headroom is
+  one-way. Reported only for a shrink, since a fixed-size file is a legitimate choice
+  otherwise.
+
+There is deliberately no warning for a growth increment that is merely "too large".
+Microsoft's own guidance is inconsistent on the threshold — one page suggests roughly an
+eighth of the file as a testing rule of thumb, another recommends no more than 100 MB for
+large files — so the check reports the increment and leaves the judgement to the operator.
 
 ## `options_override`
 

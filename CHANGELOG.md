@@ -17,6 +17,19 @@ history, so a report can always name the build that produced it.
 
 ### Added
 
+- **A `file growth` preflight check.** Autogrowth settings were never read anywhere in the
+  tool; now they are, from `sys.database_files`, on every run. It is advisory and never
+  fails a manifest. It warns when a data file grows by a **percentage** — the increment
+  scales with the file, and Microsoft's guidance is a fixed number of megabytes — naming
+  what one growth event would cost at the file's current size, because 10% of a 14 TB file
+  is a 1.4 TB blocking allocation. It also warns when a data file has autogrowth
+  **disabled** and the manifest contains a shrink, which is the combination that hands back
+  space the file cannot reclaim.
+
+  There is deliberately no "increment too large" warning: Microsoft's own guidance is
+  inconsistent on the threshold, so the check reports the increment and leaves the
+  judgement to the operator.
+
 - `preflight.require_data_free_space` now does what it has always claimed to do. A rebuild
   materializes the new index before dropping the old one, so it needs roughly the object's
   own size free; the check sums the database's `ROWS` file free space and compares it
@@ -24,8 +37,12 @@ history, so a report can always name the build that produced it.
   `sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild, not the
   sum, because each releases its temporary copy before the next begins. An object whose
   size cannot be read reports 0 and never fails a run. `create_index` is not checked — the
-  index does not exist yet, so there is nothing to size — and the check does not model file
-  autogrowth, so it can fail conservatively on a database whose files could still grow.
+  index does not exist yet, so there is nothing to size.
+
+  Autogrowth counts as headroom: `max_size − size` is added to the free space before the
+  verdict, and a file that grows until the disk fills can never be proven short. Those
+  cases warn rather than pass silently, since the growth is a blocking zero-fill unless
+  instant file initialization applies. Only a rebuild that can neither fit nor grow fails.
 
 ### Removed
 

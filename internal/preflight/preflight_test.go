@@ -2,6 +2,7 @@ package preflight_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -59,11 +60,89 @@ func TestCheckDataFreeSpace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, tt.freeMB).Severity
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, tt.freeMB, nil).Severity
 			if got != tt.want {
 				t.Errorf("CheckDataFreeSpace(need=%d, free=%d) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
 			}
 		})
+	}
+}
+
+// Free space inside the files is not the whole story: a file that can still grow has
+// headroom the check must count, or it fails runs that would have succeeded. Relying on
+// growth is a Warn rather than a Pass, because the growth itself is a blocking zero-fill.
+func TestCheckDataFreeSpaceCountsGrowthHeadroom(t *testing.T) {
+	capped := func(sizeMB, maxMB int) mssql.FileGrowth {
+		return mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: sizeMB, Growth: 65536, MaxSizeMB: maxMB}
+	}
+	unlimited := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 65536, MaxSizeMB: -1}
+	noGrowth := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}
+
+	tests := []struct {
+		name   string
+		needMB int
+		freeMB int
+		growth []mssql.FileGrowth
+		want   preflight.Severity
+	}{
+		{"short but growth covers it", 500, 100, []mssql.FileGrowth{capped(1000, 2000)}, preflight.Warn},
+		{"short and growth is unlimited", 500, 100, []mssql.FileGrowth{unlimited}, preflight.Warn},
+		{"short and growth is disabled", 500, 100, []mssql.FileGrowth{noGrowth}, preflight.Fail},
+		{"short and the cap is too low", 5000, 100, []mssql.FileGrowth{capped(1000, 1200)}, preflight.Fail},
+		{"enough free space ignores growth", 50, 100, []mssql.FileGrowth{noGrowth}, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, tt.freeMB, tt.growth).Severity
+			if got != tt.want {
+				t.Errorf("CheckDataFreeSpace(need=%d, free=%d, growth) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
+			}
+		})
+	}
+}
+
+// Autogrowth settings are advisory: a bad one is a reason to tell the operator, never a
+// reason to refuse to run. Percentage growth is Microsoft's own named anti-pattern because
+// the increment scales with the file, and growth is a blocking zero-fill without instant
+// file initialization. Growth disabled matters most when a shrink is about to remove the
+// headroom that cannot then be reclaimed.
+func TestCheckFileGrowth(t *testing.T) {
+	fixed := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, Growth: 65536, MaxSizeMB: -1} // 512 MB
+	percent := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, IsPercent: true, Growth: 10, MaxSizeMB: -1}
+	fixedSize := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, Growth: 0, MaxSizeMB: 0}
+
+	tests := []struct {
+		name      string
+		files     []mssql.FileGrowth
+		shrinking bool
+		want      preflight.Severity
+	}{
+		{"fixed increment is fine", []mssql.FileGrowth{fixed}, false, preflight.Pass},
+		{"percentage growth warns", []mssql.FileGrowth{percent}, false, preflight.Warn},
+		{"growth disabled alone is fine", []mssql.FileGrowth{fixedSize}, false, preflight.Pass},
+		{"growth disabled warns when shrinking", []mssql.FileGrowth{fixedSize}, true, preflight.Warn},
+		{"one bad file among good ones warns", []mssql.FileGrowth{fixed, percent}, false, preflight.Warn},
+		{"no files is not a finding", nil, false, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckFileGrowth(tt.files, tt.shrinking).Severity
+			if got != tt.want {
+				t.Errorf("CheckFileGrowth(shrinking=%t) = %v, want %v", tt.shrinking, got, tt.want)
+			}
+		})
+	}
+}
+
+// The warning has to carry the number that makes it actionable: what one growth event
+// would actually cost at the file's current size.
+func TestCheckFileGrowthReportsEventSize(t *testing.T) {
+	percent := mssql.FileGrowth{Name: "PRODDB", TypeDesc: "ROWS", SizeMB: 14_500_000, IsPercent: true, Growth: 10, MaxSizeMB: -1}
+
+	got := preflight.CheckFileGrowth([]mssql.FileGrowth{percent}, false)
+
+	if !strings.Contains(got.Detail, "1450000") {
+		t.Errorf("CheckFileGrowth detail = %q, want it to name the 1450000 MB growth event", got.Detail)
 	}
 }
 
@@ -163,12 +242,17 @@ type fakeProber struct {
 	dmlPermission  bool
 	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
 	dataFreeMB     int
+	growth         []mssql.FileGrowth
 	indexSizeMB    int
 }
 
 func (f fakeProber) FileSpace(context.Context, string) ([]mssql.FileSpace, error) {
 	return []mssql.FileSpace{{Name: "data", TypeDesc: "ROWS", FreeMB: f.dataFreeMB}}, nil
 }
+func (f fakeProber) FileGrowths(context.Context, string) ([]mssql.FileGrowth, error) {
+	return f.growth, nil
+}
+
 func (f fakeProber) IndexSizeMB(context.Context, string, string, string) (int, error) {
 	return f.indexSizeMB, nil
 }
@@ -471,4 +555,39 @@ func TestRunDataFreeSpace(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Growth advice is always available, independent of require_data_free_space: percentage
+// growth hurts any long operation, not just a rebuild that is short of room.
+func TestRunWarnsOnPercentGrowth(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+	manifest := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
+	}}
+
+	p := healthyProber()
+	p.growth = []mssql.FileGrowth{
+		{Name: "PRODDB", TypeDesc: "ROWS", SizeMB: 100_000, IsPercent: true, Growth: 10, MaxSizeMB: -1},
+	}
+
+	rep, err := preflight.Run(context.Background(), p, info, manifest, th, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("growth advice must never fail a run:\n%v", rep.Checks)
+	}
+	var found bool
+	for _, c := range rep.Checks {
+		if c.Name == "file growth" {
+			found = true
+			if c.Severity != preflight.Warn {
+				t.Errorf("file growth check = %v, want Warn for percentage growth", c.Severity)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("Run() emitted no file growth check:\n%v", rep.Checks)
+	}
 }

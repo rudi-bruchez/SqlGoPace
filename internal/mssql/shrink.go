@@ -25,6 +25,92 @@ type FileSpace struct {
 	FreeMB   int
 }
 
+// FileGrowth is one file's autogrowth configuration, from sys.database_files.
+// Growth is kept in its raw form because the unit depends on IsPercent, and because
+// 0 (autogrowth off) must stay distinguishable from an increment that rounds to
+// under 1 MB. Use the helpers rather than reading it directly.
+type FileGrowth struct {
+	Name      string
+	TypeDesc  string
+	SizeMB    int
+	IsPercent bool
+	// Growth is a whole-number percentage when IsPercent, otherwise a count of 8-KB
+	// pages. 0 means the file is fixed size and never grows.
+	Growth int
+	// MaxSizeMB is -1 when the file may grow until the disk is full, and 0 when no
+	// growth is allowed at all. Otherwise it is the cap, in megabytes.
+	MaxSizeMB int
+}
+
+// GrowthDisabled reports whether the file is fixed size and can never autogrow.
+func (f FileGrowth) GrowthDisabled() bool { return f.Growth == 0 }
+
+// Unlimited reports whether the file may grow until the disk fills, so its headroom
+// cannot be derived from the catalog alone.
+func (f FileGrowth) Unlimited() bool { return f.MaxSizeMB < 0 && !f.GrowthDisabled() }
+
+// NextGrowthMB is the size of the next autogrowth event at the file's current size,
+// in megabytes: the percentage applied to SizeMB, or the fixed increment. It is 0 when
+// growth is disabled, and may round to 0 for an increment under 1 MB.
+func (f FileGrowth) NextGrowthMB() int {
+	switch {
+	case f.GrowthDisabled():
+		return 0
+	case f.IsPercent:
+		return f.SizeMB * f.Growth / 100
+	default:
+		return f.Growth / 128 // 8-KB pages to MB
+	}
+}
+
+// HeadroomMB is how much the file may still grow, in megabytes: 0 when growth is
+// disabled, and the distance to MaxSizeMB when capped. Unlimited files report 0 with
+// ok=false, because the real bound is disk space, which the catalog cannot see.
+func (f FileGrowth) HeadroomMB() (mb int, ok bool) {
+	switch {
+	case f.GrowthDisabled():
+		return 0, true
+	case f.Unlimited():
+		return 0, false
+	default:
+		return max(f.MaxSizeMB-f.SizeMB, 0), true
+	}
+}
+
+// fileGrowthSQL reads the autogrowth configuration per file of one type. size and
+// max_size are in 8-KB pages (/128 = MB); max_size keeps its sentinels (-1 = until the
+// disk is full, 0 = no growth), so only positive values are converted. growth is left
+// raw: its unit depends on is_percent_growth.
+const fileGrowthSQL = `
+SELECT name, type_desc,
+       CAST(size / 128.0 AS INT) AS size_mb,
+       is_percent_growth,
+       growth,
+       CASE WHEN max_size <= 0 THEN max_size ELSE CAST(max_size / 128.0 AS INT) END AS max_size_mb
+FROM sys.database_files
+WHERE type_desc = @type
+ORDER BY file_id;`
+
+// FileGrowths lists the autogrowth configuration of every file of the given type
+// (ROWS or LOG) in the connected database, in file_id order.
+func (c *Conn) FileGrowths(ctx context.Context, fileType string) ([]FileGrowth, error) {
+	rows, err := c.pool.QueryContext(ctx, fileGrowthSQL, sql.Named("type", fileType))
+	if err != nil {
+		return nil, fmt.Errorf("read file growth: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []FileGrowth
+	for rows.Next() {
+		var f FileGrowth
+		if err := rows.Scan(&f.Name, &f.TypeDesc, &f.SizeMB, &f.IsPercent, &f.Growth, &f.MaxSizeMB); err != nil {
+			return nil, fmt.Errorf("scan file growth: %w", err)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // fileSpaceSQL reads size and used space per file of one type in the current
 // database. size is in 8-KB pages (/128 = MB); FILEPROPERTY('SpaceUsed') likewise.
 const fileSpaceSQL = `
