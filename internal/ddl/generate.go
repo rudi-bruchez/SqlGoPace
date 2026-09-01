@@ -323,6 +323,9 @@ func generateShrinkTempdb(o ShrinkTempdb, res ResolvedOptions) string {
 }
 
 func renderLiteral(l Literal) string {
+	if l.IsNull() {
+		return "NULL"
+	}
 	if l.String {
 		return nLiteral(l.Raw)
 	}

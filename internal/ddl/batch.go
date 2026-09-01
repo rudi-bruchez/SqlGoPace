@@ -87,9 +87,18 @@ func (o BatchDML) selfLimitClause() string {
 	// A row still needs work if ANY target column differs from (or is NULL against)
 	// its literal target. The disjunction is wrapped once so it is safe to AND with
 	// the operator filter.
+	//
+	// A NULL target needs its own form: `col <> NULL` is UNKNOWN for every row, so the
+	// generic clause would reduce to `col IS NULL` — true for exactly the rows the batch
+	// had just set, putting every completed row straight back into the match set. The
+	// clause written to guarantee termination would guarantee non-termination.
 	parts := make([]string, 0, len(o.Set))
 	for _, col := range sortedSetColumns(o.Set) {
 		q := quoteIdent(col)
+		if o.Set[col].IsNull() {
+			parts = append(parts, q+" IS NOT NULL")
+			continue
+		}
 		parts = append(parts, q+" IS NULL OR "+q+" <> "+renderLiteral(o.Set[col]))
 	}
 	return "(" + strings.Join(parts, " OR ") + ")"

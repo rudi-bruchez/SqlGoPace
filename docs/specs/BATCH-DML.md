@@ -143,11 +143,40 @@ Rules:
   file), not in the same transaction as the SQL → resume is **at-least-once** on the
   boundary batch. So key_range is only offered **for an idempotent SET** (literal `set:`), where
   re-applying the boundary batch is a no-op.
-- **Non-idempotent `set_raw`** is allowed but **marked non-resumable**: preflight emits a
-  `WARN`, the op runs without a resume point, and a crash mid-run leaves the table partially
-  updated for **manual reconciliation** (recorded in the `.log`). The MVP does **not** attempt exactly-
-  once for this case (it would need a database-side control table updated within the batch's
-  transaction — deferred to a later iteration if asked for).
+- **Non-idempotent `set_raw`** is allowed but **marked non-resumable**: the op runs without a
+  resume point, and a crash mid-run leaves the table partially updated for **manual
+  reconciliation** (recorded in the `.log`). The MVP does **not** attempt exactly-once for this
+  case (it would need a database-side control table updated within the batch's transaction —
+  deferred to a later iteration if asked for).
+
+**Superseded (0.20.0): the preflight `WARN` above was never implemented**, and the
+"self-limiting by construction" claim was not true in two ways. Both are now closed, but the
+reasoning is worth keeping, because it is the same reasoning that made the gap invisible.
+
+1. **A NULL target inverted the self-limit.** `set: {Col: null}` produced
+   `WHERE (Col IS NULL OR Col <> NULL)`. `Col <> NULL` is `UNKNOWN` for every row, so the
+   clause reduced to `Col IS NULL` — true for exactly the rows the batch had just set. Every
+   completed row re-entered the match set, so the loop's only exit ("the last batch affected
+   zero rows") was unreachable. The clause written to guarantee termination guaranteed
+   non-termination. The generator now emits `Col IS NOT NULL` for a NULL target
+   (`internal/ddl/batch.go`).
+2. **A `set_raw` that does not consume its own filter has no self-limit at all.**
+   `set_raw: "Counter = Counter + 1"` with `where_raw: "Status = 'A'"` passes validation —
+   the check at load is that *a* predicate exists, never that it is self-consuming, which is
+   not decidable from the text. `selfLimitClause` returns `""` for any raw SET by design. So
+   the guarantee this section claims never covered the `set_raw` case.
+
+The backstop is a **cumulative-row ceiling** on the predicate loop
+(`predicateRowCeiling`, `internal/run/batch_calc.go`): twice the table's row estimate, or
+1,000,000 when the estimate is unavailable. A terminating predicate affects each row at most
+once, so crossing it proves the predicate is not self-consuming. The operation **fails**
+(`ErrRowCeiling`) rather than stopping cleanly — the committed batches are real and a human
+has to decide about them. The `key_range` walk needs no ceiling: its watermark is strictly
+ascending, so it terminates by construction.
+
+A preflight `WARN` naming a non-idempotent `set_raw` is still worth having — it would catch
+case 2 before any row is written rather than after the ceiling's worth — but it is a heuristic
+over raw SQL text, whereas the ceiling is a proof. Order them that way if both are built.
 
 Default strategy per verb: `batch_delete` → `predicate`; `batch_update` → `predicate`
 (switch to `key_range` when the table is huge and the predicate is not selectively indexed).

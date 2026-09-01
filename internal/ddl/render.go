@@ -160,6 +160,12 @@ func compact(n *yaml.Node) {
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		key, val := n.Content[i], n.Content[i+1]
 		switch {
+		case val.Kind == yaml.MappingNode && key.Value == dataMapKey:
+			// Entries kept verbatim (see dataMapKey); only an empty map is dropped, since
+			// that is the absent-field case a batch_delete produces.
+			if len(val.Content) == 0 {
+				continue
+			}
 		case val.Kind == yaml.MappingNode:
 			compact(val)
 			if len(val.Content) == 0 {
@@ -179,6 +185,15 @@ func compact(n *yaml.Node) {
 	}
 	n.Content = kept
 }
+
+// dataMapKey is the one manifest mapping whose entries are operator data rather than
+// struct fields: batch_update's `set`, a column-name -> literal map. Everywhere else a
+// null scalar means "this optional field was not set" and compact() is right to drop it,
+// but here it is the target value — `SET [Note] = NULL` — and dropping it emptied the map,
+// which then dropped `set:` itself, so a rewritten manifest lost the column or stopped
+// parsing. The distinction cannot be made on the node: go-yaml encodes a nil *bool and a
+// null literal identically (!!null / "null"), so it has to be made on the key.
+const dataMapKey = "set"
 
 // isEmptyScalar reports whether a scalar node carries no information worth writing.
 // A `false` is NOT empty: for the option overrides (`*bool`), nil means "auto" and a

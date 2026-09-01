@@ -483,3 +483,130 @@ func TestExpandPreservesBatchDML(t *testing.T) {
 		t.Errorf("operation type = %T, want ddl.BatchDML", out.Operations[0])
 	}
 }
+
+// TestBatchDMLNullTargetSelfLimits pins the termination guarantee for a literal
+// UPDATE whose target value is NULL. `col <> NULL` is UNKNOWN for every row, so the
+// generic "IS NULL OR <> target" clause matched every row the batch had just set and
+// the predicate loop could never exhaust: the clause written to guarantee
+// termination guaranteed non-termination. The self-limit for a NULL target is
+// `col IS NOT NULL`.
+func TestBatchDMLNullTargetSelfLimits(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{
+			name: "null target",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Status: null }
+    where:
+      - { column: Archived, op: '=', value: 1 }
+`,
+			want: "UPDATE TOP (5000) [dbo].[Orders] SET [Status] = NULL WHERE ([Status] IS NOT NULL) AND ([Archived] = 1);",
+		},
+		{
+			name: "tilde is the same null",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Status: ~ }
+    confirm_full_table: true
+`,
+			want: "UPDATE TOP (5000) [dbo].[Orders] SET [Status] = NULL WHERE ([Status] IS NOT NULL);",
+		},
+		{
+			name: "empty scalar is the same null",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set:
+      Status:
+    confirm_full_table: true
+`,
+			want: "UPDATE TOP (5000) [dbo].[Orders] SET [Status] = NULL WHERE ([Status] IS NOT NULL);",
+		},
+		{
+			name: "null mixed with a value target",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Note: null, Status: 'Archived' }
+    confirm_full_table: true
+`,
+			want: "UPDATE TOP (5000) [dbo].[Orders] SET [Note] = NULL, [Status] = N'Archived' WHERE ([Note] IS NOT NULL OR [Status] IS NULL OR [Status] <> N'Archived');",
+		},
+		{
+			name: "the string \"null\" is not a null",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Status: 'null' }
+    confirm_full_table: true
+`,
+			want: "UPDATE TOP (5000) [dbo].[Orders] SET [Status] = N'null' WHERE ([Status] IS NULL OR [Status] <> N'null');",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op, ok := parseOneOp(t, tt.manifest).(ddl.BatchDML)
+			if !ok {
+				t.Fatalf("not a BatchDML")
+			}
+			if got := ddl.BatchDMLChunkSQL(op, 5000, ddl.ResolvedOptions{}); got != tt.want {
+				t.Errorf("BatchDMLChunkSQL:\n got %s\nwant %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMarshalManifestRoundTripsNullSetValue guards the rewrite path for a NULL set
+// target. MarshalManifest is the inverse of ParseManifest and is used whenever a
+// manifest is rewritten in place — a recovery manifest, the blocked-session capture,
+// the TUI's kill-rule append. A null literal renders as an empty scalar, which
+// compact() drops as carrying no information; that emptied the `set:` map and then
+// dropped `set:` itself, so the rewritten manifest no longer parsed at all.
+func TestMarshalManifestRoundTripsNullSetValue(t *testing.T) {
+	src := `operations:
+  - operation: batch_update
+    schema: dbo
+    table: Orders
+    set: { Note: null, Status: 'Archived' }
+    confirm_full_table: true
+`
+	m, err := ddl.ParseManifest(strings.NewReader(src))
+	if err != nil {
+		t.Fatalf("ParseManifest: %v", err)
+	}
+	out, err := ddl.MarshalManifest(m)
+	if err != nil {
+		t.Fatalf("MarshalManifest: %v", err)
+	}
+	m2, err := ddl.ParseManifest(strings.NewReader(string(out)))
+	if err != nil {
+		t.Fatalf("reparse of rendered manifest: %v\n--- rendered ---\n%s", err, out)
+	}
+	op, ok := m2.Operations[0].(ddl.BatchDML)
+	if !ok {
+		t.Fatalf("not a BatchDML after round trip")
+	}
+	if len(op.Set) != 2 {
+		t.Fatalf("set has %d entries after round trip, want 2\n--- rendered ---\n%s", len(op.Set), out)
+	}
+	if !op.Set["Note"].IsNull() {
+		t.Errorf("Note = %#v after round trip, want a null literal", op.Set["Note"])
+	}
+	// The generated SQL must be identical on both sides, or a rewrite silently
+	// changes what the operation does.
+	want := ddl.BatchDMLChunkSQL(m.Operations[0].(ddl.BatchDML), 1000, ddl.ResolvedOptions{})
+	if got := ddl.BatchDMLChunkSQL(op, 1000, ddl.ResolvedOptions{}); got != want {
+		t.Errorf("SQL changed across a rewrite:\n got %s\nwant %s", got, want)
+	}
+}

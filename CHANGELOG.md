@@ -13,6 +13,38 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.20.0] - 2026-09-01
+
+### Fixed
+
+- `batch_update` with `set: {Col: null}` no longer generates broken SQL. A YAML null left
+  the literal at its zero value (go-yaml does not call `UnmarshalYAML` for a `!!null` node
+  decoded into a value type), so the statement rendered as `SET [Col] = ` — a syntax error
+  that failed the operation on its first batch. `null`, `NULL`, `~` and an empty scalar now
+  all render as `NULL`, and the self-limiting clause emits `[Col] IS NOT NULL` rather than
+  `[Col] IS NULL OR [Col] <> NULL`, which is `UNKNOWN` for every row and would have put each
+  completed row straight back into the match set.
+- A manifest rewrite no longer loses a NULL `set:` value. `MarshalManifest` renders a null
+  literal as an empty scalar, which `compact()` dropped as carrying no information; that
+  emptied the `set:` map and then dropped `set:` itself, so a rewritten `batch_update` either
+  lost the column silently or stopped parsing with "set exactly one of set or set_raw".
+  Affects every in-place rewrite: recovery manifests, the blocked-session capture, and the
+  TUI's `X` key.
+
+### Added
+
+- A cumulative-row ceiling on the `batch_update` / `batch_delete` predicate loop. The loop's
+  only exit was "the last batch affected zero rows", with no iteration, row or wall-clock
+  bound, and every batch autocommits. A `set_raw` that does not consume its own filter —
+  `set_raw: "Counter = Counter + 1"` with `where_raw: "Status = 'A'"` — matches the same rows
+  forever; validation checks that *a* predicate exists, never that it is self-consuming, which
+  raw SQL text does not allow. The ceiling is twice the table's row estimate, or 1,000,000 when
+  the estimate is unavailable: a terminating predicate affects each row at most once, so
+  crossing it proves the predicate is not self-consuming. The operation fails with the
+  committed row and batch counts in its report. **Migration:** an existing non-self-consuming
+  `set_raw` manifest that previously ran until interrupted will now fail instead; the fix is a
+  `where_raw` the `set_raw` invalidates. `key_range` is unaffected — its watermark ascends, so
+  it terminates by construction.
 ## [0.19.0] - 2026-09-01
 
 ### Changed

@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.19.0 (2026-09-01).
+Status last verified against the tree at v0.20.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,19 +37,33 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1 and 8 are done (0.19.0); six remain.** Item 7 is
-hours; 2–6 are days.
+Ordered as the review ordered them. **1, 2 and 8 are done; five remain.** Item 7 is hours;
+3–6 are days.
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
   the shipped file disagreed with the five documents that called it off by default. A
   `config.yaml` scaffolded earlier is unchanged and may still be armed — the migration note
   in the CHANGELOG and in `docs/configuration.md` says so.
-- [ ] **2. `batch_update` can loop forever, committing** (finding 1). `set: {Col: null}`
-  generates `WHERE ([Col] IS NULL OR [Col] <> null)` (`internal/ddl/batch.go:93`); `<> null`
-  is `UNKNOWN`, so every updated row re-enters the match set. The clause written to guarantee
-  termination guarantees non-termination. Needs the null-literal fix **and** an absolute
-  iteration ceiling. The only finding that corrupts data with no bound at all.
+- [x] **2. `batch_update` can loop forever, committing** — done in 0.20.0. Both halves:
+  `selfLimitClause` emits `[Col] IS NOT NULL` for a NULL target (`internal/ddl/batch.go`), and
+  `runPredicate` stops at `predicateRowCeiling` (`internal/run/batch_calc.go`) — twice the
+  table's row estimate, or 1,000,000 with no estimate — failing with `ErrRowCeiling` and the
+  committed counts. A third defect surfaced while fixing it: `MarshalManifest` dropped a null
+  `set:` value, so any in-place rewrite lost the column or broke the manifest.
+  **Correction to the review's finding 1.** Its trigger A does not reproduce as written. It
+  claimed `set: {Col: null}` rendered `SET [Col] = null` and looped; go-yaml does not call
+  `Literal.UnmarshalYAML` for a `!!null` node decoded into a value type, so the literal stayed
+  at its zero value and the statement rendered `SET [Col] = ` — a **syntax error that failed
+  the operation on the first batch**. Real bug, wrong mechanism, and not CATASTROPHIC: it
+  fails fast rather than corrupting. Trigger B (`set_raw` that does not consume its own
+  filter) stands exactly as written and is the one that ran forever; the ceiling is what
+  bounds it. Read finding 1's severity as belonging to trigger B alone.
+  *Left undone:* the preflight `WARN` for a non-idempotent `set_raw` that
+  `docs/specs/BATCH-DML.md` §4 promised and that was never implemented. It would catch trigger
+  B before the first row is written rather than after the ceiling's worth — but it is a
+  heuristic over raw SQL text where the ceiling is a proof, so it is an improvement on a
+  closed hole rather than the closing of one. The spec now says so in place.
 - [ ] **3. Make the whole-table DELETE guard semantic** (finding 2). `confirm_full_table` is a
   presence check on a YAML key, so `where_raw: "1=1"` walks past it with no row-count preview.
   Alternatively drop batched DML from the advertised feature set until it is fixed.

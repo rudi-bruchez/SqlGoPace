@@ -93,7 +93,19 @@ type Literal struct {
 	String bool   // true if the YAML scalar resolved to a string
 }
 
-// UnmarshalYAML captures a scalar constant, rejecting non-scalar defaults.
+// IsNull reports whether the manifest wrote a YAML null (`null`, `NULL`, `~`, or an
+// empty scalar) for this literal.
+//
+// It is a zero-value test rather than a captured flag because go-yaml does not call
+// UnmarshalYAML for a !!null node decoded into a value type: the Literal is simply
+// left at its zero value, so the three spellings all arrive here identically. No
+// non-null scalar can produce this shape — an empty *string* is `Raw:"", String:true`
+// — so the test is exact. SQL generation must branch on it: `= NULL` is valid T-SQL
+// but `<> NULL` is UNKNOWN for every row, which is not what a predicate wants.
+func (l Literal) IsNull() bool { return l.Raw == "" && !l.String }
+
+// UnmarshalYAML captures a scalar constant, rejecting non-scalar defaults. It is not
+// called for a null scalar; see IsNull.
 func (l *Literal) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("default must be a scalar constant: %w", ErrInvalidManifest)

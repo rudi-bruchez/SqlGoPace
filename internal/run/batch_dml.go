@@ -96,6 +96,12 @@ type BatchDMLRunnerConfig struct {
 	KillGrace       time.Duration
 }
 
+// ErrRowCeiling is returned when a predicate loop crosses predicateRowCeiling: the
+// predicate is not self-consuming, so the loop would never end. The operation fails
+// rather than stopping cleanly — the committed batches are real and a human has to
+// decide what to do about them.
+var ErrRowCeiling = errors.New("batch predicate is not self-consuming (cumulative row ceiling reached)")
+
 // BatchDMLRunner drives a chunked UPDATE/DELETE: it sizes the initial batch, then
 // loops the predicate statement until it affects no rows, sampling between batches
 // and reacting with the least destructive mechanism (clean stop with committed
@@ -181,6 +187,7 @@ func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res 
 	est, _ := r.reader.TableRowEstimate(ctx, op.Schema, op.Table)
 	lo, hi := r.batchBounds()
 	size := r.initialSize(op, est, lo, hi)
+	ceiling := predicateRowCeiling(est)
 	caps := r.opCaps(res, ignore)
 
 	var stallWaited time.Duration
@@ -220,6 +227,12 @@ func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res 
 		}
 		result.Rows += rows
 		result.Batches++
+		if result.Rows >= ceiling {
+			result.Reason = fmt.Sprintf(
+				"failed: %d rows over %d batches exceeds the ceiling of %d (table estimate %d) — the predicate keeps matching rows it has already acted on",
+				result.Rows, result.Batches, ceiling, est)
+			return result, fmt.Errorf("batch_%s %s.%s after %d rows: %w", op.Verb, op.Schema, op.Table, result.Rows, ErrRowCeiling)
+		}
 		stallWaited = 0
 		r.emitProgress(op, result.Rows, est, size, perSec(rows, elapsed))
 		size = AdjustBatchRows(size, elapsed, waitDeltas(before, after), r.tuning.TargetBatch, lo, hi)

@@ -23,6 +23,39 @@ const (
 	batchMediumCeilingRows = 1_000_000
 )
 
+// Cumulative-row ceilings for one predicate-strategy operation. They are the
+// backstop against a predicate that never exhausts, not a quota: no correct batch
+// loop comes close to them.
+const (
+	// unknownTableRowCeiling applies when the row estimate is unavailable. With
+	// nothing to scale against it is deliberately generous.
+	unknownTableRowCeiling = 1_000_000
+	// smallTableRowCeiling keeps the bound sane for a tiny or stale estimate, where
+	// twice the estimate would be a handful of rows.
+	smallTableRowCeiling = 10_000
+)
+
+// predicateRowCeiling is the cumulative-row bound for one predicate-strategy
+// operation. A terminating predicate affects each row at most once — the self-limit
+// clause excludes rows already at their target value, and a DELETE removes what it
+// matches — so cumulative rows cannot exceed the table's row count. Twice that is
+// the slack for a stale estimate and for rows inserted while the loop runs.
+//
+// Crossing it proves the predicate is not self-consuming. The usual cause is a
+// set_raw that does not consume its own filter ("Counter = Counter + 1" WHERE
+// "Status = 'A'"), for which selfLimitClause can emit nothing and validation can
+// only check that *a* predicate exists. Every batch autocommits, so without this the
+// loop churns rows at full write rate until a human notices.
+//
+// A false trip is cheap: each batch is committed and the self-limit makes a re-run
+// continue, so erring tight costs a re-run while erring loose costs write volume.
+func predicateRowCeiling(est int64) int64 {
+	if est <= 0 {
+		return unknownTableRowCeiling
+	}
+	return max(2*est, smallTableRowCeiling)
+}
+
 // InitialBatchRows picks the starting batch size from the estimated row count. The
 // tiers are conservative starting points; AdjustBatchRows grows the batch from here
 // when the I/O keeps up. The result is clamped to [MinRows, MaxRows]; the driver

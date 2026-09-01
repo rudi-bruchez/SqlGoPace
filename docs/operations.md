@@ -252,6 +252,20 @@ Three rules the parser enforces, each closing a way to lose data or hang:
 - The `key_range` walk persists a watermark and re-applies the boundary batch on a resume,
   so it is restricted to an idempotent literal `UPDATE`.
 
+A literal `set` is self-limiting: the generated `WHERE` excludes rows already holding the
+target value, so the loop ends when nothing is left to change. `set: {Col: null}` is included
+— it generates `Col IS NOT NULL`, not `Col <> NULL`, which would be `UNKNOWN` for every row
+and would never terminate.
+
+A `set_raw` gets no such clause: the tool cannot tell from raw SQL text whether the SET
+consumes its own filter. **`set_raw: "Counter = Counter + 1"` with `where_raw: "Status = 'A'"`
+matches the same rows on every pass**, and each batch commits, so it would run until someone
+stopped it. A cumulative-row ceiling backstops this: twice the table's row estimate (or a
+million rows when the estimate is unavailable). A terminating predicate cannot exceed the
+table's row count, so crossing the ceiling means the predicate is not self-consuming, and the
+operation **fails** with the committed row and batch counts in its `.log`. It is a backstop,
+not a budget — write a `where_raw` your `set_raw` invalidates, and it never fires.
+
 `set_raw` and `where_raw` are interpolated into the statement verbatim. They are validated
 for shape, never for content, which makes a manifest a trusted input: see
 [`../SECURITY.md`](../SECURITY.md).

@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"errors"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -397,6 +398,64 @@ func TestAdjustBatchRows(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := AdjustBatchRows(tt.size, time.Second, tt.w, tn.TargetBatch, lo, hi); got != tt.want {
 				t.Errorf("AdjustBatchRows = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBatchDMLPredicateRowCeiling pins the absolute backstop on the predicate loop.
+// A set_raw that does not consume its own filter — "Counter = Counter + 1" WHERE
+// "Status = 'A'" — matches the same rows on every pass, so the loop's only exit
+// ("the last batch affected zero rows") is never reached. Every batch autocommits,
+// so without a ceiling this churns rows at full write rate forever. The ceiling
+// converts that into a bounded, reported failure.
+func TestBatchDMLPredicateRowCeiling(t *testing.T) {
+	s := &fakeBatchServer{remaining: math.MaxInt64, estRows: 1000} // never exhausts
+	r := newTestBatchRunner(s, NewManualClock(time.Unix(0, 0)), true)
+
+	op := ddl.BatchDML{
+		Verb: "update", Schema: "dbo", Table: "T",
+		SetRaw:   "Counter = Counter + 1",
+		WhereRaw: "Status = 'A'",
+	}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, noWatermark{}, discard)
+	if !errors.Is(err, ErrRowCeiling) {
+		t.Fatalf("Run() error = %v, want ErrRowCeiling", err)
+	}
+	// est 1000 -> ceiling max(2*1000, 10000) = 10000.
+	if res.Rows < 10000 {
+		t.Errorf("Rows = %d, want at least the ceiling (10000)", res.Rows)
+	}
+	if res.Rows > 20000 {
+		t.Errorf("Rows = %d, want the loop stopped near the ceiling, not far past it", res.Rows)
+	}
+	if res.Reason == "" {
+		t.Error("Reason is empty; the report must say why the operation stopped")
+	}
+	if res.Batches == 0 {
+		t.Error("Batches = 0, want the committed batches counted")
+	}
+}
+
+// TestPredicateRowCeiling pins the bound itself. A terminating predicate affects each
+// row at most once, so cumulative rows cannot exceed the table's row count; twice
+// that is the slack for a stale estimate and concurrent inserts.
+func TestPredicateRowCeiling(t *testing.T) {
+	tests := []struct {
+		name string
+		est  int64
+		want int64
+	}{
+		{"unavailable estimate is generous", 0, 1_000_000},
+		{"negative estimate is treated as unavailable", -1, 1_000_000},
+		{"tiny table keeps a sane floor", 5, 10_000},
+		{"small table keeps a sane floor", 1000, 10_000},
+		{"large table scales with the estimate", 50_000_000, 100_000_000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := predicateRowCeiling(tt.est); got != tt.want {
+				t.Errorf("predicateRowCeiling(%d) = %d, want %d", tt.est, got, tt.want)
 			}
 		})
 	}
