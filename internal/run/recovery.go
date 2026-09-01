@@ -67,10 +67,15 @@ func DecideRecovery(f RecoveryFacts) RecoveryAction {
 // the CONTEXT_INFO marker must prefix the session's context_info. Identity is not
 // enough: a crashed process leaves a dangling idle connection whose session still
 // exists with the recorded signature but runs nothing, so the session must also
-// have a request in flight (id.Active). This assumes recovery runs against a
-// crashed prior run, never concurrently with a live SqlGoPace process — the only
-// case where our session is legitimately idle between requests (e.g. a shrink
-// between chunks); the tool does not support concurrent instances on one queue.
+// have a request in flight (id.Active).
+//
+// That last test only works against a crashed prior run. A live peer is legitimately
+// idle between requests — awaiting relief after a pressure pause, between shrink
+// chunks, between DML batches, between operations — and id.Active is false in every
+// one of those windows, so a concurrent run would read it as dead and requeue its
+// in-flight manifest. This used to be a documented assumption and nothing more.
+// LockQueue (lock.go) now enforces it: the lock is taken before the sweep, so a second
+// process never reaches this function.
 func matchesOrphan(id mssql.SessionIdentity, st State) bool {
 	if !id.Exists || !id.Active || id.LoginTime != st.LoginTime {
 		return false

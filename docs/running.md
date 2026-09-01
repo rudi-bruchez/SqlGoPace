@@ -29,6 +29,19 @@ recording every statement, decision and reaction.
 A run opens one engine per database the queue targets, sequentially, so at most one heavy
 DDL runs server-wide at a time.
 
+**One run per queue.** A run takes an exclusive lock on `02.processing/` and holds it until
+it exits; a second run against the same processing directory refuses to start and names the
+process holding it. This is not tidiness. Crash recovery sweeps `02.processing/` before
+anything is claimed, and decides an abandoned manifest is dead by looking for a running
+request on its session — which a *live* run does not have while it waits for relief, sits
+between shrink chunks, or moves between operations. Without the lock, a cron tick landing in
+one of those windows would requeue and re-run work that was still in flight.
+
+The lock is an OS file lock, so a run that is killed leaves nothing to clean up: the next
+run takes the lock and recovers normally. Only a queue on a filesystem that does not honour
+locks (an NFSv3 share) is unprotected. Two runs on *different* processing directories never
+interfere, whether or not they target the same database.
+
 ## Setting up a directory
 
 `init` writes everything a run needs into the current directory, or into `--dir`:

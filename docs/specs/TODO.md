@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.21.0 (2026-09-01).
+Status last verified against the tree at v0.22.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,8 +37,8 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1, 2, 3 and 8 are done; four remain.** Item 7 is
-hours; 4–6 are days.
+Ordered as the review ordered them. **1, 2, 3, 4 and 8 are done; three remain.** Item 7 is
+hours; 5 and 6 are days.
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
@@ -76,9 +76,24 @@ hours; 4–6 are days.
   That is deliberate — zero is provable and needs no invented threshold, and the warning
   puts the number in front of the operator, who is the only one who can judge whether it is
   the number they expected. Revisit only if a real manifest slips through.
-- [ ] **4. Add a queue lock file, taken before recovery** (finding 3). `matchesOrphan` needs a
-  row in `dm_exec_requests`, which a paused or between-chunks instance does not have, so a
-  second run requeues a live peer's in-flight manifest. Cron overlap is not exotic.
+- [x] **4. Add a queue lock file, taken before recovery** — done in 0.22.0.
+  `run.LockQueue` (`internal/run/lock.go`, with `lock_unix.go` / `lock_windows.go`) takes an
+  OS file lock on `02.processing/`, ahead of both `--auto` and `Recover()`, held for the run.
+  An **OS** lock rather than the `O_EXCL` file the review proposed, because the file would
+  survive a crash and refusing to start on a leftover would disable crash recovery at exactly
+  the moment it is needed; the kernel drops an OS lock when the process dies however it dies.
+  On Windows the lock is one byte at offset 2^32 rather than the whole file: Windows locks are
+  mandatory, so locking the holder line would make it unreadable and reduce the refusal to
+  "holder unknown".
+  *Left undone:* the lock is per processing directory, not per database. Two runs on separate
+  queues pointed at one database still cannot see each other, so they can still rebuild the
+  same index twice or kill each other through a `login_name` rule. Closing that needs a
+  server-side lock (`sp_getapplock`, session-scoped so SQL Server releases it on disconnect),
+  which is a different mechanism and a different decision — the recovery sweep, which is what
+  made this CATASTROPHIC, is directory-scoped and is now closed. The two remaining sub-harms
+  the review listed under finding 3 are separately actionable: `BlockerKiller` has no
+  self-exclusion (`internal/run/kill.go`) where `VictimKiller` does (`internal/run/victim.go`),
+  and that asymmetry is worth fixing on its own merits.
 - [ ] **5. Give `abort-resumable` a target and a confirmation** (finding 4). It selects from
   `sys.index_resumable_operations` with no `WHERE`, so one command aborts every colleague's
   paused index build, unrecoverably.

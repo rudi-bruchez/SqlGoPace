@@ -13,6 +13,26 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.22.0] - 2026-09-01
+
+### Added
+
+- A run now takes an exclusive lock on its `02.processing/` directory and holds it until it
+  exits; a second run against the same directory refuses to start and names the process
+  holding it. Concurrency was previously ruled out by a comment in `matchesOrphan` and
+  nothing else. Crash recovery sweeps `02.processing/` before anything is claimed and infers
+  that an abandoned manifest is dead from the absence of a running request on its session —
+  which is also true of a live run awaiting relief, between shrink chunks, between DML
+  batches, or between operations. A cron tick landing in one of those windows requeued a live
+  peer's in-flight manifest and ran it: two offline rebuilds of one index at best, and with
+  `abort_blocking_resumable` an `ALTER INDEX ... ABORT` against the peer's paused build, which
+  SQL Server documents as unresumable. The lock is an OS file lock, so a killed run leaves no
+  stale lock to clear by hand — which matters, because a crash is exactly when the next run
+  has recovery to do. A queue on a filesystem that does not honour locks (NFSv3) is not
+  protected, and two runs on different processing directories never interfere.
+  **Migration:** a deliberately overlapping setup — two schedules sharing one queue — will now
+  see the second run exit immediately rather than interleave. Give them separate
+  `directories.processing` values if the overlap was intended.
 ## [0.21.0] - 2026-09-01
 
 ### Fixed

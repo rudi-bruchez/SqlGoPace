@@ -219,6 +219,26 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		fmt.Fprintln(stdout, w)
 	}
 
+	dirs := run.Dirs{
+		ToRun:      cfg.Directories.ToRun,
+		Processing: cfg.Directories.Processing,
+		Done:       cfg.Directories.Done,
+		Failed:     cfg.Directories.Failed,
+	}
+	// One run per queue. Taken before recovery, which is the sweep that makes
+	// concurrency dangerous: it reconciles 02.processing/ — where a live peer's in-flight
+	// manifest sits — and infers liveness from a row in sys.dm_exec_requests, which a peer
+	// between statements does not have. Held for the whole run, since the same overlap
+	// also lets two instances rebuild one index twice, kill each other's sessions through
+	// a login rule, or ABORT each other's paused resumable. Ahead of --auto too: that
+	// writes generated manifests into the queue, and two instances doing it would
+	// materialize the same maintenance twice.
+	queueLock, err := run.LockQueue(dirs.Processing)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = queueLock.Release() }()
+
 	// --auto: analyze and materialize maintenance manifests into the queue before
 	// the engine processes it. Materializing (rather than running purely in memory)
 	// means a crash mid-run leaves recoverable manifests + sidecars, like any run.
@@ -226,13 +246,6 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		if err := runAuto(ctx, stdout, conn, cfg, auto); err != nil {
 			return err
 		}
-	}
-
-	dirs := run.Dirs{
-		ToRun:      cfg.Directories.ToRun,
-		Processing: cfg.Directories.Processing,
-		Done:       cfg.Directories.Done,
-		Failed:     cfg.Directories.Failed,
 	}
 
 	// Crash recovery: reconcile any manifests left in processing before starting.
