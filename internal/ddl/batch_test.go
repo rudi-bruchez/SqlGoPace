@@ -751,3 +751,43 @@ func TestBatchUnmatchedRowsSQL(t *testing.T) {
 		})
 	}
 }
+
+// The whole-table guard counts the rows an operation does NOT act on, and for a literal
+// batch_update that set includes the self-limiting clause: rows already at the target are
+// spared. Probing the user filter alone reported an idempotent update as a whole-table
+// rewrite, and the remedy the message offers — confirm_full_table: true — disables the
+// guard entirely, so a false positive trained operators to disarm a real protection.
+func TestBatchUnmatchedRowsCountsTheSelfLimit(t *testing.T) {
+	// where_raw: "1=1" spares no row by the filter alone, but the update only touches
+	// rows whose Archived is not already 1.
+	op := parseOneOp(t, `operations:
+  - operation: batch_update
+    schema: dbo
+    table: MEASUREMENT
+    set: { Archived: 1 }
+    where_raw: "1=1"
+`).(ddl.BatchDML)
+
+	got := ddl.BatchUnmatchedRowsSQL(op, 1000)
+	if !strings.Contains(got, "IS NULL OR [Archived] <> 1") {
+		t.Errorf("probe ignores the self-limiting clause, so an idempotent update reads as whole-table:\n%s", got)
+	}
+}
+
+// A key_range walk's statement carries no self-limiting clause — each key is processed
+// once — so the probe must not credit it with sparing rows the walk will in fact update.
+func TestBatchUnmatchedRowsKeyRangeUsesTheFilterAlone(t *testing.T) {
+	op := parseOneOp(t, `operations:
+  - operation: batch_update
+    schema: dbo
+    table: MEASUREMENT
+    set: { Archived: 1 }
+    where_raw: "1=1"
+    batch: { strategy: key_range }
+`).(ddl.BatchDML)
+
+	got := ddl.BatchUnmatchedRowsSQL(op, 1000)
+	if strings.Contains(got, "IS NULL OR") {
+		t.Errorf("key_range does not self-limit; the probe must not assume it does:\n%s", got)
+	}
+}

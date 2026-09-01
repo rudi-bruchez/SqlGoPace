@@ -368,3 +368,23 @@ func TestKillDDLConfirmShowsElapsedWork(t *testing.T) {
 		}
 	}
 }
+
+// kill_blockers.enabled gates the automatic killer only: the console's `x` has always
+// killed regardless, while the shipped config called the key a "master arm" and said
+// "kills only happen when true". The comment is now accurate, and the prompt says which
+// side of that line the operator is on, so a manual kill is visibly a manual kill.
+func TestKillConfirmSaysWhenTheAutomaticKillerIsDisarmed(t *testing.T) {
+	base := New("op", nil)
+	mo, _ := base.Update(BlockersMsg{Blockers: []Blocker{{SPID: 58, Login: "APP_USER", Host: "APP01", Program: "OrderEntry"}}})
+
+	disarmed, _ := mo.(Model).Update(KillerArmedMsg{Armed: false})
+	body := killConfirmBody(disarmed.(Model).blockers[0], disarmed.(Model).killerArmed)
+	if !strings.Contains(body, "manual") {
+		t.Errorf("with the automatic killer disarmed the prompt should say the kill is manual:\n%s", body)
+	}
+
+	armed, _ := mo.(Model).Update(KillerArmedMsg{Armed: true})
+	if b := killConfirmBody(armed.(Model).blockers[0], armed.(Model).killerArmed); strings.Contains(b, "manual") {
+		t.Errorf("with the automatic killer armed there is no override to report:\n%s", b)
+	}
+}

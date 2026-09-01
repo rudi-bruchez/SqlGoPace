@@ -179,22 +179,23 @@ type Engine struct {
 	resumeCheck      ResumableProbe
 	aborter          ResumableAborter // clears a blocking paused resumable (opt-in)
 	reconnectTimeout time.Duration
-	database         string                // when set, process only manifests for this database
-	liveReload       bool                  // re-read ignore_blocked_sessions from the manifest mid-run
-	killer           *BlockerKiller        // when set, kills matching blockers per kill_blocking_sessions
-	killDefaultAfter time.Duration         // default delay for a kill rule that sets none
-	victims          *VictimKiller         // when set, kills amplifying maintenance victims we block
-	victimPolicy     AmplifierPolicy       // the armed policy for that killer
-	asyncStats       AsyncStatsSetting     // ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY on the target
-	amplifierSink    func([]string)        // notified with the distinct conflicting jobs (TUI)
-	manifestObserver func(path string)     // notified of the in-flight manifest path (TUI editing)
-	holdPoll         time.Duration         // cadence for narrating held-through ignored sessions
-	stepSink         func(StepEvent)       // manifest-level per-operation progress (stdout + TUI)
-	opListSink       func([]OpInfo)        // full operation list, once per manifest (TUI operations panel)
-	alertSink        func(ManifestFailure) // notified when a manifest fails, so the TUI can show why
-	compression      CompressionReader     // reads current index compression for the intent: compression skip
-	drain            func() bool           // reports a requested graceful stop (cancellable DrainFlag)
-	serverClock      ServerClock           // reads SQL Server local time for manifest windows
+	database         string                      // when set, process only manifests for this database
+	liveReload       bool                        // re-read ignore_blocked_sessions from the manifest mid-run
+	killer           *BlockerKiller              // when set, kills matching blockers per kill_blocking_sessions
+	killDefaultAfter time.Duration               // default delay for a kill rule that sets none
+	victims          *VictimKiller               // when set, kills amplifying maintenance victims we block
+	victimPolicy     AmplifierPolicy             // the armed policy for that killer
+	asyncStats       AsyncStatsSetting           // ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY on the target
+	amplifierSink    func([]string)              // notified with the distinct conflicting jobs (TUI)
+	manifestObserver func(path string)           // notified of the in-flight manifest path (TUI editing)
+	holdPoll         time.Duration               // cadence for narrating held-through ignored sessions
+	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
+	opListSink       func([]OpInfo)              // full operation list, once per manifest (TUI operations panel)
+	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
+	compression      CompressionReader           // reads current index compression for the intent: compression skip
+	drain            func() bool                 // reports a requested graceful stop (cancellable DrainFlag)
+	serverClock      ServerClock                 // reads SQL Server local time for manifest windows
+	checkpoint       func(context.Context) error // issues a CHECKPOINT between operations; nil = disabled
 	out              io.Writer
 	failures         []ManifestFailure // accumulated across the run, surfaced in Summary
 }
@@ -311,6 +312,19 @@ func WithCompressionReader(r CompressionReader) EngineOption {
 // mid-operation. Because it is polled (not latched), a Cancel before the next check resumes
 // normal processing.
 func WithDrainSignal(fn func() bool) EngineOption { return func(e *Engine) { e.drain = fn } }
+
+// WithCheckpointBetweenOperations makes the engine issue a CHECKPOINT after each
+// operation that has another one behind it, backing the config key of the same name.
+// The caller supplies the statement and decides whether it is worth issuing at all: a
+// CHECKPOINT only releases log space under SIMPLE recovery, so the recovery-model gate
+// lives at the wiring site, where the server's model is known.
+//
+// The key shipped in config.yaml and was documented in four places while being read by
+// nothing — its struct field was its only appearance in the tree — so an operator who
+// set it believed the log was released between the operations of a long manifest.
+func WithCheckpointBetweenOperations(fn func(context.Context) error) EngineOption {
+	return func(e *Engine) { e.checkpoint = fn }
+}
 
 // WithExpander enables expanding "ALTER INDEX ALL" rebuilds into one rebuild per
 // concrete index. Without it, an ALL rebuild is run as a single statement.
@@ -613,8 +627,24 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if out := e.runStep(ctx, r, i, step); out != nil {
 			return *out
 		}
+		if i < len(planned)-1 {
+			e.checkpointBetween(ctx)
+		}
 	}
 	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps)
+}
+
+// checkpointBetween issues the configured CHECKPOINT between two operations. A failure
+// is reported and swallowed: a CHECKPOINT releases log space, it is not part of the work
+// the manifest was asked to do, so refusing one is no reason to fail a manifest whose
+// operations succeeded.
+func (e *Engine) checkpointBetween(ctx context.Context) {
+	if e.checkpoint == nil {
+		return
+	}
+	if err := e.checkpoint(ctx); err != nil {
+		fmt.Fprintf(e.out, "-- checkpoint between operations failed: %v (continuing)\n", err)
+	}
 }
 
 // manifestRun is the state one manifest carries across its operations: what the

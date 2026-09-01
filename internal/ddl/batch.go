@@ -220,9 +220,27 @@ func BatchDMLChunkSQL(o BatchDML, batchSize int, res ResolvedOptions) string {
 // It returns "" when there is no filter at all: that is whole-table by construction and
 // Validate already requires confirm_full_table for it, so there is nothing to probe.
 func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
-	where := o.userWhere()
-	if where == "" {
+	// Probe the predicate the operation will actually run, not just the operator's filter.
+	// For a literal batch_update that includes the self-limiting clause, so an idempotent
+	// update whose filter is deliberately broad (`where_raw: "1=1"`, `set: {Archived: 1}`)
+	// is credited with the rows already at the target — it was reported as a whole-table
+	// rewrite, and the remedy the failure names is confirm_full_table, which turns this
+	// check off. A false positive that teaches operators to disarm the guard is worse than
+	// no guard.
+	//
+	// key_range is the exception: its statement carries no self-limiting clause (each key
+	// is processed once), so crediting it with one would spare rows the walk does update.
+	// No filter at all stays outside this guard: that is whole-table by construction and
+	// Validate already requires confirm_full_table for it, so there is nothing to probe.
+	// The test for that is the operator's filter, not the effective predicate — a literal
+	// update always has a self-limiting clause, and treating it as a filter would make
+	// this probe the arbiter of a case Validate has already settled.
+	if o.userWhere() == "" {
 		return ""
+	}
+	where := o.userWhere()
+	if !o.Batch.IsKeyRange() {
+		where = o.predicateWhere()
 	}
 	return fmt.Sprintf(
 		"SELECT COUNT(*) FROM (SELECT TOP (%d) 1 AS c FROM %s WHERE CASE WHEN (%s) THEN 1 ELSE 0 END = 0) x;",

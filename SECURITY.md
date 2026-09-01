@@ -50,7 +50,7 @@ from typed manifest operations, and object identifiers are quoted and escaped.
 That is a deliberate design property, not an accident, and it is what makes the
 generated statement predictable.
 
-It is not a sandbox, and four fields are the reason.
+It is not a sandbox, and five fields are the reason.
 
 `set_raw` and `where_raw` on `batch_update` and `batch_delete` are interpolated
 into the generated statement verbatim. They are validated for shape (a raw `SET`
@@ -63,6 +63,15 @@ same way, and are checked less than that: `type` only for being non-empty,
 `data_compression` not at all — nothing restricts it to `NONE`, `ROW` or `PAGE`.
 They read like enumerations and are not, which is the likelier way to be
 surprised by them.
+
+The fifth is `default` on `add_column`, which reaches the DDL through the same
+literal renderer as a `where` value or a `set` target. A YAML string is quoted
+and a YAML date is quoted (since 0.27.0), so the exposure is narrow — but a
+number, and anything else YAML resolves to a non-string scalar, is emitted
+verbatim. It cannot carry a quoted injection, since a value containing a quote
+resolves to a string and is escaped; what it can carry is a spelling YAML and
+T-SQL disagree about, which generates a syntax error rather than a different
+query. See `docs/operations.md`, "How a scalar value becomes a T-SQL literal".
 
 So a manifest is a trusted input, equivalent in privilege to a script the
 connected login could run itself. Write access to the `to_run` directory is

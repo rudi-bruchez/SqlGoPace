@@ -425,3 +425,42 @@ func TestKillDelayAndLoginTimeoutDefault(t *testing.T) {
 		t.Errorf("Database.LoginTimeout() = %v, want 15s", got)
 	}
 }
+
+// The empty-entry trap was closed because "" is a prefix of every verb. A one- or
+// two-character entry is the same defect with a typo instead of a dangling item:
+// commands: ["S"] matches SELECT, turning a narrowly-scoped maintenance killer into
+// "kill any session we block". Nothing in T-SQL's maintenance vocabulary is that short.
+func TestAmplifyingCommandsRejectShortPrefixes(t *testing.T) {
+	base := `database:
+  connection_string: "server=x"
+directories: {to_run: a, processing: b, done: c, failed: d}
+monitoring:
+  blocking_poll_seconds: 10
+  log_poll_seconds: 60
+  progress_poll_seconds: 30
+  log_max_size_bytes: 1000
+  log_max_percent: 80
+matrix_file: m.yaml
+kill_amplifying_maintenance:
+  enabled: true
+  commands: [%s]
+`
+	for _, tt := range []struct {
+		entry   string
+		wantErr bool
+	}{
+		{`"S"`, true},
+		{`"AL"`, true},
+		{`"   S  "`, true},
+		{`"DBCC"`, false},
+		{`"ALTER INDEX"`, false},
+	} {
+		_, err := config.Parse([]byte(fmt.Sprintf(base, tt.entry)))
+		if tt.wantErr && err == nil {
+			t.Errorf("commands: [%s] parsed clean; a prefix that short matches unrelated verbs", tt.entry)
+		}
+		if !tt.wantErr && err != nil {
+			t.Errorf("commands: [%s] should be accepted, got %v", tt.entry, err)
+		}
+	}
+}

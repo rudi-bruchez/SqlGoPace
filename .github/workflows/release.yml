@@ -28,8 +28,13 @@ jobs:
       # ship binaries that report a version nobody can find. Cheaper to fail here
       # than to discover it in a support thread.
       - name: Check the tag matches VERSION
+        env:
+          # Bound through env rather than interpolated into the script: ${{ }} is expanded
+          # by the runner before bash parses the line, so an input containing shell
+          # metacharacters would become script rather than a value.
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           file="v$(cat internal/version/VERSION | tr -d '[:space:]')"
           if [ "$tag" != "$file" ]; then
             echo "tag $tag does not match internal/version/VERSION ($file)"; exit 1
@@ -90,8 +95,9 @@ jobs:
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
-          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else

@@ -78,6 +78,14 @@ As a backstop against a rule that turns out to be too broad, set
 `options.max_block_minutes: N` on an operation: after N minutes of continuous blocking it
 yields anyway, whatever the ignore rules say.
 
+**One operation is not covered: `shrink` of a log file.** The cap is enforced by the
+supervisor that wraps each chunk of a chunked operation, and a log shrink is a single
+unchunked `DBCC SHRINKFILE` — so `max_block_minutes` is read from the manifest and then has
+nothing to apply to. The same holds for the `TRUNCATEONLY` pass of a data shrink. Both are
+normally short, which is why this is a known gap rather than a fix in flight
+([`docs/specs/TODO.md`](specs/TODO.md)), but do not plan around a cap that will not fire
+there: use a manifest `window` if a log shrink must not run past a given time.
+
 ### Discovering who you blocked
 
 When the engine reacts to blocking it writes `<manifest>.blocked.yaml` next to the run
@@ -108,11 +116,20 @@ and appendable from the console with `x`, but nothing is ever killed unless the 
 allows it:
 
 ```yaml
-# config.yaml: the master arm. Off by default; killing a session is destructive.
+# config.yaml: arms the automatic killer. Off by default; killing a session is destructive.
 kill_blockers:
   enabled: true
   default_after_seconds: 60   # applied to a rule that sets no after_seconds
 ```
+
+**`enabled` governs the automatic killer, not the `KILL` statement.** It was described as a
+"master arm" whose absence meant "kills only happen when true", and that was never true of
+the console: the `--tui` `x` key kills the selected session by hand whatever this key says.
+It asks for confirmation first, and when the automatic killer is disarmed the prompt says
+so, so a manual kill is visibly a manual override rather than the policy acting. There is no
+setting that forbids a manual kill. If the tool must not be able to `KILL` at all on an
+instance, take the permission away: revoke `ALTER ANY CONNECTION` from its login, which
+preflight already reports as a warning.
 
 ```yaml
 # the manifest: who may be killed, and after how long they have blocked us

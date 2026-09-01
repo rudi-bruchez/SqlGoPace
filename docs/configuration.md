@@ -55,7 +55,7 @@ armed in your copy without you having asked for it.
 | `history` | Optional SQLite run history. |
 | `shrink` | Tuning for the shrink driver. |
 | `batch_dml` | Tuning for the batched-DML driver. |
-| `kill_blockers` | Arms killing the sessions that block us. Off by default. |
+| `kill_blockers` | Arms the *automatic* killing of the sessions that block us. Off by default. The `--tui` console can still kill by hand, with a confirmation. |
 | `kill_amplifying_maintenance` | Arms killing maintenance sessions we block. Off by default. |
 | `matrix_file` | Path to `ddl_compatibility.yaml`, resolved relative to the config. |
 
@@ -97,7 +97,7 @@ when a scheduler launches the binary from somewhere else than you do.
 | `max_retry_attempts` | 0 | Retries after a *pressure cancel* only. A failing statement is not retried. |
 | `kill_grace_seconds` | 30 | Grace between cancelling a statement and the fallback `KILL`. |
 | `reconnect_timeout_minutes` | 2 | How long to try to re-establish a lost monitoring connection. |
-| `checkpoint_between_operations` | false | Issue a `CHECKPOINT` between operations. |
+| `checkpoint_between_operations` | false | Issue a `CHECKPOINT` after each operation that has another behind it. Only under SIMPLE recovery, where a `CHECKPOINT` releases log space; under FULL or BULK_LOGGED it frees nothing, so the run warns at startup and issues none. A failed `CHECKPOINT` is reported and does not fail the manifest. |
 
 A poll interval of zero is rejected rather than accepted as a spin loop.
 
@@ -287,7 +287,9 @@ Also optional, same reasoning.
 
 ## `kill_blockers` and `kill_amplifying_maintenance`
 
-Both are off by default and both need `ALTER ANY CONNECTION`. They kill in opposite
+Both are off by default and both need `ALTER ANY CONNECTION`. Each arms an *automatic*
+killer; neither is a lock on the `KILL` statement, which the `--tui` console can still issue
+by hand after a confirmation. They kill in opposite
 directions and are covered together in
 [`blocking-and-kills.md`](blocking-and-kills.md), which is the page to read before
 enabling either.

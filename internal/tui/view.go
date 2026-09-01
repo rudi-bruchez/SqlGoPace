@@ -423,14 +423,22 @@ func (m Model) waitsBody() string {
 // nothing we are waiting for — it only discards that session's work. The open
 // transaction count is the part an operator most needs and least has: killing a session
 // mid-transaction rolls it back.
-func killConfirmBody(bl Blocker) string {
+// killerArmed reports whether config has armed the automatic blocker killer. That key
+// gates the policy, never this key: the console has always been able to kill by hand, so
+// the prompt says which side of the line the operator is on rather than leaving a manual
+// override indistinguishable from the armed policy acting.
+func killConfirmBody(bl Blocker, killerArmed bool) string {
 	txn := "no open transaction"
 	if bl.OpenTransactions > 0 {
 		txn = fmt.Sprintf("%d open transaction(s) — killing rolls them back", bl.OpenTransactions)
 	}
+	policy := ""
+	if !killerArmed {
+		policy = "; kill_blockers is off in config, so this is a manual override"
+	}
 	return alertStyle.Render(fmt.Sprintf(
-		"kill SPID %d (%s on %s, app %s)? it is waiting on us, so this frees nothing; %s   [y] kill  [any] cancel",
-		bl.SPID, bl.Login, bl.Host, bl.Program, txn))
+		"kill SPID %d (%s on %s, app %s)? it is waiting on us, so this frees nothing; %s%s   [y] kill  [any] cancel",
+		bl.SPID, bl.Login, bl.Host, bl.Program, txn, policy))
 }
 
 // killDDLConfirmBody is the prompt behind the `k` key. A bare "are you sure?" would be
@@ -476,7 +484,7 @@ func (m Model) killDDLConfirmBody() string {
 // suspension history to review — so the footer never advertises a no-op.
 func (m Model) helpBody() string {
 	if m.mode == modeKillConfirm && m.cursor < len(m.blockers) {
-		return killConfirmBody(m.blockers[m.cursor])
+		return killConfirmBody(m.blockers[m.cursor], m.killerArmed)
 	}
 	if m.mode == modeKillDDLConfirm {
 		return m.killDDLConfirmBody()

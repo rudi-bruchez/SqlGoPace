@@ -217,22 +217,33 @@ evidence about CWE-89 here.
   map `true`/`false` to `1`/`0`) but it buys a better error message, not safety.
   `docs/operations.md` now documents the behaviour in its scalar-conversion table.
 
-- [ ] **The rest of the 2026-09-01 harm review is unaddressed** —
-  [REVIEW-2026-09-01-harm.md](REVIEW-2026-09-01-harm.md), untracked, alongside this file. F0 (the
-  unbounded `key_range` UPDATE) is fixed in v0.26.0; F3 (unquoted dates as arithmetic) in
-  v0.27.0; F1 (the unconfirmed TUI kill of our own DDL) in v0.28.0. Still open, in the
-  review's own ranking: F2 (quitting the console neither stops the run nor says so), F4
-  (`checkpoint_between_operations` is parsed, documented in four places, and read by nothing),
-  F5 (the TUI kills with `kill_blockers.enabled: false`, which the shipped config calls the
-  master arm), F6 (`max_block_minutes` excludes `shrink_log`, said only in
-  `CLAUDE.md`/`CHANGELOG.md`/`TODO.md` and not in the operator docs).
-  *Note:* everything left is a case of the documentation being more reassuring than the code,
-  not of the code destroying work. F4 and F5 are the two where an operator could believe a
-  protection is in place that is not; take those next. Fixing F1 also turned up a `p`
-  ("pause the operation") key documented in `docs/running.md` that has never existed in the
-  tree — the same class, found only because the fix touched that table. The other key tables
-  (`docs/blocking-and-kills.md`, `docs/llm-operator-guide.md`) have not been audited against
-  `handleKey` and should be.
+- [x] **The 2026-09-01 harm review is closed** —
+  [REVIEW-2026-09-01-harm.md](REVIEW-2026-09-01-harm.md), untracked, alongside this file.
+  F0 (unbounded `key_range` UPDATE) v0.26.0; F3 (unquoted dates as arithmetic) v0.27.0;
+  F1 (unconfirmed TUI kill of our own DDL) v0.28.0; F2, F4, F5, F6 and the minor items
+  v0.29.0. Two of its minor items were **not** taken, below.
+
+- [ ] **SHA-pin the GitHub Actions.** `semgrep` flags seven mutable action tags
+  (`actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`) across
+  `ci.yml` and `release.yml`. A mutable tag means the workflow runs whatever that tag points
+  at on the day it runs.
+  *Deferred because:* pinning needs the commit SHA of each action at a known-good release,
+  and `gh` is not installed in the environment this was reviewed from — guessing a SHA
+  breaks CI outright, which is worse than the exposure. Resolve them with
+  `gh api repos/actions/checkout/git/ref/tags/v7 --jq .object.sha` (and the same for the
+  other two), pin as `uses: actions/checkout@<sha> # v7`, and let Dependabot bump them.
+
+- [ ] **The remaining `0644` writes and `0755` directories.** v0.29.0 tightened the three
+  capture sidecars to `0600` because they carry other sessions' identities and SQL text.
+  `gosec` also flags the run report (`internal/report/report.go`), the recovery manifest
+  (`internal/run/engine.go`), the scaffold's files (`internal/scaffold/scaffold.go`), the
+  planner's output (`cmd/sqlgopace/plan.go`, `shrink_plan.go`) and the queue directories
+  (`internal/run/queue.go`, `lock.go`).
+  *Deferred because:* those are the operator-facing artifacts. A `.log` a colleague reads,
+  a manifest a second person reviews before it runs, and a queue directory a scheduler
+  writes into are all workflows `0600`/`0700` would break, and the review found no
+  third-party data in them that the capture sidecars do not already hold. Decide it as a
+  deployment question (umask, directory ACLs) rather than by hard-coding a mode.
 
 - [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
   `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and

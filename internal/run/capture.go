@@ -141,7 +141,10 @@ func (e *Engine) flushCapture(name string, acc *blockerCapture) {
 		return
 	}
 	path := filepath.Join(e.dirs.Processing, name+blockedCaptureSuffix)
-	if err := os.WriteFile(path, renderCapture(name, acc), 0o644); err != nil {
+	// 0600, not 0644: this sidecar names other people's sessions — login, host, application
+	// and the text of the statement they were running. On a shared administrative host that
+	// is third-party data, readable by every local user at 0644.
+	if err := os.WriteFile(path, renderCapture(name, acc), 0o600); err != nil {
 		fmt.Fprintf(e.out, "write blocked-session capture %s: %v\n", name, err)
 	}
 }

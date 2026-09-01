@@ -98,11 +98,16 @@ batch_dml:
 # match a manifest's kill_blocking_sessions rule are KILLed once they have blocked for the
 # rule's delay (after_seconds; 0 = on sight). Killing is destructive, so it is OFF by
 # default; preflight WARNS (does not fail) if the login lacks ALTER ANY CONNECTION. The
-# match rules live per-manifest (hot-reloadable; the TUI's "X" key appends to them without a
+# match rules live per-manifest (hot-reloadable; the blocker roster arms them without a
 # restart). This is finer-grained than allow_abort_blockers, works on every edition, and —
 # unlike WAIT_AT_LOW_PRIORITY — needs no SQL 2022.
 kill_blockers:
-  enabled: false               # master arm; kills only happen when true
+  # Arms the AUTOMATIC killer only. It is not a lock on the KILL statement: the --tui
+  # console's "x" key kills the selected session by hand whatever this says, after a
+  # confirmation that tells the operator the key is off and the kill is a manual override.
+  # There is no setting that forbids a manual kill; use the login's permissions for that
+  # (revoke ALTER ANY CONNECTION).
+  enabled: false
   default_after_seconds: 60    # delay applied to a rule that sets no after_seconds
 
 # Terminate maintenance statements this run's operation blocks once other sessions

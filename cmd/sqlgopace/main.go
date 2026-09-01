@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
@@ -215,6 +216,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
+	if w := checkpointIneffectiveWarning(cfg, info.RecoveryModel); w != "" {
+		fmt.Fprintln(stdout, w)
+	}
 	if w := amplifierDwellWarning(cfg); w != "" {
 		fmt.Fprintln(stdout, w)
 	}
@@ -313,6 +317,11 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	defer cancelRun()
 	drain := &run.DrainFlag{}
 	sigCh := make(chan os.Signal, 2)
+	// The interrupt messages were suppressed for the whole run under --tui, to keep them
+	// off the alternate screen. But the console can close while the run continues (`q`),
+	// and that is exactly when the operator needs to be told what Ctrl+C just did. Track
+	// whether the console is on screen instead of whether it was ever asked for.
+	var consoleLive atomic.Bool
 	signal.Notify(sigCh, os.Interrupt)
 	defer signal.Stop(sigCh)
 	go func() {
@@ -321,14 +330,14 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			return
 		case <-sigCh:
 			drain.Request()
-			if !useTUI {
+			if !consoleLive.Load() {
 				fmt.Fprintln(stdout, "-- interrupt: draining — pausing a running resumable now (resumes next run) or finishing a non-resumable op, then stopping (Ctrl+C again to abort now)")
 			}
 		}
 		select {
 		case <-runCtx.Done():
 		case <-sigCh:
-			if !useTUI {
+			if !consoleLive.Load() {
 				fmt.Fprintln(stdout, "-- interrupt: stopping now")
 			}
 			cancelRun()
@@ -386,7 +395,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var sum run.Summary
 		if useTUI {
 			banner := serverBanner(dbInfo, matrix)
-			sum, err = runWithTUI(runCtx, dbConn, engine, current, fwd, drain, banner, cfg.KillBlockers.Enabled, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
+			sum, err = runWithTUI(runCtx, stdout, &consoleLive, dbConn, engine, current, fwd, drain, banner, cfg.KillBlockers.Enabled, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
@@ -649,6 +658,14 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	if killOpt != nil {
 		opts = append(opts, killOpt)
 	}
+	// CHECKPOINT between operations, when the operator asked for it and the model makes it
+	// do something. Keyed off this database's info, not the startup connection's, so a
+	// multi-database run does not apply one database's recovery model to another.
+	if checkpointBetweenOperations(cfg, info.RecoveryModel) {
+		opts = append(opts, run.WithCheckpointBetweenOperations(func(cctx context.Context) error {
+			return conn.ExecDDL(cctx, "CHECKPOINT;")
+		}))
+	}
 	if fwd != nil {
 		opts = append(opts, run.WithOpListSink(fwd.ops)) // operations panel (TUI only)
 	}
@@ -789,7 +806,7 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, killerArmed bool, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, killerArmed bool, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", actions))
 	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
@@ -811,10 +828,6 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 	// connection under a still-running statement.
 	engineCtx, cancelEngine := context.WithCancel(ctx)
 	defer cancelEngine()
-	type result struct {
-		summary run.Summary
-		err     error
-	}
 	done := make(chan result, 1)
 	go func() {
 		summary, err := engine.ProcessAll(engineCtx)
@@ -822,12 +835,43 @@ func runWithTUI(ctx context.Context, conn *mssql.Conn, engine *run.Engine, curre
 		program.Quit() // close the console when the run finishes
 	}()
 
+	consoleLive.Store(true)
 	runErr := program.Run()
+	consoleLive.Store(false) // the alternate screen is gone: stdout is safe to write again
 	if runErr != nil {
 		cancelEngine() // console died first: stop ProcessAll from touching the connection
 	}
+	// The console closing does not stop the run, and until 0.29.0 it did not say so: `q`
+	// (and ctrl+c, which bubbletea reads as a key in raw mode, not as a signal) tore down
+	// the alternate screen and left the process blocked below on a DDL that was still
+	// executing, with engine narration going to io.Discard. The operator got a blank
+	// prompt. Say what is happening, and only when it is actually still happening.
+	// The receive must not be consumed here: done is buffered once, so taking the value in
+	// this select and receiving again below would block forever.
+	var r result
+	select {
+	case r = <-done:
+		return summaryOf(r, runErr)
+	default:
+		if runErr == nil {
+			fmt.Fprintln(stdout, "-- console closed; the run continues in the background (Ctrl+C to drain, twice to stop now)")
+		}
+	}
 	// Always wait for the engine goroutine to return before the caller closes the connection.
-	r := <-done
+	r = <-done
+	return summaryOf(r, runErr)
+}
+
+// result is what the engine goroutine hands back to runWithTUI: it is a package type
+// rather than a local one so summaryOf can be shared by the two receive paths.
+type result struct {
+	summary run.Summary
+	err     error
+}
+
+// summaryOf renders the run's outcome, letting a console failure win over the engine's
+// own result: if the terminal died we cannot trust what the operator saw.
+func summaryOf(r result, runErr error) (run.Summary, error) {
 	if runErr != nil {
 		return run.Summary{}, runErr
 	}

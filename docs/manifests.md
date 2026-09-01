@@ -116,7 +116,8 @@ options:
 
 The last two are reaction-policy overrides rather than T-SQL. `ignore_blocking` holds the
 lock through any blocking instead of yielding; `max_block_minutes` is the backstop that
-yields anyway after N minutes. Both are covered in
+yields anyway after N minutes — except on a log shrink and a `TRUNCATEONLY` pass, which run
+as one unchunked statement with no supervisor to enforce it. Both are covered in
 [`blocking-and-kills.md`](blocking-and-kills.md).
 
 Note that some combinations are refused by the server, not by us, and the resolver drops

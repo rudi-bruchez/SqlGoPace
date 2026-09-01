@@ -52,6 +52,11 @@ func (k KillBlockersConfig) DefaultAfter() time.Duration {
 	return time.Duration(k.DefaultAfterSeconds) * time.Second
 }
 
+// minCommandPrefix is the shortest kill_amplifying_maintenance.commands entry that can be
+// meant seriously. The list is prefix-matched and the built-in vocabulary's shortest verb
+// is "DBCC", so anything below this is a typo that would widen the policy silently.
+const minCommandPrefix = 4
+
 // KillAmplifyingMaintenanceConfig arms the kill of maintenance statements our
 // operation blocks that have other sessions queued behind them. Top-level, as a
 // sibling of kill_blockers: that is the mirror-direction feature, and monitoring:
@@ -464,14 +469,21 @@ func (c *Config) validate() error {
 		return fmt.Errorf("batch_dml.min_rows (%d) must be <= max_rows (%d): %w",
 			c.BatchDML.MinRows, c.BatchDML.MaxRows, ErrInvalidConfig)
 	}
-	// An entry that is empty after trimming would be a prefix of every command verb,
-	// turning the allow-list into "kill every session we block" — including application
-	// SELECTs and open user transactions. A dangling YAML item is the easy way to write
-	// one, so refuse to start rather than run with a silently widened policy.
+	// The list is prefix-matched, so a short entry silently widens the policy. An entry
+	// that is empty after trimming is a prefix of every command verb, turning the
+	// allow-list into "kill every session we block" — including application SELECTs and
+	// open user transactions — and a dangling YAML item is the easy way to write one.
+	// A typo is the other way: "S" matches SELECT just as completely. Nothing in the
+	// maintenance vocabulary this list describes is shorter than "DBCC", so refuse to
+	// start rather than run with a silently widened policy.
 	for i, cmd := range c.KillAmplifyingMaintenance.Commands {
-		if strings.TrimSpace(cmd) == "" {
+		switch n := len(strings.TrimSpace(cmd)); {
+		case n == 0:
 			return fmt.Errorf("kill_amplifying_maintenance.commands[%d] is empty; remove the entry or name a command verb: %w",
 				i, ErrInvalidConfig)
+		case n < minCommandPrefix:
+			return fmt.Errorf("kill_amplifying_maintenance.commands[%d] is %q; the list is prefix-matched, so an entry shorter than %d characters matches unrelated verbs (%q would match SELECT). Name the verb in full: %w",
+				i, strings.TrimSpace(cmd), minCommandPrefix, strings.TrimSpace(cmd), ErrInvalidConfig)
 		}
 	}
 	if e := c.Notifications.Email; e.Host != "" {

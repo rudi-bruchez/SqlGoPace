@@ -13,6 +13,68 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.29.0] - 2026-09-01
+
+### Added
+
+- `monitoring.checkpoint_between_operations` now does what it has always claimed. The field
+  was parsed, documented in four places, and read by nothing — its struct declaration was its
+  only appearance in the tree — so an operator under SIMPLE recovery who set it believed the
+  log was being released between the operations of a long manifest. The engine now issues a
+  `CHECKPOINT` after each operation that has another behind it. It is applied only under
+  SIMPLE recovery, where a `CHECKPOINT` frees log space; under FULL or BULK_LOGGED the run
+  warns at startup that the key will do nothing rather than ignoring it silently. A failed
+  `CHECKPOINT` is reported and does not fail the manifest.
+
+### Fixed
+
+- Closing the `--tui` console no longer leaves the run invisible. `q` (and Ctrl+C, which
+  bubbletea reads as a key, not a signal) tore down the alternate screen and left the process
+  blocked on a DDL that was still executing, with engine output going to `io.Discard`: the
+  operator got a blank prompt and no indication anything was running. It now says the run
+  continues, and the interrupt messages — suppressed for the whole run under `--tui` to keep
+  them off the console — are suppressed only while the console is actually on screen, which
+  is when they were needed most.
+- `kill_amplifying_maintenance.commands` rejects an entry shorter than four characters. The
+  list is prefix-matched, and the empty-entry trap was already closed for that reason, but a
+  typo does the same damage: `commands: ["S"]` matches `SELECT`, turning a narrowly-scoped
+  maintenance killer into "kill any session we block". The shortest verb in the built-in list
+  is `DBCC`.
+- The whole-table guard no longer fails an idempotent `batch_update`. It counted rows spared
+  by the operator's filter alone, so `where_raw: "1=1"` with `set: {Archived: 1}` — which
+  only touches rows not already at the target — was reported as a whole-table rewrite. The
+  remedy that failure names is `confirm_full_table: true`, which disables the guard, so a
+  false positive taught operators to disarm a real protection. The probe now uses the
+  predicate the operation actually runs, except under `key_range`, whose statement carries no
+  self-limiting clause.
+- Blocked-session, contended-tail and amplifier capture sidecars are written `0600` instead of
+  `0644`. They name other people's sessions — login, host, application, and the text of the
+  statement they were running — which on a shared administrative host was readable by every
+  local user.
+- The `go` directive moves to 1.26.6, clearing four reachable standard-library
+  vulnerabilities that `govulncheck` reported against 1.26.5 (GO-2026-6090, GO-2026-5972,
+  GO-2026-5026, and one in `net/url`). **Migration:** building from source now needs Go
+  1.26.6; released binaries were already built on the latest 1.26.x.
+- `release.yml` binds the release tag through `env:` instead of interpolating
+  `${{ github.event.inputs.tag }}` into a shell script, where the runner expands it before
+  bash parses the line.
+
+### Changed
+
+- `kill_blockers.enabled` is documented as what it is: the arm for the **automatic** killer,
+  not a lock on the `KILL` statement. The shipped config called it a "master arm" and said
+  "kills only happen when true", which was never true of the console — the `--tui` `x` key
+  has always killed by hand. The confirmation now says when the automatic killer is disarmed,
+  so a manual kill reads as the manual override it is. To stop the tool killing at all on an
+  instance, revoke `ALTER ANY CONNECTION` from its login.
+- The operator-facing pages now carry the `max_block_minutes` exception. The cap does not
+  apply to a log shrink or a `TRUNCATEONLY` pass, which run as one unchunked statement with
+  no supervisor to enforce it. That was stated only in `CLAUDE.md`, `CHANGELOG.md` and
+  `docs/specs/TODO.md`; `docs/blocking-and-kills.md` and `docs/manifests.md` promised the cap
+  without qualification.
+- `SECURITY.md` counts five verbatim-interpolated fields, not four: `add_column`'s `default`
+  reaches the DDL through the same literal renderer as a `where` value.
+
 ## [0.28.0] - 2026-09-01
 
 ### Fixed
