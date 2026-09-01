@@ -13,6 +13,31 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.26.0] - 2026-09-01
+
+### Fixed
+
+- `batch.strategy: key_range` now requires the clustered key to be **unique**, and refuses the
+  table otherwise. A batch covers the key range `(watermark, next]`, where `next` is the
+  batch-size-th smallest matching key, and the generated `UPDATE` carries no `TOP`: the range
+  holds `batch_rows` rows only when one key means one row. The clustered-key read selected
+  `sys.indexes.index_id = 1` without reading `is_unique`, and SQL Server does not require a
+  clustered index to be unique — so on `CREATE CLUSTERED INDEX IX ON T(EventId)` one batch
+  could update every row sharing an `EventId`, in a single transaction. That escalates to a
+  table X lock at 5,000 locks and is what batching exists to prevent; `escalation_cap_rows` did
+  not constrain it, because it sizes the boundary scan, not the UPDATE. `docs/specs/BATCH-DML.md`
+  specified the uniqueness requirement from the start; nothing enforced it.
+  **Migration:** a `key_range` manifest against a table whose clustered index is not unique now
+  fails preflight-style at the driver with a message naming the key. Switch it to
+  `strategy: predicate`, which is bounded by `UPDATE TOP (n)`.
+- `batch.key` no longer bypasses the composite-key guard. The guard lived only in the branch
+  that *inferred* the key, so naming `batch.key` skipped it — and the inference error read
+  "specify a single integer batch.key", which on a `(TenantId, Id)` clustered key sends the
+  operator to the most duplicated column in the table. Both branches are now one path, and the
+  message points at the `predicate` strategy instead. **Migration:** `batch.key` now asserts
+  which column the clustered key is rather than selecting among several; naming a column that
+  is not the clustered key is an error.
+
 ## [0.25.0] - 2026-09-01
 
 ### Fixed

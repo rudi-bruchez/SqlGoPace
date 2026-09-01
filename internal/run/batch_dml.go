@@ -318,34 +318,44 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 	}
 }
 
-// resolveKeyColumn determines the key_range key: the explicit batch.key, else the
-// table's single clustered key column. This iteration supports only a single integer
-// key (composite or non-integer keys use the predicate strategy instead).
+// resolveKeyColumn determines the key_range key: the table's clustered key column,
+// with batch.key — when given — asserting which column that is. This iteration supports
+// only a single, integer, *unique* clustered key; everything else uses the predicate
+// strategy.
+//
+// Uniqueness is the bound, and it is not optional. A batch's range is
+// (watermark, next], where next is the batchSize-th smallest matching key, and
+// BatchKeyRangeUpdateSQL carries no TOP of its own: the range holds batchSize rows only
+// if one key means one row. On a non-unique clustered index — `CREATE CLUSTERED INDEX
+// … ON T(EventId)`, ordinary for an event table — MAX of the first batchSize keys can
+// span millions of rows, and the single UPDATE escalates to a table lock and blows up
+// the log. The batching would be nominal.
+//
+// The three tests below used to be arranged so that naming batch.key skipped the
+// composite one entirely, and the composite error told the operator to name a
+// batch.key — which on a (TenantId, Id) key selects the most duplicated column in the
+// table. Both branches are now one path, so there is nothing to route around.
 func (r *BatchDMLRunner) resolveKeyColumn(ctx context.Context, op ddl.BatchDML) (string, error) {
 	cols, err := r.reader.ClusteringKeyColumns(ctx, op.Schema, op.Table)
 	if err != nil {
 		return "", err
 	}
-	if op.Batch.Key != "" {
-		for _, c := range cols {
-			if strings.EqualFold(c.Name, op.Batch.Key) {
-				if !c.IsInteger {
-					return "", fmt.Errorf("key_range: key %q is not an integer column (this iteration supports integer keys only)", op.Batch.Key)
-				}
-				return c.Name, nil
-			}
-		}
-		return "", fmt.Errorf("key_range: key %q is not the clustered key of %s.%s (this iteration requires the key to be the clustered/PK key)", op.Batch.Key, op.Schema, op.Table)
-	}
 	switch {
 	case len(cols) == 0:
-		return "", fmt.Errorf("key_range: %s.%s has no clustered key; specify batch.key or use the predicate strategy", op.Schema, op.Table)
+		return "", fmt.Errorf("key_range: %s.%s has no clustered key; use the predicate strategy", op.Schema, op.Table)
 	case len(cols) > 1:
-		return "", fmt.Errorf("key_range: %s.%s has a composite clustered key; specify a single integer batch.key or use the predicate strategy", op.Schema, op.Table)
-	case !cols[0].IsInteger:
-		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not an integer (this iteration supports integer keys only)", cols[0].Name, op.Schema, op.Table)
+		return "", fmt.Errorf("key_range: %s.%s has a composite clustered key, whose leading column repeats across rows; use the predicate strategy", op.Schema, op.Table)
 	}
-	return cols[0].Name, nil
+	key := cols[0]
+	switch {
+	case op.Batch.Key != "" && !strings.EqualFold(op.Batch.Key, key.Name):
+		return "", fmt.Errorf("key_range: key %q is not the clustered key of %s.%s (that is %q); use the predicate strategy", op.Batch.Key, op.Schema, op.Table, key.Name)
+	case !key.IsInteger:
+		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not an integer (this iteration supports integer keys only)", key.Name, op.Schema, op.Table)
+	case !key.IsUnique:
+		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not unique, so one batch's key range can cover any number of rows; use the predicate strategy", key.Name, op.Schema, op.Table)
+	}
+	return key.Name, nil
 }
 
 // opCaps builds the reaction capabilities shared by both strategies. A batch is

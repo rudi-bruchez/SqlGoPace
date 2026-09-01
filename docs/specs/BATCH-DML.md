@@ -79,7 +79,7 @@ operations:
       - { column: Status, op: '=', value: 'Pending' }
     batch:
       strategy: predicate                # predicate (default) | key_range
-      key: OrderID                       # required for key_range only; defaults to the clustering key
+      key: OrderID                       # key_range only; asserts the clustering key, which it defaults to
       initial_rows: 5000                 # optional; auto-calibrated otherwise
     options:
       maxdop: 1                          # the only "WITH" option applicable to DML
@@ -154,6 +154,19 @@ Rules:
   file), not in the same transaction as the SQL → resume is **at-least-once** on the
   boundary batch. So key_range is only offered **for an idempotent SET** (literal `set:`), where
   re-applying the boundary batch is a no-op.
+
+  **The "unique" in that first line is load-bearing, and was unenforced until v0.26.0.**
+  `BatchKeyRangeUpdateSQL` emits no `TOP`: the range `(cursor, next]` holds `batch_rows`
+  rows only when one key means one row. `sys.indexes.index_id = 1` selects the clustered
+  index, which SQL Server does not require to be unique, so a clustered index on a
+  repeating column let one batch cover an unbounded number of rows — a single UPDATE
+  escalating to a table X lock, which is the outcome this whole design exists to avoid.
+  `resolveKeyColumn` now reads `i.is_unique` and refuses the table. The alternative
+  considered and rejected was bounding the statement with `UPDATE TOP (n)`: alone it
+  silently skips rows the watermark then advances past, and with a re-run-until-zero loop
+  it fails to terminate whenever the filter is not self-limiting (`confirm_full_table`
+  with no `where`) — the v0.20.0 non-termination class, reintroduced. Uniqueness bounds
+  the range exactly, with neither failure mode.
 - **Non-idempotent `set_raw`** is allowed but **marked non-resumable**: the op runs without a
   resume point, and a crash mid-run leaves the table partially updated for **manual
   reconciliation** (recorded in the `.log`). The MVP does **not** attempt exactly-once for this
@@ -295,7 +308,9 @@ DML batch is not resumable in the SQL sense. Useful reactions between/during bat
   (`indexes.go`); add an `UPDATE`/`DELETE` permission probe on the table (see preflight).
 - **`internal/preflight/preflight.go`** — `CheckBatchDML`: table exists (reused), `set` columns
   exist + types compatible (reuse `ColumnExists`, add a type check),
-  `batch.key` exists & is unique for `key_range`, **UPDATE/DELETE permission** on the table, whole-table
+  `batch.key` exists & is unique for `key_range` (**moved**: this landed in the driver's
+  `resolveKeyColumn`, not in preflight — it needs the clustered-key read the walk already does,
+  and enforcing it in one place beats two), **UPDATE/DELETE permission** on the table, whole-table
   guard, **WARN** on FK reference / DELETE trigger, and the RCSI advisory. (The database-/file-scoped
   skip logic is unchanged; `batch_*` ops are schema.table-scoped so they take the normal
   existence path.)

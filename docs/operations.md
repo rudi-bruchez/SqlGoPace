@@ -238,8 +238,8 @@ waits each batch produced.
 | `set_raw` | A raw `SET` list, interpolated verbatim. See the warning below. |
 | `where` | A list of conditions, AND-ed. Operators: `=`, `<>` (or `!=`), `<`, `<=`, `>`, `>=`, `is null`, `is not null`. The two NULL tests take no `value`; every other operator requires one. |
 | `where_raw` | A raw predicate, interpolated verbatim. Mutually exclusive with `where`. |
-| `batch.strategy` | `predicate` re-runs the same filter until it matches nothing. `key_range` walks a key column and persists a watermark, so a crash resumes mid-table. |
-| `batch.key` | The key column, for `key_range`. |
+| `batch.strategy` | `predicate` re-runs the same filter until it matches nothing. `key_range` walks a key column and persists a watermark, so a crash resumes mid-table. It requires a **single-column, unique, integer clustered key** — see below. |
+| `batch.key` | The key column, for `key_range`. It asserts which column that is rather than choosing: there is only ever one candidate, so naming a different one is an error. |
 | `batch.initial_rows` | Starting batch size. Auto-sized when omitted. |
 | `confirm_full_table` | Required whenever the filter spares no row — including a filter that is written but excludes nothing. Without it the manifest is rejected. |
 
@@ -251,6 +251,13 @@ Three rules the parser enforces, each closing a way to lose data or hang:
   would loop forever. It is rejected; give it a self-limiting `where_raw`.
 - The `key_range` walk persists a watermark and re-applies the boundary batch on a resume,
   so it is restricted to an idempotent literal `UPDATE`.
+- The `key_range` key must be the table's clustered key, a single integer column, and
+  **unique**. A batch covers the key range `(watermark, next]`, where `next` is the
+  batch-size-th smallest matching key, and the `UPDATE` carries no row limit of its own —
+  so the batch holds `batch_rows` rows only when one key means one row. A clustered index
+  is not required to be unique: on `CREATE CLUSTERED INDEX IX ON T(EventId)` a single
+  batch could cover every row sharing one `EventId`. Such a table is refused with a
+  message pointing at the `predicate` strategy, which is bounded by `TOP (n)` instead.
 
 The parser can only see whether a filter was *written*. Preflight checks whether it
 **excludes anything**, by asking the server how many rows the filter would spare (counted up

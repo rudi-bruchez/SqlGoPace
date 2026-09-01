@@ -316,7 +316,7 @@ func TestBatchDMLRCSIOnGrowsPastCap(t *testing.T) {
 }
 
 func TestBatchDMLKeyRangeWalksAndPersists(t *testing.T) {
-	s := &fakeKeyServer{maxKey: 25000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true}}}
+	s := &fakeKeyServer{maxKey: 25000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true, IsUnique: true}}}
 	store := &memWatermark{}
 	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
 
@@ -340,7 +340,7 @@ func TestBatchDMLKeyRangeWalksAndPersists(t *testing.T) {
 
 func TestBatchDMLKeyRangeResumes(t *testing.T) {
 	// A crash left the walk at key 20000 of 25000; the run resumes from the watermark.
-	s := &fakeKeyServer{maxKey: 25000, walkPos: 20000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true}}}
+	s := &fakeKeyServer{maxKey: 25000, walkPos: 20000, keyCols: []mssql.KeyColumn{{Name: "Id", IsInteger: true, IsUnique: true}}}
 	store := &memWatermark{loadVal: 20000, loadOK: true}
 	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
 
@@ -359,6 +359,58 @@ func TestBatchDMLKeyRangeRejectsNonIntegerKey(t *testing.T) {
 
 	if _, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, &memWatermark{}, discard); err == nil {
 		t.Fatalf("Run() error = nil, want an error for a non-integer key")
+	}
+}
+
+// A key_range range is (watermark, next], where next is the batchSize-th smallest key.
+// That bounds the UPDATE at batchSize rows only if the key is unique: with duplicates,
+// MAX of the first batchSize keys can cover far more rows than batchSize, and the
+// statement carries no TOP of its own. So a non-unique clustered key must be refused.
+func TestBatchDMLKeyRangeRejectsNonUniqueKey(t *testing.T) {
+	s := &fakeKeyServer{maxKey: 100, keyCols: []mssql.KeyColumn{{Name: "EventId", IsInteger: true}}}
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	_, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, &memWatermark{}, discard)
+	if err == nil {
+		t.Fatalf("Run() error = nil, want an error for a non-unique clustered key")
+	}
+	if !strings.Contains(err.Error(), "not unique") {
+		t.Errorf("error = %q, want it to name the missing uniqueness", err)
+	}
+}
+
+// The composite guard lived only in the inference branch, so naming batch.key skipped
+// it — and the inference error told the operator to do exactly that. The leading column
+// of a composite key is duplicated by construction, which is the unbounded case above.
+func TestBatchDMLKeyRangeRejectsExplicitKeyOnCompositeKey(t *testing.T) {
+	s := &fakeKeyServer{maxKey: 100, keyCols: []mssql.KeyColumn{
+		{Name: "TenantId", IsInteger: true, IsUnique: true},
+		{Name: "Id", IsInteger: true, IsUnique: true},
+	}}
+	op := keyRangeOp()
+	op.Batch.Key = "TenantId"
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, &memWatermark{}, discard); err == nil {
+		t.Fatalf("Run() error = nil, want an error for an explicit key on a composite clustered key")
+	}
+}
+
+// The remediation text must not route the operator into the case the guard exists to
+// stop: naming a column of a composite key is the unbounded walk, not the way out of it.
+func TestBatchDMLKeyRangeCompositeErrorDoesNotRecommendNamingAKey(t *testing.T) {
+	s := &fakeKeyServer{maxKey: 100, keyCols: []mssql.KeyColumn{
+		{Name: "TenantId", IsInteger: true, IsUnique: true},
+		{Name: "Id", IsInteger: true, IsUnique: true},
+	}}
+	r := newBatchRunner(s, s, NewManualClock(time.Unix(0, 0)), true)
+
+	_, err := r.Run(context.Background(), keyRangeOp(), ddl.ResolvedOptions{}, nil, &memWatermark{}, discard)
+	if err == nil {
+		t.Fatalf("Run() error = nil, want an error for a composite clustered key")
+	}
+	if strings.Contains(err.Error(), "batch.key") {
+		t.Errorf("error = %q, must not tell the operator to name a batch.key on a composite key", err)
 	}
 }
 

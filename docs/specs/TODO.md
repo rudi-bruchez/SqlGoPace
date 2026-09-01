@@ -196,6 +196,29 @@ evidence about CWE-89 here.
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **The `key_range` uniqueness check runs in the driver, not preflight.** v0.26.0 put it in
+  `BatchDMLRunner.resolveKeyColumn` (`internal/run/batch_dml.go`), where the clustered-key read
+  the walk already performs is to hand. The cost is that the manifest has already been moved to
+  `02.processing/` before it is refused, so a table that can never be walked this way fails as a
+  run rather than as a rejected plan.
+  *Deferred because:* it matches where the sibling checks (non-integer key, composite key,
+  missing clustered key) already live, so moving one without the others would split the rule
+  across two packages. `internal/preflight` would need its own `ClusteringKeyColumns` read.
+  Move all four together, or none.
+
+- [ ] **The rest of the 2026-09-01 harm review is unaddressed** —
+  [REVIEW-2026-09-01-harm.md](REVIEW-2026-09-01-harm.md), untracked, alongside this file. F0 (the
+  unbounded `key_range` UPDATE) is fixed in v0.26.0. Still open, in the review's own ranking:
+  F1 (TUI `k` kills the running DDL on one unconfirmed keystroke, while the less harmful `x` was
+  given a confirmation in v0.24.0), F3 (an unquoted YAML date reaches T-SQL as bare arithmetic,
+  silently changing which rows a `batch_delete` matches), F2 (quitting the console neither stops
+  the run nor says so), F4 (`checkpoint_between_operations` is parsed, documented in four places,
+  and read by nothing), F5 (the TUI kills with `kill_blockers.enabled: false`, which the shipped
+  config calls the master arm), F6 (`max_block_minutes` excludes `shrink_log`, said only in
+  `CLAUDE.md`/`CHANGELOG.md`/`TODO.md` and not in the operator docs).
+  *Note on F3:* it is the cheapest of them — one line in `Literal.UnmarshalYAML` — and the only
+  one whose failure is silent data loss with no error to investigate afterwards. Take it next.
+
 - [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
   `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and
   `rebuild_heap`. Two separate problems, found while verifying the Standard-edition warning

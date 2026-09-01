@@ -1010,8 +1010,12 @@ func (c Condition) validate() error {
 
 // BatchSpec configures how a batch_update/batch_delete is chunked.
 type BatchSpec struct {
-	Strategy    string `yaml:"strategy"`     // "" or "predicate" (key_range is planned for a later iteration)
-	Key         string `yaml:"key"`          // key column for key_range; unused by the predicate strategy
+	Strategy string `yaml:"strategy"` // "" or "predicate", or "key_range"
+	// Key names the key_range key. It asserts rather than selects: the walk requires a
+	// single-column unique integer clustered key, so there is only ever one candidate,
+	// and naming a different column is an error rather than a choice. Unused by the
+	// predicate strategy.
+	Key         string `yaml:"key"`
 	InitialRows *int   `yaml:"initial_rows"` // optional starting batch size; auto-sized when nil
 }
 

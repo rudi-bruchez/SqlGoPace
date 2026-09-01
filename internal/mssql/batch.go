@@ -32,11 +32,17 @@ func (c *Conn) TableRowEstimate(ctx context.Context, schema, table string) (int6
 type KeyColumn struct {
 	Name      string
 	IsInteger bool
+	// IsUnique is the clustered index's own uniqueness, repeated on each of its key
+	// columns. It is a property of the index, not of the column, but the key_range
+	// walk only ever asks it of a single-column key, and carrying it here keeps
+	// ClusteringKeyColumns to one return value.
+	IsUnique bool
 }
 
 const clusteringKeyColumnsSQL = `
 SELECT c.name,
-       CASE WHEN c.system_type_id IN (48, 52, 56, 127) THEN 1 ELSE 0 END  -- tinyint/smallint/int/bigint
+       CASE WHEN c.system_type_id IN (48, 52, 56, 127) THEN 1 ELSE 0 END, -- tinyint/smallint/int/bigint
+       i.is_unique
 FROM sys.indexes i
 JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
@@ -46,8 +52,10 @@ WHERE i.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
 ORDER BY ic.key_ordinal;`
 
 // ClusteringKeyColumns returns the clustered-index key columns of [schema].[table]
-// in key order. It is empty for a heap (no clustered index); the batch-DML driver
-// uses it to infer and type-check a key_range key.
+// in key order, each carrying the index's uniqueness. It is empty for a heap (no
+// clustered index); the batch-DML driver uses it to infer, type-check and bound a
+// key_range key. A clustered index is not required to be unique, and the walk is only
+// row-bounded when it is — see resolveKeyColumn.
 func (c *Conn) ClusteringKeyColumns(ctx context.Context, schema, table string) ([]KeyColumn, error) {
 	rows, err := c.pool.QueryContext(ctx, clusteringKeyColumnsSQL,
 		sql.Named("schema", schema), sql.Named("table", table))
@@ -59,7 +67,7 @@ func (c *Conn) ClusteringKeyColumns(ctx context.Context, schema, table string) (
 	var cols []KeyColumn
 	for rows.Next() {
 		var k KeyColumn
-		if err := rows.Scan(&k.Name, &k.IsInteger); err != nil {
+		if err := rows.Scan(&k.Name, &k.IsInteger, &k.IsUnique); err != nil {
 			return nil, fmt.Errorf("scan key column: %w", err)
 		}
 		cols = append(cols, k)
