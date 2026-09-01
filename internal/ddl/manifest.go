@@ -910,7 +910,7 @@ type Shrink struct {
 	Files              string          `yaml:"files"`                          // "all" | logical file name; defaults to "all"
 	EmptyFile          bool            `yaml:"emptyfile,omitempty"`            // reserved for Phase 2; must be false in v1
 	TargetFreeSpace    string          `yaml:"targetfreespace"`                // raw "10%" | "100MB"; parsed by ParseTargetFreeSpace
-	Options            OptionOverrides `yaml:"options"`                        // only WaitAtLowPriority is relevant
+	Options            OptionOverrides `yaml:"options"`                        // WaitAtLowPriority, plus MaxBlockMinutes as the reaction-policy safety cap
 	IdentifyTailObject bool            `yaml:"identify_tail_object,omitempty"` // run the tail-object walk at shrink start
 }
 

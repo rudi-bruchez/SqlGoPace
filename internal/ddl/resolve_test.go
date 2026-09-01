@@ -298,6 +298,44 @@ func TestResolveShrinkAbortBlockers(t *testing.T) {
 	}
 }
 
+// A shrink's per-operation max_block_minutes is the safety cap the driver applies on top of
+// ignore_blocked_sessions: yield after this long even if the blocker is allow-listed. It must
+// survive Resolve, because ShrinkRunner.runChunk reads it (blockCap(res.MaxBlockMinutes)) and
+// a dropped value silently means "no cap" — an allow-listed session could then block the
+// shrink without bound.
+func TestResolveShrinkMaxBlockMinutes(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{
+		Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%",
+		Options: ddl.OptionOverrides{MaxBlockMinutes: intPtr(10)},
+	}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard}
+
+	got, _ := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.MaxBlockMinutes != 10 {
+		t.Errorf("Resolve(shrink).MaxBlockMinutes = %d, want 10", got.MaxBlockMinutes)
+	}
+}
+
+// --explain must show the cap, as it does for index DDL and batch DML. Without the decision
+// an operator has no way to confirm the cap took effect, which is how it went unnoticed that
+// a shrink dropped it entirely.
+func TestResolveShrinkMaxBlockMinutesDecision(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{
+		Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%",
+		Options: ddl.OptionOverrides{MaxBlockMinutes: intPtr(10)},
+	}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard}
+
+	_, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if v, ok := decisionValue(decisions, "max_block_minutes"); !ok || v != "10" {
+		t.Errorf("decision[max_block_minutes] = %q (ok=%t), want 10", v, ok)
+	}
+}
+
 func TestResolveShrinkTempdbAlwaysSelf(t *testing.T) {
 	m := resolveMatrix()
 	// 2022 tier where WALP is supported, with AllowAbortBlockers ON: tempdb must

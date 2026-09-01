@@ -15,6 +15,19 @@ Status last verified against the tree at v0.17.0 (2026-09-01).
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **A shrink still ignores `options.ignore_blocking`.** Fixed alongside it in v0.18.0:
+  `max_block_minutes`, which `resolveShrink` (`internal/ddl/resolve.go:231`) dropped the same
+  way. `IgnoreBlocking` remains unresolved there, and even resolving it would change nothing
+  today, because `ShrinkRunner.runChunk` (`internal/run/shrink.go:708`) builds
+  `Capabilities{CancelSafe: true, MaxBlock: …}` and leaves `IgnoreBlocking` false. So it is a
+  two-part gap, not the one-line sibling of the v0.18.0 fix.
+  *Deferred because:* it is not obviously wanted. `ignore_blocking: true` means "hold the lock
+  through **everyone**", which is a far larger commitment for a chunked shrink running for hours
+  than for one index rebuild, and a shrink already has the safer, more precise
+  `ignore_blocked_sessions` allow-list. Decide whether a shrink should be able to hold through
+  *unnamed* sessions at all before wiring it — and if the answer is no, delete the override from
+  `Shrink.Options`'s reachable surface rather than leaving a key that parses and does nothing.
+
 - [ ] **A batch DML cut short by the supervisor retries at the same size.**
   `internal/run/batch_dml.go:204` and `:279` — when `runBatch` returns `stopped`, the loop calls
   `handleStop` and `continue`s, skipping `AdjustBatchRows` entirely. So a batch that was cut short

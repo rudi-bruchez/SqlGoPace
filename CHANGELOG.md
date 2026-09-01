@@ -13,6 +13,40 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.18.0] - 2026-09-01
+
+### Fixed
+
+- A shrink now honours `options.max_block_minutes`. `resolveShrink` built its
+  `ResolvedOptions` from the `WAIT_AT_LOW_PRIORITY` decision alone and never read
+  the override, so the value was parsed, validated, documented and then dropped
+  before it reached the runner. `ShrinkRunner.runChunk` read it as
+  `blockCap(res.MaxBlockMinutes)` and therefore always saw 0, which means *no
+  cap*. The generic DDL path and `resolveBatchDML` both resolved it correctly;
+  only the shrink path did not. Applies to `shrink_data`, `shrink_log` and
+  `shrink_tempdb`, which share the one resolver.
+
+  **This is a safety cap, so read it as a behaviour change, not a tidy-up.** The
+  cap is what bounds an *allow-listed* blocker: `ignore_blocked_sessions` lets a
+  named session stay blocked indefinitely, and `max_block_minutes` is the backstop
+  for the case where one of those sessions turns out to hold a transaction.
+  Until now a shrink with an ignore list had no backstop at all — the combination
+  `docs/llm-operator-guide.md` calls mandatory ("Any ignore rule needs one") and
+  the one the maintenance planner emits by default
+  (`docs/maintenance-planner.md`). A manifest that sets the key gets a cap it did
+  not previously have, so a long-running shrink that was quietly tolerating an
+  allow-listed blocker will now yield at the configured minute.
+
+  Note for anyone re-reading the 0.17.0 entry below: its mention of "a chunk cut
+  short for blocking other sessions past `max_block_minutes`" describes a path
+  that could not fire for a shrink at the time it was written. Chunks were still
+  cut short for *non*-ignored blockers via `monitoring.blocking_timeout_minutes`,
+  which is what that fix actually observed.
+
+- `--explain` now reports the shrink's `max_block_minutes`, as it already did for
+  index DDL and batch DML. The decision trail is how an operator confirms a cap
+  took effect, and its absence is why the dropped value went unnoticed.
+
 ## [0.17.0] - 2026-09-01
 
 ### Fixed
