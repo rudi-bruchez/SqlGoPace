@@ -25,14 +25,58 @@ Until now its entire production track record is its author's. Two things gate th
   note that `shrink` is slow, fragments indexes, and is rarely the right answer to a full
   disk.
 
-- [ ] **Adversarial production-danger review (in progress, 2026-09-01).** An independent
-  fresh-agent review at maximum effort, scoped to one question: what in this tool can block,
-  harm, corrupt or take down a stranger's production server. It reasons from the **shipped
-  defaults** rather than from what a careful expert would configure, because the threat model
-  is a DBA who ran `sqlgopace init`, edited the connection string, and did not read every
-  config key.
-  *Exit condition:* every CATASTROPHIC and SEVERE finding is fixed, or documented as an
-  accepted risk with the reasoning, before the tool is advertised. Findings land here.
+- [x] **Adversarial production-danger review — done 2026-09-01.** 22 findings, four
+  CATASTROPHIC. Full evidence in
+  [2026-09-01-production-harm-review.md](2026-09-01-production-harm-review.md); it is a
+  historical record and is not updated as items are fixed.
+  **Verdict: not responsible to advertise as-is.** The theme is not code quality — the review
+  is complimentary about that — it is that **the shipped defaults and the documentation
+  disagree about what is armed, and several guards the docs name as protections do not
+  protect.** A stranger calibrates their caution from the README, and that calibration is
+  currently wrong in the dangerous direction.
+
+### The eight that gate advertising
+
+Ordered as the review ordered them. Items 1, 7 and 8 are hours; 2–6 are days.
+
+- [ ] **1. `kill_blockers.enabled: false`** in `config.yaml` and the scaffold twin (finding 6).
+  Ships `true` while five documents and the comment six lines above it say it is off.
+- [ ] **2. `batch_update` can loop forever, committing** (finding 1). `set: {Col: null}`
+  generates `WHERE ([Col] IS NULL OR [Col] <> null)` (`internal/ddl/batch.go:93`); `<> null`
+  is `UNKNOWN`, so every updated row re-enters the match set. The clause written to guarantee
+  termination guarantees non-termination. Needs the null-literal fix **and** an absolute
+  iteration ceiling. The only finding that corrupts data with no bound at all.
+- [ ] **3. Make the whole-table DELETE guard semantic** (finding 2). `confirm_full_table` is a
+  presence check on a YAML key, so `where_raw: "1=1"` walks past it with no row-count preview.
+  Alternatively drop batched DML from the advertised feature set until it is fixed.
+- [ ] **4. Add a queue lock file, taken before recovery** (finding 3). `matchesOrphan` needs a
+  row in `dm_exec_requests`, which a paused or between-chunks instance does not have, so a
+  second run requeues a live peer's in-flight manifest. Cron overlap is not exotic.
+- [ ] **5. Give `abort-resumable` a target and a confirmation** (finding 4). It selects from
+  `sys.index_resumable_operations` with no `WHERE`, so one command aborts every colleague's
+  paused index build, unrecoverably.
+- [ ] **6. Fix the TUI `x` / `X` semantics** (finding 5). `blockerGate.persistent`
+  (`cmd/sqlgopace/main.go:841`) filters `s.BlockedBy(ddlSPID)` — sessions **our DDL is
+  blocking**, i.e. victims — and feeds them to the TUI as "blockers". `x` kills one on a single
+  keystroke, unconfirmed, ungated by `kill_blockers`, with no amplifier test; `X` then writes
+  the rule into `kill_blocking_sessions`, which structurally can never match a victim. This is
+  the direction error `docs/blocking-and-kills.md` uses as its own cautionary tale.
+- [ ] **7. Report a stopped-short batch as incomplete, not done** (finding 8). Reuse the shrink
+  path; today a half-finished purge is filed as complete and made unresumable.
+- [ ] **8. Correct the false claims** in `README.md` ("no raw SQL is ever accepted or executed"
+  — there are four verbatim-interpolated fields), `SECURITY.md` (admits two of them), and
+  `docs/configuration.md` (the shipped-vs-default table says "three places" and lists two,
+  omitting `kill_blockers` and `max_retry_attempts`).
+
+**Two to name in the README even if not fixed**, because an operator who knows can work around
+them and one who does not cannot: nothing anywhere reads `sys.dm_os_volume_stats`, so free space
+on the actual disk is never checked (finding 7); and on Standard edition the only reaction rung
+left is `Cancel`, so a one-minute block rolls back a 50-minute offline rebuild while holding
+`Sch-M` (finding 10).
+
+The remaining fourteen findings are legitimate "known limitation, documented honestly" — a
+defensible posture for beta software **provided the documentation actually says so**, which is
+what item 8 is for.
 
 ## Follow-ups deferred from shipped work
 
