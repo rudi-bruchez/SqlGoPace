@@ -15,82 +15,46 @@ history, so a report can always name the build that produced it.
 
 ## [0.18.0] - 2026-09-01
 
+### Fixed
+
+- A shrink now honours `options.max_block_minutes`. `resolveShrink` never read the
+  override, so the value was parsed, validated and then dropped: `runChunk` saw
+  `blockCap(0)`, which means no cap. The generic DDL path and batched DML resolved it
+  correctly; only the shrink path did not. This is the backstop that bounds an
+  allow-listed blocker, so a shrink carrying an `ignore_blocked_sessions` list had no
+  backstop at all, and one that quietly tolerated such a blocker will now yield at the
+  configured minute. Covers `shrink_data`, `shrink_log` and `shrink_tempdb`, which share
+  the resolver. The 0.17.0 entry below describes a chunk "cut short for blocking other
+  sessions past `max_block_minutes`"; that path could not fire, and the chunks it observed
+  were cut short by `monitoring.blocking_timeout_minutes`.
+- `--explain` reports a shrink's `max_block_minutes`, as it already did for index DDL and
+  batched DML. Its absence is why the dropped value went unnoticed.
+
 ### Added
 
-- **A `file growth` preflight check.** Autogrowth settings were never read anywhere in the
-  tool; now they are, from `sys.database_files`, on every run. It is advisory and never
-  fails a manifest. It warns when a data file grows by a **percentage** — the increment
-  scales with the file, and Microsoft's guidance is a fixed number of megabytes — naming
-  what one growth event would cost at the file's current size, because 10% of a 14 TB file
-  is a 1.4 TB blocking allocation. It also warns when a data file has autogrowth
-  **disabled** and the manifest contains a shrink, which is the combination that hands back
-  space the file cannot reclaim.
-
-  There is deliberately no "increment too large" warning: Microsoft's own guidance is
-  inconsistent on the threshold, so the check reports the increment and leaves the
-  judgement to the operator.
-
-- `preflight.require_data_free_space` now does what it has always claimed to do. A rebuild
-  materializes the new index before dropping the old one, so it needs roughly the object's
-  own size free; the check sums the database's `ROWS` file free space and compares it
-  against each `rebuild_index` / `rebuild_heap` target sized from
-  `sys.dm_db_partition_stats`. The peak requirement is the largest single rebuild, not the
-  sum, because each releases its temporary copy before the next begins. An object whose
-  size cannot be read reports 0 and never fails a run. `create_index` is not checked — the
-  index does not exist yet, so there is nothing to size.
-
-  Autogrowth counts as headroom: `max_size − size` is added to the free space before the
-  verdict, and a file that grows until the disk fills can never be proven short. Those
-  cases warn rather than pass silently, since the growth is a blocking zero-fill unless
-  instant file initialization applies. Only a rebuild that can neither fit nor grow fails.
+- `preflight.require_data_free_space` is implemented. It sizes each `rebuild_index` /
+  `rebuild_heap` target from `sys.dm_db_partition_stats` and compares it against the
+  database's `ROWS` free space plus `max_size - size`: a rebuild builds the new index
+  before dropping the old, so it needs roughly the object's own size. The peak requirement
+  is the largest single rebuild, not their sum. An unreadable size never fails a run, and
+  `create_index` is not checked because it cannot be sized before it exists. A rebuild
+  that fits only by growing warns rather than passes, since the growth is a blocking
+  zero-fill without instant file initialization.
+- A `file growth` preflight check, advisory and never fatal. It warns on percentage
+  autogrowth, naming what one event costs at the file's current size, and on a data file
+  that cannot grow when the manifest contains a shrink. There is deliberately no
+  "increment too large" warning: Microsoft's guidance contradicts itself on the threshold,
+  so the increment is reported and the judgement left to the operator.
 
 ### Removed
 
-- **`preflight.check_tempdb` and `preflight.ag_send_queue_warn` are gone.** Neither ever
-  did anything. All three `preflight` keys were parsed into `PreflightConfig` and then read
-  by nothing: no tempdb-space check and no Availability Group send-queue check existed
-  anywhere in `internal/preflight`, while `docs/configuration.md` described both as working
-  and the shipped `config.yaml` set both to `true`. `require_data_free_space` has been
-  implemented rather than removed (above); the other two are deleted rather than left as
-  promises.
-
-  **Migration:** configuration is parsed with `KnownFields(true)`, so a `config.yaml` still
-  carrying either key **fails to load** with `field check_tempdb not found`. Delete the two
-  lines. Nothing is lost — they never had an effect. If you relied on the *documented*
-  behaviour of either, note that you never had it; `docs/specs/TODO.md` tracks the tempdb
-  guard as unstarted work, corrected there from a claim that it was partially covered.
-
-### Fixed
-
-- A shrink now honours `options.max_block_minutes`. `resolveShrink` built its
-  `ResolvedOptions` from the `WAIT_AT_LOW_PRIORITY` decision alone and never read
-  the override, so the value was parsed, validated, documented and then dropped
-  before it reached the runner. `ShrinkRunner.runChunk` read it as
-  `blockCap(res.MaxBlockMinutes)` and therefore always saw 0, which means *no
-  cap*. The generic DDL path and `resolveBatchDML` both resolved it correctly;
-  only the shrink path did not. Applies to `shrink_data`, `shrink_log` and
-  `shrink_tempdb`, which share the one resolver.
-
-  **This is a safety cap, so read it as a behaviour change, not a tidy-up.** The
-  cap is what bounds an *allow-listed* blocker: `ignore_blocked_sessions` lets a
-  named session stay blocked indefinitely, and `max_block_minutes` is the backstop
-  for the case where one of those sessions turns out to hold a transaction.
-  Until now a shrink with an ignore list had no backstop at all — the combination
-  `docs/llm-operator-guide.md` calls mandatory ("Any ignore rule needs one") and
-  the one the maintenance planner emits by default
-  (`docs/maintenance-planner.md`). A manifest that sets the key gets a cap it did
-  not previously have, so a long-running shrink that was quietly tolerating an
-  allow-listed blocker will now yield at the configured minute.
-
-  Note for anyone re-reading the 0.17.0 entry below: its mention of "a chunk cut
-  short for blocking other sessions past `max_block_minutes`" describes a path
-  that could not fire for a shrink at the time it was written. Chunks were still
-  cut short for *non*-ignored blockers via `monitoring.blocking_timeout_minutes`,
-  which is what that fix actually observed.
-
-- `--explain` now reports the shrink's `max_block_minutes`, as it already did for
-  index DDL and batch DML. The decision trail is how an operator confirms a cap
-  took effect, and its absence is why the dropped value went unnoticed.
+- `preflight.check_tempdb` and `preflight.ag_send_queue_warn`. Neither ever did anything:
+  all three `preflight` keys were parsed into `PreflightConfig` and read by nothing, while
+  `docs/configuration.md` described them as working and the shipped `config.yaml` set them
+  to `true`. Configuration is parsed with `KnownFields(true)`, so a `config.yaml` still
+  carrying either key fails to load with `field check_tempdb not found` — delete the two
+  lines. `docs/specs/TODO.md` tracked the tempdb guard as partially covered on the strength
+  of the phantom key, and is corrected to unstarted.
 
 ## [0.17.0] - 2026-09-01
 

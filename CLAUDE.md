@@ -85,6 +85,13 @@ mandatory for monitoring).
   `config.yaml` **plus its embedded twin** `internal/scaffold/assets/config.yaml`, which a test
   pins byte-for-byte. When a default or a semantic changes, say so as a migration note: an
   operator whose `config.yaml` sets the old value explicitly needs to be told to revisit it.
+- **Write CHANGELOG entries sober and short.** One bullet per change, a few lines, in the style
+  of the `0.16.0` section: what changed, the symptom or mechanism that made it wrong, and what
+  an operator must do. No sub-paragraphs under a bullet, no bold headings inside one, no essay
+  on the reasoning — that belongs in the spec or the commit message. Facts earn their space
+  (a message number, a symbol, a measured figure); restating the docs or explaining why a
+  decision was hard does not. A migration note is the one thing never to cut: if a config or
+  manifest stops loading, say so and name the key.
   Two categories are deliberately **not** updated: the raw AI research dumps
   (`docs/specs/gemini-shrink.md`, `docs/specs/shrink-reference-perplexity.md`) and the
   implementation plans (`docs/specs/*-IMPL.md`, `docs/specs/superpowers/`), which are historical
