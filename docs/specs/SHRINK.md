@@ -273,9 +273,32 @@ Adjustment between chunks, on **deltas** (never the cumulative values of
 `sys.dm_os_wait_stats`):
 
 - **Reduce** (`step/2`, bounded by `minStep`) if: `WRITELOG` avg > 10 ms, or
-  `PAGEIOLATCH_EX` avg > 20 ms, or blocking of other sessions > 30 s.
-- **Increase** (`step*2`, bounded by `maxStep`) if: I/O latencies < 5 ms, no significant
-  wait, low `log_space_since_backup`, and `elapsed < targetBatchDuration`.
+  `PAGEIOLATCH_EX` avg > 20 ms, or the supervisor stopped the chunk (it was blocking others
+  past `max_block_minutes`, or the log was over cap).
+- **Hold** if the chunk reached `targetBatchDuration`. That value is a **ceiling on growth,
+  never a target**: a chunk longer than it is not corrected downward.
+- **Increase** (`step * 5/4`, bounded by `maxStep`) otherwise — that is, whenever the chunk
+  was not expensive. Growth is deliberately *not* also gated on near-idle latency.
+
+The increase is additive-ish against a multiplicative decrease (AIMD) on purpose: recovering
+one halving costs `log2 / log1.25 ≈ 3.1` clean chunks, so the loop trends upward while pressure
+is rarer than about one chunk in three, and settles below the pressure threshold otherwise.
+
+> **Superseded (v0.17.0).** Until then, increase required *both* `latency < 5 ms` **and**
+> `elapsed < targetBatchDuration`. A multi-GB chunk takes minutes and `target_batch_seconds`
+> defaulted to 5, so the second condition was unsatisfiable and every reduction was permanent:
+> the step walked down to `minStep`, where the fixed per-invocation cost of `DBCC SHRINKFILE`
+> dominates the work done. The gap between the 5 ms grow ceiling and the 10/20 ms reduce floors
+> froze the step for any shrink living in between — which a shrink, being itself an I/O
+> generator, usually does. `blocking of other sessions > 30 s` was never wired: `waitDeltas`
+> never populated it. The `stopped` flag replaces it with something the supervisor measured.
+>
+> A residual, deliberate bound remains: a reduction is recoverable only while the resulting
+> chunk finishes inside the ceiling. Above it the step holds where it landed, so the descent
+> stops at "the step that takes about the ceiling" rather than at `minStep`.
+>
+> The full diagnosis, the alternatives weighed and rejected, and the TDD plan are recorded in
+> [shrink-stepsize-aimd.md](shrink-stepsize-aimd.md).
 
 ### 7.3 Proposed defaults (`shrink:` block in `config.yaml`)
 
@@ -286,13 +309,29 @@ shrink:
   initial_step_large_mb:  500   # > 50 GB
   min_step_mb:             50    # below this, per-loop overhead dominates the gain
   max_step_mb:           1024    # cap so we don't saturate the I/O in one go
-  target_batch_seconds:     5    # an "ideal" chunk lasts a few s → snappy reactions
+  max_chunk_seconds:      300    # ceiling on chunk duration: stops growth, never shrinks a step
   max_no_progress:          3    # consecutive chunks without gain before a clean stop
   no_progress_backoff_seconds:      30   # wait before retry, doubled on each no-progress
   no_progress_backoff_max_seconds: 300   # backoff cap (5 min)
   self_wait_timeout_minutes: 5   # max wait on Sch-M / snapshot before a clean stop (§8.2)
   log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free the log (§5.2)
 ```
+
+The knob was called `target_batch_seconds` and defaulted to 5 s while the original rationale held
+— short chunks meant short reaction latency, because the driver could only react at a chunk
+boundary. That is no
+longer how it works: `runChunk` supervises the statement while it runs, `pumpServerProgress`
+re-emits the server's own `percent_complete`, and the `max_block_minutes` cap applies *inside*
+the chunk. A long chunk is therefore neither blind nor unstoppable, and shrink work is preserved
+and re-entrant at any point. What is left of the knob is a growth ceiling, and 5 s was three
+orders of magnitude away from the volume-based sizing `target_chunks` performs (1000 chunks × 5 s
+= 83 min total, not a plausible budget for a multi-TB reclaim). Hence **300 s** from v0.17.0.
+
+Because the meaning inverted, the key was renamed to **`max_chunk_seconds`** rather than
+redefined in place: `KnownFields(true)` then rejects a config still carrying the old key, so an
+operator who had pinned `target_batch_seconds: 5` learns at load time instead of silently
+keeping the pre-fix behaviour (defaults only fill *absent* keys). `batch_dml` keeps its own
+`target_batch_seconds`, where a duration objective is still the right one.
 
 `log_reuse_wait_timeout_minutes` defaults to 30 min: room for one or two cycles of a common
 log backup cadence (~15 min). The wait is free (the shrink hasn't started) and emits a

@@ -192,7 +192,7 @@ shrink:
   max_step_pct_of_file:        5  # per-file ceiling, as a percent of the file (0 disables)
   min_step_mb:                50  # floor: below this, per-loop overhead dominates
   max_step_mb:              8192  # absolute ceiling: do not saturate I/O in one move
-  target_batch_seconds:        5  # aim each chunk at a few seconds, for vivid reactions
+  max_chunk_seconds:         300  # ceiling on chunk duration: stops growth, never shrinks a step
   max_no_progress:             3  # consecutive no-gain chunks before stopping cleanly
   no_progress_before_flush:    2  # no-progress events before the tempdb cache flush
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk, doubling
@@ -204,6 +204,27 @@ shrink:
 `target_chunks` is what sizes the first chunk: the driver divides the space to reclaim by
 it. The three `initial_step_*_mb` keys are the previous, tiered model and are consulted
 only when `target_chunks` is set to zero or less.
+
+From there the step is adjusted between chunks: halved when the chunk cost the server too
+much (WRITELOG or PAGEIOLATCH_EX past their thresholds, or the supervisor stopping the chunk
+because it was blocking others), grown by a quarter after any chunk that was not, held once a
+chunk reaches `max_chunk_seconds`.
+
+`max_chunk_seconds` is a **ceiling, not a target**. It stops the step growing; it never shrinks
+one. A chunk longer than it is not a problem to correct — `DBCC SHRINKFILE` restarts its
+end-of-file page walk on every call, so small chunks pay that fixed cost over and over and are
+the *slower* option on a large reclaim. Lower it only if you have a reason to want short chunks;
+note that reactions, live `percent_complete`, and the `max_block_minutes` cap all apply *during*
+a chunk, so a long one is neither blind nor unstoppable.
+
+> **Renamed in v0.17.0.** This key used to be `shrink.target_batch_seconds`, defaulting to 5,
+> and it gated growth rather than capping it — which pinned the step near `min_step_mb` on any
+> large shrink. The name changed with the meaning, so a config still carrying
+> `target_batch_seconds` under `shrink:` now **fails to load**, naming the key. That is
+> deliberate: defaults only fill absent keys, so silently accepting the old one would have kept
+> the old behaviour with nothing said. Rename it to `max_chunk_seconds` and reconsider the
+> value — 5 was right for a target, it is far too low for a ceiling. The identically named
+> `batch_dml.target_batch_seconds` is unaffected and keeps its meaning.
 
 ## `batch_dml`
 

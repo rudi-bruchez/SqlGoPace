@@ -38,11 +38,24 @@ func InitialBatchRows(estRows int64, t BatchTuning) int {
 	}
 }
 
+// Thresholds specific to the batch-DML law. The shrink stepsize no longer consults either:
+// AdjustStepMB grows on the absence of pressure rather than on near-idle storage, and takes its
+// blocking signal from whether the supervisor stopped the batch. See the note on AdjustBatchRows.
+const (
+	ioLatchGrowMs         = 5  // both latencies below this → headroom to grow
+	blockingReduceSeconds = 30 // blocking others longer than this → back off
+)
+
 // AdjustBatchRows returns the next batch size given the last batch's duration and
 // wait deltas. It halves the size under I/O pressure or sustained blocking, doubles
 // it when I/O is light and the batch finished within the target duration, and clamps
-// to [lo, hi]. It reuses the same wait thresholds as the shrink stepsize, so DML and
-// shrink throttle on the same signals. Reduction takes precedence.
+// to [lo, hi]. Reduction takes precedence.
+//
+// It shares the reduce thresholds with the shrink stepsize but not the law: AdjustStepMB moved
+// to AIMD in v0.17.0 because a duration-gated growth condition a multi-GB chunk can never meet
+// made every reduction permanent. A DML batch is not in that position — it holds locks for its
+// whole duration and has no per-invocation restart cost, so a duration objective is the right
+// one here. Note w.BlockingSeconds is never populated by waitDeltas, so that clause is inert.
 func AdjustBatchRows(size int, elapsed time.Duration, w WaitDeltas, target time.Duration, lo, hi int) int {
 	reduce := w.WriteLogAvgMs > writeLogReduceMs ||
 		w.PageIOLatchExAvgMs > pageIOLatchReduceMs ||

@@ -74,7 +74,7 @@ shrink:
   initial_step_large_mb:  500   # legacy tier: > 50 GB
   min_step_mb:             50    # chunk floor
   max_step_mb:           8192    # absolute chunk ceiling
-  target_batch_seconds:     5    # aim each chunk at a few seconds
+  max_chunk_seconds:      300    # ceiling on chunk duration: stops the step growing, never shrinks it
   max_no_progress:          3    # consecutive no-gain chunks before a clean stop
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
   no_progress_backoff_max_seconds: 300   # backoff ceiling

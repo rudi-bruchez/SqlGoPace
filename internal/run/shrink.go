@@ -503,7 +503,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return result, err
 			}
-			step = clampStep(step/2, r.tuning.MinStepMB, maxStep)
+			step = halveStep(step, r.tuning, maxStep)
 			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
 			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			r.applyMaintBlock(sink, f, tp, lastMaint)
@@ -566,7 +566,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		noProgress = 0
 		backoff = r.tuning.NoProgressBackoff
 		stallWaited = 0
-		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), r.tuning, maxStep)
+		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), stopped, r.tuning, maxStep)
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current
@@ -1049,9 +1049,9 @@ func giveUpReason(tp *tailProbe, base string) string {
 }
 
 // waitDeltas extracts the stepsize-gating wait deltas from two session-wait
-// snapshots: average WRITELOG and PAGEIOLATCH_EX latency per waiting task. The
-// blocking dimension is handled by the pressure-stop path, not the step adjust, so
-// BlockingSeconds is left zero here.
+// snapshots: average WRITELOG and PAGEIOLATCH_EX latency per waiting task.
+// BlockingSeconds is left zero — the blocking dimension reaches AdjustStepMB through the
+// chunk's stopped flag instead, which is what the supervisor actually measured.
 func waitDeltas(before, after []mssql.SessionWait) WaitDeltas {
 	var d WaitDeltas
 	for _, w := range mssql.DiffWaits(before, after) {

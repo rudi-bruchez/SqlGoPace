@@ -193,7 +193,7 @@ type ShrinkConfig struct {
 	MaxStepPctOfFile            int `yaml:"max_step_pct_of_file"`            // per-file ceiling: cap the step at this % of the file (0 disables)
 	MinStepMB                   int `yaml:"min_step_mb"`                     // floor: below this, per-loop overhead dominates
 	MaxStepMB                   int `yaml:"max_step_mb"`                     // absolute ceiling: avoid saturating I/O in one move
-	TargetBatchSeconds          int `yaml:"target_batch_seconds"`            // an "ideal" chunk lasts a few seconds
+	MaxChunkSeconds             int `yaml:"max_chunk_seconds"`               // ceiling on chunk duration: stops growth, never forces a reduction
 	MaxNoProgress               int `yaml:"max_no_progress"`                 // consecutive no-gain chunks before clean stop
 	NoProgressBeforeFlush       int `yaml:"no_progress_before_flush"`        // no-progress events before the tempdb cache-flush escalation; must be < MaxNoProgress
 	NoProgressBackoffSeconds    int `yaml:"no_progress_backoff_seconds"`     // wait before retry, doubled each no-progress
@@ -202,9 +202,9 @@ type ShrinkConfig struct {
 	LogReuseWaitTimeoutMinutes  int `yaml:"log_reuse_wait_timeout_minutes"`  // max wait for a scheduled BACKUP LOG to free the log
 }
 
-// TargetBatch returns the ideal per-chunk duration.
-func (s ShrinkConfig) TargetBatch() time.Duration {
-	return time.Duration(s.TargetBatchSeconds) * time.Second
+// MaxChunk returns the per-chunk duration ceiling.
+func (s ShrinkConfig) MaxChunk() time.Duration {
+	return time.Duration(s.MaxChunkSeconds) * time.Second
 }
 
 // NoProgressBackoff returns the initial backoff after a no-progress chunk.
@@ -396,7 +396,7 @@ func (s *ShrinkConfig) applyDefaults() {
 	setIf(&s.MaxStepPctOfFile, 5)
 	setIf(&s.MinStepMB, 50)
 	setIf(&s.MaxStepMB, 8192)
-	setIf(&s.TargetBatchSeconds, 5)
+	setIf(&s.MaxChunkSeconds, 300)
 	setIf(&s.MaxNoProgress, 3)
 	setIf(&s.NoProgressBeforeFlush, 2)
 	setIf(&s.NoProgressBackoffSeconds, 30)

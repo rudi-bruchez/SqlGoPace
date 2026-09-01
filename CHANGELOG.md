@@ -13,6 +13,59 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.17.0] - 2026-09-01
+
+### Fixed
+
+- The shrink chunk size can grow again. `AdjustStepMB` halved the step under I/O
+  pressure but would only raise it when latency was under 5 ms **and** the chunk
+  had finished inside `target_batch_seconds`. A multi-GB `DBCC SHRINKFILE` chunk
+  takes minutes and that knob defaulted to 5 seconds, so the second condition was
+  unsatisfiable and every reduction was permanent. On a busy instance — where a
+  shrink, being itself a WRITELOG and PAGEIOLATCH_EX generator, trips the reduce
+  thresholds routinely — the step ratcheted down to `min_step_mb` over the hours
+  a large reclaim runs, and the run ended up paying the fixed per-invocation cost
+  of `DBCC SHRINKFILE` a hundred times over instead of a dozen. Observed on a
+  multi-TB data file that started at 8 GB chunks and finished at 50 MB ones,
+  slowing down as it went.
+- The step no longer freezes between the thresholds. Growth required latency
+  below 5 ms while reduction started at 10 ms (WRITELOG) or 20 ms
+  (PAGEIOLATCH_EX); a shrink sustaining a healthy 7 ms sat in the gap and could
+  never move in either direction.
+- A chunk the supervisor had to stop now shrinks the next one instead of growing
+  it. The blocking dimension was meant to reach the controller through
+  `WaitDeltas.BlockingSeconds`, which `waitDeltas` never populated, so the signal
+  was always zero: a chunk cut short for blocking other sessions past
+  `max_block_minutes` could still be read as "cheap" and double the step. It now
+  reads the supervisor's own outcome.
+
+### Changed
+
+- The shrink stepsize controller is AIMD: halve on pressure or on a supervisor
+  stop, hold once a chunk reaches the duration ceiling, otherwise grow by a
+  quarter. Recovering one halving costs about 3.1 clean chunks, so the loop
+  trends upward while pressure is rarer than roughly one chunk in three and
+  settles below the pressure threshold otherwise. A residual bound is deliberate:
+  a reduction is recoverable only while the resulting chunk still finishes inside
+  the ceiling, so the descent stops at the step that takes about
+  `target_batch_seconds` rather than at `min_step_mb`.
+- **Breaking:** `shrink.target_batch_seconds` is renamed
+  `shrink.max_chunk_seconds` and defaults to 300 instead of 5. **A `config.yaml`
+  still carrying the old key under `shrink:` now fails to load**, naming the key.
+  That is deliberate rather than an oversight: the meaning inverted, and defaults
+  only fill *absent* keys, so accepting the old name would have silently kept the
+  pre-fix behaviour on exactly the deployments the fix is for. Rename the key and
+  reconsider the number — 5 was reasonable for a target, it is far too low for a
+  ceiling. `batch_dml.target_batch_seconds` is untouched and keeps both its name
+  and its meaning.
+- The knob is now a **ceiling on growth, never a target**: a chunk longer than it
+  is not corrected downward. The old name and the old 5-second default came from
+  a rationale that no longer holds — short chunks meant short reaction latency,
+  back when the driver could only react at a chunk boundary. Reactions, live
+  `percent_complete` and the `max_block_minutes` cap all apply *inside* a chunk
+  today, so a long chunk is neither blind nor unstoppable, and shrink work is
+  preserved and re-entrant at any point.
+
 ## [0.16.0] - 2026-08-31
 
 ### Fixed

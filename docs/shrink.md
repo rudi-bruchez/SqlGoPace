@@ -3,7 +3,11 @@
 `shrink` and `shrink_tempdb` are the two operations that are not a single statement. They
 are drivers: they read the file's space at run time, run a free `TRUNCATEONLY` pass, then
 move pages in calibrated chunks, adjusting the chunk size from the I/O and log waits each
-chunk produced.
+chunk produced. The adjustment runs both ways: a chunk that cost the server too much halves
+the next one, a chunk that did not grows it by a quarter, and growth stops once a chunk
+reaches `shrink.target_batch_seconds`. Larger chunks are the faster option on a big reclaim —
+`DBCC SHRINKFILE` restarts its end-of-file page walk on every call, so a small step pays that
+fixed cost over and over.
 
 Because every internal batch commits, a shrink can be stopped at any moment with no
 rollback, and it is re-entrant: re-running toward the same target resumes where it left off.
@@ -53,6 +57,8 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
   times out.
 - **Reactions between chunks.** Under blocking or log pressure the driver pauses between
   chunks, which is free because committed work is kept, and shrinks the next chunk smaller.
+  The step climbs back once the pressure clears, so a single bad moment does not shrink the
+  chunk for the rest of the run.
 
 A data-file shrink fragments indexes by design. Rebuild or reorganize afterwards if needed;
 [`maintenance-planner.md`](maintenance-planner.md) can generate the pre-shrink reorganize

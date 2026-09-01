@@ -697,7 +697,7 @@ func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
 		MaxStepPctOfFile:      s.MaxStepPctOfFile,
 		MinStepMB:             s.MinStepMB,
 		MaxStepMB:             s.MaxStepMB,
-		TargetBatch:           s.TargetBatch(),
+		MaxChunkDuration:      s.MaxChunk(),
 		MaxNoProgress:         s.MaxNoProgress,
 		NoProgressBeforeFlush: s.NoProgressBeforeFlush,
 		NoProgressBackoff:     s.NoProgressBackoff(),

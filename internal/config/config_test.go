@@ -160,7 +160,7 @@ func TestShrinkConfigDefaultsWhenAbsent(t *testing.T) {
 		{"max_step_pct_of_file", s.MaxStepPctOfFile, 5},
 		{"min_step_mb", s.MinStepMB, 50},
 		{"max_step_mb", s.MaxStepMB, 8192},
-		{"target_batch_seconds", s.TargetBatchSeconds, 5},
+		{"max_chunk_seconds", s.MaxChunkSeconds, 300},
 		{"max_no_progress", s.MaxNoProgress, 3},
 		{"no_progress_before_flush", s.NoProgressBeforeFlush, 2},
 		{"no_progress_backoff_seconds", s.NoProgressBackoffSeconds, 30},
@@ -173,8 +173,8 @@ func TestShrinkConfigDefaultsWhenAbsent(t *testing.T) {
 			t.Errorf("Shrink.%s = %d, want default %d", c.name, c.got, c.want)
 		}
 	}
-	if got, want := s.TargetBatch(), 5*time.Second; got != want {
-		t.Errorf("TargetBatch() = %v, want %v", got, want)
+	if got, want := s.MaxChunk(), 300*time.Second; got != want {
+		t.Errorf("MaxChunk() = %v, want %v", got, want)
 	}
 	if got, want := s.LogReuseWaitTimeout(), 30*time.Minute; got != want {
 		t.Errorf("LogReuseWaitTimeout() = %v, want %v", got, want)
@@ -196,8 +196,41 @@ func TestShrinkConfigPartialOverride(t *testing.T) {
 		t.Errorf("MaxStepMB = %d, want overridden 4096", cfg.Shrink.MaxStepMB)
 	}
 	// Untouched fields keep their defaults.
-	if cfg.Shrink.TargetBatchSeconds != 5 {
-		t.Errorf("TargetBatchSeconds = %d, want default 5", cfg.Shrink.TargetBatchSeconds)
+	if cfg.Shrink.MaxChunkSeconds != 300 {
+		t.Errorf("MaxChunkSeconds = %d, want default 300", cfg.Shrink.MaxChunkSeconds)
+	}
+}
+
+// TestShrinkConfigRejectsRenamedTargetBatchSeconds pins the migration for the v0.17.0 rename.
+// The key changed to max_chunk_seconds because its meaning inverted: it used to be a duration
+// the driver aimed each chunk at, it is now a ceiling that only stops the step growing. Silently
+// ignoring the old key would be the worst outcome — applyDefaults only fills zeros, so a config
+// still carrying `target_batch_seconds: 5` under `shrink:` would keep the pre-fix behavior and
+// go on ratcheting the step down to min_step_mb with nothing said. KnownFields(true) makes it a
+// load error instead, and the error has to name the key so the operator knows what to change.
+func TestShrinkConfigRejectsRenamedTargetBatchSeconds(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	yaml := validYAML + "shrink:\n  target_batch_seconds: 5\n"
+	_, err := config.Parse([]byte(yaml))
+	if err == nil {
+		t.Fatal("Parse() error = nil, want a rejection: the old shrink key must not be silently ignored")
+	}
+	if !strings.Contains(err.Error(), "target_batch_seconds") {
+		t.Errorf("Parse() error = %q, want it to name target_batch_seconds so the operator can find it", err)
+	}
+}
+
+// The same key is still valid under batch_dml, where a duration objective remains the right one.
+func TestBatchDMLConfigKeepsTargetBatchSeconds(t *testing.T) {
+	t.Setenv("TEST_SERVER", "myhost")
+
+	cfg, err := config.Parse([]byte(validYAML + "batch_dml:\n  target_batch_seconds: 7\n"))
+	if err != nil {
+		t.Fatalf("Parse() error = %v, want nil", err)
+	}
+	if cfg.BatchDML.TargetBatchSeconds != 7 {
+		t.Errorf("BatchDML.TargetBatchSeconds = %d, want 7", cfg.BatchDML.TargetBatchSeconds)
 	}
 }
 

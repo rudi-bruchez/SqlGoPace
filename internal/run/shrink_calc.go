@@ -62,7 +62,7 @@ type ShrinkTuning struct {
 	MaxStepPctOfFile      int           // per-file step ceiling as a percent of file size (0 disables)
 	MinStepMB             int           // step floor
 	MaxStepMB             int           // absolute step ceiling
-	TargetBatch           time.Duration // ideal per-chunk duration
+	MaxChunkDuration      time.Duration // ceiling on chunk duration: stops growth, never reduces
 	MaxNoProgress         int           // consecutive no-gain chunks before clean stop
 	NoProgressBeforeFlush int           // no-progress events before the tempdb cache flush (tempdb path only)
 	NoProgressBackoff     time.Duration // initial backoff after a no-progress chunk
@@ -99,12 +99,11 @@ const (
 	tailWalkAbsCap = 262144 // ~2 GB at 8 KB/page: hard ceiling on the backward loop
 )
 
-// Wait thresholds that gate the step adjustment (design §7.2).
+// Wait thresholds that gate the step adjustment (design §7.2). Shared with AdjustBatchRows,
+// so DML and shrink back off on the same latencies.
 const (
-	writeLogReduceMs      = 10 // WRITELOG avg above this → I/O is the bottleneck
-	pageIOLatchReduceMs   = 20 // PAGEIOLATCH_EX avg above this → read I/O is the bottleneck
-	ioLatchGrowMs         = 5  // both latencies below this → headroom to grow
-	blockingReduceSeconds = 30 // blocking others longer than this → back off
+	writeLogReduceMs    = 10 // WRITELOG avg above this → I/O is the bottleneck
+	pageIOLatchReduceMs = 20 // PAGEIOLATCH_EX avg above this → read I/O is the bottleneck
 )
 
 // InitialStepMB picks the starting chunk size in megabytes from the volume to reclaim and
@@ -144,28 +143,40 @@ func effectiveMaxStepMB(fileSizeMB int, t ShrinkTuning) int {
 	return m
 }
 
-// AdjustStepMB returns the next chunk size given the last chunk's duration and wait
-// deltas. It halves the step under I/O pressure or sustained blocking, doubles it
-// when I/O is light and the chunk finished within the target batch duration, and
-// clamps the result to [MinStepMB, maxStep] (the per-file effective ceiling). Reduction
-// takes precedence: the two conditions are mutually exclusive in practice (one needs high
-// latency, the other low), but the order makes the safe choice explicit.
-func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, t ShrinkTuning, maxStep int) int {
-	reduce := w.WriteLogAvgMs > writeLogReduceMs ||
-		w.PageIOLatchExAvgMs > pageIOLatchReduceMs ||
-		w.BlockingSeconds > blockingReduceSeconds
-	grow := w.WriteLogAvgMs < ioLatchGrowMs &&
-		w.PageIOLatchExAvgMs < ioLatchGrowMs &&
-		w.BlockingSeconds == 0 &&
-		elapsed < t.TargetBatch
-
+// AdjustStepMB returns the next chunk size, clamped to [MinStepMB, maxStep] (the per-file
+// effective ceiling). It is an AIMD loop, and the two rates are load-bearing: /2 against *5/4
+// means recovering one halving costs log2/log1.25 ≈ 3.1 clean chunks, so the step trends upward
+// while pressure is rarer than about one chunk in three. Changing either rate means re-deriving
+// that ratio.
+//
+// Pressure is either a wait the shrink itself suffered (WRITELOG or PAGEIOLATCH_EX past the
+// thresholds) or stopped — the supervisor cut the chunk short because it was blocking others or
+// filling the log. Growth is simply the absence of pressure, deliberately *not* also gated on
+// near-idle storage: a shrink is itself an I/O generator, so a "quiet enough to grow" test is one
+// it can rarely pass, and pairing it with a duration test it can never pass (a multi-GB chunk
+// takes minutes) made every reduction permanent — the step then walked down to MinStepMB, where
+// the fixed per-invocation cost of DBCC SHRINKFILE dominates the work done.
+//
+// t.MaxChunkDuration is a ceiling, not a target: it stops growth, it never forces a reduction. So a
+// reduction is recoverable only while the resulting chunk still finishes inside the ceiling;
+// above it the step holds where it landed. That bound is intended — the ceiling means "no chunk
+// longer than this" — and it replaces an unbounded descent with one an operator sets.
+func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, stopped bool, t ShrinkTuning, maxStep int) int {
 	switch {
-	case reduce:
-		step /= 2
-	case grow:
-		step *= 2
+	case stopped || w.WriteLogAvgMs > writeLogReduceMs || w.PageIOLatchExAvgMs > pageIOLatchReduceMs:
+		return halveStep(step, t, maxStep)
+	case elapsed < t.MaxChunkDuration: // at or past the ceiling, hold rather than push further
+		step = max(step*5/4, step+1) // +1 so integer truncation cannot stall a tiny MinStepMB
 	}
 	return clampStep(step, t.MinStepMB, maxStep)
+}
+
+// halveStep is the multiplicative-decrease half of the AIMD law. It lives here, rather than
+// inline, because the driver halves the step on a second path too — a chunk that errored without
+// moving a page (see ShrinkRunner.shrinkData). Both go through this so the decrease has one home:
+// anyone re-deriving the stability ratio in AdjustStepMB has to account for both callers.
+func halveStep(step int, t ShrinkTuning, maxStep int) int {
+	return clampStep(step/2, t.MinStepMB, maxStep)
 }
 
 // clampStep bounds step to [lo, hi].

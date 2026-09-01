@@ -39,6 +39,13 @@ type fakeServer struct {
 
 	waits []mssql.SessionWait // returned by SessionWaits (constant across calls)
 
+	// waitAccrual, if set, makes SessionWaits return a cumulative total that grows by one copy
+	// of it per call, the way the real DMVs accumulate. Consecutive snapshots then yield a
+	// constant non-zero delta — the signal the stepsize controller actually reacts to, which a
+	// constant `waits` cannot produce (its delta is always zero).
+	waitAccrual []mssql.SessionWait
+	waitCalls   int64
+
 	sessions []mssql.Session // returned by ActiveSessions (constant across calls)
 
 	// sampledOnce, if non-nil, is closed the first time ActiveSessions is called, so a test can
@@ -126,7 +133,17 @@ func (s *fakeServer) LogReuse(_ context.Context) (string, string, error) {
 func (s *fakeServer) ActiveLogFloorMB(_ context.Context) (int, error) { return s.floorMB, nil }
 
 func (s *fakeServer) SessionWaits(_ context.Context, _ int) ([]mssql.SessionWait, error) {
-	return s.waits, nil
+	if s.waitAccrual == nil {
+		return s.waits, nil
+	}
+	s.waitCalls++
+	out := make([]mssql.SessionWait, len(s.waitAccrual))
+	for i, w := range s.waitAccrual {
+		out[i] = w
+		out[i].WaitTimeMS = w.WaitTimeMS * s.waitCalls
+		out[i].WaitingTasksCount = w.WaitingTasksCount * s.waitCalls
+	}
+	return out, nil
 }
 
 func (s *fakeServer) ActiveSessions(context.Context) ([]mssql.Session, error) {
@@ -195,7 +212,7 @@ func testTuning() ShrinkTuning {
 		InitialStepLargeMB:   500,
 		MinStepMB:            50,
 		MaxStepMB:            1024,
-		TargetBatch:          5 * time.Second,
+		MaxChunkDuration:     5 * time.Second,
 		MaxNoProgress:        3,
 		NoProgressBackoff:    1 * time.Second,
 		NoProgressBackoffMax: 8 * time.Second,
@@ -751,8 +768,45 @@ func TestShrinkStepAdjustsUnderIOPressure(t *testing.T) {
 	if d.WriteLogAvgMs != 30 {
 		t.Fatalf("waitDeltas WriteLogAvgMs = %v, want 30", d.WriteLogAvgMs)
 	}
-	if got := AdjustStepMB(400, time.Second, d, testTuning(), testTuning().MaxStepMB); got != 200 {
+	if got := AdjustStepMB(400, time.Second, d, false, testTuning(), testTuning().MaxStepMB); got != 200 {
 		t.Errorf("AdjustStepMB under WRITELOG pressure = %d, want 200", got)
+	}
+}
+
+// TestShrinkStepRecoversAcrossChunks is the driver-level regression for the reported bug. The
+// step freezing was an emergent property of the loop rather than of the pure calc, so pinning it
+// needs a test that actually runs chunks: it covers the wiring (waitDeltas feeding the
+// controller, the adjusted step reaching ShrinkProgress) that the calc tests cannot see.
+//
+// Every chunk here sees a 7 ms WRITELOG average — healthy, but inside the band the old law
+// refused to grow on — so the step used to stay pinned at its initial 100 MB for the entire
+// shrink, and the run paid the fixed per-invocation cost of DBCC SHRINKFILE 45 times instead
+// of a dozen.
+func TestShrinkStepRecoversAcrossChunks(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 5000, usedMB: 400, floorMB: 400,
+		// 70 ms over 10 waiting tasks per call is a 7 ms average per chunk: above the old
+		// 5 ms grow ceiling, below the 10 ms reduce floor — the former dead band.
+		waitAccrual: []mssql.SessionWait{{WaitType: "WRITELOG", WaitTimeMS: 70, WaitingTasksCount: 10}},
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+	r.tuning.MaxChunkDuration = 300 * time.Second // the regime the new default targets
+
+	var steps []int
+	r.progress = func(p ShrinkProgress) { steps = append(steps, p.StepMB) }
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, func(ReactionEvent) {}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(steps) < 2 {
+		t.Fatalf("emitted %d progress snapshots, want several chunks", len(steps))
+	}
+	if first, last := steps[0], steps[len(steps)-1]; last <= first {
+		t.Errorf("StepMB went %d -> %d over %d snapshots; a shrink whose every chunk is healthy "+
+			"must grow its step, not stay pinned at the initial value", first, last, len(steps))
 	}
 }
 
