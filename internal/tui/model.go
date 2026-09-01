@@ -280,9 +280,10 @@ type Action struct {
 type inputMode int
 
 const (
-	modeNormal      inputMode = iota
-	modeCriterion             // ignore-this-session prompt (from "i")
-	modeKillConfirm           // "really kill this session?" prompt (from "x")
+	modeNormal         inputMode = iota
+	modeCriterion                // ignore-this-session prompt (from "i")
+	modeKillConfirm              // "really kill this session?" prompt (from "x")
+	modeKillDDLConfirm           // "really kill our own running DDL?" prompt (from "k")
 )
 
 // Model is the incident console state.
@@ -551,6 +552,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mode == modeKillConfirm {
 		return m.handleKillConfirmKey(msg)
 	}
+	if m.mode == modeKillDDLConfirm {
+		return m.handleKillDDLConfirmKey(msg)
+	}
 	if m.inCriterionMode() {
 		return m.handleCriterionKey(msg)
 	}
@@ -593,7 +597,12 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = modeKillConfirm
 		}
 	case "k":
-		m.emit(Action{Kind: ActionKillDDL})
+		// Confirm first, for the same reason `x` does — with more force. This kills our
+		// own running DDL: a non-resumable rebuild loses every hour it has done and
+		// starts a rollback that holds the same locks and cannot be interrupted. `x`,
+		// which only costs a foreign session its transaction, was gated in 0.24.0 while
+		// the more destructive neighbour kept firing on one keystroke.
+		m.mode = modeKillDDLConfirm
 	case "d":
 		// Toggle: request a graceful stop, or cancel a pending one. The host performs the
 		// same toggle on the shared flag and confirms via StatusMsg.
@@ -619,6 +628,18 @@ func (m Model) handleKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.String() == "y" {
 		m.emit(Action{Kind: ActionKillBlocker, SPID: m.blockers[m.cursor].SPID})
+	}
+	m.mode = modeNormal
+	return m, nil
+}
+
+// handleKillDDLConfirmKey answers the "really kill our own DDL?" prompt. Only "y"
+// confirms; every other key dismisses it, so a stray keystroke cannot destroy the run's
+// work. It needs no selection guard — the target is the operation, which always exists
+// while the console is up.
+func (m Model) handleKillDDLConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "y" {
+		m.emit(Action{Kind: ActionKillDDL})
 	}
 	m.mode = modeNormal
 	return m, nil

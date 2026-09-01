@@ -349,3 +349,22 @@ func TestRosterViewEmpty(t *testing.T) {
 		t.Errorf("empty roster should say so:\n%s", out)
 	}
 }
+
+// The kill-DDL prompt must state how much work the rollback would discard: that, not the
+// question itself, is what the operator is deciding. Elapsed comes from the once-a-second
+// tick, so this drives one — the external test cannot reach tickMsg.
+func TestKillDDLConfirmShowsElapsedWork(t *testing.T) {
+	m := New("rebuild_index dbo.MEASUREMENT", nil)
+	start := time.Now().Add(-4 * time.Hour)
+	mo, _ := m.Update(StatusMsg{Status: StatusRunning, StartedAt: start})
+	mo, _ = mo.(Model).Update(ProgressMsg{Percent: 63})
+	mo, _ = mo.(Model).Update(tickMsg(time.Now()))
+	mo, _ = mo.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+
+	body := mo.(Model).killDDLConfirmBody()
+	for _, want := range []string{"4:00:00", "elapsed", "63% done"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("kill-DDL prompt missing %q:\n%s", want, body)
+		}
+	}
+}

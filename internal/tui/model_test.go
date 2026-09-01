@@ -470,12 +470,70 @@ func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 	}
 }
 
-func TestModelKillDDL(t *testing.T) {
+// TestKillDDLNeedsConfirmation pins the gate on `k`. It terminates OUR running DDL: on a
+// non-resumable operation that discards every hour of work and starts a rollback holding
+// the same locks, which cannot be stopped. It used to fire on one keystroke, while the
+// neighbouring `x` — strictly less damaging, since it only loses a foreign session's
+// transaction — was given a confirmation in 0.24.0.
+func TestKillDDLNeedsConfirmation(t *testing.T) {
 	actions := make(chan tui.Action, 4)
-	m := tui.New("op", actions)
-	send(m, key("k"))
+	m := tui.New("rebuild_index dbo.MEASUREMENT", actions)
+	m, _ = send(m, tui.ServerInfoMsg{Edition: "standard", ADR: false})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StartedAt: time.Now().Add(-4 * time.Hour)})
+	m, _ = send(m, tui.ProgressMsg{Percent: 63})
+
+	m, _ = send(m, key("k"))
+	if a, ok := drain(t, actions); ok {
+		t.Fatalf("k emitted %+v without confirmation", a)
+	}
+
+	view := m.View()
+	// The cost of the rollback is what the operator is deciding about, and it is
+	// proportional to the work already done.
+	for _, want := range []string{"rebuild_index dbo.MEASUREMENT", "63"} {
+		if !strings.Contains(view, want) {
+			t.Errorf("confirmation does not show %q; the operator cannot judge the cost:\n%s", want, view)
+		}
+	}
+	// On a tier without RESUMABLE the rollback is total and uninterruptible. Saying so is
+	// the whole reason this prompt exists rather than a bare "are you sure?".
+	if !strings.Contains(strings.ToLower(view), "cannot be stopped") {
+		t.Errorf("confirmation does not say the rollback cannot be stopped:\n%s", view)
+	}
+
+	_, _ = send(m, key("y"))
 	if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionKillDDL {
-		t.Errorf("k = %+v ok=%t, want KillDDL", a, ok)
+		t.Errorf("after confirming, action = %+v ok=%t, want KillDDL", a, ok)
+	}
+}
+
+// Only "y" confirms, so a stray keystroke at the prompt cannot destroy hours of work.
+func TestKillDDLConfirmationCancels(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("rebuild_index dbo.MEASUREMENT", actions)
+
+	m, _ = send(m, key("k"))
+	m, _ = send(m, key("n"))
+	if a, ok := drain(t, actions); ok {
+		t.Fatalf("a key other than y emitted %+v; the prompt must cancel", a)
+	}
+	// And the console is usable again rather than stuck in the prompt.
+	m, _ = send(m, key("d"))
+	if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionDrain {
+		t.Errorf("after cancelling, d = %+v ok=%t, want Drain (prompt should have closed)", a, ok)
+	}
+}
+
+// Accelerated Database Recovery makes the rollback cheap, so the prompt must not tell an
+// operator on an ADR database that it will hold locks for hours.
+func TestKillDDLConfirmationMentionsADR(t *testing.T) {
+	actions := make(chan tui.Action, 4)
+	m := tui.New("rebuild_index dbo.MEASUREMENT", actions)
+	m, _ = send(m, tui.ServerInfoMsg{Edition: "enterprise", ADR: true})
+
+	m, _ = send(m, key("k"))
+	if !strings.Contains(m.View(), "ADR") {
+		t.Errorf("confirmation does not mention ADR on a database that has it:\n%s", m.View())
 	}
 }
 

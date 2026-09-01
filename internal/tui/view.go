@@ -433,6 +433,43 @@ func killConfirmBody(bl Blocker) string {
 		bl.SPID, bl.Login, bl.Host, bl.Program, txn))
 }
 
+// killDDLConfirmBody is the prompt behind the `k` key. A bare "are you sure?" would be
+// worth little: what the operator is actually deciding is whether the rollback costs less
+// than letting the operation finish, and that turns on three things the console already
+// knows — how much work would be discarded, whether the edition allows the operation to be
+// resumable (in which case a kill pauses it instead of losing it), and whether ADR makes
+// the rollback cheap. It states all three rather than asking blind.
+//
+// It does not claim to know whether *this* operation is resumable — the model is never
+// told — so on a tier that has RESUMABLE it says "if"; on one that does not, the answer is
+// settled and it says so.
+func (m Model) killDDLConfirmBody() string {
+	done := ""
+	if m.elapsed > 0 {
+		done = ", " + formatElapsed(m.elapsed) + " elapsed"
+	}
+	if m.percent > 0 {
+		done += fmt.Sprintf(", %.0f%% done", m.percent)
+	}
+
+	var cost string
+	switch m.server.Edition {
+	case "standard", "express":
+		cost = fmt.Sprintf("on %s edition it cannot be resumable, so the rollback discards all of it and cannot be stopped",
+			m.server.Edition)
+	default:
+		cost = "if it is resumable it pauses with its progress kept; if not, the rollback discards it and cannot be stopped"
+	}
+	if m.server.ADR {
+		// The same assumption reaction.go already makes when it weighs a cancel.
+		cost += " (ADR is on, so the rollback itself should be fast)"
+	}
+
+	return alertStyle.Render(fmt.Sprintf(
+		"kill our own running DDL — %s%s? %s   [y] kill  [any] cancel",
+		m.operation, done, cost))
+}
+
 // helpBody is the footer: the normal shortcut line, or the active criterion sub-prompt.
 // The normal line lists only shortcuts that do something in the current state — the
 // blocker keys appear only when a session is actually blocked, [b] only when there is
@@ -440,6 +477,9 @@ func killConfirmBody(bl Blocker) string {
 func (m Model) helpBody() string {
 	if m.mode == modeKillConfirm && m.cursor < len(m.blockers) {
 		return killConfirmBody(m.blockers[m.cursor])
+	}
+	if m.mode == modeKillDDLConfirm {
+		return m.killDDLConfirmBody()
 	}
 	if m.inCriterionMode() && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]

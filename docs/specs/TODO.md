@@ -220,15 +220,19 @@ evidence about CWE-89 here.
 - [ ] **The rest of the 2026-09-01 harm review is unaddressed** —
   [REVIEW-2026-09-01-harm.md](REVIEW-2026-09-01-harm.md), untracked, alongside this file. F0 (the
   unbounded `key_range` UPDATE) is fixed in v0.26.0; F3 (unquoted dates as arithmetic) in
-  v0.27.0. Still open, in the review's own ranking: F1 (TUI `k` kills the running DDL on one
-  unconfirmed keystroke, while the less harmful `x` was given a confirmation in v0.24.0), F2
-  (quitting the console neither stops the run nor says so), F4
+  v0.27.0; F1 (the unconfirmed TUI kill of our own DDL) in v0.28.0. Still open, in the
+  review's own ranking: F2 (quitting the console neither stops the run nor says so), F4
   (`checkpoint_between_operations` is parsed, documented in four places, and read by nothing),
   F5 (the TUI kills with `kill_blockers.enabled: false`, which the shipped config calls the
   master arm), F6 (`max_block_minutes` excludes `shrink_log`, said only in
   `CLAUDE.md`/`CHANGELOG.md`/`TODO.md` and not in the operator docs).
-  *Note on F1:* it is the only one left that can destroy work rather than mislead, and the
-  confirm-mode machinery it needs already exists for the `x` key. Take it next.
+  *Note:* everything left is a case of the documentation being more reassuring than the code,
+  not of the code destroying work. F4 and F5 are the two where an operator could believe a
+  protection is in place that is not; take those next. Fixing F1 also turned up a `p`
+  ("pause the operation") key documented in `docs/running.md` that has never existed in the
+  tree — the same class, found only because the fix touched that table. The other key tables
+  (`docs/blocking-and-kills.md`, `docs/llm-operator-guide.md`) have not been audited against
+  `handleKey` and should be.
 
 - [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
   `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and

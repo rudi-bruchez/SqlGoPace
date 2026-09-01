@@ -13,6 +13,25 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.28.0] - 2026-09-01
+
+### Fixed
+
+- The TUI's `k` key asks before killing the running DDL. It fired on one keystroke, with no
+  prompt and no undo, while the neighbouring `x` — which only costs a foreign session its
+  transaction — was given a confirmation in 0.24.0. `k` terminates the operation this run is
+  executing: on Standard or Express, where `RESUMABLE` is unavailable, that discards every
+  hour an index rebuild has done and starts a rollback holding the same locks, which cannot
+  be stopped. The prompt states the cost rather than asking blind — the operation, its
+  elapsed time and percent complete, whether the edition permits a resumable (in which case a
+  kill pauses it instead), and whether ADR makes the rollback cheap. Only `y` confirms.
+
+### Changed
+
+- `docs/running.md` no longer documents a `p` ("pause the operation") key. There is no such
+  key and there never was one in the tree: the console has `i`, `x`, `b`, `k`, `d`, `enter`,
+  `?`, `q` and the arrows.
+
 ## [0.27.0] - 2026-09-01
 
 ### Fixed

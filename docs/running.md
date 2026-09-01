@@ -109,13 +109,22 @@ progress, the sessions it is blocking, the sessions blocking it, and the reactio
 | `i` | Ignore the selected session: writes an `ignore_blocked_sessions` rule into the running manifest, hot-reloaded. |
 | `x` | Kill the selected session, after a confirmation. |
 | `b` | The blocker roster: the sessions that have blocked *us*, and where a kill rule is armed. |
-| `k` | Kill the running DDL. |
-| `p` | Pause the operation. |
+| `k` | Kill the running DDL, after a confirmation. |
 | `d` | Drain: finish the current operation, then stop cleanly. |
 
 Pressing `i` asks which criterion to match on, so the rule it writes is durable
 (`app_name`, `login_name`, `host_name`) rather than tied to a session id that will not
 exist tomorrow.
+
+**`k` is the most destructive key here**, which is why it asks first. It terminates the
+operation *this run* is executing. The prompt states what it would cost, from what the
+console already knows: how long the operation has run and how far it got — that is what the
+rollback discards — whether the edition allows the operation to be resumable (on Enterprise
+or Azure a killed resumable rebuild pauses with its server-side progress kept; on Standard
+or Express it cannot be resumable, so the rollback is total and cannot be interrupted), and
+whether Accelerated Database Recovery is on, which makes the rollback itself cheap. Only `y`
+confirms; any other key cancels. Prefer `d` (drain) whenever you can wait — it finishes the
+current operation instead of undoing it.
 
 **Read the direction before pressing `x`.** The selectable list is the sessions *waiting on*
 the DDL — the ones it is holding up. Killing one of them frees nothing the operation is
