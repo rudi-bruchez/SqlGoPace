@@ -761,7 +761,7 @@ func TestCheckBatchDMLSelectivity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			c := preflight.CheckBatchDMLSelectivity(tt.op, tt.spared, tt.limit)
+			c := preflight.CheckBatchDMLSelectivity(tt.op, tt.spared, tt.spared, tt.limit)
 			if c.Severity != tt.want {
 				t.Errorf("Severity = %v, want %v (%s)", c.Severity, tt.want, c.Detail)
 			}
@@ -830,4 +830,34 @@ func findCheck(rep preflight.Report, sub string) (preflight.Check, bool) {
 		}
 	}
 	return preflight.Check{}, false
+}
+
+// The whole-table guard turns on zero-vs-non-zero spared rows. Probing the effective
+// predicate (filter AND self-limit) instead of the filter made the verdict a function of
+// table state: `where_raw: "1=1"` with `set: {Status: 'X'}` passed as soon as 1000 rows
+// already held 'X', so the same manifest passed today and failed yesterday, and a
+// whole-table rewrite ran unconfirmed. The filter decides whether it is whole-table; the
+// self-limit only decides whether that is survivable, which is a warning, not a pass.
+func TestBatchDMLSelectivityUsesBothProbes(t *testing.T) {
+	op := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "MEASUREMENT",
+		Set: map[string]ddl.Literal{"Status": {Raw: "X", String: true}}, WhereRaw: "1=1"}
+
+	tests := []struct {
+		name                   string
+		filterSpared, opSpared int64
+		want                   preflight.Severity
+	}{
+		{"filter excludes nothing and nothing is idempotent-spared", 0, 0, preflight.Fail},
+		{"filter excludes nothing; only idempotence narrows it", 0, 900, preflight.Warn},
+		{"filter excludes nothing; many already at target", 0, 1000, preflight.Warn},
+		{"filter is selective", 1000, 1000, preflight.Pass},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := preflight.CheckBatchDMLSelectivity(op, tt.filterSpared, tt.opSpared, 1000)
+			if got.Severity != tt.want {
+				t.Errorf("severity = %v, want %v (%s)", got.Severity, tt.want, got.Detail)
+			}
+		})
+	}
 }

@@ -491,11 +491,22 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 			// when the table is absent (CheckOperation already fails the manifest).
 			if tableExists && !b.ConfirmFullTable {
 				if probe := ddl.BatchUnmatchedRowsSQL(b, unmatchedRowSample); probe != "" {
-					spared, _, err := p.QueryInt(ctx, probe)
+					filterSpared, _, err := p.QueryInt(ctx, probe)
 					if err != nil {
 						return Report{}, fmt.Errorf("preflight batch selectivity %s.%s: %w", b.Schema, b.Table, err)
 					}
-					rep.add(CheckBatchDMLSelectivity(b, spared, unmatchedRowSample))
+					// The second probe only changes the verdict when the filter spares
+					// nothing, so a selective filter costs one round trip, not two.
+					opSpared := filterSpared
+					if filterSpared == 0 {
+						if p2 := ddl.BatchUntouchedRowsSQL(b, unmatchedRowSample); p2 != "" && p2 != probe {
+							opSpared, _, err = p.QueryInt(ctx, p2)
+							if err != nil {
+								return Report{}, fmt.Errorf("preflight batch self-limit %s.%s: %w", b.Schema, b.Table, err)
+							}
+						}
+					}
+					rep.add(CheckBatchDMLSelectivity(b, filterSpared, opSpared, unmatchedRowSample))
 				}
 			}
 		}
@@ -538,17 +549,32 @@ const unmatchedRowSample = 1000
 // the operation is whole-table however it is spelled, and it fails. A handful warns with
 // the number, because "this deletes all but three rows" is something the operator should
 // see and only they can judge. Reaching the sample cap is a filter doing its job.
-func CheckBatchDMLSelectivity(op ddl.BatchDML, spared int64, limit int) Check {
+// filterSpared is how many rows the operator's filter leaves alone; opSpared how many the
+// statement will not modify once its self-limiting clause is counted too (equal to
+// filterSpared for a DELETE and under key_range). Both are counted up to limit.
+//
+// The two are separate because they answer different questions and only one of them is
+// about the manifest. A filter that excludes nothing is whole-table however the table
+// happens to look; that is a property of what was written and it fails. Rows already
+// holding the target value make such an operation *survivable*, not *narrow*, so they
+// downgrade the verdict to a warning rather than clearing it — a check that turned on them
+// alone would pass or fail the same manifest depending on how much of a previous run had
+// completed.
+func CheckBatchDMLSelectivity(op ddl.BatchDML, filterSpared, opSpared int64, limit int) Check {
 	name := fmt.Sprintf("%s whole-table guard", op.CommandType())
 	switch {
-	case spared == 0:
+	case filterSpared == 0 && opSpared == 0:
 		return Check{name, Fail, fmt.Sprintf(
 			"the filter spares no row of [%s].[%s]: this %ss the whole table. Set confirm_full_table: true if that is what you mean",
 			op.Schema, op.Table, op.Verb)}
-	case spared < int64(limit):
+	case filterSpared == 0:
+		return Check{name, Warn, fmt.Sprintf(
+			"the filter spares no row of [%s].[%s]: only the idempotence clause narrows this %s, and it would rewrite the whole table on a table where no row yet holds the target value",
+			op.Schema, op.Table, op.Verb)}
+	case filterSpared < int64(limit):
 		return Check{name, Warn, fmt.Sprintf(
 			"the filter spares only %d row(s) of [%s].[%s] — close to a whole-table %s",
-			spared, op.Schema, op.Table, op.Verb)}
+			filterSpared, op.Schema, op.Table, op.Verb)}
 	default:
 		return Check{name, Pass, fmt.Sprintf("the filter spares at least %d rows", limit)}
 	}

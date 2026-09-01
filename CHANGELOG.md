@@ -13,6 +13,45 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.29.1] - 2026-09-01
+
+Findings from an XHIGH review of the four 0.26.0–0.29.0 commits. The first is a
+regression 0.29.0 introduced.
+
+### Fixed
+
+- The whole-table guard no longer passes a whole-table rewrite once a previous run has
+  touched rows. 0.29.0 made it probe the effective predicate (filter **and** the
+  idempotence clause) to stop it failing a safe `batch_update`; because the verdict turns
+  on zero-versus-non-zero spared rows, that made it a function of table state — the same
+  manifest failed on an untouched table and passed once 1000 rows already held the target
+  value. `where_raw: "1=1"` excludes nothing however the data looks. The filter now decides
+  the verdict, and the idempotence clause downgrades a `Fail` to a `Warn` that names it,
+  instead of clearing it. The second probe is only issued when the filter spares nothing.
+- The `checkpoint_between_operations` startup warning is emitted per target database, not
+  once from the startup connection. The checkpoint itself was already gated per database,
+  so a connection to a SIMPLE utility database silently vouched for FULL production targets.
+- A `CHECKPOINT` is no longer issued after a *skipped* operation. `runStep` carries on from
+  three places — the resume cursor, an `intent: compression` skip, and a completed
+  operation — and only the last wrote any log. A resumed 200-operation manifest opened with
+  ~190 round trips before doing any work.
+- The `--tui` confirmation prompts are rendered even with the help footer hidden (`?`). The
+  footer was drawn only when help was on, so an operator who had toggled it off entered a
+  modal kill confirmation they could not see, and their next keystroke answered a question
+  never asked.
+- A `KILL` issued from the console reports a failure instead of discarding it. With `k` now
+  costing a deliberate confirmation, a kill the server refuses (no `ALTER ANY CONNECTION`)
+  must not look like it worked.
+
+### Changed
+
+- `docs/specs/TODO.md` corrects a claim this session put there: the deferral of the
+  remaining `0644` writes said the run report holds no third-party data beyond the capture
+  sidecars. It does — `internal/run/victim.go` writes a blocked session's login and host
+  into a reaction line stored in the `.log`. The deferral stands, on the honest ground that
+  the `.log` is meant to be read; the reasoning no longer misstates the exposure. Also
+  noted there and in 0.29.0: file modes are ignored on Windows apart from the read-only bit.
+
 ## [0.29.0] - 2026-09-01
 
 ### Added
@@ -50,7 +89,9 @@ history, so a report can always name the build that produced it.
 - Blocked-session, contended-tail and amplifier capture sidecars are written `0600` instead of
   `0644`. They name other people's sessions — login, host, application, and the text of the
   statement they were running — which on a shared administrative host was readable by every
-  local user.
+  local user. This affects POSIX deployments: Windows ignores the mode apart from the
+  read-only bit. The run report (`.log`) still carries the same class of data at `0644` and
+  is deliberately left readable; see `docs/specs/TODO.md`.
 - The `go` directive moves to 1.26.6, clearing four reachable standard-library
   vulnerabilities that `govulncheck` reported against 1.26.5 (GO-2026-6090, GO-2026-5972,
   GO-2026-5026, and one in `net/url`). **Migration:** building from source now needs Go

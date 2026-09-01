@@ -241,9 +241,16 @@ evidence about CWE-89 here.
   (`internal/run/queue.go`, `lock.go`).
   *Deferred because:* those are the operator-facing artifacts. A `.log` a colleague reads,
   a manifest a second person reviews before it runs, and a queue directory a scheduler
-  writes into are all workflows `0600`/`0700` would break, and the review found no
-  third-party data in them that the capture sidecars do not already hold. Decide it as a
-  deployment question (umask, directory ACLs) rather than by hard-coding a mode.
+  writes into are all workflows `0600`/`0700` would break, so the right control is the
+  directory's permissions rather than a hard-coded mode on each write.
+  **Correcting an earlier claim here:** this entry first said the review found no
+  third-party data in them beyond what the capture sidecars hold. That is false. The run
+  report carries it too — `internal/run/victim.go:534` appends `"; source: %s (login=%s
+  host=%s)"` to a reaction detail, which the engine stores as a `report.ReactionLine` in
+  the `.log`. So the choice is a real one about who may read the queue, not a free pass;
+  make it deliberately. Note also that file modes are ignored on Windows apart from the
+  read-only bit, so the `0600` already applied to the sidecars protects the POSIX
+  deployments only.
 
 - [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
   `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
 
@@ -27,6 +28,29 @@ operations:
     schema: dbo
     table: T
     index: IX3
+`
+
+// Same three operations, all already at their target compression, so intent: compression
+// skips every one of them.
+const threeOpSkipManifest = `
+description: checkpoint skip test
+intent: compression
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX1
+    data_compression: PAGE
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX2
+    data_compression: PAGE
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX3
+    data_compression: PAGE
 `
 
 func setupThreeOpEngine(t *testing.T, opts ...run.EngineOption) (*run.Engine, run.Dirs) {
@@ -76,15 +100,30 @@ func TestCheckpointBetweenOperations(t *testing.T) {
 	}
 }
 
-// Not wired means not called: the option is the whole switch, so an operator who leaves
-// the key false pays nothing.
-func TestNoCheckpointWhenNotWired(t *testing.T) {
-	eng, dirs := setupThreeOpEngine(t)
-	if _, err := eng.ProcessAll(context.Background()); err != nil {
+// A skipped operation wrote no log, so there is nothing to release. Checkpointing after
+// one would open a resumed 200-operation manifest with 190 round trips before any work.
+// intent: compression is the reachable skip in a unit test; the resume-cursor skip shares
+// the same carry-on return in runStep.
+func TestNoCheckpointAfterASkippedOperation(t *testing.T) {
+	var calls int
+	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
+	eng, dirs := setupThreeOpEngine(t,
+		run.WithCompressionReader(comp),
+		run.WithCheckpointBetweenOperations(func(context.Context) error { calls++; return nil }))
+	// Every operation is already at its target compression, so all three are skipped.
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(threeOpSkipManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
 		t.Fatalf("ProcessAll() error = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(dirs.Done, "010_a.yaml.log")); err != nil {
-		t.Errorf("manifest should still complete without the option: %v", err)
+	if sum.Done != 1 {
+		t.Fatalf("Summary = %+v, want Done:1", sum)
+	}
+	if calls != 0 {
+		t.Errorf("checkpoints = %d, want 0: every operation was skipped as already compressed", calls)
 	}
 }
 

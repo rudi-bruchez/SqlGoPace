@@ -768,9 +768,12 @@ func TestBatchUnmatchedRowsCountsTheSelfLimit(t *testing.T) {
     where_raw: "1=1"
 `).(ddl.BatchDML)
 
-	got := ddl.BatchUnmatchedRowsSQL(op, 1000)
+	if got := ddl.BatchUnmatchedRowsSQL(op, 1000); strings.Contains(got, "IS NULL OR") {
+		t.Errorf("the filter probe must answer for the filter alone, or the verdict turns on table state:\n%s", got)
+	}
+	got := ddl.BatchUntouchedRowsSQL(op, 1000)
 	if !strings.Contains(got, "IS NULL OR [Archived] <> 1") {
-		t.Errorf("probe ignores the self-limiting clause, so an idempotent update reads as whole-table:\n%s", got)
+		t.Errorf("the self-limit probe ignores the idempotence clause:\n%s", got)
 	}
 }
 
@@ -786,8 +789,11 @@ func TestBatchUnmatchedRowsKeyRangeUsesTheFilterAlone(t *testing.T) {
     batch: { strategy: key_range }
 `).(ddl.BatchDML)
 
-	got := ddl.BatchUnmatchedRowsSQL(op, 1000)
+	got := ddl.BatchUntouchedRowsSQL(op, 1000)
 	if strings.Contains(got, "IS NULL OR") {
 		t.Errorf("key_range does not self-limit; the probe must not assume it does:\n%s", got)
+	}
+	if got != ddl.BatchUnmatchedRowsSQL(op, 1000) {
+		t.Errorf("under key_range the two probes ask the same question and must agree:\n%s", got)
 	}
 }

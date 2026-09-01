@@ -50,8 +50,11 @@ func (m Model) View() string {
 		panel("", m.blockedBody(col), secondaryColor, col),
 		panel("", m.waitsBody(), secondaryColor, col))
 
+	// A confirmation prompt is modal: the next keystroke answers it. Rendering it only
+	// when the help footer is on left an operator who had pressed `?` in a mode they
+	// could not see, with their next key silently answering a question never asked.
 	footer := ""
-	if m.showHelp {
+	if m.showHelp || m.mode != modeNormal {
 		footer = panel("", m.helpBody(), secondaryColor, full)
 	}
 

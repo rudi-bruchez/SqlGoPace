@@ -230,17 +230,35 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 	//
 	// key_range is the exception: its statement carries no self-limiting clause (each key
 	// is processed once), so crediting it with one would spare rows the walk does update.
-	// No filter at all stays outside this guard: that is whole-table by construction and
-	// Validate already requires confirm_full_table for it, so there is nothing to probe.
-	// The test for that is the operator's filter, not the effective predicate — a literal
-	// update always has a self-limiting clause, and treating it as a filter would make
-	// this probe the arbiter of a case Validate has already settled.
-	if o.userWhere() == "" {
-		return ""
+	return unmatchedRowsSQL(o, o.userWhere(), limit)
+}
+
+// BatchUntouchedRowsSQL counts, up to limit, the rows the operation will not modify: the
+// operator's filter plus the self-limiting clause a literal UPDATE carries. It answers a
+// different question from BatchUnmatchedRowsSQL, and preflight needs both.
+//
+// The filter decides whether an operation is whole-table *as written* — `where_raw: "1=1"`
+// excludes nothing whatever the data looks like. The self-limit decides only whether that
+// is survivable on this particular table today, which is a warning and not a pass: a
+// verdict that turned on it would let the same manifest fail on an untouched table and
+// pass once a prior run had left rows at the target.
+//
+// It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause)
+// and under key_range (whose statement does not carry one), so preflight only pays for the
+// second probe when the two can differ.
+func BatchUntouchedRowsSQL(o BatchDML, limit int) string {
+	if o.Batch.IsKeyRange() {
+		return unmatchedRowsSQL(o, o.userWhere(), limit)
 	}
-	where := o.userWhere()
-	if !o.Batch.IsKeyRange() {
-		where = o.predicateWhere()
+	return unmatchedRowsSQL(o, o.predicateWhere(), limit)
+}
+
+// unmatchedRowsSQL builds the shared probe: how many of the first limit rows the given
+// predicate does not match. An empty predicate returns "" — no filter at all is whole-table
+// by construction, and Validate already requires confirm_full_table for it.
+func unmatchedRowsSQL(o BatchDML, where string, limit int) string {
+	if where == "" {
+		return ""
 	}
 	return fmt.Sprintf(
 		"SELECT COUNT(*) FROM (SELECT TOP (%d) 1 AS c FROM %s WHERE CASE WHEN (%s) THEN 1 ELSE 0 END = 0) x;",

@@ -33,10 +33,11 @@ func checkpointIneffectiveWarning(cfg *config.Config, recoveryModel string) stri
 	if !cfg.Monitoring.CheckpointBetweenOperations || checkpointBetweenOperations(cfg, recoveryModel) {
 		return ""
 	}
-	if strings.TrimSpace(recoveryModel) == "" {
-		recoveryModel = "an unreported"
+	model := strings.TrimSpace(recoveryModel)
+	if model == "" {
+		model = "an unreported"
 	}
 	return fmt.Sprintf("-- warning: monitoring.checkpoint_between_operations is set, but this database is in "+
-		"%s recovery, where a CHECKPOINT frees no log space (only a log backup does). No checkpoint will be issued",
-		recoveryModel)
+		"%s recovery model, where a CHECKPOINT frees no log space (only a log backup does). No checkpoint will be issued",
+		model)
 }

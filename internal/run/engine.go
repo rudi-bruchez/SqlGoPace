@@ -627,9 +627,6 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if out := e.runStep(ctx, r, i, step); out != nil {
 			return *out
 		}
-		if i < len(planned)-1 {
-			e.checkpointBetween(ctx)
-		}
 	}
 	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps)
 }
@@ -638,8 +635,12 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 // is reported and swallowed: a CHECKPOINT releases log space, it is not part of the work
 // the manifest was asked to do, so refusing one is no reason to fail a manifest whose
 // operations succeeded.
-func (e *Engine) checkpointBetween(ctx context.Context) {
-	if e.checkpoint == nil {
+func (e *Engine) checkpointBetween(ctx context.Context, i, total int) {
+	// Only after an operation that actually ran, and only with another behind it. A
+	// skipped operation — before the resume cursor, or satisfied by intent: compression —
+	// wrote no log, so there is nothing to release; checkpointing there would open a
+	// resumed 200-operation manifest with 190 round trips before any work.
+	if e.checkpoint == nil || i >= total-1 {
 		return
 	}
 	if err := e.checkpoint(ctx); err != nil {
@@ -937,6 +938,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		// continue-on-failure: quarantine the failed op and keep going.
 		r.failedOps = append(r.failedOps, step.Operation)
 		fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
+		e.checkpointBetween(ctx, i, len(r.planned))
 		return nil // carry on to the next operation
 	}
 	// A shrink can finish without error yet stop short of target (it stalled or timed
@@ -974,6 +976,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		r.st.Paused = nil
 	}
 	e.advanceCursor(r.name, &r.cursor, i)
+	e.checkpointBetween(ctx, i, len(r.planned))
 	return nil
 }
 

@@ -216,9 +216,6 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	fmt.Fprintf(stdout, "-- target: tier=%s major=%d adr=%t recovery=%s rcsi=%t si=%t\n",
 		info.Tier(), info.MajorVersion, info.ADREnabled, info.RecoveryModel, info.RCSIEnabled, info.SnapshotIsolation)
-	if w := checkpointIneffectiveWarning(cfg, info.RecoveryModel); w != "" {
-		fmt.Fprintln(stdout, w)
-	}
 	if w := amplifierDwellWarning(cfg); w != "" {
 		fmt.Fprintln(stdout, w)
 	}
@@ -368,6 +365,12 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			}
 			fmt.Fprintf(stdout, "-- skip database %s: unsupported engine edition %d\n", db, dbInfo.EngineEdition)
 			continue
+		}
+		// Per database, not per run: the checkpoint itself is gated on this database's
+		// recovery model in buildEngine, and a startup connection to a SIMPLE utility
+		// database would otherwise silently vouch for FULL production targets.
+		if w := checkpointIneffectiveWarning(cfg, dbInfo.RecoveryModel); w != "" {
+			fmt.Fprintln(stdout, w)
 		}
 		if len(targets) > 1 {
 			fmt.Fprintf(stdout, "-- database %s\n", db)
@@ -1202,9 +1205,15 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 		case a := <-actions:
 			switch a.Kind {
 			case tui.ActionKillDDL:
-				_ = conn.Kill(ctx, ddlSPID)
+				// The operator confirmed this one; a KILL that the server refuses (no
+				// ALTER ANY CONNECTION) must not look like it worked.
+				if err := conn.Kill(ctx, ddlSPID); err != nil {
+					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill DDL (SPID %d) failed: %v", ddlSPID, err)})
+				}
 			case tui.ActionKillBlocker:
-				_ = conn.Kill(ctx, a.SPID)
+				if err := conn.Kill(ctx, a.SPID); err != nil {
+					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill SPID %d failed: %v", a.SPID, err)})
+				}
 			case tui.ActionDrain:
 				// The drain key toggles: request a graceful stop, or cancel a pending one.
 				if drain.Draining() {

@@ -488,12 +488,12 @@ func TestKillDDLNeedsConfirmation(t *testing.T) {
 	}
 
 	view := m.View()
-	// The cost of the rollback is what the operator is deciding about, and it is
-	// proportional to the work already done.
-	for _, want := range []string{"rebuild_index dbo.MEASUREMENT", "63"} {
-		if !strings.Contains(view, want) {
-			t.Errorf("confirmation does not show %q; the operator cannot judge the cost:\n%s", want, view)
-		}
+	// Assert on text only the prompt produces. The operation label and the percentage
+	// also appear in the normal panels, so matching those would pass with no prompt at
+	// all; TestKillDDLConfirmShowsElapsedWork checks the cost figures against the
+	// prompt body itself, where they can only come from the prompt.
+	if !strings.Contains(view, "kill our own running DDL") {
+		t.Errorf("k did not open a confirmation prompt:\n%s", view)
 	}
 	// On a tier without RESUMABLE the rollback is total and uninterruptible. Saying so is
 	// the whole reason this prompt exists rather than a bare "are you sure?".
