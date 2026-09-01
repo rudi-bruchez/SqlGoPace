@@ -24,17 +24,23 @@ build is connected.
 ## Two different questions
 
 This page answers "what happens if the key is absent". That is not the same as "what the
-repository's `config.yaml` sets", and in two places they differ on purpose, because the
-shipped file is deliberately more cautious than the bare default:
+repository's `config.yaml` sets", and in three places they differ on purpose:
 
 | Key | Default when absent | The shipped `config.yaml` |
 |---|---|---|
 | `preflight.require_data_free_space` | false | **true** |
 | `history.enabled` | false | **true**, writing `./sqlgopace_history.db` |
+| `monitoring.max_retry_attempts` | 0 | **1**: one retry after a pressure cancel |
 
-If you copied that file, those are the values you have. It is the recommended starting
-point, and `require_data_free_space: true` in particular can fail a first run's preflight,
-which is the intended behaviour rather than a fault.
+If you copied that file, those are the values you have. The first two make it more cautious
+than the bare default: `require_data_free_space: true` in particular can fail a first run's
+preflight, which is the intended behaviour rather than a fault. The third does not — it retries
+once on the chance the pressure has cleared, at the cost of repeating the work so far.
+
+`kill_blockers.enabled` was a fourth, undisclosed divergence until 0.19.0: the shipped file
+armed it while this page and four others said it was off by default. It now ships `false`.
+If you scaffolded a `config.yaml` before 0.19.0, check that key — killing blockers may be
+armed in your copy without you having asked for it.
 
 ## Sections
 
@@ -88,7 +94,7 @@ when a scheduler launches the binary from somewhere else than you do.
 | `log_max_percent` | required | Log-usage percentage ceiling, 1 to 100. |
 | `blocking_timeout_minutes` | 1 | How long we may block another session before yielding. |
 | `log_drain_timeout_minutes` | 30 | How long to wait for the log to drain before giving up cleanly. |
-| `max_retry_attempts` | 0 | Retries after a recoverable failure. |
+| `max_retry_attempts` | 0 | Retries after a *pressure cancel* only. A failing statement is not retried. |
 | `kill_grace_seconds` | 30 | Grace between cancelling a statement and the fallback `KILL`. |
 | `reconnect_timeout_minutes` | 2 | How long to try to re-establish a lost monitoring connection. |
 | `checkpoint_between_operations` | false | Issue a `CHECKPOINT` between operations. |

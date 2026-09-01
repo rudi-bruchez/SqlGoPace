@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.18.0 (2026-09-01).
+Status last verified against the tree at v0.19.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,10 +37,14 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. Items 1, 7 and 8 are hours; 2–6 are days.
+Ordered as the review ordered them. **1 and 8 are done (0.19.0); six remain.** Item 7 is
+hours; 2–6 are days.
 
-- [ ] **1. `kill_blockers.enabled: false`** in `config.yaml` and the scaffold twin (finding 6).
-  Ships `true` while five documents and the comment six lines above it say it is off.
+- [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
+  `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
+  the shipped file disagreed with the five documents that called it off by default. A
+  `config.yaml` scaffolded earlier is unchanged and may still be armed — the migration note
+  in the CHANGELOG and in `docs/configuration.md` says so.
 - [ ] **2. `batch_update` can loop forever, committing** (finding 1). `set: {Col: null}`
   generates `WHERE ([Col] IS NULL OR [Col] <> null)` (`internal/ddl/batch.go:93`); `<> null`
   is `UNKNOWN`, so every updated row re-enters the match set. The clause written to guarantee
@@ -63,10 +67,17 @@ Ordered as the review ordered them. Items 1, 7 and 8 are hours; 2–6 are days.
   the direction error `docs/blocking-and-kills.md` uses as its own cautionary tale.
 - [ ] **7. Report a stopped-short batch as incomplete, not done** (finding 8). Reuse the shrink
   path; today a half-finished purge is filed as complete and made unresumable.
-- [ ] **8. Correct the false claims** in `README.md` ("no raw SQL is ever accepted or executed"
-  — there are four verbatim-interpolated fields), `SECURITY.md` (admits two of them), and
-  `docs/configuration.md` (the shipped-vs-default table says "three places" and lists two,
-  omitting `kill_blockers` and `max_retry_attempts`).
+- [x] **8. Correct the false claims** — done in 0.19.0. `README.md` no longer says "no raw
+  SQL is ever accepted or executed"; it says a manifest is a trusted input and points at
+  `SECURITY.md`, which now names all four verbatim-interpolated fields instead of two:
+  `set_raw`, `where_raw`, `type` (presence-checked only, `manifest.go:703,723`) and
+  `data_compression` (unvalidated, `generate.go:110`). `docs/configuration.md`'s
+  shipped-vs-default table gained the third divergence, `monitoring.max_retry_attempts`
+  (ships `1`, default `0`), and its description of that key was corrected: it retries after
+  a *pressure cancel* only (`monitored_runner.go:68`), not after a failure.
+  *Left undone:* an allow-list validating `data_compression` against `NONE|ROW|PAGE`, and
+  the same for `type`. Both are code, not documentation, and item 8 was scoped to making
+  the docs true; the fields are now disclosed rather than silently unvalidated.
 
 **Two to name in the README even if not fixed**, because an operator who knows can work around
 them and one who does not cannot: nothing anywhere reads `sys.dm_os_volume_stats`, so free space

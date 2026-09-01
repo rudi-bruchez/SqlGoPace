@@ -35,8 +35,10 @@ mechanism available.
 ## In short
 
 - **You declare, it generates.** Sixteen operation types, from `rebuild_index` to
-  `batch_delete`. No raw SQL is ever accepted or executed, which is what makes the rest of
-  this list possible.
+  `batch_delete`. It never accepts or runs a `.sql` file: every statement is built from a
+  typed operation with its identifiers quoted, which is what makes the rest of this list
+  possible. It is not a sandbox, though — four manifest fields are interpolated verbatim,
+  and [SECURITY.md](SECURITY.md) names them. A manifest is a trusted input.
 - **The right options for the server in front of you.** `ONLINE`, `RESUMABLE`,
   `WAIT_AT_LOW_PRIORITY`, `MAXDOP` and compression are injected from the detected version
   and edition, so one manifest is correct on 2016 Standard and on 2022 Enterprise.

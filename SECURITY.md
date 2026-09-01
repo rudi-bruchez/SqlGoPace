@@ -50,11 +50,19 @@ from typed manifest operations, and object identifiers are quoted and escaped.
 That is a deliberate design property, not an accident, and it is what makes the
 generated statement predictable.
 
-It is not a sandbox, and two fields are the reason. `set_raw` and `where_raw` on
-`batch_update` and `batch_delete` are interpolated into the generated statement
-verbatim. They are validated for shape (a raw `SET` must come with a
-self-limiting predicate, a missing predicate must be confirmed explicitly) but
-their SQL text is not inspected or sanitised.
+It is not a sandbox, and four fields are the reason.
+
+`set_raw` and `where_raw` on `batch_update` and `batch_delete` are interpolated
+into the generated statement verbatim. They are validated for shape (a raw `SET`
+must come with a self-limiting predicate, a missing predicate must be confirmed
+explicitly) but their SQL text is not inspected or sanitised.
+
+`type` on `add_column` and `alter_column`, and `data_compression` on
+`rebuild_index`, `create_index` and `rebuild_heap`, are pasted into the DDL the
+same way, and are checked less than that: `type` only for being non-empty,
+`data_compression` not at all — nothing restricts it to `NONE`, `ROW` or `PAGE`.
+They read like enumerations and are not, which is the likelier way to be
+surprised by them.
 
 So a manifest is a trusted input, equivalent in privilege to a script the
 connected login could run itself. Write access to the `to_run` directory is

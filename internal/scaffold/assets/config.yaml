@@ -102,7 +102,7 @@ batch_dml:
 # restart). This is finer-grained than allow_abort_blockers, works on every edition, and —
 # unlike WAIT_AT_LOW_PRIORITY — needs no SQL 2022.
 kill_blockers:
-  enabled: true                # master arm; kills only happen when true
+  enabled: false               # master arm; kills only happen when true
   default_after_seconds: 60    # delay applied to a rule that sets no after_seconds
 
 # Terminate maintenance statements this run's operation blocks once other sessions

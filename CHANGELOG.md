@@ -13,6 +13,32 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.19.0] - 2026-09-01
+
+### Changed
+
+- `kill_blockers.enabled` now ships `false` in `config.yaml` and in the copy `sqlgopace
+  init` writes. It shipped `true` while five documents and the comment six lines above the
+  value itself said blocker-killing was off by default, so a scaffolded install had the
+  master arm on the destructive path enabled without the operator choosing it. The Go
+  default was always `false`; only the shipped file disagreed. **Migration:** if you
+  scaffolded a `config.yaml` before 0.19.0, check `kill_blockers.enabled` in your copy — it
+  is unchanged and may still be armed. Nothing fires without a per-manifest
+  `kill_blocking_sessions` rule, so a queue with no such rule is unaffected.
+
+### Fixed
+
+- `README.md` claimed "no raw SQL is ever accepted or executed". Four manifest fields are
+  interpolated verbatim: `set_raw` and `where_raw` on the batched-DML operations, `type` on
+  `add_column` / `alter_column` (presence-checked only), and `data_compression` on
+  `rebuild_index` / `create_index` / `rebuild_heap` (not validated at all — nothing
+  restricts it to `NONE`, `ROW` or `PAGE`). The README now says a manifest is a trusted
+  input and points at `SECURITY.md`, which named two of the four and now names all four.
+- `docs/configuration.md`'s shipped-versus-default table listed two divergences and there
+  were three: `monitoring.max_retry_attempts` ships `1` against a default of `0`. The same
+  page described that key as retrying "after a recoverable failure"; it retries after a
+  pressure cancel only, and a statement that fails is not retried.
+
 ## [0.18.0] - 2026-09-01
 
 ### Fixed
