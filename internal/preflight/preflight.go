@@ -339,6 +339,9 @@ type Prober interface {
 	FileSpace(ctx context.Context, fileType string) ([]mssql.FileSpace, error)
 	FileGrowths(ctx context.Context, fileType string) ([]mssql.FileGrowth, error)
 	IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error)
+	// QueryInt runs a scalar query built by internal/ddl. Only the batched-DML
+	// selectivity probe uses it; nothing here composes SQL of its own.
+	QueryInt(ctx context.Context, statement string) (int64, bool, error)
 }
 
 var _ Prober = (*mssql.Conn)(nil)
@@ -483,6 +486,18 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 				}
 			}
 			rep.add(CheckBatchDMLIsolation(info, b))
+			// The whole-table guard, made semantic. Skipped when the operator has already
+			// confirmed (nothing left to establish, and no reason to pay for the read) and
+			// when the table is absent (CheckOperation already fails the manifest).
+			if tableExists && !b.ConfirmFullTable {
+				if probe := ddl.BatchUnmatchedRowsSQL(b, unmatchedRowSample); probe != "" {
+					spared, _, err := p.QueryInt(ctx, probe)
+					if err != nil {
+						return Report{}, fmt.Errorf("preflight batch selectivity %s.%s: %w", b.Schema, b.Table, err)
+					}
+					rep.add(CheckBatchDMLSelectivity(b, spared, unmatchedRowSample))
+				}
+			}
 		}
 	}
 	return rep, nil
@@ -505,6 +520,38 @@ func CheckBatchDMLPermission(op ddl.BatchDML, perm string, hasAccess bool) Check
 			fmt.Sprintf("the connected login lacks %s permission on [%s].[%s]", perm, op.Schema, op.Table)}
 	}
 	return Check{name, Pass, perm + " granted"}
+}
+
+// unmatchedRowSample is how many spared rows the selectivity probe counts before it
+// stops. It is a sample size, not a threshold: the verdict turns on zero versus
+// non-zero, and the cap is only there to keep the probe from scanning a large table
+// once it has already seen enough to answer.
+const unmatchedRowSample = 1000
+
+// CheckBatchDMLSelectivity gives confirm_full_table the meaning the documentation
+// always claimed for it. The flag was a presence test on a YAML key, so a filter that
+// was *written* satisfied it however little it excluded: `where_raw: "1=1"`, or
+// `where: [{column: Id, op: ">=", value: 0}]` on an identity column — the shape a tired
+// DBA actually writes — deleted every row with no confirmation and no preview.
+//
+// spared is how many rows the filter would leave alone, counted up to limit. Zero means
+// the operation is whole-table however it is spelled, and it fails. A handful warns with
+// the number, because "this deletes all but three rows" is something the operator should
+// see and only they can judge. Reaching the sample cap is a filter doing its job.
+func CheckBatchDMLSelectivity(op ddl.BatchDML, spared int64, limit int) Check {
+	name := fmt.Sprintf("%s whole-table guard", op.CommandType())
+	switch {
+	case spared == 0:
+		return Check{name, Fail, fmt.Sprintf(
+			"the filter spares no row of [%s].[%s]: this %ss the whole table. Set confirm_full_table: true if that is what you mean",
+			op.Schema, op.Table, op.Verb)}
+	case spared < int64(limit):
+		return Check{name, Warn, fmt.Sprintf(
+			"the filter spares only %d row(s) of [%s].[%s] — close to a whole-table %s",
+			spared, op.Schema, op.Table, op.Verb)}
+	default:
+		return Check{name, Pass, fmt.Sprintf("the filter spares at least %d rows", limit)}
+	}
 }
 
 // CheckBatchDMLIsolation is an advisory (never blocking) on how the database's

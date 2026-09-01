@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.20.0 (2026-09-01).
+Status last verified against the tree at v0.21.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,8 +37,8 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1, 2 and 8 are done; five remain.** Item 7 is hours;
-3–6 are days.
+Ordered as the review ordered them. **1, 2, 3 and 8 are done; four remain.** Item 7 is
+hours; 4–6 are days.
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
@@ -64,9 +64,18 @@ Ordered as the review ordered them. **1, 2 and 8 are done; five remain.** Item 7
   B before the first row is written rather than after the ceiling's worth — but it is a
   heuristic over raw SQL text where the ceiling is a proof, so it is an improvement on a
   closed hole rather than the closing of one. The spec now says so in place.
-- [ ] **3. Make the whole-table DELETE guard semantic** (finding 2). `confirm_full_table` is a
-  presence check on a YAML key, so `where_raw: "1=1"` walks past it with no row-count preview.
-  Alternatively drop batched DML from the advertised feature set until it is fixed.
+- [x] **3. Make the whole-table DELETE guard semantic** — done in 0.21.0.
+  `ddl.BatchUnmatchedRowsSQL` counts the rows the filter would spare, capped at 1000;
+  `preflight.CheckBatchDMLSelectivity` fails on zero, warns below the cap with the number,
+  passes at it. Skipped when `confirm_full_table` is already set, so the confirmed path pays
+  nothing. The `CASE WHEN (pred) THEN 1 ELSE 0 END = 0` wrapper is load-bearing: a plain
+  `NOT (pred)` drops the rows where the predicate is UNKNOWN, which the DML spares too, so
+  they would have been miscounted as matched.
+  *Left undone:* the guard fires on **zero** spared rows, not on "essentially the whole
+  table". A filter sparing one row of ten million passes with a warning naming the count.
+  That is deliberate — zero is provable and needs no invented threshold, and the warning
+  puts the number in front of the operator, who is the only one who can judge whether it is
+  the number they expected. Revisit only if a real manifest slips through.
 - [ ] **4. Add a queue lock file, taken before recovery** (finding 3). `matchesOrphan` needs a
   row in `dm_exec_requests`, which a paused or between-chunks instance does not have, so a
   second run requeues a live peer's in-flight manifest. Cron overlap is not exotic.

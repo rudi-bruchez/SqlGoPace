@@ -13,6 +13,20 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.21.0] - 2026-09-01
+
+### Fixed
+
+- `confirm_full_table` now means what the documentation always claimed. It was a presence
+  test on a YAML key, so any filter that was *written* satisfied it however little it
+  excluded: `where_raw: "1=1"`, or `where: [{column: Id, op: ">=", value: 0}]` on an identity
+  column, deleted every row of the table with no confirmation, no warning and no row-count
+  preview. Preflight now asks the server how many rows the filter would spare, counted up to
+  1000: zero fails the manifest, one to 999 warns with the number, the cap passes. The probe
+  is skipped when `confirm_full_table: true` is already set, so a confirmed whole-table
+  operation costs nothing. **Migration:** a manifest whose filter excludes no row now fails
+  preflight instead of running — add `confirm_full_table: true` if that was the intent. The
+  probe needs `SELECT` on the table, which batched DML already required.
 ## [0.20.0] - 2026-09-01
 
 ### Fixed

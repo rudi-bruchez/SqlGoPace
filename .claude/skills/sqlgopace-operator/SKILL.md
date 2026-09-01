@@ -58,7 +58,8 @@ will do, and name what to verify before it runs.
   unless `kill_blockers.enabled: true` in the config, so say that when you write one.
 - **Batched DML needs `SELECT` as well as `UPDATE` or `DELETE`.** Every batch is an
   `UPDATE`/`DELETE TOP (n)`, so `db_datawriter` alone fails mid-run. It also refuses to run
-  with no predicate at all unless `confirm_full_table: true` says you meant it.
+  when the filter spares no row — not just when the filter is missing — unless
+  `confirm_full_table: true` says you meant it. So `where_raw: "1=1"` is refused too.
 - **`maxdop` is bounded to 0..32767.** Outside that the manifest is rejected, because SQL
   Server would reject the statement with Msg 304.
 

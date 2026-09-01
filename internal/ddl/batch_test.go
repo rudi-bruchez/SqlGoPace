@@ -610,3 +610,57 @@ func TestMarshalManifestRoundTripsNullSetValue(t *testing.T) {
 		t.Errorf("SQL changed across a rewrite:\n got %s\nwant %s", got, want)
 	}
 }
+
+// TestBatchUnmatchedRowsSQL pins the selectivity probe. It asks "does this predicate
+// spare any row at all", capped, so preflight can tell a genuinely selective filter
+// from `where_raw: "1=1"` — which walks past confirm_full_table today. The CASE wrapper
+// is what makes it correct under three-valued logic: a plain NOT (pred) drops the rows
+// where the predicate is UNKNOWN, which the DML does not act on either, so they must
+// count as spared.
+func TestBatchUnmatchedRowsSQL(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{
+			name: "declarative where",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: AuditLog
+    where:
+      - { column: CreatedAt, op: '<', value: '2024-01-01' }
+`,
+			want: "SELECT COUNT(*) FROM (SELECT TOP (1000) 1 AS c FROM [dbo].[AuditLog] WHERE CASE WHEN ([CreatedAt] < N'2024-01-01') THEN 1 ELSE 0 END = 0) x;",
+		},
+		{
+			name: "raw where",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: Orders
+    where_raw: "1=1"
+`,
+			want: "SELECT COUNT(*) FROM (SELECT TOP (1000) 1 AS c FROM [dbo].[Orders] WHERE CASE WHEN (1=1) THEN 1 ELSE 0 END = 0) x;",
+		},
+		{
+			name: "no predicate has nothing to probe",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: Scratch
+    confirm_full_table: true
+`,
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op := parseOneOp(t, tt.manifest).(ddl.BatchDML)
+			if got := ddl.BatchUnmatchedRowsSQL(op, 1000); got != tt.want {
+				t.Errorf("BatchUnmatchedRowsSQL:\n got %s\nwant %s", got, tt.want)
+			}
+		})
+	}
+}

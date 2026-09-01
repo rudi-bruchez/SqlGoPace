@@ -241,7 +241,7 @@ waits each batch produced.
 | `batch.strategy` | `predicate` re-runs the same filter until it matches nothing. `key_range` walks a key column and persists a watermark, so a crash resumes mid-table. |
 | `batch.key` | The key column, for `key_range`. |
 | `batch.initial_rows` | Starting batch size. Auto-sized when omitted. |
-| `confirm_full_table` | Required to run with no predicate at all. Without it, a manifest that would touch every row is rejected. |
+| `confirm_full_table` | Required whenever the filter spares no row — including a filter that is written but excludes nothing. Without it the manifest is rejected. |
 
 Three rules the parser enforces, each closing a way to lose data or hang:
 
@@ -251,6 +251,22 @@ Three rules the parser enforces, each closing a way to lose data or hang:
   would loop forever. It is rejected; give it a self-limiting `where_raw`.
 - The `key_range` walk persists a watermark and re-applies the boundary batch on a resume,
   so it is restricted to an idempotent literal `UPDATE`.
+
+The parser can only see whether a filter was *written*. Preflight checks whether it
+**excludes anything**, by asking the server how many rows the filter would spare (counted up
+to 1000, so a selective filter is answered almost immediately and only a filter that matches
+everything pays for a scan):
+
+| Rows spared | Verdict |
+|---|---|
+| 0 | **Fail** — this is a whole-table operation however it is spelled. Set `confirm_full_table: true` if you mean it. |
+| 1–999 | **Warn**, with the number. "This deletes all but three rows" is something only you can judge. |
+| 1000 | **Pass** — the filter is doing its job. |
+
+So `where_raw: "1=1"`, and `where: [{column: Id, op: ">=", value: 0}]` on an identity column,
+are refused the same way an absent filter is. The probe is skipped entirely when
+`confirm_full_table: true` is already set: you have said what you mean, and there is nothing
+left for the check to establish.
 
 A literal `set` is self-limiting: the generated `WHERE` excludes rows already holding the
 target value, so the loop ends when nothing is left to change. `set: {Col: null}` is included

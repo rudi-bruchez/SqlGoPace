@@ -117,6 +117,17 @@ operations:
   reminds that **`TRUNCATE TABLE`** is the right tool for an unconditional full wipe when
   FKs/triggers/access allow it — batched DELETE is for when TRUNCATE is not viable.
 
+  **Amended (0.21.0): as written above this guard did not guard.** It was a presence test on
+  a YAML key, so any filter that was *written* satisfied it however little it excluded —
+  `where_raw: "1=1"`, or `where: [{column: Id, op: ">=", value: 0}]` on an identity column,
+  deleted every row with no confirmation and no preview. What matters is whether the filter
+  spares a row, not whether it exists, so preflight now asks the server:
+  `BatchUnmatchedRowsSQL` counts the rows the filter would leave alone, capped at 1000.
+  Zero fails, a handful warns with the number, the cap passes. The probe is skipped when
+  `confirm_full_table` is already set — there is nothing left to establish — and the CASE
+  wrapper in the generated SQL is load-bearing: a plain `NOT (pred)` drops the rows where the
+  predicate is UNKNOWN, which the DML spares too.
+
 ---
 
 ## 4. Idempotence & crash resume (the core safety model)

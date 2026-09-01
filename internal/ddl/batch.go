@@ -202,6 +202,33 @@ func BatchDMLChunkSQL(o BatchDML, batchSize int, res ResolvedOptions) string {
 	return batchStatement(o, strconv.Itoa(batchSize), res)
 }
 
+// BatchUnmatchedRowsSQL counts, up to limit, the rows the operation's filter would
+// NOT act on. Preflight uses it to give confirm_full_table a meaning: zero spared rows
+// is a whole-table operation however the filter is spelled, so `where_raw: "1=1"` and
+// `where: [{column: Id, op: ">=", value: 0}]` no longer walk past the guard that only
+// ever checked whether the filter was absent.
+//
+// The CASE wrapper is not decoration. A plain `NOT (pred)` returns only the rows where
+// the predicate is FALSE, dropping those where it is UNKNOWN — but the DML does not act
+// on those either, so they are spared and must be counted. CASE resolves UNKNOWN to its
+// ELSE branch, which makes "= 0" exactly "this row survives".
+//
+// TOP bounds the cost: the probe stops at the first `limit` survivors, so a selective
+// filter is answered almost immediately. Only a filter that really does match everything
+// scans the table — and that is the case worth paying for.
+//
+// It returns "" when there is no filter at all: that is whole-table by construction and
+// Validate already requires confirm_full_table for it, so there is nothing to probe.
+func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
+	where := o.userWhere()
+	if where == "" {
+		return ""
+	}
+	return fmt.Sprintf(
+		"SELECT COUNT(*) FROM (SELECT TOP (%d) 1 AS c FROM %s WHERE CASE WHEN (%s) THEN 1 ELSE 0 END = 0) x;",
+		limit, qualified(o.Schema, o.Table), where)
+}
+
 // generateBatchDML returns an INDICATIVE statement for the plan/report. The real
 // SQL is built per batch at run time by the batch-DML driver (the batch size comes
 // from adaptive sizing), so PlannedOperation.SQL is illustrative only; the engine

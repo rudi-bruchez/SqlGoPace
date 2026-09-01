@@ -251,6 +251,8 @@ type fakeProber struct {
 	growthErr      error
 	indexSizeErr   error
 	indexSizeMB    int
+	unmatchedRows  int64
+	queries        *int // probe call count, a pointer so a value copy still counts
 	indexSizeByPartition map[int]int
 }
 
@@ -306,6 +308,16 @@ func (f fakeProber) IsSysadmin(context.Context) (bool, error) {
 func (f fakeProber) HasAlterAnyConnection(context.Context) (bool, error) {
 	return f.alterAnyConn, nil
 }
+
+// QueryInt answers the selectivity probe, counting the calls so a test can assert the
+// probe was skipped — which is half of what confirm_full_table now buys.
+func (f fakeProber) QueryInt(_ context.Context, _ string) (int64, bool, error) {
+	if f.queries != nil {
+		*f.queries++
+	}
+	return f.unmatchedRows, true, nil
+}
+
 func (f fakeProber) HasDMLPermission(_ context.Context, _, _, perm string) (bool, error) {
 	if f.dmlDenied != nil && f.dmlDenied[perm] {
 		return false, nil
@@ -719,4 +731,103 @@ func TestRunSurvivesAnObjectSizeReadFailure(t *testing.T) {
 	if rep.HasFailure() {
 		t.Errorf("an unreadable object size failed the run:\n%v", rep.Checks)
 	}
+}
+
+var (
+	batchServerInfo = mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	batchThresholds = preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+)
+
+// TestCheckBatchDMLSelectivity pins the verdicts of the whole-table guard. The point
+// of the check is that confirm_full_table stops being a presence test on a YAML key:
+// what matters is whether the filter spares any row, not whether it was written.
+func TestCheckBatchDMLSelectivity(t *testing.T) {
+	del := ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "Orders", WhereRaw: "1=1"}
+	upd := ddl.BatchDML{Verb: "update", Schema: "dbo", Table: "Orders", WhereRaw: "1=1",
+		Set: map[string]ddl.Literal{"A": {Raw: "1"}}}
+
+	tests := []struct {
+		name    string
+		op      ddl.BatchDML
+		spared  int64
+		limit   int
+		want    preflight.Severity
+		wantSub string
+	}{
+		{"delete sparing nothing fails", del, 0, 1000, preflight.Fail, "confirm_full_table"},
+		{"update sparing nothing fails", upd, 0, 1000, preflight.Fail, "confirm_full_table"},
+		{"sparing a handful warns", del, 3, 1000, preflight.Warn, "3"},
+		{"sparing the whole sample passes", del, 1000, 1000, preflight.Pass, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := preflight.CheckBatchDMLSelectivity(tt.op, tt.spared, tt.limit)
+			if c.Severity != tt.want {
+				t.Errorf("Severity = %v, want %v (%s)", c.Severity, tt.want, c.Detail)
+			}
+			if tt.wantSub != "" && !strings.Contains(c.Detail, tt.wantSub) {
+				t.Errorf("Detail = %q, want it to mention %q", c.Detail, tt.wantSub)
+			}
+		})
+	}
+}
+
+// TestRunFailsAnUnconfirmedWholeTableDelete is the end-to-end shape of the guard: the
+// manifest that motivated it — a predicate that is written, passes validation, and
+// deletes every row — must not run.
+func TestRunFailsAnUnconfirmedWholeTableDelete(t *testing.T) {
+	p := healthyProber()
+	p.dmlPermission = true
+	p.unmatchedRows = 0 // the filter spares nothing
+	m := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "Orders", WhereRaw: "1=1"},
+	}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, m, batchThresholds, false)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	guard, ok := findCheck(rep, "whole-table guard")
+	if !ok {
+		t.Fatalf("no whole-table guard check ran:\n%v", rep.Checks)
+	}
+	if guard.Severity != preflight.Fail {
+		t.Errorf("guard = %v (%s), want Fail", guard.Severity, guard.Detail)
+	}
+	if !rep.HasFailure() {
+		t.Errorf("preflight passed an unconfirmed whole-table delete:\n%v", rep.Checks)
+	}
+}
+
+// TestRunSkipsTheProbeWhenConfirmed: the operator said they meant it, so there is
+// nothing left to establish and no reason to pay for a scan.
+func TestRunSkipsTheProbeWhenConfirmed(t *testing.T) {
+	var probes int
+	p := healthyProber()
+	p.dmlPermission = true
+	p.unmatchedRows = 0
+	p.queries = &probes
+	m := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.BatchDML{Verb: "delete", Schema: "dbo", Table: "Orders",
+			WhereRaw: "1=1", ConfirmFullTable: true},
+	}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, m, batchThresholds, false)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if rep.HasFailure() {
+		t.Fatalf("preflight failed a confirmed whole-table delete:\n%v", rep.Checks)
+	}
+	if probes != 0 {
+		t.Errorf("ran %d probe queries, want 0 — confirm_full_table settles it", probes)
+	}
+}
+
+// findCheck returns the first check whose name contains sub.
+func findCheck(rep preflight.Report, sub string) (preflight.Check, bool) {
+	for _, c := range rep.Checks {
+		if strings.Contains(c.Name, sub) {
+			return c, true
+		}
+	}
+	return preflight.Check{}, false
 }
