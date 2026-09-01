@@ -13,6 +13,23 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.23.0] - 2026-09-01
+
+### Changed
+
+- `abort-resumable` now requires a target. It read `sys.index_resumable_operations` with no
+  `WHERE` clause, so "every paused resumable in the database" was the only mode, reachable
+  with nothing but `--config`: one command on a shared server aborted every colleague's
+  in-flight index build, and SQL Server cannot resume an aborted operation. New `--table`
+  (`schema.table`, or a bare table name) and `--index` filters select what to abort; `--all` is
+  the explicit way to decline a target and needs `--yes`, as does `--include-running`, which
+  kills the sessions building those indexes. `--dry-run` needs neither, so the review path
+  stays the easy one. The header now prints the resolved scope before the first `ABORT`
+  instead of warning after the decision was made. **Migration:** `sqlgopace abort-resumable
+  --config c.yaml` is now an error rather than a database-wide abort; add `--table`/`--index`,
+  or `--all --yes` for the old behaviour.
+- The engine's "a paused resumable operation blocks this rebuild" error now spells out the
+  full targeted command, since the bare one it used to suggest is refused.
 ## [0.22.0] - 2026-09-01
 
 ### Added

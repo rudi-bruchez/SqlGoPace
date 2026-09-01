@@ -1372,7 +1372,13 @@ func (e *Engine) blockingResumable(ctx context.Context, op ddl.Operation) bool {
 // on a shared/production database.
 func (e *Engine) clearOrRejectBlockingResumable(ctx context.Context, op ddl.Operation, optIn bool) error {
 	if !optIn {
-		return fmt.Errorf("a paused resumable operation blocks this rebuild; resolve it with `sqlgopace abort-resumable` or set abort_blocking_resumable: true in the manifest")
+		// Name the target: abort-resumable refuses a bare invocation, and an operator
+		// arriving from this message should not have to work out the flags under pressure.
+		ref := op.Target()
+		return fmt.Errorf(
+			"a paused resumable operation blocks this rebuild; resolve it with `sqlgopace abort-resumable --config <config> --table %s.%s --index %s --yes` "+
+				"(preview it with --dry-run first; an aborted operation cannot be resumed), or set abort_blocking_resumable: true in the manifest",
+			ref.Schema, ref.Table, ref.Name)
 	}
 	if e.aborter == nil {
 		return fmt.Errorf("abort_blocking_resumable is set but no aborter is wired")

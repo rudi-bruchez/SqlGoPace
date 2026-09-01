@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.22.0 (2026-09-01).
+Status last verified against the tree at v0.23.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,8 +37,7 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1, 2, 3, 4 and 8 are done; three remain.** Item 7 is
-hours; 5 and 6 are days.
+Ordered as the review ordered them. **1–5 and 8 are done; two remain (6 and 7).**
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
@@ -94,9 +93,20 @@ hours; 5 and 6 are days.
   the review listed under finding 3 are separately actionable: `BlockerKiller` has no
   self-exclusion (`internal/run/kill.go`) where `VictimKiller` does (`internal/run/victim.go`),
   and that asymmetry is worth fixing on its own merits.
-- [ ] **5. Give `abort-resumable` a target and a confirmation** (finding 4). It selects from
-  `sys.index_resumable_operations` with no `WHERE`, so one command aborts every colleague's
-  paused index build, unrecoverably.
+- [x] **5. Give `abort-resumable` a target and a confirmation** — done in 0.23.0.
+  `--table` / `--index` filters, `--all` as the explicit no-target mode, `--yes` required for
+  `--all` and for `--include-running`, and the resolved scope printed before the first
+  `ABORT` rather than a warning after the decision. `--dry-run` needs no confirmation, on
+  purpose: it is the review path, and ceremony there pushes operators toward the destructive
+  form. `parseAbortFlags` is split out from `runAbortResumable` so the gate is tested without
+  a database.
+  *Left undone:* the review's better suggestion — default to aborting only the operations
+  this tool paused, which the sidecar already records in `State.Paused`. It needs the
+  subcommand to read the queue's state sidecars, which today it does not open at all, and
+  ownership would still be unknowable for anything paused by an earlier install. The target
+  filter closes the CATASTROPHIC part (a bare command can no longer touch a colleague's
+  build); owner-defaulting would make the common case shorter to type, which is a usability
+  gain rather than a safety one.
 - [ ] **6. Fix the TUI `x` / `X` semantics** (finding 5). `blockerGate.persistent`
   (`cmd/sqlgopace/main.go:841`) filters `s.BlockedBy(ddlSPID)` — sessions **our DDL is
   blocking**, i.e. victims — and feeds them to the TUI as "blockers". `x` kills one on a single

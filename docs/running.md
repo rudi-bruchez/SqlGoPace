@@ -194,16 +194,39 @@ progress, which is a deliberate choice to make on a shared database.
 
 ### `abort-resumable`
 
+**An aborted index operation cannot be resumed.** SQL Server discards its progress, and this
+command cannot tell which paused operations are yours — `sys.index_resumable_operations` is
+database-wide and records no owner. So it requires a target, and requires you to say so out
+loud when you decline to give one.
+
 ```bash
-# Preview what would be aborted, changing nothing
-sqlgopace abort-resumable --config config.yaml --dry-run
+# Preview what matches, changing nothing. Start here.
+sqlgopace abort-resumable --config config.yaml --all --dry-run
 
-# Abort every PAUSED resumable operation in the connected database
-sqlgopace abort-resumable --config config.yaml
+# One table, or one index by name
+sqlgopace abort-resumable --config config.yaml --table dbo.MEASUREMENT
+sqlgopace abort-resumable --config config.yaml --index PK_MEASUREMENT
 
-# Also abort RUNNING ones, which may disrupt an active run
-sqlgopace abort-resumable --config config.yaml --include-running
+# Every paused resumable in the database, including other people's
+sqlgopace abort-resumable --config config.yaml --all --yes
+
+# Also abort RUNNING ones, killing the sessions building them
+sqlgopace abort-resumable --config config.yaml --table dbo.MEASUREMENT --include-running --yes
 ```
+
+| Flag | Meaning |
+|---|---|
+| `--table` | `schema.table`, or a bare table name to match it in any schema. |
+| `--index` | An index name. Combined with `--table` both must match. |
+| `--all` | No target: every matching operation in the database. Needs `--yes`. |
+| `--include-running` | Also abort `RUNNING` operations, which kills the sessions building them. Needs `--yes`. |
+| `--yes` | Confirms a destructive, unresumable abort. |
+| `--dry-run` | Lists what would be aborted and changes nothing. Never needs `--yes`. |
+
+Running it with neither a target nor `--all` is an error rather than a no-op, so a truncated
+command line cannot become a database-wide abort. `--dry-run` is deliberately free of
+ceremony: it is the review path, and making it awkward would only push you toward the
+destructive form. The header prints the scope it resolved before the first `ABORT` is issued.
 
 Only `PAUSED` operations are aborted by default. The exit code is non-zero if any abort
 fails.
