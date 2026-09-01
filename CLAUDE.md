@@ -143,8 +143,9 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   `MonitoredRunner`. The engine routes `ddl.Shrink` ops to whatever satisfies `ShrinkDriver`
   (wired via `WithShrinkRunner`; `*ShrinkRunner` is the production impl) — `processOne` branches on
   `step.Operation.(ddl.Shrink)`. `shrink_calc.go` holds the pure step-size math (`InitialStepMB`,
-  `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting (only
-  `WAIT_AT_LOW_PRIORITY` is meaningful for a shrink). Reads come through the narrow `ShrinkReader`
+  `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting
+  (`WAIT_AT_LOW_PRIORITY`, plus the `max_block_minutes` safety cap — applied by the chunked
+  path only, so `shrink_log` is uncapped). Reads come through the narrow `ShrinkReader`
   interface (`*mssql.Conn` in prod, fakes in tests).
 - **`recovery.go`** (`Recoverer`) reconciles anything left in `02.processing/` after a crash
   (adopt a live op, resume a paused resumable, or requeue). Database-aware: each in-flight op
@@ -160,7 +161,8 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   only package that issues SQL directly; everything DB-specific lives here behind interfaces the
   core consumes.
 - **`internal/config`** — `config.yaml` parsing + `${VAR}` env injection.
-- **`internal/preflight`** — pre-run checks (free space, tempdb, AG send-queue). Database- and
+- **`internal/preflight`** — pre-run checks (server, log, blocking, permissions, data free
+  space, file autogrowth). Database- and
   file-scoped operations (`check_db`, `shrink`) have empty `Schema`/`Table`, so they **skip the
   `schema.table` existence check** in both `CheckOperation` and `objectExistence` — the engine
   validates the database/file at run time (fixed in 028602a; was failing with `table [].[] does

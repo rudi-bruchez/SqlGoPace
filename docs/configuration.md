@@ -24,7 +24,7 @@ build is connected.
 ## Two different questions
 
 This page answers "what happens if the key is absent". That is not the same as "what the
-repository's `config.yaml` sets", and in three places they differ on purpose, because the
+repository's `config.yaml` sets", and in two places they differ on purpose, because the
 shipped file is deliberately more cautious than the bare default:
 
 | Key | Default when absent | The shipped `config.yaml` |
@@ -113,23 +113,30 @@ until the disk fills) can never be proven short — those cases **warn** rather 
 silently, because the growth itself is a blocking zero-fill unless instant file
 initialization applies. Only a rebuild that cannot fit *and* cannot grow fails.
 
-One limit remains: `create_index` is not checked, because the index does not exist yet and
-there is nothing to size.
+Three limits remain. **`create_index` is not checked**, because the index does not exist yet
+and there is nothing to size. **Filegroups are not modelled**: the check sums free space
+across every `ROWS` file in the database, so on a multi-filegroup database it can pass a
+rebuild whose own filegroup is full while another has room. And **the size read is
+optional** — it needs `VIEW DEFINITION` (see [Permissions](permissions.md)); without it the
+object reports as unknown size and the check passes rather than failing the run.
 
 ### The `file growth` check
 
 Read on every run, independent of `require_data_free_space`, and **advisory only** — it
-never fails a manifest. It warns when:
+never fails a manifest, and a growth setting it cannot read is reported as unread rather
+than assumed. It covers both data and log files, and warns when:
 
-- **a data file grows by a percentage.** The increment scales with the file, so it gets
-  larger exactly as the file gets harder to grow. Microsoft's guidance is to set a fixed
-  number of megabytes instead. The warning names what one growth event would cost at the
-  file's current size, which is the number that makes the setting feel real: 10% of a
-  14 TB file is a 1.4 TB blocking allocation.
-- **a data file has autogrowth disabled while the manifest contains a shrink.** The shrink
+- **a file grows by a percentage.** The increment scales with the file, so it gets larger
+  exactly as the file gets harder to grow. Microsoft's guidance is to set a fixed number of
+  megabytes instead. The warning names what one growth event would cost at the file's
+  current size, which is the number that makes the setting feel real: 10% of a 14 TB file is
+  a 1.4 TB blocking allocation.
+- **a file has autogrowth disabled and this manifest shrinks that kind of file.** The shrink
   hands back space the file will not be able to reclaim, so the reclaimed headroom is
-  one-way. Reported only for a shrink, since a fixed-size file is a legitimate choice
-  otherwise.
+  one-way. The two directions are not interchangeable: a `type: log` shrink is judged against
+  the log file, and a log that cannot grow after a shrink is how a database ends up refusing
+  writes with error 9002. Reported only for a file type the manifest actually shrinks, since
+  a fixed-size file is a legitimate choice otherwise.
 
 There is deliberately no warning for a growth increment that is merely "too large".
 Microsoft's own guidance is inconsistent on the threshold — one page suggests roughly an

@@ -36,6 +36,18 @@ Until now its entire production track record is its author's. Two things gate th
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **`shrink_log` ignores `max_block_minutes`.** v0.18.0 made `resolveShrink` resolve the
+  cap, and `shrink_data` / `shrink_tempdb` apply it because both run chunked through
+  `runChunk` (`internal/run/shrink.go:489`), which builds
+  `Capabilities{MaxBlock: blockCap(res.MaxBlockMinutes)}`. `shrinkLog`
+  (`internal/run/shrink.go:589`) issues one statement through `runWatchedStatement`, which
+  never builds `Capabilities`, so the cap is resolved and then unused.
+  *Deferred because:* a log shrink is a single short statement rather than an hours-long
+  chunk loop, so the exposure is small, and giving `runWatchedStatement` a supervisor is a
+  change to a path shared with the unchunked data shrink — worth doing deliberately rather
+  than as a rider on a preflight change. Until then the CHANGELOG and `CLAUDE.md` both say
+  plainly that `shrink_log` is uncapped.
+
 - [ ] **A shrink still ignores `options.ignore_blocking`.** Fixed alongside it in v0.18.0:
   `max_block_minutes`, which `resolveShrink` (`internal/ddl/resolve.go:231`) dropped the same
   way. `IgnoreBlocking` remains unresolved there, and even resolving it would change nothing

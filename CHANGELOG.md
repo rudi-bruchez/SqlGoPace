@@ -23,8 +23,10 @@ history, so a report can always name the build that produced it.
   correctly; only the shrink path did not. This is the backstop that bounds an
   allow-listed blocker, so a shrink carrying an `ignore_blocked_sessions` list had no
   backstop at all, and one that quietly tolerated such a blocker will now yield at the
-  configured minute. Covers `shrink_data`, `shrink_log` and `shrink_tempdb`, which share
-  the resolver. The 0.17.0 entry below describes a chunk "cut short for blocking other
+  configured minute. The value is resolved for all three shrink command types, and applied
+  by `shrink_data` and `shrink_tempdb`, which run chunked through `runChunk`. `shrink_log`
+  issues a single statement outside that path and stays uncapped; that gap is recorded in
+  `docs/specs/TODO.md`. The 0.17.0 entry below describes a chunk "cut short for blocking other
   sessions past `max_block_minutes`"; that path could not fire, and the chunks it observed
   were cut short by `monitoring.blocking_timeout_minutes`.
 - `--explain` reports a shrink's `max_block_minutes`, as it already did for index DDL and

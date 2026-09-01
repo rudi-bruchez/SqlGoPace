@@ -98,8 +98,10 @@ func TestFileGrowthsIntegration(t *testing.T) {
 		if f.MaxSizeMB < -1 {
 			t.Errorf("%s MaxSizeMB = %d; only -1 and 0 are sentinels, anything lower is a bad conversion", f.Name, f.MaxSizeMB)
 		}
-		if f.IsPercent && (f.Growth < 0 || f.Growth > 100) {
-			t.Errorf("%s percentage growth = %d, want a whole percentage", f.Name, f.Growth)
+		// Microsoft documents percentage growth as "a whole number percentage" without an
+		// upper bound, so only a negative value is provably wrong.
+		if f.IsPercent && f.Growth < 0 {
+			t.Errorf("%s percentage growth = %d, want a non-negative whole percentage", f.Name, f.Growth)
 		}
 		// A capped file must not report negative headroom.
 		if mb, ok := f.HeadroomMB(); ok && mb < 0 {

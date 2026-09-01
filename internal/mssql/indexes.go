@@ -3,7 +3,6 @@ package mssql
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 )
 
@@ -102,19 +101,23 @@ FROM sys.dm_db_partition_stats ps
 JOIN sys.indexes i
   ON i.object_id = ps.object_id AND i.index_id = ps.index_id
 WHERE ps.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
-  AND ((@index = N'' AND i.index_id = 0) OR i.name = @index);`
+  AND ((@index = N'' AND i.index_id = 0) OR i.name = @index)
+  AND (@partition = 0 OR ps.partition_number = @partition);`
 
 // IndexSizeMB returns the used size in MB of [schema].[table]'s index, or of the heap
 // when index is empty, summed across partitions. It returns 0 when the object cannot be
 // measured (no such object, or no allocated pages); callers treat 0 as "size unknown"
 // and must not fail a run on it.
-func (c *Conn) IndexSizeMB(ctx context.Context, schema, table, index string) (int, error) {
+func (c *Conn) IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error) {
+	// 0 means "every partition": partition numbers start at 1, so it cannot collide.
+	part := 0
+	if partition != nil {
+		part = *partition
+	}
 	var mb sql.NullInt64
 	err := c.pool.QueryRowContext(ctx, indexSizeMBSQL,
-		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index)).Scan(&mb)
-	if errors.Is(err, sql.ErrNoRows) {
-		return 0, nil
-	}
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index),
+		sql.Named("partition", part)).Scan(&mb)
 	if err != nil {
 		return 0, fmt.Errorf("index size %s.%s.%s: %w", schema, table, index, err)
 	}
