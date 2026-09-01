@@ -13,6 +13,24 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.27.0] - 2026-09-01
+
+### Fixed
+
+- An unquoted date in a manifest is now generated as a date literal instead of arithmetic.
+  YAML resolves `2020-01-01` to `!!timestamp`, not `!!str`, so it took the unquoted branch of
+  `renderLiteral` and reached the server as `[CreatedAt] > 2020-01-01` — 2020 minus 1 minus 1,
+  an integer a legacy `datetime` column accepts as a day offset from the base date. Valid
+  T-SQL against the wrong value, and with `>` it matched every row of a table whose author had
+  written a date filter; a `batch_delete` so written deleted the table with no error to find
+  afterwards. `Literal.UnmarshalYAML` now treats `!!timestamp` as a string, so quoted and
+  unquoted dates generate identical SQL. Affects `where` values, `set` targets and
+  `add_column` defaults. Rejecting the unquoted form was considered and dropped: `'2020-01-01'`
+  produces the same SQL, so it would only have cost the author two quotes.
+  **Migration:** none — the generated SQL changes only where it was wrong. Note that neither
+  spelling is immune to `SET DATEFORMAT` on a `datetime` column; `docs/operations.md` now says
+  which forms are.
+
 ## [0.26.0] - 2026-09-01
 
 ### Fixed

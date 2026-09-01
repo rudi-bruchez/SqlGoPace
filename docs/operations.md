@@ -130,6 +130,30 @@ exists for.
 No injectable options. A `NOT NULL` column with a constant default is metadata-only on
 Enterprise, which preflight reports.
 
+### How a scalar value becomes a T-SQL literal
+
+Every `value` (in a `where` condition), `set` target and `add_column` `default` is a scalar
+constant, and how it is written in YAML decides how it reaches the server:
+
+| YAML | T-SQL |
+|---|---|
+| a string, quoted or not (`Pending`, `'Pending'`) | `N'Pending'` |
+| a number (`0`, `1.50`) | `0`, `1.50` |
+| a date, quoted or not (`2020-01-01`, `'2020-01-01'`) | `N'2020-01-01'` |
+| `null`, `~`, or an empty value | `NULL` |
+| `true` / `false` | `true` / `false` — **not valid T-SQL**; write `1` / `0` for a `BIT` |
+
+Quoting a date is optional but harmless, and the two spellings generate identical SQL.
+Until 0.27.0 they did not: an unquoted date reached the server as arithmetic
+(`[CreatedAt] > 2020-01-01` is 2020 − 1 − 1), which a legacy `datetime` column accepts as a
+day offset — a valid query against the wrong value.
+
+One caveat that no spelling here removes: on a `datetime` or `smalldatetime` column,
+`'2020-01-01'` is interpreted according to the session's `SET DATEFORMAT` / `SET LANGUAGE`.
+Microsoft documents `yyyyMMdd` and the full `yyyy-MM-ddTHH:mm:ss` as the only forms
+unaffected by them. On `date`, `datetime2` and `datetimeoffset` columns `yyyy-MM-dd` is the
+ISO 8601 form and needs no such care.
+
 ### `alter_column`
 
 ```yaml

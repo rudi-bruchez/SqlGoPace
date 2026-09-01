@@ -2,6 +2,7 @@ package ddl_test
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -490,6 +491,92 @@ func TestExpandPreservesBatchDML(t *testing.T) {
 // the predicate loop could never exhaust: the clause written to guarantee
 // termination guaranteed non-termination. The self-limit for a NULL target is
 // `col IS NOT NULL`.
+// YAML resolves an unquoted ISO date to !!timestamp, not !!str, so it took
+// renderLiteral's unquoted branch and reached T-SQL as three integers and two minus
+// signs: `[CreatedAt] > 2020-01-01` is arithmetic (2018), not a date. Against a
+// datetime column that is valid and silently compares to the wrong value, which on `>`
+// matches every row of a table the author believed was filtered. A date literal in
+// T-SQL is a quoted string, so a !!timestamp must take the quoted branch.
+func TestBatchDMLQuotesUnquotedDates(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{
+			name: "plain date in a where condition",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: CreatedAt, op: '<', value: 2020-01-01 }
+`,
+			want: "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [CreatedAt] < N'2020-01-01';",
+		},
+		{
+			name: "single-digit month and day",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: CreatedAt, op: '<', value: 2020-1-1 }
+`,
+			want: "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [CreatedAt] < N'2020-1-1';",
+		},
+		{
+			name: "full timestamp",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: CreatedAt, op: '>=', value: 2020-01-01T10:00:00Z }
+`,
+			want: "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [CreatedAt] >= N'2020-01-01T10:00:00Z';",
+		},
+		{
+			name: "date as an update target",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: MEASUREMENT
+    set: { ArchivedOn: 2020-01-01 }
+    where:
+      - { column: Archived, op: '=', value: 1 }
+`,
+			want: "UPDATE TOP (5000) [dbo].[MEASUREMENT] SET [ArchivedOn] = N'2020-01-01' WHERE ([ArchivedOn] IS NULL OR [ArchivedOn] <> N'2020-01-01') AND ([Archived] = 1);",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op := parseOneOp(t, tt.manifest).(ddl.BatchDML)
+			got := ddl.BatchDMLChunkSQL(op, 5000, ddl.ResolvedOptions{})
+			if got != tt.want {
+				t.Errorf("BatchDMLChunkSQL()\n got = %s\nwant = %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// A quoted date and an unquoted one must generate the same SQL: the YAML author should
+// not have to know how the parser resolves a bare scalar to get the query they wrote.
+func TestBatchDMLQuotedAndUnquotedDatesAgree(t *testing.T) {
+	tmpl := `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: CreatedAt, op: '<', value: %s }
+`
+	bare := ddl.BatchDMLChunkSQL(parseOneOp(t, fmt.Sprintf(tmpl, "2020-01-01")).(ddl.BatchDML), 100, ddl.ResolvedOptions{})
+	quoted := ddl.BatchDMLChunkSQL(parseOneOp(t, fmt.Sprintf(tmpl, "'2020-01-01'")).(ddl.BatchDML), 100, ddl.ResolvedOptions{})
+	if bare != quoted {
+		t.Errorf("unquoted and quoted dates disagree:\n bare   = %s\n quoted = %s", bare, quoted)
+	}
+}
+
 func TestBatchDMLNullTargetSelfLimits(t *testing.T) {
 	tests := []struct {
 		name     string

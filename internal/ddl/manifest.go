@@ -106,12 +106,27 @@ func (l Literal) IsNull() bool { return l.Raw == "" && !l.String }
 
 // UnmarshalYAML captures a scalar constant, rejecting non-scalar defaults. It is not
 // called for a null scalar; see IsNull.
+//
+// A !!timestamp counts as a string, because a date literal in T-SQL *is* a quoted
+// string. YAML resolves an unquoted ISO date (`2020-01-01`, `2020-1-1`,
+// `2020-01-01T10:00:00Z`) to !!timestamp rather than !!str, so it used to take
+// renderLiteral's unquoted branch and reach the server as arithmetic: `[CreatedAt] >
+// 2020-01-01` is 2020 minus 1 minus 1, an int that a datetime column accepts as a day
+// offset from the base date. Valid T-SQL, silently the wrong value, and on `>` it
+// matches every row of a table whose author believed it was date-filtered.
+//
+// Quoting is the whole fix, and rejecting the unquoted spelling would not have been one:
+// `value: '2020-01-01'` generates exactly the same SQL, so refusing the bare form would
+// only have cost the author two quotes. Note that neither spelling is immune to
+// SET DATEFORMAT on a legacy `datetime` column — Microsoft documents only `yyyyMMdd` and
+// the full `yyyy-MM-ddTHH:mm:ss` as locale-independent there — but that is equally true
+// of a hand-quoted date and is not what this branch decides.
 func (l *Literal) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("default must be a scalar constant: %w", ErrInvalidManifest)
 	}
 	l.Raw = value.Value
-	l.String = value.Tag == "!!str"
+	l.String = value.Tag == "!!str" || value.Tag == "!!timestamp"
 	return nil
 }
 
