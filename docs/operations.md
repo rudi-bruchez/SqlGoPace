@@ -286,6 +286,12 @@ not a budget — write a `where_raw` your `set_raw` invalidates, and it never fi
 for shape, never for content, which makes a manifest a trusted input: see
 [`../SECURITY.md`](../SECURITY.md).
 
+A batch that stops early — log pressure, blocking, or the self-wait budget — keeps every
+batch it committed and is reported **INCOMPLETE**: the manifest moves to `04.failed/` for
+review rather than `03.done/`, and a `key_range` walk keeps its watermark so a re-run
+continues where it left off. That is the same treatment a shrink that stalls gets. It is not
+a failure of the operation, it is a refusal to call a half-finished purge complete.
+
 Permissions are the one place batched DML differs from every other operation: it needs
 `SELECT` as well as `UPDATE` or `DELETE`, because the `TOP` and the predicate both read.
 `db_datawriter` alone fails.

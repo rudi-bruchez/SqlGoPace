@@ -13,6 +13,21 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.25.0] - 2026-09-01
+
+### Fixed
+
+- A batched DML that stops early is reported INCOMPLETE instead of as a success. Log
+  pressure, blocking, or the `self_wait_timeout_minutes` budget end the loop with its
+  committed batches preserved and a reason, but no error, so the engine finalized the
+  manifest into `03.done/`: an operator draining a queue from cron saw a completed purge that
+  had abandoned most of its rows. It now takes the same path a shrink that stalls has taken
+  since 0.17.0 — `04.failed/`, labelled INCOMPLETE, counted separately in the run summary.
+  A `key_range` walk also keeps its watermark in that case; it was cleared on any nil-error
+  return, so the walk could not be resumed either. **Migration:** batched DML that used to
+  land in `03.done/` after stopping short will now land in `04.failed/`. Re-run it to
+  continue; the committed batches are not repeated. If you alert on `fail`, add `incomplete`
+  (`notifications.on_events`).
 ## [0.24.0] - 2026-09-01
 
 ### Changed

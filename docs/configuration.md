@@ -177,7 +177,7 @@ Fires a webhook and/or an email for the events listed in `on_events`.
 | Event | Fires when |
 |---|---|
 | `fail` | A manifest failed. |
-| `incomplete` | A shrink stopped short of target, work preserved. |
+| `incomplete` | A shrink stopped short of target, or a batched DML stopped before its predicate was exhausted. Work preserved in both cases. |
 | `interrupted` | Ctrl+C or a drain stopped the run. |
 | `run_failure` | The run itself stopped for a reason outside any manifest. |
 | `pause`, `cancel`, `abort` | The reaction hierarchy acted. |

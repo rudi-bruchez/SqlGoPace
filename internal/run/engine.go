@@ -823,7 +823,10 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 				// Clear the watermark only on true completion; on any failure keep it so a
 				// manual re-run resumes mid-table (a graceful stop and a crash already
 				// preserve it — the walk is idempotent, so a resume never double-applies).
-				if op.Batch.IsKeyRange() && runErr == nil {
+				// Not on a stopped-short run either: it returns a nil error, so clearing on
+				// that alone deleted the resume point of a walk that had abandoned most of
+				// its rows, making it unresumable as well as misreported.
+				if op.Batch.IsKeyRange() && runErr == nil && !batchStoppedShort(batchResult) {
 					store.clear()
 				}
 			} else {
@@ -916,6 +919,19 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
 			i, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
+		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
+	}
+	// A batch-DML operation stops the same way: log pressure, blocking, or the self-wait
+	// budget end the loop with its committed batches preserved and a Reason, but no error.
+	// That reached the engine as a clean success, so a purge that abandoned most of its
+	// rows was finalized into done/ — and an operator draining a queue from cron saw a
+	// completed operation. Same verdict as the shrink, same path.
+	if batchStoppedShort(batchResult) {
+		opRep.Outcome = "incomplete"
+		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
+		r.rep.Operations = append(r.rep.Operations, opRep)
+		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped before the predicate was exhausted, work preserved — %s",
+			i, step.Operation.CommandType(), batchResult.Reason)
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	opRep.Outcome = "success"
@@ -1038,6 +1054,12 @@ func shrinkStoppedShort(results []ShrinkResult) bool {
 	}
 	return false
 }
+
+// batchStoppedShort reports whether a batch-DML operation ended before its predicate
+// was exhausted. The driver signals that with a Reason and a nil error — the batches it
+// did commit are real and a re-run continues from them — so without this the engine
+// could not tell it from a completed purge.
+func batchStoppedShort(r *BatchDMLResult) bool { return r != nil && r.Reason != "" }
 
 // shrinkShortReason returns the reason of the first file that stopped short, for the
 // run report's error line. Empty only if no file stopped short (never called then).

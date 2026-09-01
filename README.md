@@ -31,6 +31,20 @@ mechanism available.
 > Read [Blocking, yielding and kills](docs/blocking-and-kills.md) before enabling any kill
 > policy, and treat `shrink` with particular care: it is slow, it fragments indexes, and it
 > is rarely the right answer to a full disk.
+>
+> **Two limits worth knowing before you plan around them**, because you can work around
+> either one once you know:
+>
+> - **Free space is checked inside the database, never on the disk.** The preflight
+>   free-space check reads the data files' unused space and their room to grow to
+>   `max_size`; it does not read `sys.dm_os_volume_stats`, so a file set to grow
+>   unlimited on a volume with 2 GB left looks like plenty of headroom. Watch the volume
+>   yourself.
+> - **On Standard edition there is nothing to yield with.** `ONLINE`, `RESUMABLE` and
+>   `WAIT_AT_LOW_PRIORITY` are Enterprise/Azure only, so a `rebuild_index` on Standard runs
+>   offline holding `Sch-M` and the reaction hierarchy has one rung left: cancel. A one-minute
+>   block can therefore roll back a fifty-minute rebuild. Size the operations, and the
+>   window, accordingly.
 
 ## In short
 

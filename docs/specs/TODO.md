@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.24.0 (2026-09-01).
+Status last verified against the tree at v0.25.0 (2026-09-01).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -37,7 +37,8 @@ Until now its entire production track record is its author's. Two things gate th
 
 ### The eight that gate advertising
 
-Ordered as the review ordered them. **1–6 and 8 are done; only 7 remains.**
+Ordered as the review ordered them. **All eight are done (0.19.0–0.25.0).** What each one
+left undone is recorded with it; none of those residues is a gate.
 
 - [x] **1. `kill_blockers.enabled: false`** — done in 0.19.0. `config.yaml:105` and
   `internal/scaffold/assets/config.yaml:105`. The Go zero value was always `false`, so only
@@ -124,8 +125,12 @@ Ordered as the review ordered them. **1–6 and 8 are done; only 7 remains.**
   now states the direction in the strongest terms available. Note the old comment already said
   "one session blocked by the running DDL" and the bug happened anyway, which is the argument
   for doing the rename.
-- [ ] **7. Report a stopped-short batch as incomplete, not done** (finding 8). Reuse the shrink
-  path; today a half-finished purge is filed as complete and made unresumable.
+- [x] **7. Report a stopped-short batch as incomplete, not done** — done in 0.25.0.
+  `batchStoppedShort` routes through the existing `finalizeIncomplete`, exactly as the review
+  suggested, and the `key_range` watermark is no longer cleared on that path — it was cleared
+  on any nil-error return, so the walk that abandoned most of its rows was unresumable as well
+  as misreported. `docs/configuration.md`'s `incomplete` notification event now says it covers
+  batched DML.
 - [x] **8. Correct the false claims** — done in 0.19.0. `README.md` no longer says "no raw
   SQL is ever accepted or executed"; it says a manifest is a trusted input and points at
   `SECURITY.md`, which now names all four verbatim-interpolated fields instead of two:
@@ -138,15 +143,26 @@ Ordered as the review ordered them. **1–6 and 8 are done; only 7 remains.**
   the same for `type`. Both are code, not documentation, and item 8 was scoped to making
   the docs true; the fields are now disclosed rather than silently unvalidated.
 
-**Two to name in the README even if not fixed**, because an operator who knows can work around
-them and one who does not cannot: nothing anywhere reads `sys.dm_os_volume_stats`, so free space
-on the actual disk is never checked (finding 7); and on Standard edition the only reaction rung
-left is `Cancel`, so a one-minute block rolls back a 50-minute offline rebuild while holding
-`Sch-M` (finding 10).
+- [x] **The two to name in the README even if not fixed** — done in 0.25.0, in the beta
+  warning block. Both re-verified against the tree first: `sys.dm_os_volume_stats` appears
+  nowhere in the repository, so disk free space is genuinely never read (finding 7); and
+  `ddl_compatibility.yaml` gates `online`, `wait_at_low_priority` and `resumable` to
+  `[enterprise, azure]`, so a Standard-edition `rebuild_index` really does have `Cancel` as its
+  only rung (finding 10). Naming them is not fixing them: reading the volume, and giving
+  Standard something better than cancel, are both still open.
 
 The remaining fourteen findings are legitimate "known limitation, documented honestly" — a
 defensible posture for beta software **provided the documentation actually says so**, which is
 what item 8 is for.
+
+**Where that leaves the verdict.** All eight gate items and both README notes are done, so the
+specific objections the review raised are addressed. That is not the same as the review
+re-running clean: it was a point-in-time reading of a tree that has since changed in eight
+places, and three of those changes turned up defects the review had not found (a manifest
+rewrite dropping a null `set:` value, a watermark cleared on a stopped-short walk, a Windows
+lock making its own holder line unreadable). Re-run the harm review against the current tree
+before treating the gate as cleared — and note that its finding 1 trigger A did not reproduce,
+so treat its severities as claims to check rather than facts.
 
 ### From the SAST scan (2026-09-01)
 
