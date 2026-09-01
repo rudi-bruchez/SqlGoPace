@@ -11,7 +11,28 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.17.0 (2026-09-01).
+Status last verified against the tree at v0.18.0 (2026-09-01).
+
+## Before advertising this publicly — the production-safety gate
+
+The tool is about to be offered to DBAs who will point it at their own production servers.
+Until now its entire production track record is its author's. Two things gate that offer.
+
+- [x] **README carries a beta warning.** Done 2026-09-01: a `status: beta` badge plus a
+  warning block above the fold — take a backup you have tested *restoring*, rehearse on a
+  copy, `--dry-run --explain` before every new manifest, read
+  [blocking-and-kills.md](../blocking-and-kills.md) before arming any kill policy, and a
+  note that `shrink` is slow, fragments indexes, and is rarely the right answer to a full
+  disk.
+
+- [ ] **Adversarial production-danger review (in progress, 2026-09-01).** An independent
+  fresh-agent review at maximum effort, scoped to one question: what in this tool can block,
+  harm, corrupt or take down a stranger's production server. It reasons from the **shipped
+  defaults** rather than from what a careful expert would configure, because the threat model
+  is a DBA who ran `sqlgopace init`, edited the connection string, and did not read every
+  config key.
+  *Exit condition:* every CATASTROPHIC and SEVERE finding is fixed, or documented as an
+  accepted risk with the reasoning, before the tool is advertised. Findings land here.
 
 ## Follow-ups deferred from shipped work
 
