@@ -13,6 +13,61 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.30.0] - 2026-09-02
+
+Six backlog items from `docs/specs/TODO.md`, taken together because each was
+deferred with the same reason: known, small, and not yet worth its own session.
+
+### Added
+
+- `.github/dependabot.yml`, weekly, for the GitHub Actions ecosystem. A pinned SHA that
+  nobody moves is a pin to a version whose vulnerabilities are published.
+
+### Changed
+
+- `max_block_minutes` now applies to the two shrink statements that run outside the chunk
+  loop: `shrink_log` and the `TRUNCATEONLY` pass of a data shrink. `resolveShrink` has
+  resolved the cap since 0.18.0, but `runWatchedStatement` drained its samples without a
+  supervisor, so the value was read from the manifest and never used — a log shrink held its
+  lock for as long as the server took. A capped `TRUNCATEONLY` hands over to the page-moving
+  loop, which applies the cap per chunk; a capped log shrink ends the operation cleanly and a
+  re-run continues from the smaller size.
+- An unquoted `true` / `false` in a manifest scalar generates `1` / `0`, the values a `BIT`
+  is compared to, instead of a bare `true` that SQL Server cannot parse.
+- The four `key_range` preconditions (a clustered key, single-column, integer, unique) are
+  checked in preflight, so a table the walk cannot bound is a rejected plan rather than a
+  failed run in `04.failed/`. The driver reaches the same verdict from the read it performs
+  anyway, so a clustered index that changes between the two is still caught.
+- `sqlgopace init` writes `.env.example` mode `0600`. `getting-started.md` says to
+  `cp .env.example .env` and fill in `DB_PASSWORD`, and `cp` carries the source mode, so a
+  0644 template handed the operator a world-readable credentials file. Migration: if you
+  already have a `.env`, run `chmod 600 .env` — no existing file is changed. Windows ignores
+  file modes apart from the read-only bit.
+- The GitHub Actions are pinned to commit SHAs (`actions/checkout` v7.0.1,
+  `actions/setup-go` v7.0.0, `golangci/golangci-lint-action` v9.3.0). A mutable tag runs
+  whatever it points at on the day the workflow runs.
+
+### Removed
+
+- The `data_compression` entry in `ddl_compatibility.yaml`, for `rebuild_index`,
+  `create_index` and `rebuild_heap`. It gated nothing — `data_compression` is a manifest
+  field written into the `WITH` clause by `generate.go`, and `Resolve` never read the
+  matrix — and the fact it stated was wrong: SQL Server 2016 SP1 brought data compression to
+  Standard, Web and Express, which `editions: [enterprise, azure]` denied. No behaviour
+  changes; `docs/llm-operator-guide.md`'s option table said the same thing and no longer
+  does. Restoring a real gate means wiring the field through `Resolve` and expressing
+  "2016 SP1", which `min_major` cannot say.
+
+### Fixed
+
+- `internal/preflight/preflight_test.go` is gofmt-clean, so CI's `Format` step passes again.
+  It was the only unformatted file in the tree and had been failing that job.
+- Number spellings YAML accepts and T-SQL does not are refused when the manifest is parsed,
+  naming the value: `1_000`, `0x1F`, `0o17`, `.inf`, `.nan`. A leading zero (`017`) is
+  refused for a different reason — both languages accept it and disagree about the value,
+  octal 15 against decimal 17. Migration: a manifest using one of these stops loading, and
+  the error names the key; write plain decimal, or quote the value to send a string.
+
 ## [0.29.1] - 2026-09-01
 
 Findings from an XHIGH review of the four 0.26.0–0.29.0 commits. The first is a

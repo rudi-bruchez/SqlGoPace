@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.25.0 (2026-09-01).
+Status last verified against the tree at v0.30.0 (2026-09-02).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -170,12 +170,14 @@ Scanner floor only — full triage in [2026-09-01-sast-scan.md](2026-09-01-sast-
 these can harm a database, so none gates advertising the way the eight above do. The first two
 are worth doing before a public release anyway; both are minutes.
 
-- [ ] **`.env.example` ships `0o644`, and the docs say to `cp` it** (`scaffold.go:95`,
-  `docs/getting-started.md:77`). Under the default umask the resulting `.env` — holding
-  `DB_PASSWORD` — is world-readable on Linux and macOS. Write the asset `0o600` instead.
-  *Still open:* it touches the scaffold assets a test pins byte-for-byte, and the same
-  deployment question as the entry below (file modes are ignored on Windows). This is the
-  one SAST item with a real secret behind it — do it before a public release.
+- [x] **`.env.example` ships `0o644`, and the docs say to `cp` it** — done in v0.30.0.
+  `scaffold.File` carries a per-file `mode` and `.env.example` is the one written `0600`
+  (`internal/scaffold/scaffold.go`), pinned by `TestEnvExampleIsPrivate` and, on POSIX only,
+  by `TestWriteAppliesTheDeclaredModes`. `docs/getting-started.md` says to `chmod 600 .env`
+  for a file written by hand or refreshed with `--force`, since `os.WriteFile` keeps an
+  existing file's mode.
+  *Left undone:* nothing here protects Windows, which ignores every mode bit but read-only;
+  there the directory's ACL is the control.
 
 - [x] **Capture files expose third-party SQL text at `0o644`** — done in v0.29.0
   (`capture.go`, `contended.go`, `amplifier_capture.go` now write `0o600`). The queue
@@ -188,12 +190,14 @@ are worth doing before a public release anyway; both are minutes.
 - [x] **Bump the toolchain to `go1.26.6`** — done in v0.29.0 (`go.mod`). `govulncheck` now
   reports zero reachable vulnerabilities, down from four.
 
-- [ ] **SHA-pin the actions.** `actions/checkout@v7` and `actions/setup-go@v7` are mutable
-  tags in the job that publishes the binaries, with `contents: write`; `ci.yml` adds
-  `golangci/golangci-lint-action@v9`. The only finding a downstream user cannot protect
-  themselves from. See the duplicate entry under "Follow-ups deferred from shipped work"
-  for why it was not done and the exact commands — **merge the two entries when you take
-  it**.
+- [x] **SHA-pin the actions** — done in v0.30.0, and the duplicate entry below is merged
+  into this one. `actions/checkout@3d3c42e5…` (v7.0.1), `actions/setup-go@b7ad1dad…`
+  (v7.0.0) and `golangci/golangci-lint-action@ba0d7d2e…` (v9.3.0) across `ci.yml` and
+  `release.yml`. `gh` is still not installed here; the SHAs were resolved through the public
+  GitHub API (`/repos/<owner>/<repo>/git/ref/tags/<tag>`, dereferencing the annotated tag for
+  golangci-lint) and each was verified to be a real commit before being written. A new
+  `.github/dependabot.yml` bumps them weekly — without it, pinning trades a mutable tag for a
+  frozen version whose vulnerabilities get published.
 
 **The scan's most useful result was a negative one:** `gosec` reported *zero* SQL-injection
 findings from a codebase that builds T-SQL by concatenation throughout, because the taint
@@ -202,26 +206,25 @@ evidence about CWE-89 here.
 
 ## Follow-ups deferred from shipped work
 
-- [ ] **The `key_range` uniqueness check runs in the driver, not preflight.** v0.26.0 put it in
-  `BatchDMLRunner.resolveKeyColumn` (`internal/run/batch_dml.go`), where the clustered-key read
-  the walk already performs is to hand. The cost is that the manifest has already been moved to
-  `02.processing/` before it is refused, so a table that can never be walked this way fails as a
-  run rather than as a rejected plan.
-  *Deferred because:* it matches where the sibling checks (non-integer key, composite key,
-  missing clustered key) already live, so moving one without the others would split the rule
-  across two packages. `internal/preflight` would need its own `ClusteringKeyColumns` read.
-  Move all four together, or none.
+- [x] **The `key_range` uniqueness check runs in the driver, not preflight** — done in
+  v0.30.0, all four together as the entry required. The rule is
+  `preflight.KeyRangeColumn`, reported by `CheckBatchDMLKeyRange`; `Prober` gained
+  `ClusteringKeyColumns`, and `BatchDMLRunner.resolveKeyColumn` is now three lines calling the
+  same function from the read the walk performs anyway. Reaching the verdict twice is
+  deliberate rather than redundant: a clustered index dropped or recreated between preflight
+  and the run is still caught, and the two can never disagree because there is one rule.
 
-- [ ] **`true` / `false` in a manifest scalar generate invalid T-SQL.** Found while fixing F3
-  (v0.27.0) by enumerating what go-yaml resolves each spelling to. `!!bool` takes
-  `renderLiteral`'s unquoted branch, so `value: true` emits a bare `true`, which T-SQL does not
-  accept anywhere a `BIT` is compared. Same for the exotic numeric spellings YAML allows and
-  T-SQL does not (`1_000`, `0o17`, `.inf`, `.nan`).
-  *Deferred because:* every one of them is a **loud** syntax error at execution, not a wrong
-  result — the opposite of the F3 date, which was valid SQL against the wrong value, and the
-  only reason F3 was urgent. The fix is worth doing (reject them in `Literal.UnmarshalYAML`, or
-  map `true`/`false` to `1`/`0`) but it buys a better error message, not safety.
-  `docs/operations.md` now documents the behaviour in its scalar-conversion table.
+- [x] **`true` / `false` in a manifest scalar generate invalid T-SQL** — done in v0.30.0,
+  both halves of the entry, in `Literal.UnmarshalYAML`. `!!bool` maps to `1` / `0`; the
+  numeric spellings T-SQL cannot read are refused at parse time by `checkNumericLiteral`.
+  **One of them turned out not to be a message-quality fix at all.** A leading zero is
+  accepted by *both* languages and read differently — `017` is octal 15 in YAML and decimal
+  17 in SQL Server — so it was the F3 class exactly: valid SQL against the wrong value,
+  silent. It is refused rather than converted, because converting it would mean guessing
+  which of the two the author meant.
+  *Left undone:* the conversion is one-way. `set: {Archived: true}` round-trips through
+  `MarshalManifest` as `1`, which is the same value written the way the server reads it, but
+  an operator diffing a rewritten manifest against their original will see it.
 
 - [x] **The 2026-09-01 harm review is closed** —
   [REVIEW-2026-09-01-harm.md](REVIEW-2026-09-01-harm.md), untracked, alongside this file.
@@ -229,21 +232,15 @@ evidence about CWE-89 here.
   F1 (unconfirmed TUI kill of our own DDL) v0.28.0; F2, F4, F5, F6 and the minor items
   v0.29.0. Two of its minor items were **not** taken, below.
 
-- [ ] **SHA-pin the GitHub Actions.** `semgrep` flags seven mutable action tags
-  (`actions/checkout@v7`, `actions/setup-go@v7`, `golangci/golangci-lint-action@v9`) across
-  `ci.yml` and `release.yml`. A mutable tag means the workflow runs whatever that tag points
-  at on the day it runs.
-  *Deferred because:* pinning needs the commit SHA of each action at a known-good release,
-  and `gh` is not installed in the environment this was reviewed from — guessing a SHA
-  breaks CI outright, which is worse than the exposure. Resolve them with
-  `gh api repos/actions/checkout/git/ref/tags/v7 --jq .object.sha` (and the same for the
-  other two), pin as `uses: actions/checkout@<sha> # v7`, and let Dependabot bump them.
+- [x] **SHA-pin the GitHub Actions** — done in v0.30.0. This entry was the duplicate of the
+  one in the SAST section above, which now carries the details.
 
 - [ ] **The remaining `0644` writes and `0755` directories.** v0.29.0 tightened the three
   capture sidecars to `0600` because they carry other sessions' identities and SQL text.
   `gosec` also flags the run report (`internal/report/report.go`), the recovery manifest
-  (`internal/run/engine.go`), the scaffold's files (`internal/scaffold/scaffold.go`), the
-  planner's output (`cmd/sqlgopace/plan.go`, `shrink_plan.go`) and the queue directories
+  (`internal/run/engine.go`), the scaffold's files (`internal/scaffold/scaffold.go` — all
+  but `.env.example`, which v0.30.0 made `0600`), the planner's output
+  (`cmd/sqlgopace/plan.go`, `shrink_plan.go`) and the queue directories
   (`internal/run/queue.go`, `lock.go`).
   *Deferred because:* those are the operator-facing artifacts. A `.log` a colleague reads,
   a manifest a second person reviews before it runs, and a queue directory a scheduler
@@ -258,7 +255,8 @@ evidence about CWE-89 here.
   read-only bit, so the `0600` already applied to the sidecars protects the POSIX
   deployments only.
 
-- [ ] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong.** It reads
+- [x] **`ddl_compatibility.yaml`'s `data_compression` entry is both dead and wrong** —
+  deleted in v0.30.0; the reasoning that decided it is at the end of this entry. It read
   `{ min_major: 10, editions: [enterprise, azure] }` for `rebuild_index`, `create_index` and
   `rebuild_heap`. Two separate problems, found while verifying the Standard-edition warning
   added to the README in 0.25.0:
@@ -273,24 +271,30 @@ evidence about CWE-89 here.
      footnoted "Applies to SQL Server 2016 (13.x) SP1 as part of creating a Common
      Programmability Surface Area (CPSA) across editions". So the correct gate would be
      `min_major: 13` for Standard/Express (10 for Enterprise), not enterprise-only.
-  *Deferred because:* deciding between the two fixes needs a call the matrix's own rule
-  frames — `CLAUDE.md` says the matrix carries version × edition gates *only*. Either wire
-  `data_compression` through `Resolve` so the gate is real (and then it must be correct, which
-  means SP1-aware and would refuse compression on Standard below 2016 SP1 — a behaviour
-  change), or delete the entry as documentation masquerading as a gate. Deleting is the
-  smaller, more honest change; wiring it is the one that would catch an operator asking for
-  compression on 2014 Standard.
-- [ ] **`shrink_log` ignores `max_block_minutes`.** v0.18.0 made `resolveShrink` resolve the
-  cap, and `shrink_data` / `shrink_tempdb` apply it because both run chunked through
-  `runChunk` (`internal/run/shrink.go:489`), which builds
-  `Capabilities{MaxBlock: blockCap(res.MaxBlockMinutes)}`. `shrinkLog`
-  (`internal/run/shrink.go:589`) issues one statement through `runWatchedStatement`, which
-  never builds `Capabilities`, so the cap is resolved and then unused.
-  *Deferred because:* a log shrink is a single short statement rather than an hours-long
-  chunk loop, so the exposure is small, and giving `runWatchedStatement` a supervisor is a
-  change to a path shared with the unchunked data shrink — worth doing deliberately rather
-  than as a rider on a preflight change. Until then the CHANGELOG and `CLAUDE.md` both say
-  plainly that `shrink_log` is uncapped.
+  **Deleted in v0.30.0**, with a note in `ddl_compatibility.yaml` saying what belongs there
+  and why this did not. What decided it: a *correct* gate has to express "2016 SP1", and
+  `min_major` cannot — it keys on the major version alone, so the honest options were an
+  entry that is wrong or no entry. `docs/llm-operator-guide.md`'s option table carried the
+  same wrong fact and now says `data_compression` is ungated, on every edition.
+  *Still open, and unaffected by the deletion:* the field is an unvalidated string
+  interpolated into the `WITH` clause (`SECURITY.md` names it). An allow-list is not simply
+  `NONE|ROW|PAGE` — `COLUMNSTORE` and `COLUMNSTORE_ARCHIVE` are valid on a columnstore index,
+  which `expand.go` only strips on the `index: ALL` path — so it needs the operation's index
+  type, not just the string. Wiring the field through `Resolve` would catch an operator
+  asking for compression on 2014 Standard, and remains the larger fix.
+- [x] **`shrink_log` ignores `max_block_minutes`** — done in v0.30.0.
+  `runWatchedStatement` takes `ddl.ResolvedOptions` and applies the cap itself, on the same
+  rule `supervise` uses (a continuous streak of blocking *any* session, ignored or not, so
+  the cap overrides every ignore policy). It returns a `watchedOutcome` rather than a bool,
+  which is what let the two callers differ: a capped `TRUNCATEONLY` falls through to the
+  page-moving loop, which caps per chunk; a capped log shrink has no second phase, so the
+  operation ends cleanly with the freed space kept. `docs/blocking-and-kills.md` no longer
+  carries the exception.
+  *Deliberately not done:* the chunked path answers a cap with `awaitRelief` and a retry.
+  `runWatchedStatement` does not — for a single statement that would be a re-issue loop with
+  no bound but the log-drain timeout, and the operator re-running is both simpler and
+  honest, since the statement is re-entrant. Revisit if a real log shrink turns out to need
+  several passes to finish.
 
 - [ ] **A shrink still ignores `options.ignore_blocking`.** Fixed alongside it in v0.18.0:
   `max_block_minutes`, which `resolveShrink` (`internal/ddl/resolve.go:231`) dropped the same

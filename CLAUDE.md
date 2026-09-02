@@ -145,7 +145,8 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   `step.Operation.(ddl.Shrink)`. `shrink_calc.go` holds the pure step-size math (`InitialStepMB`,
   `AdjustStepMB`, clamp); `shrink.go` drives the loop, sampling between chunks and reacting
   (`WAIT_AT_LOW_PRIORITY`, plus the `max_block_minutes` safety cap — applied by the chunked
-  path only, so `shrink_log` is uncapped). Reads come through the narrow `ShrinkReader`
+  path and, since 0.30.0, by `runWatchedStatement` for the two unchunked statements —
+  `shrink_log` and the `TRUNCATEONLY` pass). Reads come through the narrow `ShrinkReader`
   interface (`*mssql.Conn` in prod, fakes in tests).
 - **`recovery.go`** (`Recoverer`) reconciles anything left in `02.processing/` after a crash
   (adopt a live op, resume a paused resumable, or requeue). Database-aware: each in-flight op
@@ -162,7 +163,10 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
   core consumes.
 - **`internal/config`** — `config.yaml` parsing + `${VAR}` env injection.
 - **`internal/preflight`** — pre-run checks (server, log, blocking, permissions, data free
-  space, file autogrowth). Database- and
+  space, file autogrowth, the batched-DML whole-table guard and `key_range` key). It owns the
+  rules a manifest must satisfy *before* the engine moves it to `02.processing/`; a rule the
+  driver also needs at run time lives here and is called from there (`KeyRangeColumn`), never
+  duplicated. Database- and
   file-scoped operations (`check_db`, `shrink`) have empty `Schema`/`Table`, so they **skip the
   `schema.table` existence check** in both `CheckOperation` and `objectExistence` — the engine
   validates the database/file at run time (fixed in 028602a; was failing with `table [].[] does
