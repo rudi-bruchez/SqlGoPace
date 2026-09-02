@@ -1,0 +1,10 @@
+# Pinning the actions to a commit SHA is only half the control: a pin that nobody
+# moves keeps running a version whose vulnerabilities are published. This is the
+# other half — Dependabot rewrites the SHA and the trailing `# vX.Y.Z` comment
+# together, so the pin stays both current and readable.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
