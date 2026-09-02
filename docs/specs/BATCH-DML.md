@@ -161,7 +161,13 @@ Rules:
   index, which SQL Server does not require to be unique, so a clustered index on a
   repeating column let one batch cover an unbounded number of rows — a single UPDATE
   escalating to a table X lock, which is the outcome this whole design exists to avoid.
-  `resolveKeyColumn` now reads `i.is_unique` and refuses the table. The alternative
+  The rule reads `i.is_unique` and refuses the table. It lives in
+  `preflight.KeyRangeColumn` since v0.30.0, alongside its three siblings (no clustered key,
+  composite key, non-integer key) — a table that can never be walked this way is now a
+  rejected plan rather than a failed run. `BatchDMLRunner.resolveKeyColumn` calls the same
+  function from the read the walk performs anyway, so the verdict is reached twice and
+  cannot differ, and a clustered index that changed between preflight and the run is still
+  caught. The alternative
   considered and rejected was bounding the statement with `UPDATE TOP (n)`: alone it
   silently skips rows the watermark then advances past, and with a re-run-until-zero loop
   it fails to terminate whenever the filter is not self-limiting (`confirm_full_table`
@@ -308,9 +314,11 @@ DML batch is not resumable in the SQL sense. Useful reactions between/during bat
   (`indexes.go`); add an `UPDATE`/`DELETE` permission probe on the table (see preflight).
 - **`internal/preflight/preflight.go`** — `CheckBatchDML`: table exists (reused), `set` columns
   exist + types compatible (reuse `ColumnExists`, add a type check),
-  `batch.key` exists & is unique for `key_range` (**moved**: this landed in the driver's
-  `resolveKeyColumn`, not in preflight — it needs the clustered-key read the walk already does,
-  and enforcing it in one place beats two), **UPDATE/DELETE permission** on the table, whole-table
+  `batch.key` exists & is unique for `key_range` (`CheckBatchDMLKeyRange`, v0.30.0; it
+  landed in the driver first, on the argument that the clustered-key read the walk already
+  does made one place better than two — which was true about the *read* and wrong about the
+  *verdict*, since a manifest refused there has already been moved to `02.processing/` and
+  opened a run report), **UPDATE/DELETE permission** on the table, whole-table
   guard, **WARN** on FK reference / DELETE trigger, and the RCSI advisory. (The database-/file-scoped
   skip logic is unchanged; `batch_*` ops are schema.table-scoped so they take the normal
   existence path.)

@@ -339,6 +339,7 @@ type Prober interface {
 	FileSpace(ctx context.Context, fileType string) ([]mssql.FileSpace, error)
 	FileGrowths(ctx context.Context, fileType string) ([]mssql.FileGrowth, error)
 	IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error)
+	ClusteringKeyColumns(ctx context.Context, schema, table string) ([]mssql.KeyColumn, error)
 	// QueryInt runs a scalar query built by internal/ddl. Only the batched-DML
 	// selectivity probe uses it; nothing here composes SQL of its own.
 	QueryInt(ctx context.Context, statement string) (int64, bool, error)
@@ -486,6 +487,17 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 				}
 			}
 			rep.add(CheckBatchDMLIsolation(info, b))
+			// The key_range walk is bounded only on a single unique integer clustered key.
+			// Reading it here rather than in the driver is what makes an unwalkable table a
+			// rejected plan instead of a failed run. Only key_range asks: a predicate walk
+			// needs no clustered key, and a heap is walked by predicate every day.
+			if tableExists && b.Batch.IsKeyRange() {
+				cols, err := p.ClusteringKeyColumns(ctx, b.Schema, b.Table)
+				if err != nil {
+					return Report{}, fmt.Errorf("preflight key_range key %s.%s: %w", b.Schema, b.Table, err)
+				}
+				rep.add(CheckBatchDMLKeyRange(b, cols))
+			}
 			// The whole-table guard, made semantic. Skipped when the operator has already
 			// confirmed (nothing left to establish, and no reason to pay for the read) and
 			// when the table is absent (CheckOperation already fails the manifest).
@@ -531,6 +543,56 @@ func CheckBatchDMLPermission(op ddl.BatchDML, perm string, hasAccess bool) Check
 			fmt.Sprintf("the connected login lacks %s permission on [%s].[%s]", perm, op.Schema, op.Table)}
 	}
 	return Check{name, Pass, perm + " granted"}
+}
+
+// KeyRangeColumn determines the key_range key from a table's clustered key columns, or
+// reports why the table cannot be walked that way. batch.key, when given, asserts which
+// column the clustered key is rather than selecting one: the walk requires a single-column
+// unique integer clustered key, so there is only ever one candidate.
+//
+// Uniqueness is the bound, and it is not optional. A batch's range is (watermark, next],
+// where next is the batchSize-th smallest matching key, and BatchKeyRangeUpdateSQL carries
+// no TOP of its own: the range holds batchSize rows only if one key means one row. On a
+// non-unique clustered index — `CREATE CLUSTERED INDEX … ON T(EventId)`, ordinary for an
+// event table — MAX of the first batchSize keys can span millions of rows, and the single
+// UPDATE escalates to a table lock and blows up the log. The batching would be nominal.
+//
+// The four tests used to be arranged so that naming batch.key skipped the composite one
+// entirely, and the composite error told the operator to name a batch.key — which on a
+// (TenantId, Id) key selects the most duplicated column in the table. They are one path
+// now, so there is nothing to route around.
+//
+// It lives here, not in the driver that consumes it, so the verdict is reached before the
+// engine moves the manifest to 02.processing/: a table that can never be walked this way is
+// a rejected plan, not a failed run. BatchDMLRunner.resolveKeyColumn calls the same function
+// with the read it performs anyway, so the two can never disagree.
+func KeyRangeColumn(op ddl.BatchDML, cols []mssql.KeyColumn) (string, error) {
+	switch {
+	case len(cols) == 0:
+		return "", fmt.Errorf("key_range: %s.%s has no clustered key; use the predicate strategy", op.Schema, op.Table)
+	case len(cols) > 1:
+		return "", fmt.Errorf("key_range: %s.%s has a composite clustered key, whose leading column repeats across rows; use the predicate strategy", op.Schema, op.Table)
+	}
+	key := cols[0]
+	switch {
+	case op.Batch.Key != "" && !strings.EqualFold(op.Batch.Key, key.Name):
+		return "", fmt.Errorf("key_range: key %q is not the clustered key of %s.%s (that is %q); use the predicate strategy", op.Batch.Key, op.Schema, op.Table, key.Name)
+	case !key.IsInteger:
+		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not an integer (this iteration supports integer keys only)", key.Name, op.Schema, op.Table)
+	case !key.IsUnique:
+		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not unique, so one batch's key range can cover any number of rows; use the predicate strategy", key.Name, op.Schema, op.Table)
+	}
+	return key.Name, nil
+}
+
+// CheckBatchDMLKeyRange reports KeyRangeColumn's verdict as a preflight check.
+func CheckBatchDMLKeyRange(op ddl.BatchDML, cols []mssql.KeyColumn) Check {
+	name := fmt.Sprintf("%s key_range key", op.CommandType())
+	key, err := KeyRangeColumn(op, cols)
+	if err != nil {
+		return Check{name, Fail, err.Error()}
+	}
+	return Check{name, Pass, fmt.Sprintf("walking [%s].[%s] by its unique integer clustered key [%s]", op.Schema, op.Table, key)}
 }
 
 // unmatchedRowSample is how many spared rows the selectivity probe counts before it

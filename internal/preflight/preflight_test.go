@@ -115,10 +115,10 @@ func TestCheckFileGrowth(t *testing.T) {
 	fixedSize := mssql.FileGrowth{Name: "data", TypeDesc: "ROWS", SizeMB: 100_000, Growth: 0, MaxSizeMB: 0}
 
 	tests := []struct {
-		name      string
-		files     []mssql.FileGrowth
-		shrunk    map[string]bool
-		want      preflight.Severity
+		name   string
+		files  []mssql.FileGrowth
+		shrunk map[string]bool
+		want   preflight.Severity
 	}{
 		{"fixed increment is fine", []mssql.FileGrowth{fixed}, nil, preflight.Pass},
 		{"percentage growth warns", []mssql.FileGrowth{percent}, nil, preflight.Warn},
@@ -235,24 +235,26 @@ func TestCheckOperation(t *testing.T) {
 
 // fakeProber is a scripted Prober for testing Run without a database.
 type fakeProber struct {
-	logSpace       mssql.LogSpace
-	reuseWait      string
-	sessions       []mssql.Session
-	tableExists    bool
-	indexExists    bool
-	elevatedAccess bool
-	alterAnyConn   bool
-	sysadmin       bool
-	dmlPermission  bool
-	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
-	dataFreeMB     int
-	growth         []mssql.FileGrowth
-	growthByType   map[string][]mssql.FileGrowth
-	growthErr      error
-	indexSizeErr   error
-	indexSizeMB    int
-	unmatchedRows  int64
-	queries        *int // probe call count, a pointer so a value copy still counts
+	logSpace             mssql.LogSpace
+	reuseWait            string
+	sessions             []mssql.Session
+	tableExists          bool
+	indexExists          bool
+	elevatedAccess       bool
+	alterAnyConn         bool
+	sysadmin             bool
+	dmlPermission        bool
+	dmlDenied            map[string]bool // perms this login lacks, overriding dmlPermission
+	dataFreeMB           int
+	growth               []mssql.FileGrowth
+	growthByType         map[string][]mssql.FileGrowth
+	growthErr            error
+	indexSizeErr         error
+	indexSizeMB          int
+	unmatchedRows        int64
+	clusterKey           []mssql.KeyColumn
+	clusterKeyErr        error
+	queries              *int // probe call count, a pointer so a value copy still counts
 	indexSizeByPartition map[int]int
 }
 
@@ -270,6 +272,10 @@ func (f fakeProber) FileGrowths(_ context.Context, fileType string) ([]mssql.Fil
 		return f.growth, nil
 	}
 	return nil, nil
+}
+
+func (f fakeProber) ClusteringKeyColumns(context.Context, string, string) ([]mssql.KeyColumn, error) {
+	return f.clusterKey, f.clusterKeyErr
 }
 
 func (f fakeProber) IndexSizeMB(_ context.Context, _, _, _ string, partition *int) (int, error) {
@@ -637,8 +643,8 @@ func TestRunSizesRebuildByPartition(t *testing.T) {
 
 	p := healthyProber()
 	p.dataFreeMB = 500
-	p.indexSizeMB = 5000                            // the whole index does not fit
-	p.indexSizeByPartition = map[int]int{37: 100}   // the one partition does
+	p.indexSizeMB = 5000                          // the whole index does not fit
+	p.indexSizeByPartition = map[int]int{37: 100} // the one partition does
 	p.growth = []mssql.FileGrowth{{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}}
 
 	manifest := &ddl.Manifest{Operations: []ddl.Operation{
@@ -860,4 +866,139 @@ func TestBatchDMLSelectivityUsesBothProbes(t *testing.T) {
 			}
 		})
 	}
+}
+
+// keyRangeProber is healthyProber with the two facts a batch_update needs to clear every
+// other check: the DML permissions, and a filter that spares rows so the whole-table guard
+// passes. That leaves the key_range preconditions as the only thing left to fail.
+func keyRangeProber() fakeProber {
+	p := healthyProber()
+	p.dmlPermission = true
+	p.unmatchedRows = 500
+	return p
+}
+
+// keyRangeOp is a batch_update walking a table by its clustered key.
+func keyRangeOp() ddl.BatchDML {
+	return ddl.BatchDML{
+		Verb: "update", Schema: "dbo", Table: "T",
+		Set:   map[string]ddl.Literal{"Archived": {Raw: "1"}},
+		Where: []ddl.Condition{{Column: "Status", Op: "=", Value: &ddl.Literal{Raw: "X", String: true}}},
+		Batch: ddl.BatchSpec{Strategy: "key_range"},
+	}
+}
+
+// TestKeyRangePreconditionsFailInPreflight: a table the key_range walk cannot bound has to
+// be refused as a plan, not as a run. Until v0.30.0 the four conditions were tested in
+// BatchDMLRunner.resolveKeyColumn, which runs after the engine has moved the manifest into
+// 02.processing/ and opened a run report — so a manifest that could never have worked was
+// reported as a failed run rather than a rejected plan.
+func TestKeyRangePreconditionsFailInPreflight(t *testing.T) {
+	info := mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}
+	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}
+
+	tests := []struct {
+		name string
+		key  string // batch.key, when the manifest names one
+		cols []mssql.KeyColumn
+		want string // a fragment the failing check's detail must carry
+	}{
+		{
+			name: "heap: no clustered key at all",
+			cols: nil,
+			want: "no clustered key",
+		},
+		{
+			name: "composite clustered key",
+			cols: []mssql.KeyColumn{
+				{Name: "TenantId", IsInteger: true, IsUnique: true},
+				{Name: "Id", IsInteger: true, IsUnique: true},
+			},
+			want: "composite",
+		},
+		{
+			name: "non-integer clustered key",
+			cols: []mssql.KeyColumn{{Name: "Code", IsUnique: true}},
+			want: "not an integer",
+		},
+		{
+			name: "non-unique clustered key",
+			cols: []mssql.KeyColumn{{Name: "EventId", IsInteger: true}},
+			want: "not unique",
+		},
+		{
+			name: "batch.key names a column that is not the clustered key",
+			key:  "CreatedAt",
+			cols: []mssql.KeyColumn{{Name: "Id", IsInteger: true, IsUnique: true}},
+			want: "is not the clustered key",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := keyRangeProber()
+			p.clusterKey = tt.cols
+			op := keyRangeOp()
+			op.Batch.Key = tt.key
+			m := &ddl.Manifest{Operations: []ddl.Operation{op}}
+
+			rep, err := preflight.Run(context.Background(), p, info, m, th, false)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if rep.OK() {
+				t.Fatalf("report OK, want a failure:\n%v", rep.Checks)
+			}
+			if !anyCheckContains(rep, preflight.Fail, tt.want) {
+				t.Errorf("no failing check mentioning %q:\n%v", tt.want, rep.Checks)
+			}
+		})
+	}
+}
+
+// TestKeyRangeOnAUniqueIntegerKeyPasses guards the check against overreach: the one shape
+// the walk does support must not be refused.
+func TestKeyRangeOnAUniqueIntegerKeyPasses(t *testing.T) {
+	p := keyRangeProber()
+	p.clusterKey = []mssql.KeyColumn{{Name: "Id", IsInteger: true, IsUnique: true}}
+	m := &ddl.Manifest{Operations: []ddl.Operation{keyRangeOp()}}
+
+	rep, err := preflight.Run(context.Background(), p,
+		mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}, m,
+		preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !rep.OK() {
+		t.Errorf("report failed on a unique integer clustered key:\n%v", rep.Checks)
+	}
+}
+
+// TestPredicateStrategyDoesNotReadTheClusteredKey: the key_range preconditions apply to
+// key_range alone. A predicate walk needs no clustered key — a heap is walked by predicate
+// every day — so reading one would fail manifests that are perfectly valid.
+func TestPredicateStrategyDoesNotReadTheClusteredKey(t *testing.T) {
+	p := keyRangeProber()
+	p.clusterKeyErr = errors.New("ClusteringKeyColumns must not be called for a predicate walk")
+	op := keyRangeOp()
+	op.Batch = ddl.BatchSpec{} // predicate, the default
+	m := &ddl.Manifest{Operations: []ddl.Operation{op}}
+
+	rep, err := preflight.Run(context.Background(), p,
+		mssql.ServerInfo{EngineEdition: 3, MajorVersion: 16}, m,
+		preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80}, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !rep.OK() {
+		t.Errorf("a predicate batch was refused:\n%v", rep.Checks)
+	}
+}
+
+func anyCheckContains(rep preflight.Report, sev preflight.Severity, fragment string) bool {
+	for _, c := range rep.Checks {
+		if c.Severity == sev && strings.Contains(c.Detail, fragment) {
+			return true
+		}
+	}
+	return false
 }

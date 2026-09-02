@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/preflight"
 )
 
 // BatchExecutor is an Executor that can also report rows affected (to detect when a
@@ -318,44 +318,18 @@ func (r *BatchDMLRunner) runKeyRange(ctx context.Context, op ddl.BatchDML, res d
 	}
 }
 
-// resolveKeyColumn determines the key_range key: the table's clustered key column,
-// with batch.key — when given — asserting which column that is. This iteration supports
-// only a single, integer, *unique* clustered key; everything else uses the predicate
-// strategy.
-//
-// Uniqueness is the bound, and it is not optional. A batch's range is
-// (watermark, next], where next is the batchSize-th smallest matching key, and
-// BatchKeyRangeUpdateSQL carries no TOP of its own: the range holds batchSize rows only
-// if one key means one row. On a non-unique clustered index — `CREATE CLUSTERED INDEX
-// … ON T(EventId)`, ordinary for an event table — MAX of the first batchSize keys can
-// span millions of rows, and the single UPDATE escalates to a table lock and blows up
-// the log. The batching would be nominal.
-//
-// The three tests below used to be arranged so that naming batch.key skipped the
-// composite one entirely, and the composite error told the operator to name a
-// batch.key — which on a (TenantId, Id) key selects the most duplicated column in the
-// table. Both branches are now one path, so there is nothing to route around.
+// resolveKeyColumn determines the key_range key: the table's clustered key column, with
+// batch.key — when given — asserting which column that is. The rule lives in
+// preflight.KeyRangeColumn, which runs against the same facts before the manifest is moved
+// to 02.processing/; this is the same verdict reached again from the read the walk performs
+// anyway, so a table whose clustered index changed between preflight and the run is still
+// refused rather than walked unbounded.
 func (r *BatchDMLRunner) resolveKeyColumn(ctx context.Context, op ddl.BatchDML) (string, error) {
 	cols, err := r.reader.ClusteringKeyColumns(ctx, op.Schema, op.Table)
 	if err != nil {
 		return "", err
 	}
-	switch {
-	case len(cols) == 0:
-		return "", fmt.Errorf("key_range: %s.%s has no clustered key; use the predicate strategy", op.Schema, op.Table)
-	case len(cols) > 1:
-		return "", fmt.Errorf("key_range: %s.%s has a composite clustered key, whose leading column repeats across rows; use the predicate strategy", op.Schema, op.Table)
-	}
-	key := cols[0]
-	switch {
-	case op.Batch.Key != "" && !strings.EqualFold(op.Batch.Key, key.Name):
-		return "", fmt.Errorf("key_range: key %q is not the clustered key of %s.%s (that is %q); use the predicate strategy", op.Batch.Key, op.Schema, op.Table, key.Name)
-	case !key.IsInteger:
-		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not an integer (this iteration supports integer keys only)", key.Name, op.Schema, op.Table)
-	case !key.IsUnique:
-		return "", fmt.Errorf("key_range: clustered key %q of %s.%s is not unique, so one batch's key range can cover any number of rows; use the predicate strategy", key.Name, op.Schema, op.Table)
-	}
-	return key.Name, nil
+	return preflight.KeyRangeColumn(op, cols)
 }
 
 // opCaps builds the reaction capabilities shared by both strategies. A batch is
