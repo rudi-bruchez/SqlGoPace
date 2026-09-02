@@ -312,9 +312,13 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 			Statement: ddl.ShrinkTruncateOnlySQL(f.Name),
 		}
 		r.emitProgress(base)
-		if stopped, terr := r.runTruncateOnly(ctx, f.Name, base, ignore, sink); terr != nil {
+		outcome, terr := r.runTruncateOnly(ctx, f.Name, res, base, ignore, sink)
+		if terr != nil {
 			return nil, fmt.Errorf("shrink_tempdb %q: truncateonly: %w", f.Name, terr)
-		} else if stopped {
+		}
+		// watchedCapped falls through to the chunk loop, as in shrinkData: the cap yields
+		// the statement, it does not end the operation.
+		if outcome == watchedStopped {
 			return nil, ErrStopped
 		}
 	}
@@ -397,7 +401,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// fragmentation. On a large file this can run for a while, so it is interruptible: a
 	// graceful stop cancels it and the space it already released is preserved (a re-run
 	// resumes from the smaller size), so it stops cleanly rather than failing.
-	stopped, err := r.runTruncateOnly(ctx, f.Name, truncProgress, ignore, sink)
+	outcome, err := r.runTruncateOnly(ctx, f.Name, res, truncProgress, ignore, sink)
 	if err != nil {
 		return result, fmt.Errorf("shrink %q: truncateonly: %w", f.Name, err)
 	}
@@ -406,10 +410,13 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		return result, err
 	}
 	result.FinalMB = size
-	if stopped {
+	if outcome == watchedStopped {
 		result.Reason = "stopped: graceful stop during TRUNCATEONLY (freed space preserved)"
 		return result, ErrStopped
 	}
+	// A capped TRUNCATEONLY yielded the lock; it did not end the operation. Phase B moves
+	// pages in chunks and applies the same cap per chunk, so it is the right thing to hand
+	// over to — the sink has already narrated why this pass stopped early.
 	if size <= final {
 		return result, nil // truncate-only was enough
 	}
@@ -631,7 +638,7 @@ func (r *ShrinkRunner) shrinkLog(ctx context.Context, op ddl.Shrink, res ddl.Res
 		FinalMB: final, Statement: stmt,
 	}
 	r.emitProgress(base)
-	stopped, err := r.runWatchedStatement(ctx, stmt, "log shrink", base, ignore, sink)
+	outcome, err := r.runWatchedStatement(ctx, stmt, "log shrink", res, base, ignore, sink)
 	if err != nil {
 		return result, fmt.Errorf("shrink %q: %w", f.Name, err)
 	}
@@ -640,9 +647,16 @@ func (r *ShrinkRunner) shrinkLog(ctx context.Context, op ddl.Shrink, res ddl.Res
 		return result, err
 	}
 	result.FinalMB = size
-	if stopped {
+	switch outcome {
+	case watchedStopped:
 		result.Reason = "stopped: graceful stop during the log shrink (freed space preserved)"
 		return result, ErrStopped
+	case watchedCapped:
+		// A clean abort, like the log-reuse timeout above: the log shrink has no second
+		// phase to hand over to, and what it truncated is already released, so a re-run
+		// continues from the smaller size.
+		result.Reason = fmt.Sprintf("stopped: max_block_minutes (%d) reached during the log shrink (freed space preserved)", res.MaxBlockMinutes)
+		return result, nil
 	}
 	return result, nil
 }
@@ -748,10 +762,25 @@ func (r *ShrinkRunner) cancelAndAwait(cancelExec context.CancelFunc, done <-chan
 	}
 }
 
+// watchedOutcome is how a runWatchedStatement call ended.
+type watchedOutcome int
+
+const (
+	// watchedCompleted: the statement returned on its own. The accompanying error is its
+	// result — nil on success.
+	watchedCompleted watchedOutcome = iota
+	// watchedStopped: a graceful stop canceled it. The caller ends the operation.
+	watchedStopped
+	// watchedCapped: max_block_minutes canceled it after that long blocking another
+	// session. The statement yielded, the operation did not fail: what it already released
+	// is preserved, so the caller moves on to its next phase or reports a clean abort.
+	watchedCapped
+)
+
 // runTruncateOnly runs the free TRUNCATEONLY pass under monitoring. It is the Phase A
 // case of runWatchedStatement.
-func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, base ShrinkProgress, ignore IgnoreSource, sink ReactionSink) (stopped bool, err error) {
-	return r.runWatchedStatement(ctx, ddl.ShrinkTruncateOnlySQL(file), "TRUNCATEONLY", base, ignore, sink)
+func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, res ddl.ResolvedOptions, base ShrinkProgress, ignore IgnoreSource, sink ReactionSink) (watchedOutcome, error) {
+	return r.runWatchedStatement(ctx, ddl.ShrinkTruncateOnlySQL(file), "TRUNCATEONLY", res, base, ignore, sink)
 }
 
 // runWatchedStatement runs one *unchunked* shrink statement — the TRUNCATEONLY pass and the
@@ -760,12 +789,19 @@ func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, base Sh
 // boundary; instead this polls the stop flag on the monitoring cadence and cancels the
 // running statement when a stop is requested. What such a statement has already released is
 // preserved on the server (a re-run resumes from the smaller size), so stopping one is a
-// clean, re-entrant interruption. It returns stopped=true when a drain canceled it (the
-// caller turns that into ErrStopped) and the raw exec error otherwise (nil on completion,
-// ctx.Err on a hard cancel). It mirrors runChunk's cancel → KILL-grace fallback, drawing the
+// clean, re-entrant interruption. It returns watchedStopped when a drain canceled it (the
+// caller turns that into ErrStopped), watchedCapped when the safety cap below did, and
+// otherwise watchedCompleted with the raw exec error (nil on completion, ctx.Err on a hard
+// cancel). It mirrors runChunk's cancel → KILL-grace fallback, drawing the
 // KILL from the pool via Executor. label names the phase in the stop events; base is the
 // progress re-emitted with the server's live percent_complete.
-func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label string, base ShrinkProgress, ignore IgnoreSource, sink ReactionSink) (stopped bool, err error) {
+//
+// res carries max_block_minutes, the one pressure rule that applies here. It is a safety
+// cap rather than a reaction: it overrides every ignore policy, so it fires on blocking ANY
+// session. Until v0.30.0 this function drained its samples without applying it, which left
+// the cap resolved and unused on both statements — a log shrink or a TRUNCATEONLY could
+// hold its lock for as long as the server took.
+func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label string, res ddl.ResolvedOptions, base ShrinkProgress, ignore IgnoreSource, sink ReactionSink) (watchedOutcome, error) {
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 	done := make(chan error, 1)
@@ -776,13 +812,17 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 	// server's percent_complete; the sample pump keeps the blocking poll alive, which is
 	// what consults the blocker and victim killers — both hang off Sampler.Blocking, so
 	// without this poll no blocker is ever killed while these statements run. The samples
-	// themselves are drained below: no pressure reaction applies here, since there is no
-	// chunk boundary to pause at and aborting stays the operator's call, via a graceful stop.
+	// also drive the max_block cap below; no other pressure reaction applies here, since
+	// there is no chunk boundary to pause at and aborting stays the operator's call, via a
+	// graceful stop.
 	watchCtx, stopWatching := context.WithCancel(ctx)
 	defer stopWatching()
 	go r.pumpServerProgress(watchCtx, base)
 	samples := make(chan Sample)
 	go pumpSamples(watchCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+
+	maxBlock := blockCap(res.MaxBlockMinutes)
+	var blockedSince time.Time // start of the current continuous blocking streak
 
 	ticker := time.NewTicker(r.pollIntv)
 	defer ticker.Stop()
@@ -791,14 +831,39 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 		// completes on its own is never mis-reported as stopped.
 		select {
 		case err := <-done:
-			return false, err
+			return watchedCompleted, err
 		default:
 		}
 		select {
 		case err := <-done:
-			return false, err
-		case <-samples:
-			// Drained: the poll runs for its side effects (the killers), not for a reaction.
+			return watchedCompleted, err
+		case s := <-samples:
+			// The poll runs for its side effects (the killers) whatever the cap says.
+			if maxBlock <= 0 {
+				continue
+			}
+			if !s.Blocking {
+				blockedSince = time.Time{} // the streak has to be continuous
+				continue
+			}
+			if blockedSince.IsZero() {
+				blockedSince = r.clk.Now()
+			}
+			if r.clk.Since(blockedSince) < maxBlock {
+				continue
+			}
+			// The statement may have finished while this sample was in flight; prefer the
+			// real result over reporting a completed statement as capped.
+			select {
+			case err := <-done:
+				return watchedCompleted, err
+			default:
+			}
+			sink(ReactionEvent{Kind: "cancel", Detail: fmt.Sprintf(
+				"shrink %q %s yielded: max_block_minutes (%d) reached while blocking another session; freed space preserved",
+				base.File, label, res.MaxBlockMinutes)})
+			r.cancelAndAwait(cancelExec, done, sink, label+" did not stop within the grace period")
+			return watchedCapped, nil
 		case <-ticker.C:
 			if !stopRequested(r.stop) {
 				continue
@@ -807,12 +872,12 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 			// the real result over reporting a completed statement as stopped.
 			select {
 			case err := <-done:
-				return false, err
+				return watchedCompleted, err
 			default:
 			}
 			sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q %s stopped on graceful stop; freed space preserved", base.File, label)})
 			r.cancelAndAwait(cancelExec, done, sink, label+" did not stop within the grace period")
-			return true, nil
+			return watchedStopped, nil
 		}
 	}
 }

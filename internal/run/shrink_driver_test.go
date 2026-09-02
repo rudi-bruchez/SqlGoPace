@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +28,7 @@ type fakeServer struct {
 	noProgress    bool  // chunk moves never change the size (simulate 49516 / data at end)
 	floorMB       int   // a chunk cannot shrink below this (also the active-log floor)
 	blockTruncate bool  // model a long-running TRUNCATEONLY: block until the context is canceled
+	blockShrink   bool  // model a long-running page-moving/log shrink: block until the context is canceled
 	chunkErr      error // if set, every page-moving chunk returns this error (a shrink that cannot move a page)
 
 	// chunkErrs scripts transient chunk errors (e.g. Msg 845): each page-moving chunk exec
@@ -84,6 +86,10 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	case strings.Contains(sql, "CHECKPOINT"):
 		// no size change
 	case strings.Contains(sql, "DBCC SHRINKFILE"):
+		if s.blockShrink {
+			<-ctx.Done() // a long shrink that only ends when the driver cancels it
+			return ctx.Err()
+		}
 		if len(s.chunkErrs) > 0 {
 			err := s.chunkErrs[0]
 			s.chunkErrs = s.chunkErrs[1:]
@@ -1122,5 +1128,108 @@ func TestTempdb845RetriesWithoutFailing(t *testing.T) {
 		if strings.Contains(stmt, "FREESYSTEMCACHE") {
 			t.Errorf("flush must not run when FlushCaches is false; exec log = %v", s.execLog)
 		}
+	}
+}
+
+// blockingSampler reports our statement as blocking a session that is on the ignore list
+// (Any without Unignored), so only the max_block safety cap can act on it, and advances the
+// manual clock by step on every poll so the cap's timer can expire in a test. After
+// stopAfter polls it reports no blocking at all, which lets a later phase run clean.
+type blockingSampler struct {
+	clk       *ManualClock
+	step      time.Duration
+	stopAfter int // 0 = never stop reporting
+
+	mu    sync.Mutex
+	polls int
+}
+
+func (b *blockingSampler) Blocking(context.Context, IgnoredSessions) (BlockState, error) {
+	b.mu.Lock()
+	b.polls++
+	n := b.polls
+	b.mu.Unlock()
+	if b.stopAfter > 0 && n > b.stopAfter {
+		return BlockState{}, nil
+	}
+	b.clk.Advance(b.step)
+	return BlockState{Any: true}, nil
+}
+
+func (b *blockingSampler) Log(context.Context) (LogSample, error) { return LogSample{}, nil }
+
+// TestShrinkLogYieldsAtMaxBlockMinutes pins the safety cap on the one shrink statement that
+// runs outside the chunk loop. resolveShrink has resolved max_block_minutes since v0.18.0,
+// but shrinkLog issues a single statement through runWatchedStatement, which used to drain
+// its samples without a supervisor — so the cap was resolved and then never applied, and a
+// log shrink held its lock through an ignored blocker for as long as the server took.
+func TestShrinkLogYieldsAtMaxBlockMinutes(t *testing.T) {
+	clk := NewManualClock(time.Unix(0, 0))
+	s := &fakeServer{
+		fileType: mssql.FileTypeLog, name: "Log", recovery: "SIMPLE",
+		sizeMB: 4000, usedMB: 400, floorMB: 400, blockShrink: true,
+	}
+	r := newTestRunner(s, clk)
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = &blockingSampler{clk: clk, step: 40 * time.Second}
+
+	var reactions []ReactionEvent
+	var mu sync.Mutex
+	sink := func(e ReactionEvent) { mu.Lock(); reactions = append(reactions, e); mu.Unlock() }
+
+	// Bounded so an unapplied cap fails the test instead of hanging it: the fake holds the
+	// statement open until something cancels it, and the cap is the only thing that can.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "log", Files: "Log", TargetFreeSpace: "10%"}
+	got, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil (a capped abort is clean: the freed space is preserved)", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	if !strings.Contains(got[0].Reason, "max_block_minutes") {
+		t.Errorf("Reason = %q, want it to name max_block_minutes", got[0].Reason)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, e := range reactions {
+		if strings.Contains(e.Detail, "max_block_minutes") {
+			return
+		}
+	}
+	t.Errorf("no reaction event naming max_block_minutes; got %+v", reactions)
+}
+
+// TestTruncateOnlyCappedFallsThroughToTheChunkLoop: the cap yields the statement, it does not
+// end the operation. TRUNCATEONLY is Phase A of a data shrink, so a capped one must hand over
+// to the page-moving loop — which enforces the same cap per chunk — rather than reporting the
+// file as stopped the way a graceful stop does.
+func TestTruncateOnlyCappedFallsThroughToTheChunkLoop(t *testing.T) {
+	clk := NewManualClock(time.Unix(0, 0))
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 2000, usedMB: 200,
+		blockTruncate: true,
+	}
+	r := newTestRunner(s, clk)
+	r.pollIntv = 2 * time.Millisecond
+	// Blocks only while the TRUNCATEONLY runs; the chunk loop that follows samples clean.
+	r.sampler = &blockingSampler{clk: clk, step: 40 * time.Second, stopAfter: 3}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	got, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d results, want 1", len(got))
+	}
+	if got[0].Chunks == 0 {
+		t.Errorf("Chunks = 0: the capped TRUNCATEONLY ended the operation instead of handing over to Phase B (%+v)", got[0])
 	}
 }

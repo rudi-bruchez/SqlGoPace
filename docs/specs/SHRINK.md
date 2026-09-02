@@ -241,22 +241,34 @@ minutes, so it samples the server for its whole duration exactly as a chunk does
 pump reports the server's `percent_complete` (`dm_exec_requests`) to the console, and the
 blocking poll runs so the blocker and victim killers — which are consulted inside
 `ServerSampler.Blocking` — can act on a session that blocks it. The samples are otherwise
-discarded: **no pressure reaction applies to Phase A**. `TRUNCATEONLY` takes no
-`WAIT_AT_LOW_PRIORITY` (§3), and aborting it stays the operator's call through a graceful stop,
-which is clean and re-entrant (the space already released is preserved).
+discarded, with one exception from v0.30.0: **no pressure reaction applies to Phase A except
+the `max_block_minutes` safety cap.** `TRUNCATEONLY` takes no `WAIT_AT_LOW_PRIORITY` (§3), and
+aborting it otherwise stays the operator's call through a graceful stop, which is clean and
+re-entrant (the space already released is preserved).
 
 This gives the driver **two** monitoring postures, split on whether the statement is chunked:
 
 | Statement | Samples (killers, progress) | Reacts to pressure |
 |---|---|---|
 | Phase B chunk (§7.1, §8) | yes | yes — pause between chunks, abort |
-| Phase A `TRUNCATEONLY` | yes | no |
-| Log shrink (§5.2) | yes | no |
+| Phase A `TRUNCATEONLY` | yes | `max_block_minutes` only |
+| Log shrink (§5.2) | yes | `max_block_minutes` only |
 
 The log shrink is a single unchunked statement like Phase A, so it takes the same posture and
 the same code path (`runWatchedStatement`): it can be blocked (§8.2) and can block others, so
 it must not run dark, but it has no chunk boundary to pause at. A graceful stop cancels either
 one and the run stays re-entrant.
+
+**The cap was resolved and unused until v0.30.0** (`resolveShrink` has read
+`max_block_minutes` since v0.18.0, but `runWatchedStatement` built no `Capabilities`), so
+these two statements held their locks for as long as the server took. They now apply it on
+`supervise`'s rule — a continuous streak of blocking *any* session, ignored or not, since the
+cap overrides every ignore policy. What follows a capped statement differs by what it can hand
+over to: `TRUNCATEONLY` moves on to Phase B, which caps per chunk; the log shrink has no
+second phase, so the operation ends cleanly and a re-run continues from the smaller size. It is
+deliberately not the chunk loop's answer — `awaitRelief` then retry — because for a single
+statement that is a re-issue loop bounded only by the log-drain timeout, where the operator
+re-running is simpler and just as correct.
 
 ### 7.2 Stepsize calibration
 

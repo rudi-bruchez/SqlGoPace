@@ -78,13 +78,15 @@ As a backstop against a rule that turns out to be too broad, set
 `options.max_block_minutes: N` on an operation: after N minutes of continuous blocking it
 yields anyway, whatever the ignore rules say.
 
-**One operation is not covered: `shrink` of a log file.** The cap is enforced by the
-supervisor that wraps each chunk of a chunked operation, and a log shrink is a single
-unchunked `DBCC SHRINKFILE` — so `max_block_minutes` is read from the manifest and then has
-nothing to apply to. The same holds for the `TRUNCATEONLY` pass of a data shrink. Both are
-normally short, which is why this is a known gap rather than a fix in flight
-([`docs/specs/TODO.md`](specs/TODO.md)), but do not plan around a cap that will not fire
-there: use a manifest `window` if a log shrink must not run past a given time.
+Every operation is covered from 0.30.0, including the two shrink statements that run
+outside the chunk loop. The cap used to be enforced only by the supervisor wrapping each
+chunk, so a log shrink and the `TRUNCATEONLY` pass of a data shrink — both single unchunked
+`DBCC SHRINKFILE` statements — read `max_block_minutes` from the manifest and had nothing to
+apply it to. They now yield on the same rule. What follows differs by statement, because
+what each one can hand over to differs: a capped `TRUNCATEONLY` moves on to the page-moving
+chunk loop, which applies the cap per chunk; a capped log shrink has no second phase, so the
+operation ends cleanly with the space it already released kept, and a re-run continues from
+the smaller size. Either way the reason is in the run report.
 
 ### Discovering who you blocked
 
