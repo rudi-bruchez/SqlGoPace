@@ -141,7 +141,14 @@ constant, and how it is written in YAML decides how it reaches the server:
 | a number (`0`, `1.50`) | `0`, `1.50` |
 | a date, quoted or not (`2020-01-01`, `'2020-01-01'`) | `N'2020-01-01'` |
 | `null`, `~`, or an empty value | `NULL` |
-| `true` / `false` | `true` / `false` — **not valid T-SQL**; write `1` / `0` for a `BIT` |
+| `true` / `false` | `1` / `0`, the values a `BIT` is compared to |
+
+A number has to be written the way SQL Server reads it. YAML accepts spellings it does not,
+and from 0.30.0 the manifest is refused at parse time rather than at the first batch:
+`1_000`, `0x1F`, `0o17`, `.inf` and `.nan` have no T-SQL form, and a leading zero (`017`) is
+octal in YAML and decimal in SQL Server — two different numbers. Write plain decimal, or
+quote the value to send it as a string. Until 0.30.0 all of these reached the server as
+written, where they failed to compile.
 
 Quoting a date is optional but harmless, and the two spellings generate identical SQL.
 Until 0.27.0 they did not: an unquoted date reached the server as arithmetic

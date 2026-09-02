@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -121,12 +122,56 @@ func (l Literal) IsNull() bool { return l.Raw == "" && !l.String }
 // SET DATEFORMAT on a legacy `datetime` column — Microsoft documents only `yyyyMMdd` and
 // the full `yyyy-MM-ddTHH:mm:ss` as locale-independent there — but that is equally true
 // of a hand-quoted date and is not what this branch decides.
+//
+// A !!bool becomes 1 or 0. T-SQL has no true/false keyword — a BIT is compared to 1 or 0 —
+// so `value: true` used to reach the server as a bare `true` and fail to compile. That was a
+// loud failure rather than a wrong answer, unlike the date above, so this buys a working
+// manifest and not safety. The conversion is one-way: `set: {Archived: true}` round-trips
+// through MarshalManifest as `1`, which is the same value written the way the server reads it.
+//
+// The numeric spellings YAML allows and T-SQL does not are refused here rather than
+// converted; see checkNumericLiteral.
 func (l *Literal) UnmarshalYAML(value *yaml.Node) error {
 	if value.Kind != yaml.ScalarNode {
 		return fmt.Errorf("default must be a scalar constant: %w", ErrInvalidManifest)
 	}
+	switch value.Tag {
+	case "!!bool":
+		l.Raw = "0"
+		if b, err := strconv.ParseBool(value.Value); err == nil && b {
+			l.Raw = "1"
+		}
+		return nil
+	case "!!int", "!!float":
+		if err := checkNumericLiteral(value.Tag, value.Value); err != nil {
+			return err
+		}
+	}
 	l.Raw = value.Value
 	l.String = value.Tag == "!!str" || value.Tag == "!!timestamp"
+	return nil
+}
+
+// numericLiteral matches the number spellings SQL Server reads: an optional sign, decimal
+// digits with an optional fraction, and an optional exponent.
+var numericLiteral = regexp.MustCompile(`^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$`)
+
+// checkNumericLiteral refuses a YAML number that SQL Server would refuse or read as a
+// different value. A Literal keeps the scalar's text as written, so the two languages have
+// to agree on it, and YAML accepts a good deal T-SQL does not: digit separators (1_000),
+// alternative bases (0x1F, 0o17), and .inf / .nan, none of which have a T-SQL spelling. A
+// leading zero is the one that matters most, because both languages accept it and disagree:
+// YAML reads 017 as octal 15, SQL Server as decimal 17. Refusing at parse time keeps the
+// mistake in the manifest, where it can still be corrected.
+func checkNumericLiteral(tag, raw string) error {
+	if !numericLiteral.MatchString(raw) {
+		return fmt.Errorf("%q is not a number SQL Server can read; write it in plain decimal, or quote it to send a string: %w",
+			raw, ErrInvalidManifest)
+	}
+	if digits := strings.TrimLeft(raw, "+-"); tag == "!!int" && len(digits) > 1 && digits[0] == '0' {
+		return fmt.Errorf("%q has a leading zero, which YAML reads as octal and SQL Server reads as decimal — two different numbers; write it without the leading zero: %w",
+			raw, ErrInvalidManifest)
+	}
 	return nil
 }
 

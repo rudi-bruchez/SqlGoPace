@@ -797,3 +797,112 @@ func TestBatchUnmatchedRowsKeyRangeUsesTheFilterAlone(t *testing.T) {
 		t.Errorf("under key_range the two probes ask the same question and must agree:\n%s", got)
 	}
 }
+
+// TestBatchDMLRendersBooleans pins the T-SQL spelling of a YAML boolean. YAML resolves an
+// unquoted true/false to !!bool, which used to take renderLiteral's unquoted branch and
+// emit a bare `true` — a syntax error everywhere T-SQL expects a BIT. The values SQL Server
+// reads are 1 and 0, and that is what a manifest saying `true` means. Unlike the date in
+// TestBatchDMLQuotesUnquotedDates this failed loudly rather than silently, so it is a
+// message-quality fix, not a safety one.
+func TestBatchDMLRendersBooleans(t *testing.T) {
+	tests := []struct {
+		name     string
+		manifest string
+		want     string
+	}{
+		{
+			name: "true in a where condition",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: Archived, op: '=', value: true }
+`,
+			want: "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [Archived] = 1;",
+		},
+		{
+			name: "false as an update target",
+			manifest: `operations:
+  - operation: batch_update
+    schema: dbo
+    table: MEASUREMENT
+    set: { Archived: false }
+    where:
+      - { column: Status, op: '=', value: 'X' }
+`,
+			want: "UPDATE TOP (5000) [dbo].[MEASUREMENT] SET [Archived] = 0 WHERE ([Archived] IS NULL OR [Archived] <> 0) AND ([Status] = N'X');",
+		},
+		{
+			name: "a quoted true stays a string",
+			manifest: `operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: Flag, op: '=', value: 'true' }
+`,
+			want: "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [Flag] = N'true';",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			op := parseOneOp(t, tt.manifest).(ddl.BatchDML)
+			if got := ddl.BatchDMLChunkSQL(op, 5000, ddl.ResolvedOptions{}); got != tt.want {
+				t.Errorf("BatchDMLChunkSQL()\n got = %s\nwant = %s", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestRejectsNumericSpellingsTSQLCannotRead: YAML accepts number spellings T-SQL does not,
+// and a Literal keeps the text as written. `1_000` and `0x1F` are syntax errors on the
+// server; `017` is worse, because both languages accept it and disagree about the value
+// (YAML octal 15, T-SQL decimal 17). Refuse them at parse time, where the manifest can still
+// be corrected, rather than at the first batch against a production table.
+func TestRejectsNumericSpellingsTSQLCannotRead(t *testing.T) {
+	// Not in this list: 1:30, which go-yaml v3 resolves to !!str (YAML 1.1 sexagesimals are
+	// gone), so it is already quoted into the statement rather than emitted as a number.
+	for _, value := range []string{"1_000", "0x1F", "0o17", "017", ".inf", ".nan"} {
+		t.Run(value, func(t *testing.T) {
+			manifest := fmt.Sprintf(`operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: Amount, op: '=', value: %s }
+`, value)
+			_, err := ddl.ParseManifest(strings.NewReader(manifest))
+			if err == nil {
+				t.Fatalf("ParseManifest(%s) = nil error, want a rejection", value)
+			}
+			if !errors.Is(err, ddl.ErrInvalidManifest) {
+				t.Errorf("error = %v, want ErrInvalidManifest", err)
+			}
+			if !strings.Contains(err.Error(), value) {
+				t.Errorf("error = %v, want it to quote the offending value %q", err, value)
+			}
+		})
+	}
+}
+
+// TestAcceptsPlainNumbers guards the rejection above against overreach: the spellings an
+// operator actually writes must keep working, unquoted and unchanged.
+func TestAcceptsPlainNumbers(t *testing.T) {
+	for _, value := range []string{"0", "42", "-7", "+7", "3.5", "-0.25", "1e3", "1.5E-3"} {
+		t.Run(value, func(t *testing.T) {
+			manifest := fmt.Sprintf(`operations:
+  - operation: batch_delete
+    schema: dbo
+    table: MEASUREMENT
+    where:
+      - { column: Amount, op: '=', value: %s }
+`, value)
+			op := parseOneOp(t, manifest).(ddl.BatchDML)
+			want := "DELETE TOP (5000) FROM [dbo].[MEASUREMENT] WHERE [Amount] = " + value + ";"
+			if got := ddl.BatchDMLChunkSQL(op, 5000, ddl.ResolvedOptions{}); got != want {
+				t.Errorf("BatchDMLChunkSQL()\n got = %s\nwant = %s", got, want)
+			}
+		})
+	}
+}
