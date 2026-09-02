@@ -198,8 +198,11 @@ fifteen minutes.
 | [Configuration](docs/configuration.md) | Every key, with defaults. |
 
 Writing manifests with an AI assistant is covered by the
-[LLM operator guide](docs/llm-operator-guide.md), and the repository ships a
-[Claude Code skill](.claude/skills/) that loads the same knowledge automatically.
+[LLM operator guide](docs/llm-operator-guide.md), and the repository ships two
+[Claude Code skills](.claude/skills/) that load the same knowledge automatically:
+`sqlgopace-operator` writes and reviews manifests, `sqlgopace-run` executes one and reads
+what came back. They are versioned with the code they describe, and they defer to the pages
+above rather than restating them — where the two disagree, the docs are right.
 
 ## Compatibility
 
