@@ -492,6 +492,11 @@ func (m Model) helpBody() string {
 	if m.mode == modeKillDDLConfirm {
 		return m.killDDLConfirmBody()
 	}
+	if m.mode == modeArmKillConfirm {
+		return fmt.Sprintf("arm auto-kill for %s=%s? every session matching it that blocks this run "+
+			"is killed, until the run ends   [y] arm  [any other key] cancel",
+			m.pendingArm.Criterion, m.pendingArm.Value)
+	}
 	if m.inCriterionMode() && m.cursor < len(m.blockers) {
 		bl := m.blockers[m.cursor]
 		return fmt.Sprintf("ignore SPID %d as:  [s] session_id  [a] app=%s  [l] login=%s  [h] host=%s   [esc] cancel",

@@ -108,7 +108,7 @@ progress, the sessions it is blocking, the sessions blocking it, and the reactio
 |---|---|
 | `i` | Ignore the selected session: writes an `ignore_blocked_sessions` rule into the running manifest, hot-reloaded. |
 | `x` | Kill the selected session, after a confirmation. |
-| `b` | The blocker roster: the sessions that have blocked *us*, and where a kill rule is armed. |
+| `b` | The blocker roster: the sessions that have blocked *us*, and where a kill rule is armed, after a confirmation. |
 | `k` | Kill the running DDL, after a confirmation. |
 | `d` | Drain: finish the current operation, then stop cleanly. |
 
@@ -116,7 +116,15 @@ Pressing `i` asks which criterion to match on, so the rule it writes is durable
 (`app_name`, `login_name`, `host_name`) rather than tied to a session id that will not
 exist tomorrow.
 
-**`k` is the most destructive key here**, which is why it asks first. It terminates the
+**Arming a rule from the roster is the most destructive gesture in the console**, which is
+why it asks first. `x` and `k` each end one thing you can see and name; arming ends every
+session that later blocks the run and matches an `app_name`, `login_name` or `host_name` —
+an unbounded set, chosen by attribute, until the run ends. It was the *last* of the three to
+be gated (0.32.0), having fired on a single keystroke while its two less harmful neighbours
+had asked since 0.24.0 and 0.28.0. Disarming is not gated: it can only reduce what the run
+will terminate.
+
+**`k` is the most destructive key on the main screen**, which is why it asks first. It terminates the
 operation *this run* is executing. The prompt states what it would cost, from what the
 console already knows: how long the operation has run and how far it got — that is what the
 rollback discards — whether the edition allows the operation to be resumable (on Enterprise

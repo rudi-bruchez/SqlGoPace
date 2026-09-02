@@ -284,6 +284,7 @@ const (
 	modeCriterion                // ignore-this-session prompt (from "i")
 	modeKillConfirm              // "really kill this session?" prompt (from "x")
 	modeKillDDLConfirm           // "really kill our own running DDL?" prompt (from "k")
+	modeArmKillConfirm           // "really arm this rule?" prompt (from the roster)
 )
 
 // Model is the incident console state.
@@ -327,6 +328,7 @@ type Model struct {
 	rosterCursor int             // selected group within the roster
 	rosterByHost bool            // roster grouping key: false = login, true = host
 	armed        map[string]bool // roster-armed kill rules, keyed "criterion=value" (drives ✓)
+	pendingArm   rosterGroup     // the group awaiting confirmation in modeArmKillConfirm
 	killerArmed  bool            // whether kill_blockers is enabled in config (roster warning)
 }
 
@@ -555,6 +557,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mode == modeKillDDLConfirm {
 		return m.handleKillDDLConfirmKey(msg)
 	}
+	if m.mode == modeArmKillConfirm {
+		return m.handleArmKillConfirmKey(msg)
+	}
 	if m.inCriterionMode() {
 		return m.handleCriterionKey(msg)
 	}
@@ -645,6 +650,26 @@ func (m Model) handleKillDDLConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleArmKillConfirmKey confirms arming a kill rule; "y" confirms, every other key
+// dismisses it.
+//
+// This is the most destructive gesture in the console and it was the last to be gated.
+// `x` kills one named session and has asked since 0.24.0; `k` kills our own DDL and has
+// asked since 0.28.0; arming terminates every session that later blocks the DDL and
+// matches an app_name / login_name / host_name — an unbounded set, chosen by attribute,
+// for the rest of the run — and fired on one keystroke until the ledger in
+// harm_audit_test.go put it next to its neighbours.
+func (m Model) handleArmKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "y" && m.pendingArm.Value != "" {
+		g := m.pendingArm
+		m.emit(Action{Kind: ActionArmKillRule, Criterion: g.Criterion, Value: g.Value})
+		m.armed[rosterKey(g.Criterion, g.Value)] = true
+	}
+	m.pendingArm = rosterGroup{}
+	m.mode = modeNormal
+	return m, nil
+}
+
 // handleCriterionKey handles the "ignore this session by …" sub-prompt: it emits the
 // ignore action for the selected session and chosen criterion, then returns to normal
 // mode. Esc/q cancels; any other key keeps the prompt open.
@@ -712,12 +737,14 @@ func (m Model) handleRosterKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		key := rosterKey(g.Criterion, g.Value)
 		if m.armed[key] {
+			// Disarming only ever reduces what the run will terminate, so it needs no
+			// gate. Arming does: see handleArmKillConfirmKey.
 			m.emit(Action{Kind: ActionDisarmKillRule, Criterion: g.Criterion, Value: g.Value})
 			delete(m.armed, key)
-		} else {
-			m.emit(Action{Kind: ActionArmKillRule, Criterion: g.Criterion, Value: g.Value})
-			m.armed[key] = true
+			return m, nil
 		}
+		m.pendingArm = g
+		m.mode = modeArmKillConfirm
 	}
 	return m, nil
 }

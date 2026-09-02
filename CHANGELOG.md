@@ -13,6 +13,33 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.32.0] - 2026-09-02
+
+### Changed
+
+- Arming a kill rule from the console's blocker roster (`b`, then enter/space) now asks
+  for confirmation. It fired on one keystroke, while `x` (kills one named session) has
+  confirmed since 0.24.0 and `k` (kills our own DDL) since 0.28.0 — and arming is the more
+  destructive of the three: it terminates every session that later blocks the run and
+  matches the group's `app_name`, `login_name` or `host_name`, until the run ends.
+  Disarming stays ungated; it can only reduce what the run terminates.
+  `docs/running.md` said `k` was the most destructive key in the console. It was not.
+
+### Added
+
+- `internal/tui/harm_audit_test.go`: a ledger of every operator action with its harm rank
+  and the gate the key handler actually imposes, and a pairwise check that no action is
+  reachable with a weaker gesture than a less harmful one. The gate is measured by driving
+  `Model.Update`, and every `ActionKind` in `model.go` must be ranked, so neither a removed
+  confirmation nor a new unranked action can pass. It found the arming defect above on its
+  first run.
+
+  This is the class the project had already paid for four times, one instance per release,
+  each looking like a one-off: 0.23.0, 0.24.0 and two in 0.28.0. The asymmetry is invisible
+  in a diff — each handler is correct on its own terms — and invisible to TDD, which asserts
+  that a key does what it was meant to do. `TestRosterArmThenDisarm` had pinned the ungated
+  behaviour green since the roster shipped.
+
 ## [0.31.0] - 2026-09-02
 
 ### Changed

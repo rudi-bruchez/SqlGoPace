@@ -100,6 +100,27 @@ mandatory for monitoring).
   readers need the reasoning that was abandoned, not just the rule that replaced it. The same pass
   covers `docs/specs/TODO.md` — see the backlog section below; anything you deliberately left
   undone goes there, with its reasoning, before the session ends.
+- **Three audits walk a type instead of reading a diff; none is a `/simplify` candidate.**
+  `internal/config/audit_test.go` walks `Config` by reflection rather than reading a diff, because
+  the two defect classes it covers survived both TDD and a diff-scoped review.
+  `TestNoInertConfigKey` fails on a key nothing outside `internal/config` reads, directly or
+  through an accessor — applying a default to a key is not using it, which is how
+  `checkpoint_between_operations` shipped parsed, documented and dead.
+  `TestShippedConfigStatesTheRealDefaults` compares the shipped `config.yaml` against a minimal
+  one, so a key the file presents as documentation cannot quietly mean something else when an
+  operator deletes it. **Neither is dead weight and neither is a candidate for a `/simplify`
+  pass.** The entries in `documentedDivergences` marked `OPEN` are known defects, not blessed
+  exceptions: they are listed in `docs/specs/TODO.md` and the map empties as the defaults land.
+  A defect class found twice belongs here as a test, not in a sixth review.
+  The third is `internal/tui/harm_audit_test.go`, which ranks every console `ActionKind` by
+  what it costs and whom, measures the gate by driving `Model.Update`, and fails when a more
+  harmful action is reachable with a weaker gesture than a less harmful one. That class had
+  been fixed by hand four times, one per release (0.23.0, 0.24.0, twice in 0.28.0), because
+  it is invisible in a diff — each handler is correct on its own terms — and invisible to
+  TDD, which asserts that a key does what it was meant to do. **Adding an `ActionKind`
+  means ranking it there**; the harm ordering is stated in that file because the code states
+  it nowhere, so argue with the ordering rather than deleting the row.
+
 - **Lint config is golangci-lint v2** (`.golangci.yml`, `version: "2"`). errcheck/govet/staticcheck/
   ineffassign/unused are in the v2 default set and are not listed. Comments/identifiers use **US
   spelling** (normalized in 46cf1f4).

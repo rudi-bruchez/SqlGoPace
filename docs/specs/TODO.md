@@ -204,7 +204,265 @@ findings from a codebase that builds T-SQL by concatenation throughout, because 
 crosses a package boundary its AST rule cannot follow. Do not read a clean `gosec` run as
 evidence about CWE-89 here.
 
+## From the field (2026-09-02)
+
+### Planning a compression campaign
+
+Five findings from staging a PAGE-compression campaign over an 8.5 TB `EXAMPLEDB` on **SQL Server
+2019 Standard**: 912 objects not yet PAGE, 7.8 TB of them, 19 objects carrying 6.1 TB and two of
+those 1.4 TB and 1.25 TB each. An earlier attempt on the same database — a size-split of the
+trial the original specs came from — had ended with **20 of a 33-operation manifest cancelled**,
+each after 2 to 14 minutes of work that was then rolled back.
+
+None of these is a bug. Every one of them is the tool doing exactly what it was told while the
+operator did, by hand and in SQL, the reasoning the tool had the facts to do itself. That is the
+common thread, and it is why they are grouped rather than filed one by one.
+
+- [ ] **Standard edition has no reaction available, and nothing says so before the run.** The
+  hierarchy is `WAIT_AT_LOW_PRIORITY` → `RESUMABLE` pause/resume → `KILL`. The first two are
+  Enterprise. On Standard the only lever left for a rebuild is cancel — and a cancelled rebuild
+  rolls back completely, unlike a shrink, which keeps the space it already freed. So an offline
+  rebuild that runs longer than `blocking_timeout_minutes` on a table anything writes to
+  **cannot complete**, no matter how many times it is retried: `max_retry_attempts` just spends
+  the cost again. That is what produced the 20 cancellations, and the run report explained each
+  one individually (`operation canceled under pressure`) without ever stating the shared cause.
+  `Resolve` already knows the edition and already emits `Decision`s; preflight already knows the
+  object's size, and a previous run's measured throughput is in the history DB. The verdict is
+  computable *before the first statement*: "no reaction is available on this target; this
+  operation is expected to exceed the blocking timeout; it will be cancelled".
+  *Why it is worth doing rather than documenting:* the operator who most needs it is the one who
+  wrote a manifest that looks exactly like a working one. Nothing in the manifest, the `--explain`
+  output or the plan distinguishes an operation that will finish from one that structurally
+  cannot, and the cost of finding out is hours of production locking for no result.
+  *Open question the design has to answer:* what the tool should then do — refuse, warn, or
+  reorder. Refusing is wrong for a genuine maintenance window where nothing is writing.
+
+- [ ] **`max_block_minutes` means the opposite thing on a rebuild and on a shrink, under one
+  key.** On a shrink, yielding at the cap is nearly free: the pages already moved stay moved and a
+  re-run continues from the smaller file — which is exactly what v0.30.0 leaned on when it
+  extended the cap to the two unchunked statements. On a rebuild, yielding at the cap throws away
+  the entire operation, and the rollback holds the lock while it happens. The same number is a
+  cheap safety valve in one manifest and a "waste N minutes and change nothing" switch in the
+  other. `docs/manifests.md` documents the mechanism identically for both.
+  *Deferred rather than obvious:* the fix is not a second key. It is deciding whether the engine
+  should say so — in `--explain`, in the run report, or by resolving a different default per
+  operation kind — and a per-kind default is a behaviour change that needs its own migration note.
+
+- [ ] **The data-free-space check sizes a compression rebuild from the wrong number, in both
+  directions.** `CheckDataFreeSpace` takes `needMB` from the object's *current* size. Microsoft's
+  rule (*Disk space requirements for index DDL operations*, *SORT_IN_TEMPDB Option For Indexes*)
+  is that the destination filegroup needs roughly the size of the **new** structure, the old one
+  being deallocated only at commit. For a `data_compression: PAGE` rebuild the new structure is
+  the smaller one, so the check overstates the need and warns on operations that would have fit.
+  The other direction is worse. When the files are uncapped — the common case — a shortfall
+  degrades to a `Warn` naming the autogrowth, and the run proceeds. On a database that has just
+  been shrunk that means **the rebuild campaign silently gives back the space the shrink spent
+  hours reclaiming**: on this one, 797 GB free at 9.2 %, against a single object of 1.4 TB, with a
+  data file whose `FILEGROWTH` is 1 MB.
+  *The general point, which is bigger than the check:* a shrink and a compression campaign on the
+  same database are in direct conflict, and the tool models neither side as knowing about the
+  other. It has every fact needed to say "this operation is expected to grow the file by N GB",
+  which is the sentence the operator actually needs. Wire the estimate through preflight first;
+  a real space budget across a queue is a larger design.
+
+- [ ] **`.blocked.yaml` is the most useful artifact the tool produces, and it is per-run only.**
+  Every ignore rule in the new campaign came from reading those captures: which logins were
+  blocked, how often, and which of them were read-only reporting sessions safe to hold the lock
+  through versus writers that must never be held up. That reasoning was done by grepping and
+  counting across two runs months apart. The captures are advisory-only by design and should stay
+  that way — copying one into a manifest must remain a deliberate act — but the aggregate is a
+  read, not an action: *"these four logins account for every cancellation you have had; three of
+  them never held a write transaction."*
+  *Deferred because:* it wants the history DB (`internal/report/history.go`) rather than the
+  sidecars, and it is a reporting feature, not a safety one. Cheap, and it compounds with every
+  run.
+
+- [ ] **A campaign is not an object the tool models.** 912 objects, five manifests, a maintenance
+  window that opens for four hours at a time, partial completion, re-runs across months. The one
+  primitive that fits is already right: `intent: compression` makes a re-run skip whatever already
+  carries the target, so a half-finished stage is safe to re-queue. What is missing is the
+  question that follows every window — *how far through am I* — which today is answered by
+  re-querying the catalog by hand. History has the runs, the catalog has the state; a
+  `--campaign`-style status could join them.
+  *Deferred because:* it needs a definition of what a campaign is (a filename prefix? a tag in the
+  manifest? a set of manifests sharing a `description`?), and picking the wrong one bakes a
+  concept into the queue that the queue currently does not need. Design before building.
+
+### An 18-run shrink, and the plan behind it
+
+Read from one completed run's report and the SQLite history beside it: a `shrink_data` that
+reached its target after **18 runs spread over six weeks** (11 `INCOMPLETE`, 4 `FAILED`, 2
+`INTERRUPTED`, 1 `SUCCESS`), plus the `maintenance_analysis` rows of the planner run that
+preceded it. The findings below are ordered by how much they cost, not by how hard they are.
+
+- [ ] **`index.rebuild_max_size_mb` silently vetoes a compression change, on exactly the objects
+  where compression pays.** `decideIndex` (`internal/maint/decide.go`) evaluates
+  `decideCompression` first, then applies the size ceiling: over it, a wanted REBUILD is
+  downgraded to a REORGANIZE, and since a reorganize cannot change compression the change is
+  dropped with `; compression change dropped (needs rebuild)`. The ceiling exists for a
+  *fragmentation* reason — a huge REBUILD is expensive — and it silently decides a *compression*
+  question that has no cheaper alternative. On the database this was read from, it vetoed the
+  27 largest objects: **6.4 TB, 83 % of everything not yet compressed**, every one of them over
+  the 50 GB default.
+  Three separate defects sit inside that one behaviour, and each is worth its own fix:
+  1. **The measurement is taken and thrown away.** `plan.estimateFor` runs
+     `sp_estimate_data_compression_savings` for ROW and PAGE with no size gate, so the planner
+     paid to estimate a 1.4 TB index, fed the result to `decideCompression`, and then discarded
+     the decision. `maintenance_analysis` stores `current_compression` and `chosen_compression`
+     but **not the estimate**, so nothing survives. Re-answering the question means paying for
+     the same estimate again.
+  2. **`chosen_compression` conflates "chose not to" with "could not".** A genuine "PAGE gains
+     less than `min_gain_percent`, keep NONE" and a "we gave up because of the ceiling" land in
+     the same column with the same value. Only the free-text `reason` distinguishes them, so any
+     aggregate over that column is misleading — a reader of this history concluded the planner
+     had measured no benefit on 6.4 TB, which is the opposite of what happened.
+  3. **The ceiling has no compression-specific escape.** `rebuild_over_ceiling` offers
+     `reorganize` or `skip`; neither is "rebuild anyway, because only a rebuild can do this".
+  *What the design has to decide:* whether the ceiling should apply to a compression-motivated
+  rebuild at all. Arguments both ways — a 1.4 TB offline rebuild on Standard is genuinely
+  dangerous, which is what the ceiling is protecting against; but silently answering "no
+  compression, forever" for every large table makes the planner useless precisely where it
+  matters. A third option is to keep the veto and **say so loudly** in the plan output, which is
+  the smallest honest change.
+
+- [ ] **The shrink report merges the two phases, so nobody can tell which one did the work.**
+  `ShrinkResult` carries `chunks` and `gained_mb`, but `result.Chunks++` happens only in the
+  page-moving loop: the Phase A `TRUNCATEONLY` contributes to `gained_mb` and to nothing else.
+  The run that prompted this reported *6 312 671 MB gained over 100 chunks* — 61.6 GB per chunk,
+  against a `max_step_mb` of 8192. Arithmetically impossible for Phase B, and the reader is left
+  to deduce that a single truncate released most of it because seventeen earlier runs had already
+  moved the pages forward. Split the two in `shrink[]`: MB and elapsed for the truncate, MB,
+  chunks and elapsed for the loop. Small, and it is the number an operator needs to plan the
+  next shrink.
+
+- [ ] **The history DB is a run ledger, not an outcome ledger.** `runs` has `manifest`,
+  `outcome`, timings, `operations` (a count), `peak_blocked`, `skipped`, `error` — and nothing
+  about what any operation *did*. No MB reclaimed, no chunks, no file, no object. Across 18 runs
+  of one shrink the history cannot answer "are we converging?"; that lives only in the `.log`
+  sidecars, which follow the manifest through the queue and are overwritten by the next run.
+  An `operations` table keyed to `runs.id`, carrying the same fields the JSON block already
+  computes, would make a campaign readable. It also feeds the "no reaction available" verdict
+  above, which wants a previous run's measured throughput.
+
+- [ ] **"No further progress" is a pause condition treated as a stop condition.** 11 of the 18
+  runs ended `INCOMPLETE` with `stopped short of target, work preserved — no further progress`,
+  and every one of them made progress again when a human restarted it, sometimes an hour later,
+  sometimes eight. So what `max_no_progress: 3` detects is not "this file cannot shrink further",
+  it is "not at this step size, not right now". The backoff ladder tops out at
+  `no_progress_backoff_max_seconds: 300`; the remedy that actually worked was two orders of
+  magnitude longer.
+  *Deferred rather than obvious:* the fix is not simply a bigger ceiling — a run that sleeps for
+  hours holds its queue lock and its connection, and an operator watching a TUI that says
+  "waiting" for six hours will kill it. The options are a much longer ladder, a halve-and-retry
+  before giving up (the AIMD law already halves on pressure; a no-progress chunk is arguably the
+  same signal), or a genuine requeue-with-delay that releases everything. Pick one deliberately.
+
+- [ ] **The same physical situation is fatal on one path and benign on another.** Two runs died
+  `FAILED` on `mssql: Could not adjust the space allocation for file 'PRODDB'`, and one on
+  `truncateonly: SQL Server had internal error`. Eleven other runs met what is very likely the
+  same condition — the file will not give up more space right now — and reported it as
+  `no further progress (work preserved)`, leaving the work banked and the manifest resumable.
+  A hard `FAILED` moves the manifest to `04.failed`, which needs a human to put it back.
+  *Worth checking before fixing:* whether these are really the same state. The error text comes
+  from the server, so the classification is a mapping question (which `mssql` error numbers mean
+  "cannot shrink now" rather than "something is broken"), and getting it wrong in the permissive
+  direction would retry a genuine failure forever.
+
+- [ ] **An unknown manifest field is rejected without a suggestion, and the two field names most
+  easily confused are exactly the ones that got confused.** One run failed at load with
+  `unknown field "kill_blocked_sessions"` — a cross of `ignore_blocked_sessions` (sessions *we*
+  block) and `kill_blocking_sessions` (sessions blocking *us*). The pair is documented, has its
+  own section in `blocking-and-kills.md`, and is still the trap. A Levenshtein match against the
+  known key set — `did you mean "kill_blocking_sessions"?` — is a few lines in the decoder's
+  error path and turns a lost run into a corrected typo.
+
+- [ ] **The tool's own advisory sidecars are discoverable as manifests.** `Queue.Discover` accepts
+  any `*.yaml` / `*.yml` not starting with a dot (`internal/run/queue.go:64`). The sidecars are
+  named `<manifest>.blocked.yaml`, `.contended.yaml`, `.amplifiers.yaml`, so a copy that lands in
+  `01.to_run` is picked up and executed as a manifest. It happened twice: two `FAILED` runs on
+  `unknown field "observed"`, two junk rows in the history, and the sidecars moved out of the
+  queue into `03.done` / `04.failed`. They are documented as "advisory only — SqlGoPace never
+  reads this file back", which is exactly the promise being broken.
+  *Note when fixing:* `.recovery.yaml` is the odd one out — it is *meant* to be re-queued. So the
+  rule is a suffix denylist, not "anything with two dots", and it should skip with a clear
+  message rather than a `FAILED` run.
+
+- [ ] **The shrink ETA is a backward-looking average, and it is never recorded.** `estimateShrink`
+  projects the remaining MB over the rate achieved so far. While the step size is still growing —
+  which is the whole point of the AIMD law — that projection is structurally pessimistic, and the
+  operator who prompted this reported the run finishing far sooner than the console had promised.
+  Nothing in the report or the history keeps the ETA, so the size of the error cannot be measured
+  after the fact. Record the projection alongside the outcome first; only then is there evidence
+  to decide whether the estimator needs a step-size-aware term.
+
+- [ ] **`write_ratio` is stored without the counts that make it trustworthy.**
+  `decideCompression` applies the write-intensive cap only when `reads + writes >=
+  activity_floor` (1000). `maintenance_analysis` records the ratio and not the counts, so a
+  recorded `0.500` on a barely-touched index is indistinguishable from a well-measured one — and
+  in the data read here, eight objects sit at exactly `0.500` and four at exactly `0.000`, which
+  is the shape of a low-count artifact. Anyone reusing the stored ratio to make a decision (which
+  is exactly what happened, to re-target a campaign from PAGE to ROW) cannot tell which rows to
+  trust. Store `reads`, `writes`, and whether the floor was met.
+
 ## Follow-ups deferred from shipped work
+
+- [x] **Five config keys whose only statement of their default is the shipped file** — done in
+  v0.31.0. `applyDefaults` (`internal/config/config.go`) now materializes all five:
+  `monitoring.max_retry_attempts` 1, `preflight.require_data_free_space` true,
+  `history.enabled` true, `history.destination` `sqlite://./sqlgopace_history.db`,
+  `notifications.on_events` the five events the file lists. The three whose zero value is a
+  setting became tri-state (`*int` / `*bool`) with accessors `MaxRetries()`,
+  `DataFreeSpaceRequired()` and `IsEnabled()`, so an explicit `0`, `false` or
+  `on_events: []` is still honoured; the pointers are filled in `applyDefaults` rather than
+  left nil so the parsed config carries the value it will act on. The five OPEN entries are
+  gone from `documentedDivergences`; `docs/configuration.md` no longer has a
+  shipped-versus-default table, and the CHANGELOG carries the migration note.
+
+- [ ] **Two defaulting mechanisms for one config surface.** The two entries left in
+  `documentedDivergences` are intended, not defects: `kill_amplifying_maintenance.
+  min_blocked_behind` and `after_seconds` default through the `MinBehind()` / `After()`
+  accessors instead of `applyDefaults`, so the parsed field stays zero while the behaviour
+  matches the file. The wart is having both mechanisms; moving these two to `applyDefaults`
+  would empty the ledger and make the audit's remaining output pure signal. Deferred because
+  it is cosmetic — the behaviour is already what the file says — and because the accessor
+  pattern is what the tri-state fields now use too, so the right unification is a decision
+  about which mechanism wins, not a two-line move.
+
+- [x] **The third audit: a destructive-action ledger** — done in 0.32.0,
+  `internal/tui/harm_audit_test.go`. It ranks every console `ActionKind` by what it costs
+  and whom, measures each gate by driving the real `Model.Update`, and fails on any action
+  reachable with a weaker gesture than a less harmful one; a new `ActionKind` that nobody
+  ranked also fails. It found the fifth instance of the class on its first run:
+  `ActionArmKillRule` fired on one keystroke from the roster while `x` and `k` — both less
+  harmful — had confirmed since 0.24.0 and 0.28.0. Arming now confirms; disarming does not.
+  `docs/running.md`'s claim that `k` was the most destructive key was corrected at the same
+  time. The harm ordering is stated in the test because the code states it nowhere; that
+  was the part deferred as "most of the work", and writing it down is what exposed the
+  defect.
+  *Left undone:* the CLI half — its own entry below.
+
+- [ ] **The harm ledger covers the console, not the CLI.** `internal/tui/harm_audit_test.go`
+  ranks every `ActionKind` and measures its gate, but the same class lives on the
+  command-line surface and is not audited: `abort-resumable --yes` (gated in 0.23.0 after
+  shipping with no target and no confirmation), the batched-DML whole-table guard
+  (`confirm_full_table`), and the DDL delete confirmation. The blocker is the completeness
+  half, not the ranking: console actions are enumerable because every one is an `ActionKind`
+  constant in a single type, whereas the CLI's destructive operations are flags on
+  subcommands with no shared type to walk. A hand-maintained list of them is exactly what
+  this audit exists to avoid — it would go stale the first time someone adds a subcommand,
+  which is the failure it is meant to prevent. So the work is: find something to derive the
+  destructive CLI set from (a marker on the flag registration, or a `destructive: true`
+  field on the subcommand struct), then the pairwise check is the same twenty lines. Worth
+  doing before the next destructive subcommand, not after.
+
+- [ ] **The inert-key audit stops at the config surface.** `TestNoInertConfigKey` walks
+  `Config` and fails on a key nothing outside `internal/config` reads, directly or through an
+  accessor — the F4 class (`checkpoint_between_operations`, parsed and documented and read by
+  nothing) mechanized. It is not extended to manifest fields, where the same class lives:
+  matching is by identifier name, and operation fields are `Schema`, `Table`, `Index`, names
+  shared across every operation type, so a genuinely inert one would be laundered by a
+  sibling's use. Doing it properly needs type-accurate reachability (`x/tools/go/packages`),
+  a dependency the audit does not justify on its own.
 
 - [x] **The `key_range` uniqueness check runs in the driver, not preflight** — done in
   v0.30.0, all four together as the entry required. The rule is
@@ -391,12 +649,22 @@ Kept so the entries above are not re-proposed. Each names the evidence in the tr
 
 ## Suggested order
 
-1. The batch DML stop-branch follow-up is the cheapest real gain here — three lines, and it makes
+1. **"No reaction is available on this target"**, from the field section above. It is the only
+   entry here that prevents hours of production locking that cannot succeed, it needs no new
+   read — edition, size and measured throughput are all already in hand — and the same pass
+   naturally carries the free-space estimate for a compression rebuild, which is the other half
+   of the same blind spot.
+2. **`rebuild_max_size_mb` vetoing compression**, from the same section. It makes the
+   maintenance planner answer "no compression" for every table over 50 GB — the only ones where
+   it pays — and says so only in a free-text reason nobody aggregates. Even if the veto turns out
+   to be the right call on Standard, storing the estimate and separating "chose not to" from
+   "could not" are both small and both stop the history from misleading its next reader.
+3. The batch DML stop-branch follow-up is the cheapest real gain here — three lines, and it makes
    an operation adaptive that currently is not. Take it the next time batch DML is in scope.
-2. `remote-tui.md` is unblocked now that the step sink exists.
-3. `TEMPDB-GUARD.md` is cross-cutting (it serves `SORT_IN_TEMPDB` rebuilds, shrink and batched DML
+4. `remote-tui.md` is unblocked now that the step sink exists.
+5. `TEMPDB-GUARD.md` is cross-cutting (it serves `SORT_IN_TEMPDB` rebuilds, shrink and batched DML
    alike), so it is the one whose value grows with every driver added.
-4. `WAIT-OBSERVABILITY.md` is the smallest of the three iterations and depends on nothing.
+6. `WAIT-OBSERVABILITY.md` is the smallest of the three iterations and depends on nothing.
 
 ## Context
 

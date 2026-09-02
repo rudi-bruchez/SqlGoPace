@@ -262,8 +262,21 @@ func TestRosterArmThenDisarm(t *testing.T) {
 	}}
 	m.rosterOpen = true
 
-	// space arms the selected (login) group.
-	ma, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	// space asks first: arming is the console's most destructive gesture (it kills every
+	// future session matching the group), so it is gated like x and k. See harm_audit_test.go.
+	mp, _ := m.Update(tea.KeyMsg{Type: tea.KeySpace})
+	m = mp.(Model)
+	if m.mode != modeArmKillConfirm {
+		t.Fatalf("space should open the arm confirmation, mode = %v", m.mode)
+	}
+	select {
+	case a := <-actions:
+		t.Fatalf("arming emitted %+v before the operator confirmed", a)
+	default:
+	}
+
+	// y arms.
+	ma, _ := m.Update(runes("y"))
 	m = ma.(Model)
 	a := <-actions
 	if a.Kind != ActionArmKillRule || a.Criterion != "login_name" || a.Value != "APP01" {
