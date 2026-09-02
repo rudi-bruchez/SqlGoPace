@@ -272,7 +272,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 
 	var history *report.History
-	if cfg.History.Enabled {
+	if cfg.History.IsEnabled() {
 		history, err = report.OpenHistory(sqlitePath(cfg.History.Destination))
 		if err != nil {
 			return err
@@ -486,7 +486,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	thresholds := preflight.Thresholds{
 		LogMaxBytes:          cfg.Monitoring.LogMaxSizeBytes,
 		LogMaxPercent:        cfg.Monitoring.LogMaxPercent,
-		RequireDataFreeSpace: cfg.Preflight.RequireDataFreeSpace,
+		RequireDataFreeSpace: cfg.Preflight.DataFreeSpaceRequired(),
 	}
 	killArmed := cfg.KillBlockers.Enabled ||
 		cfg.KillAmplifyingMaintenance.Enabled ||
@@ -560,7 +560,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		BlockingTimeout: cfg.Monitoring.BlockingTimeout(),
 		LogDrainTimeout: cfg.Monitoring.LogDrainTimeout(),
 		KillGrace:       cfg.Monitoring.KillGrace(),
-		MaxRetries:      cfg.Monitoring.MaxRetryAttempts,
+		MaxRetries:      cfg.Monitoring.MaxRetries(),
 	})
 	// Progress goes to the TUI when the console is running, else to stdout/log. The
 	// step sink follows the same rule (in TUI mode engineOut is io.Discard anyway).

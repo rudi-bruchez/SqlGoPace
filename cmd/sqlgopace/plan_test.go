@@ -14,6 +14,10 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 )
 
+// boolPtr builds the tri-state *bool the config fields use; package main cannot
+// reach internal/config's unexported helper.
+func boolPtr(b bool) *bool { return &b }
+
 func scenarioProfile(t *testing.T) *maint.Profile {
 	t.Helper()
 	p, err := maint.Parse([]byte("compression:\n  enabled: true\nheap:\n  enabled: true\nstatistics:\n  enabled: true\ncheckdb:\n  enabled: true\n"))
@@ -93,7 +97,7 @@ func TestRecordPlanHistory(t *testing.T) {
 	manifests := manifestsFromPlan(plan, "MYDB")
 
 	dbPath := filepath.Join(t.TempDir(), "history.db")
-	cfg := &config.Config{History: config.HistoryConfig{Enabled: true, Destination: "sqlite://" + dbPath}}
+	cfg := &config.Config{History: config.HistoryConfig{Enabled: boolPtr(true), Destination: "sqlite://" + dbPath}}
 
 	recordPlanHistory(context.Background(), io.Discard, cfg, "MYDB", plan, manifests)
 
@@ -114,7 +118,7 @@ func TestRecordPlanHistory(t *testing.T) {
 
 func TestRecordPlanHistoryDisabled(t *testing.T) {
 	// With history disabled, recording is a no-op and must not error or create a file.
-	cfg := &config.Config{History: config.HistoryConfig{Enabled: false}}
+	cfg := &config.Config{History: config.HistoryConfig{Enabled: boolPtr(false)}}
 	recordPlanHistory(context.Background(), io.Discard, cfg, "MYDB", maint.Plan{}, nil)
 }
 

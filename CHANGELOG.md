@@ -13,6 +13,34 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.31.0] - 2026-09-02
+
+### Changed
+
+- Five config keys now default to what the shipped `config.yaml` advertises. Each was
+  documented only by that file, so deleting the key silently turned the feature off:
+  `monitoring.max_retry_attempts` (was 0, now 1), `preflight.require_data_free_space`
+  (was off, now on), `history.enabled` (was off, now on), `history.destination` (was
+  empty, now `sqlite://./sqlgopace_history.db`), and `notifications.on_events` (was
+  empty — a configured webhook fired nothing — now `[cancel, fail, pause, abort,
+  run_failure]`). The three whose zero value is a setting became tri-state, so an
+  explicit `0`, `false` or `on_events: []` is still honoured; only an absent key takes
+  the default.
+
+  Migration: a `config.yaml` that omits any of these five now behaves as the file's own
+  comments describe. If you relied on the old silence — no history file, no free-space
+  guard, no retry, no notifications — state the old value explicitly.
+
+### Added
+
+- `internal/config/audit_test.go`: two reflection-based audits of the config surface.
+  `TestNoInertConfigKey` fails on a key nothing outside `internal/config` reads, directly
+  or through an accessor, which is how `checkpoint_between_operations` once shipped
+  parsed, documented and dead. `TestShippedConfigStatesTheRealDefaults` compares the
+  shipped `config.yaml` against a minimal one, so a key the file presents as documentation
+  cannot quietly mean something else when an operator deletes it. Both walk the `Config`
+  type rather than a diff, because both defect classes survived TDD and diff-scoped review.
+
 ## [0.30.0] - 2026-09-02
 
 Six backlog items from `docs/specs/TODO.md`, taken together because each was

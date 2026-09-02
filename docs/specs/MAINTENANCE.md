@@ -547,7 +547,8 @@ attached to each `maint.Decision`.
 
 This enables the trend analysis the feature is about: which objects are repeatedly rebuilt
 (oscillation → fill-factor problem), whether a chosen compression held, how fragmentation evolves.
-Recording is **best-effort and opt-in** (`history.enabled`) — a failure is logged, never fatal, and
+Recording is **best-effort and on by default** (`history.enabled`, opt-in until 0.31.0) — a
+failure is logged, never fatal, and
 the existing per-run `.log` / `RunRecord` history is unchanged.
 
 ## 8. Monitoring & reaction fit (per operation)

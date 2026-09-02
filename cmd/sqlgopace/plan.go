@@ -319,7 +319,7 @@ func runAuto(ctx context.Context, w io.Writer, conn *mssql.Conn, cfg *config.Con
 // recordPlanHistory persists the plan's emitted decisions to the local SQLite
 // history, when enabled. It is best-effort: a failure is logged, never fatal.
 func recordPlanHistory(ctx context.Context, w io.Writer, cfg *config.Config, db string, pl maint.Plan, manifests []namedManifest) {
-	if !cfg.History.Enabled {
+	if !cfg.History.IsEnabled() {
 		return
 	}
 	h, err := report.OpenHistory(sqlitePath(cfg.History.Destination))

@@ -21,23 +21,28 @@ database:
 appended to `app name` automatically, so `sys.dm_exec_sessions.program_name` shows which
 build is connected.
 
-## Two different questions
+## What happens when a key is absent
 
-This page answers "what happens if the key is absent". That is not the same as "what the
-repository's `config.yaml` sets", and in three places they differ on purpose:
+This page answers "what happens if the key is absent". Until 0.31.0 that was not the same
+as "what the repository's `config.yaml` sets", and five keys differed: an operator who
+deleted one got a quieter, less cautious tool than the file described. The code now applies
+what the shipped file advertises, so the two questions have the same answer:
 
-| Key | Default when absent | The shipped `config.yaml` |
+| Key | Default when absent | Was, before 0.31.0 |
 |---|---|---|
-| `preflight.require_data_free_space` | false | **true** |
-| `history.enabled` | false | **true**, writing `./sqlgopace_history.db` |
-| `monitoring.max_retry_attempts` | 0 | **1**: one retry after a pressure cancel |
+| `preflight.require_data_free_space` | **true** | false |
+| `history.enabled` | **true** | false |
+| `history.destination` | **`sqlite://./sqlgopace_history.db`** | empty |
+| `monitoring.max_retry_attempts` | **1** | 0 |
+| `notifications.on_events` | **`[cancel, fail, pause, abort, run_failure]`** | empty: nothing fired |
 
-If you copied that file, those are the values you have. The first two make it more cautious
-than the bare default: `require_data_free_space: true` in particular can fail a first run's
-preflight, which is the intended behaviour rather than a fault. The third does not — it retries
-once on the chance the pressure has cleared, at the cost of repeating the work so far.
+`require_data_free_space: true` can fail a first run's preflight; that is the intended
+behaviour rather than a fault. `max_retry_attempts: 1` retries once on the chance the
+pressure has cleared, at the cost of repeating the work so far. Set either key explicitly to
+the old value if you relied on it. An explicit `0`, `false`, or `on_events: []` is still
+honoured — only an absent key takes the default.
 
-`kill_blockers.enabled` was a fourth, undisclosed divergence until 0.19.0: the shipped file
+`kill_blockers.enabled` was a sixth, undisclosed divergence until 0.19.0: the shipped file
 armed it while this page and four others said it was off by default. It now ships `false`.
 If you scaffolded a `config.yaml` before 0.19.0, check that key — killing blockers may be
 armed in your copy without you having asked for it.
@@ -94,7 +99,7 @@ when a scheduler launches the binary from somewhere else than you do.
 | `log_max_percent` | required | Log-usage percentage ceiling, 1 to 100. |
 | `blocking_timeout_minutes` | 1 | How long we may block another session before yielding. |
 | `log_drain_timeout_minutes` | 30 | How long to wait for the log to drain before giving up cleanly. |
-| `max_retry_attempts` | 0 | Retries after a *pressure cancel* only. A failing statement is not retried. |
+| `max_retry_attempts` | 1 | Retries after a *pressure cancel* only. A failing statement is not retried. |
 | `kill_grace_seconds` | 30 | Grace between cancelling a statement and the fallback `KILL`. |
 | `reconnect_timeout_minutes` | 2 | How long to try to re-establish a lost monitoring connection. |
 | `checkpoint_between_operations` | false | Issue a `CHECKPOINT` after each operation that has another behind it. Only under SIMPLE recovery, where a `CHECKPOINT` releases log space; under FULL or BULK_LOGGED it frees nothing, so the run warns at startup and issues none. A failed `CHECKPOINT` is reported and does not fail the manifest. |
@@ -105,7 +110,7 @@ A poll interval of zero is rejected rather than accepted as a spin loop.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `require_data_free_space` | false | Fail an index rebuild that does not have roughly its own size free in the database's data files. |
+| `require_data_free_space` | true | Fail an index rebuild that does not have roughly its own size free in the database's data files. |
 
 A rebuild materializes the new index before dropping the old one, so it needs room for a
 second copy of the object. The check sums the free space of the database's `ROWS` files and
@@ -172,7 +177,9 @@ options_override:
 
 ## `notifications`
 
-Fires a webhook and/or an email for the events listed in `on_events`.
+Fires a webhook and/or an email for the events listed in `on_events`, which defaults to
+`[cancel, fail, pause, abort, run_failure]`. An explicit `on_events: []` subscribes to
+nothing and is honoured.
 
 | Event | Fires when |
 |---|---|
@@ -214,8 +221,8 @@ configured webhook will tell you about a killed maintenance job.
 
 ```yaml
 history:
-  enabled: false
-  destination: ""     # SQLite file path
+  enabled: true                                  # the default; set false to write no history
+  destination: "sqlite://./sqlgopace_history.db"  # the default SQLite path
 ```
 
 ## `shrink`

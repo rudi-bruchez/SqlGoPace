@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -115,7 +116,7 @@ type MonitoringConfig struct {
 	LogMaxPercent               int   `yaml:"log_max_percent"`
 	BlockingTimeoutMinutes      int   `yaml:"blocking_timeout_minutes"`
 	LogDrainTimeoutMinutes      int   `yaml:"log_drain_timeout_minutes"`
-	MaxRetryAttempts            int   `yaml:"max_retry_attempts"`
+	MaxRetryAttempts            *int  `yaml:"max_retry_attempts"`
 	KillGraceSeconds            int   `yaml:"kill_grace_seconds"`
 	ReconnectTimeoutMinutes     int   `yaml:"reconnect_timeout_minutes"`
 	CheckpointBetweenOperations bool  `yaml:"checkpoint_between_operations"`
@@ -157,11 +158,38 @@ func (m MonitoringConfig) ReconnectTimeout() time.Duration {
 	return time.Duration(m.ReconnectTimeoutMinutes) * time.Minute
 }
 
+// defaultMaxRetryAttempts is what an absent max_retry_attempts means: one retry, two
+// attempts in all, which is what the shipped config.yaml advertises. An explicit 0
+// means one attempt and is honoured.
+const defaultMaxRetryAttempts = 1
+
+// MaxRetries is how many times a failed operation is retried.
+func (m MonitoringConfig) MaxRetries() int {
+	if m.MaxRetryAttempts == nil {
+		return defaultMaxRetryAttempts
+	}
+	return *m.MaxRetryAttempts
+}
+
 // PreflightConfig toggles individual pre-flight checks.
 type PreflightConfig struct {
 	// RequireDataFreeSpace fails preflight when an index rebuild does not have roughly
-	// its own size free in the database's data files.
-	RequireDataFreeSpace bool `yaml:"require_data_free_space"`
+	// its own size free in the database's data files. Read it through
+	// DataFreeSpaceRequired: an absent key means the check is on.
+	RequireDataFreeSpace *bool `yaml:"require_data_free_space"`
+}
+
+// defaultRequireDataFreeSpace is what an absent require_data_free_space means: a guard
+// the shipped config.yaml presents as armed must not disarm itself for the operator who
+// deletes the line.
+const defaultRequireDataFreeSpace = true
+
+// DataFreeSpaceRequired reports whether the data-free-space check runs.
+func (p PreflightConfig) DataFreeSpaceRequired() bool {
+	if p.RequireDataFreeSpace == nil {
+		return defaultRequireDataFreeSpace
+	}
+	return *p.RequireDataFreeSpace
 }
 
 // forceBool is a tri-state override: nil means "auto".
@@ -298,10 +326,30 @@ type EmailConfig struct {
 	StartTLS bool     `yaml:"starttls"`
 }
 
-// HistoryConfig holds run-history persistence settings.
+// defaultOnEvents is what an absent on_events means: the events the shipped config.yaml
+// subscribes to. An explicit "on_events: []" subscribes to nothing and is kept.
+var defaultOnEvents = []string{"cancel", "fail", "pause", "abort", "run_failure"}
+
+// HistoryConfig holds run-history persistence settings. Read Enabled through
+// IsEnabled: an absent key means history is recorded, as the shipped config.yaml says.
 type HistoryConfig struct {
-	Enabled     bool   `yaml:"enabled"`
+	Enabled     *bool  `yaml:"enabled"`
 	Destination string `yaml:"destination"`
+}
+
+// The two history defaults: an absent key records history, to the path the shipped
+// config.yaml names.
+const (
+	defaultHistoryEnabled     = true
+	defaultHistoryDestination = "sqlite://./sqlgopace_history.db"
+)
+
+// IsEnabled reports whether run history is recorded.
+func (h HistoryConfig) IsEnabled() bool {
+	if h.Enabled == nil {
+		return defaultHistoryEnabled
+	}
+	return *h.Enabled
 }
 
 // Policy maps the configured option overrides to a ddl.Policy.
@@ -379,6 +427,26 @@ func (c *Config) applyDefaults() {
 	if c.Monitoring.KillGraceSeconds <= 0 {
 		c.Monitoring.KillGraceSeconds = 30
 	}
+	// The five below default to what the shipped config.yaml advertises. Each was a key
+	// whose value the file stated and the code did not, so deleting the line turned a
+	// guard or a record off in silence (0.31.0). The tri-state fields are materialized
+	// here rather than left nil so the parsed config carries the value it will act on.
+	if c.Monitoring.MaxRetryAttempts == nil {
+		c.Monitoring.MaxRetryAttempts = ptr(defaultMaxRetryAttempts)
+	}
+	if c.Preflight.RequireDataFreeSpace == nil {
+		c.Preflight.RequireDataFreeSpace = ptr(defaultRequireDataFreeSpace)
+	}
+	if c.History.Enabled == nil {
+		c.History.Enabled = ptr(defaultHistoryEnabled)
+	}
+	if strings.TrimSpace(c.History.Destination) == "" {
+		c.History.Destination = defaultHistoryDestination
+	}
+	// nil is an absent key; an explicit "on_events: []" subscribes to nothing and is kept.
+	if c.Notifications.OnEvents == nil {
+		c.Notifications.OnEvents = slices.Clone(defaultOnEvents)
+	}
 	c.Shrink.applyDefaults()
 	c.BatchDML.applyDefaults()
 	if c.Notifications.Email.Host != "" && c.Notifications.Email.Port <= 0 {
@@ -409,6 +477,9 @@ func (s *ShrinkConfig) applyDefaults() {
 	setIf(&s.SelfWaitTimeoutMinutes, 5)
 	setIf(&s.LogReuseWaitTimeoutMinutes, 30)
 }
+
+// ptr returns a pointer to v, for the tri-state fields whose zero value is a setting.
+func ptr[T any](v T) *T { return &v }
 
 func (c *Config) validate() error {
 	if strings.TrimSpace(c.Database.ConnectionString) == "" {
@@ -446,7 +517,7 @@ func (c *Config) validate() error {
 	if c.Monitoring.LogMaxSizeBytes <= 0 {
 		return fmt.Errorf("monitoring.log_max_size_bytes must be > 0: %w", ErrInvalidConfig)
 	}
-	if c.Monitoring.MaxRetryAttempts < 0 {
+	if c.Monitoring.MaxRetries() < 0 {
 		return fmt.Errorf("monitoring.max_retry_attempts must be >= 0: %w", ErrInvalidConfig)
 	}
 	if strings.TrimSpace(c.MatrixFile) == "" {
