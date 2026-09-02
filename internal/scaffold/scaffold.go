@@ -21,21 +21,25 @@ import (
 var assets embed.FS
 
 // File is one scaffolded file: the path it is written to, relative to the target
-// directory, and the embedded asset it comes from.
+// directory, the embedded asset it comes from, and the mode it is created with.
 type File struct {
 	Path  string
 	asset string
+	mode  fs.FileMode
 }
 
 // Files are written in this order, which is also the order they are reported in.
 var Files = []File{
-	{Path: "config.yaml", asset: "assets/config.yaml"},
-	{Path: "ddl_compatibility.yaml", asset: "assets/ddl_compatibility.yaml"},
-	{Path: "maintenance_profile.yaml", asset: "assets/maintenance_profile.yaml"},
-	{Path: ".env.example", asset: "assets/env.example"},
+	{Path: "config.yaml", asset: "assets/config.yaml", mode: 0o644},
+	{Path: "ddl_compatibility.yaml", asset: "assets/ddl_compatibility.yaml", mode: 0o644},
+	{Path: "maintenance_profile.yaml", asset: "assets/maintenance_profile.yaml", mode: 0o644},
+	// 0600, alone among these: getting-started.md says to `cp .env.example .env`
+	// and fill in DB_PASSWORD, and cp carries the source mode, so a 0644 template
+	// hands the operator a world-readable credentials file.
+	{Path: ".env.example", asset: "assets/env.example", mode: 0o600},
 	// The dot prefix is what keeps the example out of the run: Queue.Discover
 	// skips manifests whose name starts with one. Renaming it arms it.
-	{Path: filepath.Join("01.to_run", ".010_example_rebuild.yaml"), asset: "assets/example_manifest.yaml"},
+	{Path: filepath.Join("01.to_run", ".010_example_rebuild.yaml"), asset: "assets/example_manifest.yaml", mode: 0o644},
 }
 
 // Dirs are the queue lifecycle directories, matching the defaults in config.yaml.
@@ -92,7 +96,7 @@ func writeFile(dir string, f File, force bool) (bool, error) {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return false, fmt.Errorf("create directory for %s: %w", p, err)
 	}
-	if err := os.WriteFile(p, body, 0o644); err != nil {
+	if err := os.WriteFile(p, body, f.mode); err != nil {
 		return false, fmt.Errorf("write %s: %w", p, err)
 	}
 	return true, nil

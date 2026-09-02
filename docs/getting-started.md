@@ -78,6 +78,11 @@ cp .env.example .env
 $EDITOR .env            # DB_SERVER, DB_NAME, DB_USER, DB_PASSWORD
 ```
 
+`init` writes `.env.example` mode `0600` so the copy is private from the start. If you
+wrote `.env` by hand, or `init` refreshed an older 0644 template with `--force`, set it
+yourself — `chmod 600 .env`. Windows ignores file modes, so there the file inherits the
+directory's ACL and nothing here applies.
+
 `DB_SERVER` goes into an ODBC-style `server=` keyword, so a non-default port is a comma,
 not a colon: `SQLPROD01,14433`, never `SQLPROD01:14433`. A colon is read as part of the host
 name and fails with `lookup SQLPROD01:14433: no such host`. A named instance uses a

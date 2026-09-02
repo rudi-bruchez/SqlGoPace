@@ -4,6 +4,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -130,6 +131,44 @@ func TestExampleManifestIsDisabled(t *testing.T) {
 		}
 		if base := filepath.Base(f.Path); base[0] != '.' {
 			t.Errorf("%s would be picked up by Discover; it must start with a dot", f.Path)
+		}
+	}
+}
+
+// TestEnvExampleIsPrivate pins the mode of the one scaffolded file that becomes a
+// secret. getting-started.md tells the operator to `cp .env.example .env` and fill
+// in DB_PASSWORD; under a default umask, copying a 0644 template produces a
+// world-readable credentials file.
+func TestEnvExampleIsPrivate(t *testing.T) {
+	for _, f := range Files {
+		if f.Path != ".env.example" {
+			continue
+		}
+		if f.mode != 0o600 {
+			t.Errorf(".env.example is scaffolded %#o, want 0600", f.mode)
+		}
+		return
+	}
+	t.Fatal(".env.example is no longer scaffolded; delete this test or follow the template")
+}
+
+// TestWriteAppliesTheDeclaredModes checks that the modes in Files reach the disk.
+// Skipped on Windows, which ignores every bit but read-only.
+func TestWriteAppliesTheDeclaredModes(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ignores file modes apart from the read-only bit")
+	}
+	dir := t.TempDir()
+	if _, err := Write(dir, false); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	for _, f := range Files {
+		info, err := os.Stat(filepath.Join(dir, f.Path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != f.mode {
+			t.Errorf("%s written %#o, want %#o", f.Path, got, f.mode)
 		}
 	}
 }
