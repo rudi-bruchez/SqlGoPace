@@ -9,6 +9,14 @@
 #   2 -> standard | 3 -> enterprise (Enterprise/Developer/Evaluation) | 4 -> express
 #   5 -> azure (SQL Database) | 8 -> azure (Managed Instance)   <- evergreen, pseudo-major 9999
 # Unsupported editions: 6/9/11/12 (Synapse / SQL Edge / Fabric).
+#
+# What belongs here: options that Resolve decides. `data_compression` does not — it is a
+# manifest field passed straight through to the WITH clause by generate.go, so an entry
+# for it here gated nothing and was removed. Its facts were wrong too: SQL Server 2016 SP1
+# brought data compression to Standard, Web and Express as part of the Common
+# Programmability Surface Area, which `editions: [enterprise, azure]` denied. Restoring a
+# gate means wiring the field through Resolve first, and then expressing "2016 SP1", which
+# min_major cannot say.
 
 major_to_year:
   13: 2016
@@ -26,7 +34,6 @@ commands:
     wait_at_low_priority: { min_major: 12, editions: [enterprise, azure], requires: [online] }   # 2014
     resumable:            { min_major: 14, editions: [enterprise, azure], requires: [online] }   # 2017
     sort_in_tempdb:       { min_major: 9,  editions: [enterprise, standard, azure] }
-    data_compression:     { min_major: 10, editions: [enterprise, azure] }                       # 2008
     maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
 
   create_index:                   # CREATE [UNIQUE] INDEX
@@ -34,7 +41,6 @@ commands:
     resumable:            { min_major: 15, editions: [enterprise, azure], requires: [online] }   # 2019
     wait_at_low_priority: { min_major: 16, editions: [enterprise, azure], requires: [online] }   # 2022
     sort_in_tempdb:       { min_major: 9,  editions: [enterprise, standard, azure] }
-    data_compression:     { min_major: 10, editions: [enterprise, azure] }
     maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
 
   alter_column:                   # ALTER TABLE ALTER COLUMN
@@ -65,7 +71,6 @@ commands:
 
   rebuild_heap:                     # ALTER TABLE ... REBUILD (heap)
     online:               { min_major: 13, editions: [enterprise, azure] }             # ONLINE heap rebuild, 2016
-    data_compression:     { min_major: 10, editions: [enterprise, azure] }
     maxdop:               { min_major: 9,  editions: [enterprise, standard, azure] }
     # NB: no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap rebuild, on any version.
 

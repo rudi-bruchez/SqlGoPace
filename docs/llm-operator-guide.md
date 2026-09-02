@@ -190,8 +190,13 @@ what is legal and injects it. Key gates for `rebuild_index` (the common case):
 | `online` | 2005 | Enterprise, Azure | — |
 | `wait_at_low_priority` | 2014 | Enterprise, Azure | online |
 | `resumable` | 2017 | Enterprise, Azure | online |
-| `data_compression` | 2008 | Enterprise, Azure | — |
 | `maxdop`, `sort_in_tempdb` | 2005/2008 | Enterprise, **Standard**, Azure | — |
+
+`data_compression` is not in that table and is not gated at all: it is a manifest field
+written into the `WITH` clause as given, on every edition. It used to carry a matrix entry
+saying Enterprise-only from 2008, which was both inert and wrong — 2016 SP1 brought data
+compression to Standard, Web and Express. A target that does not support the value you ask
+for refuses the statement itself.
 
 Two restrictions are database- or combination-scoped rather than version-scoped, so they
 are not in the table and the resolver applies them on top of it. `resumable` is refused
