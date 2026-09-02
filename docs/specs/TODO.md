@@ -173,21 +173,27 @@ are worth doing before a public release anyway; both are minutes.
 - [ ] **`.env.example` ships `0o644`, and the docs say to `cp` it** (`scaffold.go:95`,
   `docs/getting-started.md:77`). Under the default umask the resulting `.env` — holding
   `DB_PASSWORD` — is world-readable on Linux and macOS. Write the asset `0o600` instead.
-  *Not done here because:* the scan was scoped to SAST with no code changes, and this touches
-  the scaffold assets a test pins.
-- [ ] **SHA-pin the two actions in `release.yml`.** `actions/checkout@v7` and
-  `actions/setup-go@v7` are mutable tags in the job that publishes the binaries, with
-  `contents: write`. The only finding a downstream user cannot protect themselves from.
-- [ ] **Capture files expose third-party SQL text at `0o644`** (`capture.go:144`,
-  `contended.go:158`, `amplifier_capture.go:158`, dirs at `queue.go:35`). `active_query` /
-  `parent_query` of other people's sessions, world-readable under `02.processing/`. Advisory
-  files never read back, so `0o600` / `0o700` costs nothing.
-- [ ] **`release.yml` interpolates the tag into `run:`** (`:31`, `:93`). Needs repo write access
-  to exploit, so it is the author alone today; bind it through `env:` before a second
-  maintainer exists.
-- [ ] **Bump the toolchain to `go1.26.6`.** Four reachable stdlib vulnerabilities, all fixed
-  there; all reached only through operator-supplied input, so exposure is low and the fix is a
-  version string in `go.mod` and both workflows.
+  *Still open:* it touches the scaffold assets a test pins byte-for-byte, and the same
+  deployment question as the entry below (file modes are ignored on Windows). This is the
+  one SAST item with a real secret behind it — do it before a public release.
+
+- [x] **Capture files expose third-party SQL text at `0o644`** — done in v0.29.0
+  (`capture.go`, `contended.go`, `amplifier_capture.go` now write `0o600`). The queue
+  directories and the remaining `0644` writes were deliberately left; see "The remaining
+  `0644` writes" below for the reasoning and the correction to it.
+
+- [x] **`release.yml` interpolates the tag into `run:`** — done in v0.29.0; both sites bind
+  it through `env: RELEASE_TAG`.
+
+- [x] **Bump the toolchain to `go1.26.6`** — done in v0.29.0 (`go.mod`). `govulncheck` now
+  reports zero reachable vulnerabilities, down from four.
+
+- [ ] **SHA-pin the actions.** `actions/checkout@v7` and `actions/setup-go@v7` are mutable
+  tags in the job that publishes the binaries, with `contents: write`; `ci.yml` adds
+  `golangci/golangci-lint-action@v9`. The only finding a downstream user cannot protect
+  themselves from. See the duplicate entry under "Follow-ups deferred from shipped work"
+  for why it was not done and the exact commands — **merge the two entries when you take
+  it**.
 
 **The scan's most useful result was a negative one:** `gosec` reported *zero* SQL-injection
 findings from a codebase that builds T-SQL by concatenation throughout, because the taint
