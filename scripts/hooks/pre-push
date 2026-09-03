@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Refuse a push whose lint or tests fail, so a red build is seen here rather than
+# in CI five minutes later. Installed by scripts/setup-dev.sh.
+#
+# This exists because a broken lint job is invisible from a green local `make
+# test`, and this repository has now been red for that reason three times: once
+# for three weeks, once for nineteen hours. Both are cheap to prevent: warm, the
+# two commands below take under two seconds together.
+#
+# Escape hatch: git push --no-verify
+set -uo pipefail
+
+root=$(git rev-parse --show-toplevel) || exit 0
+cd "$root" || exit 0
+
+# A branch deletion pushes no commits, so there is nothing to check. Git writes
+# one line per ref on stdin, with an all-zero local sha for a deletion.
+if ! grep -qvE '^[^ ]+ 0+ ' /dev/stdin 2>/dev/null; then
+	exit 0
+fi
+
+fail=0
+
+# Unlike the secret-scanning pre-commit hook, a missing linter is an error here
+# rather than a warning: skipping the check silently is precisely the failure
+# this hook was added to stop.
+if ! command -v golangci-lint >/dev/null 2>&1; then
+	echo "pre-push: golangci-lint not found. Run scripts/setup-dev.sh, or push with --no-verify." >&2
+	fail=1
+else
+	# The linter config enables the gofmt and goimports formatters, so this also
+	# covers the formatting step CI runs separately.
+	echo "pre-push: make lint" >&2
+	make lint >&2 || fail=1
+fi
+
+echo "pre-push: make test" >&2
+make test >&2 || fail=1
+
+if [ "$fail" -ne 0 ]; then
+	echo >&2
+	echo "pre-push: push refused. Fix the above, or override with git push --no-verify." >&2
+	exit 1
+fi
+exit 0

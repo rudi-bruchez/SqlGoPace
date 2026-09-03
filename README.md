@@ -213,10 +213,12 @@ Continuous integration exercises SQL Server 2022.
 
 ## Contributing
 
-Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers the build and test
-commands, how to run the suite against a real server, and the conventions that are not
-obvious from the code: manifest-driven rather than raw SQL, no query timeout, and the rule
-that a claim about SQL Server behaviour is earned by running it.
+Pull requests are welcome. Start with `make setup`, which installs the linter at the
+version CI pins and a pre-push hook that runs it, then read
+[CONTRIBUTING.md](CONTRIBUTING.md). It covers the build and test commands, how to run the
+suite against a real server, and the conventions that are not obvious from the code:
+manifest-driven rather than raw SQL, no query timeout, and the rule that a claim about SQL
+Server behaviour is earned by running it.
 
 For a security problem, see [SECURITY.md](SECURITY.md) rather than opening an issue. It
 also describes what privileges the tool holds and where its trust boundary sits, which is

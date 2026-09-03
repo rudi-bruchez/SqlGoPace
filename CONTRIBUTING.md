@@ -4,6 +4,29 @@ Thanks for looking. SqlGoPace runs DDL against production SQL Server instances,
 so the bar for a change is less "does it work" than "does it still behave when
 the server pushes back". What follows is what that means in practice.
 
+## Setting up
+
+```bash
+make setup      # linter at the version CI pins, plus the pre-push hook
+```
+
+This is worth running before anything else. It installs `golangci-lint` at the
+version `.github/workflows/ci.yml` pins, reading it from the workflow so the two
+cannot drift, and installs `scripts/hooks/pre-push`, which runs the lint and the
+tests before letting a push leave the machine. Warm, that costs under two
+seconds; this repository has been red in CI three times for a lint failure that
+a green local `make test` could not show, once for three weeks. `make
+setup-check` reports what is missing without changing anything, and
+`git push --no-verify` overrides the hook when you mean to.
+
+Two traps the script handles, worth knowing if you set this up by hand. A
+distribution-packaged `golangci-lint` built with an older Go than this module
+targets reports its version happily and then panics on the first real run, so
+the script verifies by running the linter rather than by asking its version.
+And hooks go to `git rev-parse --git-path hooks` rather than to `.git/hooks`,
+because a contributor with `core.hooksPath` set would otherwise get a hook
+written where git never looks, which is worse than no hook at all.
+
 ## Getting a build and the tests green
 
 ```bash

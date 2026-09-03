@@ -15,9 +15,17 @@ E2E_DSN ?= sqlserver://sa:Str0ng_Passw0rd!@localhost:1433?database=tempdb&encryp
 CONTAINER ?= docker
 COMPOSE   ?= docker compose
 
-.PHONY: all build test cover lint tidy vet integration e2e-up e2e-down e2e-test e2e clean
+.PHONY: all setup setup-check build test cover lint tidy vet integration e2e-up e2e-down e2e-test e2e clean
 
 all: lint test build
+
+# Install the linter version CI pins and the pre-push hook that runs it.
+# Idempotent; `make setup-check` reports without changing anything.
+setup:
+	./scripts/setup-dev.sh
+
+setup-check:
+	./scripts/setup-dev.sh --check
 
 build:
 	go build -o bin/$(BINARY) ./cmd/sqlgopace

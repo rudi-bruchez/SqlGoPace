@@ -16,6 +16,8 @@ flags, subcommands). Read it before changing CLI surface or manifest semantics.
 ## Commands
 
 ```bash
+make setup      # linter at the CI-pinned version + pre-push hook (run once per machine)
+make setup-check # report what setup is missing, change nothing
 make build      # -> bin/sqlgopace (bin/sqlgopace.exe on Windows)
 make test       # unit tests with -race, NO database needed
 make vet
