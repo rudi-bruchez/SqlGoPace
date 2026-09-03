@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,6 +129,7 @@ type Summary struct {
 	Incomplete  int // a shrink finished but stopped short of target (work preserved, re-runnable)
 	Interrupted int // paused and left for recovery (session killed / connection lost)
 	Deferred    int // manifests skipped this run because they were outside their window
+	Skipped     int // manifests another run on the same 01.to_run claimed first
 	Failures    []ManifestFailure
 }
 
@@ -150,6 +152,7 @@ const (
 	outcomeFailed
 	outcomeIncomplete
 	outcomeInterrupted
+	outcomeSkipped // another run claimed it first; it is not ours and it did not fail
 )
 
 // Engine is the outer orchestration loop: it walks the manifest queue and, for
@@ -437,6 +440,8 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 			sum.Incomplete++
 		case outcomeInterrupted:
 			sum.Interrupted++
+		case outcomeSkipped:
+			sum.Skipped++
 		default:
 			sum.Failed++
 		}
@@ -502,6 +507,18 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 
 	procPath, err := e.queue.Claim(name)
 	if err != nil {
+		// The queue lock is per processing directory, so two runs can legitimately share
+		// one 01.to_run and both discover this manifest. Claim is an atomic rename, so
+		// exactly one wins and it is never executed twice — but the loser has not failed
+		// at anything, and calling that a failure exits non-zero and pages whoever is on
+		// call about a manifest the other run is executing correctly. The peer is
+		// identified by the source being gone, not by the error alone: a rename also
+		// fails with ErrNotExist when the destination directory is missing, and that is
+		// a real failure.
+		if errors.Is(err, fs.ErrNotExist) && !e.queue.InToRun(name) {
+			fmt.Fprintf(e.out, "skip %s: claimed by another run on this queue\n", name)
+			return outcomeSkipped
+		}
 		fmt.Fprintf(e.out, "skip %s: %v\n", name, err)
 		return outcomeFailed
 	}

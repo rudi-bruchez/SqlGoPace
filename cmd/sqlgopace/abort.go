@@ -226,7 +226,7 @@ func runAbortResumable(stdout, stderr io.Writer, args []string) error {
 	}
 
 	ctx := context.Background()
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return err
 	}

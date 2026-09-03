@@ -80,7 +80,7 @@ func (c *Conn) ClusteringKeyColumns(ctx context.Context, schema, table string) (
 // walk uses it to read the next watermark (NULL means the walk is exhausted).
 func (c *Conn) QueryInt(ctx context.Context, statement string) (int64, bool, error) {
 	var v sql.NullInt64
-	if err := c.exec.QueryRowContext(ctx, statement).Scan(&v); err != nil {
+	if err := c.execSession().QueryRowContext(ctx, statement).Scan(&v); err != nil {
 		return 0, false, fmt.Errorf("query int: %w", err)
 	}
 	return v.Int64, v.Valid, nil

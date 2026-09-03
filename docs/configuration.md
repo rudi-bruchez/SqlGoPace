@@ -101,7 +101,7 @@ when a scheduler launches the binary from somewhere else than you do.
 | `log_drain_timeout_minutes` | 30 | How long to wait for the log to drain before giving up cleanly. |
 | `max_retry_attempts` | 1 | Retries after a *pressure cancel* only. A failing statement is not retried. |
 | `kill_grace_seconds` | 30 | Grace between cancelling a statement and the fallback `KILL`. |
-| `reconnect_timeout_minutes` | 2 | How long to try to re-establish a lost monitoring connection. |
+| `reconnect_timeout_minutes` | 2 | How long to wait for the server to come back. Two paths use it: re-pinning the execution connection after a statement left it unusable, and deciding whether a lost connection was an interruption or a failure. It does **not** bound the wait for an *abandoned* session to stop — that asks whether our own statement has finished, and is a fixed two minutes. |
 | `checkpoint_between_operations` | false | Issue a `CHECKPOINT` after each operation that has another behind it. Only under SIMPLE recovery, where a `CHECKPOINT` releases log space; under FULL or BULK_LOGGED it frees nothing, so the run warns at startup and issues none. A failed `CHECKPOINT` is reported and does not fail the manifest. |
 
 A poll interval of zero is rejected rather than accepted as a spin loop.

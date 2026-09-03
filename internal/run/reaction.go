@@ -78,6 +78,20 @@ type TailFinding struct {
 // ReactionSink receives reaction events as they happen.
 type ReactionSink func(ReactionEvent)
 
+// noteRepin reports through sink that the execution connection was re-pinned while a
+// statement ran. The connection repairs itself when a statement leaves it unusable
+// (an attention the driver cannot complete poisons it), which means the rest of the
+// run happens under a different server session. That is not allowed to be silent:
+// the session id is what a DMV capture, a held-lock query, and the run's own state
+// sidecar are keyed on, and the operation that broke the connection is worth
+// noticing on its own.
+func noteRepin(sink ReactionSink, before, after int) {
+	if after == before || after <= 0 || before <= 0 {
+		return
+	}
+	sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("execution connection re-pinned: SPID %d -> %d", before, after)})
+}
+
 // Capabilities describes what the running operation and server support, which
 // determines the least-destructive reaction available.
 type Capabilities struct {

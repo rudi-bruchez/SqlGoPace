@@ -13,6 +13,70 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.33.0] - 2026-09-03
+
+### Fixed
+
+- A canceled operation no longer takes the rest of the manifest with it. Aborting a
+  statement — how the cancel reaction and a resumable pause both stop the DDL — sends an
+  attention, and an attention the driver cannot complete leaves the pinned execution
+  connection poisoned. Nothing re-established it, so every later operation died on it in
+  milliseconds: `execute ddl: driver: bad connection`, then `execute ddl: sql: connection
+  is already closed`. Observed on a 827-operation compression manifest where one rebuild
+  was canceled for blocking a loader and the twelve operations behind it failed in 2-30 ms
+  each. The connection is now checked before the next statement and re-pinned when it is
+  unusable, hardened and re-stamped with the run marker before anything executes on it.
+- Re-pinning no longer starts the next operation beside an abandoned one. The driver gives
+  up on a connection when SQL Server does not confirm the attention within ~10 s
+  (go-mssqldb `cancelDrainTimeout`, twice) — well inside `kill_grace_seconds`, so the
+  runner's fallback `KILL` never fires and the request can still be running server-side.
+  A repair now identifies that session by `login_time`, `KILL`s it (best effort; a login
+  without `ALTER ANY CONNECTION` just waits), and waits up to two minutes for it to stop.
+  If it will not stop, the operation fails naming the session rather than issuing DDL
+  against a second one. A session id that has been reassigned is never killed. Found by the
+  harm review in [docs/specs/REVIEW-2026-09-03-harm.md](docs/specs/REVIEW-2026-09-03-harm.md),
+  finding 1.
+- The console's `k` key (kill our own DDL) read the session id captured when the run
+  started. After a re-pin that id names a different session, and SQL Server reuses session
+  ids, so the kill could have terminated somebody else's work. It reads the live id now.
+  The blocking monitor did the same and would have reported no blocking at all.
+- The `--tui` header follows the execution session instead of naming the one the run
+  started with. It was sent once, so after a re-pin the operator read one session id on
+  screen and `k` ended another — and the id on screen might by then belong to an unrelated
+  connection they were about to check in SSMS. Same review, finding 3.
+
+- A manifest another run claimed first is no longer counted as a failure. The queue lock is
+  per processing directory, so two runs can share one `01.to_run`; the claim is an atomic
+  rename, so the manifest still runs exactly once, but the loser recorded `failed` and the
+  process exited non-zero — an alert for work the other run was doing correctly. It is now
+  reported as `skipped`, with a `skipped` column in the run summary, and only when the source
+  manifest is really gone (a rename that fails because the *destination* is missing is still
+  a failure). `docs/running.md` claimed two runs on different processing directories "never
+  interfere"; it now says what the lock actually guarantees, which is that they never sweep
+  each other. Same review, finding 2.
+
+- Re-pinning the execution connection now uses `monitoring.reconnect_timeout_minutes`
+  instead of a hardcoded 30 seconds. The key already existed and is documented as how long
+  to wait for the server to come back, but only the resumable probe read it, so a failover
+  longer than 30 s failed the repair and charged each failed attempt to a different
+  operation. Same review, finding 4.
+  **Migration:** the default budget for a repair moves from 30 s to two minutes (the key's
+  default). An operator who wants the old behaviour sets `reconnect_timeout_minutes: 1` —
+  but note the key also governs how an interruption is classified, so it is not free to
+  lower. The bounded wait for an *abandoned* session to stop is deliberately **not** this
+  key: it asks whether our own statement has finished rolling back, not whether the server
+  is reachable, and stays a fixed two minutes.
+
+### Changed
+
+- The execution session id is no longer fixed for the life of a run. It is written into
+  the `.state.json` sidecar when a manifest starts and is not rewritten after a re-pin, so
+  a crash in that window leaves an orphan recovery cannot adopt and requeues the manifest
+  instead — conservative, and the same outcome as any unmatched orphan. Nothing to change
+  in a config or a manifest.
+- A re-pin is reported in the `.log` as `warn: execution connection re-pinned: SPID a -> b`
+  for a DDL operation, so a session id in a report can be matched to the right session.
+
 ## [0.32.0] - 2026-09-02
 
 ### Changed

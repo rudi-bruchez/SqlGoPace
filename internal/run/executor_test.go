@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -572,14 +573,14 @@ func (f fakeProbe) ActiveSessions(context.Context) ([]mssql.Session, error) {
 func TestServerSamplerBlocking(t *testing.T) {
 	t.Run("blocked by our spid", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57}}}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Blocking(context.Background(), nil)
 		if err != nil || !got.Unignored || !got.Any {
 			t.Errorf("Blocking() = (%+v, %v), want {Any:true Unignored:true}", got, err)
 		}
 	})
 	t.Run("blocked by someone else", func(t *testing.T) {
 		probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 99}}}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), nil)
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Blocking(context.Background(), nil)
 		if err != nil || got.Any || got.Unignored {
 			t.Errorf("Blocking() = (%+v, %v), want all false", got, err)
 		}
@@ -590,7 +591,7 @@ func TestServerSamplerBlocking(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileIgnoredSessions() error = %v", err)
 		}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Blocking(context.Background(), ignore)
 		if err != nil || got.Unignored || !got.Any {
 			t.Errorf("Blocking() = (%+v, %v), want {Any:true Unignored:false} — held through an ignored session", got, err)
 		}
@@ -604,7 +605,7 @@ func TestServerSamplerBlocking(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileIgnoredSessions() error = %v", err)
 		}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Blocking(context.Background(), ignore)
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Blocking(context.Background(), ignore)
 		if err != nil || !got.Unignored {
 			t.Errorf("Blocking() = (%+v, %v), want Unignored:true — a non-ignored session is blocked", got, err)
 		}
@@ -614,7 +615,7 @@ func TestServerSamplerBlocking(t *testing.T) {
 func TestServerSamplerLog(t *testing.T) {
 	t.Run("over percent cap reads reuse wait", func(t *testing.T) {
 		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 90}, reuseWait: "ACTIVE_TRANSACTION"}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Log(context.Background())
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
 		if err != nil {
 			t.Fatalf("Log() error = %v", err)
 		}
@@ -624,7 +625,7 @@ func TestServerSamplerLog(t *testing.T) {
 	})
 	t.Run("healthy leaves reuse wait unread", func(t *testing.T) {
 		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 10}, reuseWait: "ACTIVE_TRANSACTION"}
-		got, err := NewServerSampler(probe, 57, 1000, 80).Log(context.Background())
+		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
 		if err != nil {
 			t.Fatalf("Log() error = %v", err)
 		}
@@ -637,7 +638,7 @@ func TestServerSamplerLog(t *testing.T) {
 func TestServerSamplerSuppressesPendingVictim(t *testing.T) {
 	snap := amplifierSnapshot(16)
 	probe := fakeProbe{sessions: snap} // the existing fake in this file; a value type, not a pointer
-	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+	sampler := NewServerSampler(probe, staticSession(67), 1<<40, 100)
 
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
 	killer := NewVictimKiller(
@@ -662,7 +663,7 @@ func TestServerSamplerSuppressesPendingVictim(t *testing.T) {
 func TestServerSamplerCountsVictimWhenKillFails(t *testing.T) {
 	snap := amplifierSnapshot(16)
 	probe := &fakeProbe{sessions: snap}
-	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+	sampler := NewServerSampler(probe, staticSession(67), 1<<40, 100)
 
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
 	killer := NewVictimKiller(
@@ -687,7 +688,7 @@ func TestServerSamplerCountsVictimWhenKillFails(t *testing.T) {
 
 func TestServerSamplerWithoutVictimKillerIsUnchanged(t *testing.T) {
 	probe := fakeProbe{sessions: amplifierSnapshot(16)}
-	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+	sampler := NewServerSampler(probe, staticSession(67), 1<<40, 100)
 
 	st, err := sampler.Blocking(context.Background(), nil)
 	if err != nil {
@@ -705,7 +706,7 @@ func TestServerSamplerSuppressionDoesNotMaskAnotherBlockedSession(t *testing.T) 
 	snap := append(amplifierSnapshot(16),
 		mssql.Session{SPID: 500, Command: "SELECT", BlockingSPID: 67, Login: "app", Program: "PayrollApp"})
 	probe := fakeProbe{sessions: snap}
-	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+	sampler := NewServerSampler(probe, staticSession(67), 1<<40, 100)
 
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
 	killer := NewVictimKiller(
@@ -732,7 +733,7 @@ func TestSamplerMutualBlockIssuesExactlyOneKill(t *testing.T) {
 	snap := amplifierSnapshot(16)
 	snap[0].BlockingSPID = 79 // 79 blocks us and we block 79
 	probe := fakeProbe{sessions: snap}
-	sampler := NewServerSampler(probe, 67, 1<<40, 100)
+	sampler := NewServerSampler(probe, staticSession(67), 1<<40, 100)
 
 	var killed []int
 	clk := NewManualClock(time.Unix(1_800_000_000, 0))
@@ -838,7 +839,7 @@ func TestSamplerKillsARecurringBlockerAcrossPollGaps(t *testing.T) {
 	k.SetSource(staticKill{rules: compiled})
 
 	probe := &recurringBlockerProbe{blockers: []int{104, 104, 155}}
-	s := NewServerSampler(probe, 100, 0, 0)
+	s := NewServerSampler(probe, staticSession(100), 0, 0)
 	s.SetKiller(k)
 
 	// Poll 1 and 2 are the first chunk: the blocker serves its dwell and is killed.
@@ -863,3 +864,48 @@ func TestSamplerKillsARecurringBlockerAcrossPollGaps(t *testing.T) {
 		t.Fatalf("a blocker returning after a chunk gap must be killed at once, got %v", rec.spids)
 	}
 }
+
+// movingSession is an execution connection whose session id changes, as it does
+// when the pinned connection is re-pinned after a cancel poisoned it.
+type movingSession struct {
+	mu   sync.Mutex
+	spid int
+}
+
+func (s *movingSession) SPID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spid
+}
+
+func (s *movingSession) set(spid int) {
+	s.mu.Lock()
+	s.spid = spid
+	s.mu.Unlock()
+}
+
+// A repaired execution connection is a new server session. A sampler holding the id
+// captured at startup would see nothing blocked by us and report no blocking at all,
+// silently disabling every reaction for the rest of the run.
+func TestServerSamplerFollowsTheExecutionSessionID(t *testing.T) {
+	sess := &movingSession{spid: 57}
+	probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 88}}}
+	sampler := NewServerSampler(probe, sess, 1000, 80)
+
+	got, err := sampler.Blocking(context.Background(), nil)
+	if err != nil || got.Any {
+		t.Fatalf("Blocking() = (%+v, %v), want no blocking: 88 is not our session yet", got, err)
+	}
+
+	sess.set(88) // the execution connection was re-pinned onto session 88
+
+	got, err = sampler.Blocking(context.Background(), nil)
+	if err != nil || !got.Any || !got.Unignored {
+		t.Errorf("Blocking() = (%+v, %v), want {Any:true Unignored:true} — the sampler must follow the re-pinned session", got, err)
+	}
+}
+
+// staticSession is an execution connection whose session id never changes.
+type staticSession int
+
+func (s staticSession) SPID() int { return int(s) }

@@ -18,9 +18,18 @@ import (
 // context), not by a separate ALTER INDEX PAUSE, so the interface only needs to
 // run, identify, and kill the execution session.
 type Executor interface {
-	SPID() int
+	SessionID
 	ExecDDL(ctx context.Context, sql string) error
 	Kill(ctx context.Context, spid int) error
+}
+
+// SessionID reports the session id of the execution connection. It is an interface
+// rather than an int because that id is not fixed for the life of a run: a pinned
+// connection a canceled statement poisoned is re-pinned onto a new server session,
+// and anything holding the old id would attribute no blocking to us at all. Read it
+// on every use.
+type SessionID interface {
+	SPID() int
 }
 
 var _ Executor = (*mssql.Conn)(nil)
@@ -320,7 +329,7 @@ type sampleProbe interface {
 // ServerSampler builds a Sample from live server state for the DDL session.
 type ServerSampler struct {
 	probe         sampleProbe
-	spid          int
+	sess          SessionID
 	logMaxBytes   int64
 	logMaxPercent int
 	killer        *BlockerKiller // optional: kills matching blockers, reusing the Blocking snapshot
@@ -328,8 +337,8 @@ type ServerSampler struct {
 }
 
 // NewServerSampler returns a sampler for the given DDL session and log thresholds.
-func NewServerSampler(probe sampleProbe, spid int, logMaxBytes int64, logMaxPercent int) *ServerSampler {
-	return &ServerSampler{probe: probe, spid: spid, logMaxBytes: logMaxBytes, logMaxPercent: logMaxPercent}
+func NewServerSampler(probe sampleProbe, sess SessionID, logMaxBytes int64, logMaxPercent int) *ServerSampler {
+	return &ServerSampler{probe: probe, sess: sess, logMaxBytes: logMaxBytes, logMaxPercent: logMaxPercent}
 }
 
 var _ Sampler = (*ServerSampler)(nil)
@@ -352,13 +361,14 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 	if err != nil {
 		return BlockState{}, err
 	}
+	spid := s.sess.SPID()
 	// Update victim episodes and kill anything eligible before reading suppression, so
 	// a victim that becomes eligible on this very poll is suppressed on this poll too.
-	s.victims.consider(ctx, sessions, s.spid, ignore)
+	s.victims.consider(ctx, sessions, spid, ignore)
 
 	var st BlockState
 	for _, sess := range sessions {
-		if !sess.BlockedBy(s.spid) {
+		if !sess.BlockedBy(spid) {
 			continue
 		}
 		st.Any = true
@@ -369,7 +379,7 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 	}
 	// Reuse the same snapshot to kill any session blocking our DDL that matches a kill
 	// rule (the inverse direction: here we are the victim). No-op when no killer is set.
-	s.killer.consider(ctx, sessions, s.spid)
+	s.killer.consider(ctx, sessions, spid)
 	return st, nil
 }
 

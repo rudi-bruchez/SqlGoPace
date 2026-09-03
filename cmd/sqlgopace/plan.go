@@ -133,7 +133,7 @@ func runPlan(stdout, stderr io.Writer, args []string) error {
 	}
 
 	ctx := context.Background()
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -235,7 +235,7 @@ func planMulti(ctx context.Context, stdout io.Writer, conn *mssql.Conn, cfg *con
 	width := prefixWidth(len(selected))
 	var allManifests []namedManifest
 	for i, db := range selected {
-		dbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+		dbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version(), connOptions(cfg)...)
 		if err != nil {
 			fmt.Fprintf(stdout, "-- skip database %s: connect: %v\n", db, err)
 			continue

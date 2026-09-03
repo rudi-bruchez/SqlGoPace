@@ -15,6 +15,25 @@ work at all:
 The monitoring connection is why `VIEW SERVER STATE` is not optional. Without it the
 sampling loop fails on every run, including one that blocks nobody.
 
+The execution connection is pinned, not immortal. Stopping a statement — a cancel
+reaction, or the abort that pauses a resumable operation — sends an attention, and an
+attention the driver cannot complete leaves that connection unusable. It is checked
+before the next statement and re-pinned when it is broken; the new session is hardened
+and re-stamped with the run marker before anything runs on it, and a DDL operation records
+`warn: execution connection re-pinned: SPID a -> b` in the `.log` — a shrink and a batched
+DML are repaired the same way but do not yet say so.
+
+Before pinning a new session the run makes sure the old one has actually stopped. The client
+abandoning a connection does not mean SQL Server stopped the statement on it, so the old
+session is identified by its `login_time`, killed if it is still ours and still running, and
+waited on for up to two minutes. If it will not stop, the operation **fails** naming that
+session — the run refuses to issue DDL beside a request that still holds its locks. A session
+id that has since been given to another connection is never killed.
+
+Two consequences worth knowing: the session id in a report is the one that was live at the
+time and can change mid-run, and the `--tui` header follows it. A re-pin costs one operation
+nothing — before 0.33.0 it cost every operation left in the manifest.
+
 ## The queue
 
 ```
@@ -39,8 +58,18 @@ one of those windows would requeue and re-run work that was still in flight.
 
 The lock is an OS file lock, so a run that is killed leaves nothing to clean up: the next
 run takes the lock and recovers normally. Only a queue on a filesystem that does not honour
-locks (an NFSv3 share) is unprotected. Two runs on *different* processing directories never
-interfere, whether or not they target the same database.
+locks (an NFSv3 share) is unprotected.
+
+**What the lock does and does not buy.** Two runs on *different* processing directories never
+**sweep** each other, which is the race that matters: neither can requeue the other's
+in-flight manifest. They are not otherwise isolated. If they also share `01.to_run` they both
+discover the same manifests, and each one is claimed by an atomic rename — so it runs exactly
+once, on whichever run got there first. The other reports
+`skip <name>: claimed by another run on this queue` and counts it as **skipped**, not failed,
+so a shared queue does not produce a non-zero exit for work the peer did correctly.
+
+Give the second schedule its own `01.to_run` as well if you want two genuinely independent
+queues.
 
 ## Setting up a directory
 

@@ -714,3 +714,48 @@ func mustExist(t *testing.T, path string) {
 		t.Errorf("expected file %s: %v", path, err)
 	}
 }
+
+// peerClaimingRunner simulates the other run taking a manifest out of the shared
+// 01.to_run while this run is busy with the previous one: it deletes onClaim the
+// first time it is asked to execute anything.
+type peerClaimingRunner struct {
+	onClaim string
+	done    bool
+}
+
+func (p *peerClaimingRunner) Run(_ context.Context, _ ddl.Operation, _ string, _ run.Capabilities, _ run.ReactionSink) error {
+	if !p.done {
+		p.done = true
+		_ = os.Remove(p.onClaim)
+	}
+	return nil
+}
+
+// docs/running.md says two runs on different processing directories never interfere.
+// They still share 01.to_run, so both discover the same manifest and one loses the
+// rename. Losing it is the correct, safe outcome — the peer is running that manifest —
+// but recording a failure exits non-zero, which on a schedule pages somebody at 02:00
+// about a manifest that succeeded on the other instance.
+func TestAManifestClaimedByAPeerIsNotAFailure(t *testing.T) {
+	runner := &peerClaimingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "020_b.yaml"), []byte(engineManifest), 0o644); err != nil {
+		t.Fatalf("write second manifest: %v", err)
+	}
+	runner.onClaim = filepath.Join(dirs.ToRun, "020_b.yaml")
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	if sum.Failed != 0 {
+		t.Errorf("Failed = %d, want 0: the peer is running that manifest, this run did not fail", sum.Failed)
+	}
+	if sum.Done != 1 {
+		t.Errorf("Done = %d, want 1", sum.Done)
+	}
+	if sum.Skipped != 1 {
+		t.Errorf("Skipped = %d, want 1 — the manifest a peer took must be counted apart", sum.Skipped)
+	}
+}

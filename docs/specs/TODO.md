@@ -406,6 +406,85 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
 
 ## Follow-ups deferred from shipped work
 
+- [x] **The 2026-09-03 harm review is closed out** — findings 1, 2, 3 and 4 fixed in 0.33.0
+  ([REVIEW-2026-09-03-harm.md](REVIEW-2026-09-03-harm.md); it is a historical record and is
+  not updated as items are fixed). Evidence: `(*mssql.Conn).stopOrphan` and its four tests in
+  `internal/mssql/conn_repair_test.go` (1); `outcomeSkipped` in `internal/run/engine.go` with
+  `TestAManifestClaimedByAPeerIsNotAFailure` (2); `spidAnnouncer` in `cmd/sqlgopace/main.go`
+  with `TestSPIDAnnouncerFollowsTheExecutionSession` (3); `mssql.WithReconnectTimeout` and
+  `connOptions` with `TestRepairGivesUpAfterTheConfiguredReconnectTimeout` (4).
+  *Left undone:* the wait for an abandoned session to stop is a fixed two minutes
+  (`orphanStopTimeout`). It is deliberately not `reconnect_timeout_minutes` — that key asks
+  whether the server is reachable, this asks whether our own statement has finished rolling
+  back. Making it configurable would mean a new key, its shipped-file twin, its docs row and
+  its two audit entries; nobody has asked, and the failure it produces is loud and
+  actionable rather than silent. Revisit if an operator reports rollbacks that routinely
+  outlast it.
+  Its finding 5 (`0o644` writes) is **withdrawn**: it is the entry *The remaining `0644`
+  writes* below, whose reasoning is better than the finding's and which already corrects the
+  claim the finding repeated. Two reviewers have now reached the same wrong conclusion about
+  it; read that entry before raising it a third time.
+
+- [ ] **A fourth audit: the statement-executing drivers against the rules that must hold on
+  all of them.** Deferred deliberately on 2026-09-03 — the work is wanted, not urgent. What
+  follows is the analysis, so whoever picks it up does not have to re-derive it.
+
+  **The class.** Three code paths run a statement on the pinned execution connection. Every
+  cross-cutting rule has to land in all three, nothing enforces that, and — this is why it
+  survives review — *each path is correct on its own terms*. A diff-scoped reader opens
+  `runChunk` and finds nothing wrong: the function does what it says. The gap is only visible
+  with the three side by side, which is a view no diff ever produces.
+
+  | rule | `MonitoredRunner.runStatement` | `ShrinkRunner.runChunk` / `runWatchedStatement` | `BatchDMLRunner.runBatch` |
+  |---|---|---|---|
+  | fallback `KILL` after the grace | `monitored_runner.go:204,210` | `shrink.go:752,758` | `batch_dml.go:422,428` |
+  | `max_block` cap | via `Capabilities.MaxBlock`, `engine.go:703` | `shrink.go:722,824` — **hand-fixed in 0.30.0** | `batch_dml.go:344` |
+  | drain / graceful stop | `ErrStopped` | `stopRequested` | `stopRequested` |
+  | `ignore_blocked_sessions` | `caps.Ignore` | `IgnoreSource` | `IgnoreSource` |
+  | re-pin narration (`noteRepin`) | `monitored_runner.go:180,193` | **missing** | **missing** |
+
+  **The instances, honestly counted: two.** 0.30.0, where `max_block_minutes` was enforced by
+  the chunked shrink path but not by `runWatchedStatement`, so the two unchunked statements
+  ignored the safety cap. And 0.33.0, where the re-pin narration reached only the DDL path, so
+  a shrink can continue under a new server session with nothing in the `.log` saying so — that
+  one was left in knowingly. (An earlier draft of this entry, and a session summary, said
+  "four" or "five". That was the count for the *TUI harm* class, which CLAUDE.md records as
+  hand-fixed once per release across 0.23.0, 0.24.0 and twice in 0.28.0. Two is still the
+  threshold this project sets: *a defect class found twice belongs here as a test*.)
+
+  Rewrite either instance changing only a noun and you get the other. That is the tell.
+
+  **The structural cause, and it is worth fixing alongside.** All three carry their own copy of
+  the abort → wait for grace → `KILL` block, and even the field holding the same
+  `kill_grace_seconds` is named differently: `killGrace` in `monitored_runner.go:27`, `killGr`
+  in `shrink.go:155` and `batch_dml.go:122`. There is nowhere in the tree that states "these
+  are the rules for running a statement", so each new rule has to be *remembered* three times,
+  by a person. The audit makes the omission fail the build; extracting the shared block would
+  remove most of the occasions for it.
+
+  **Shape of the audit**, following `internal/config/audit_test.go` and
+  `internal/tui/harm_audit_test.go`: enumerate the statement-executing paths and the rules,
+  then *drive* each path and assert the rule fired. Both halves must come from the source or it
+  rots — a new driver nobody listed has to fail the test, exactly as an unranked `ActionKind`
+  does today.
+
+  **Expect writing the rule list to be most of the work**, the way ranking harm was in the TUI
+  ledger, and expect the next defect to appear while writing it. Note that "the harness is
+  expensive" is precisely the reasoning that shipped instance two; if it is used again, it
+  should be because someone weighed it, not because it went unnoticed.
+
+- [ ] **The `.state.json` sidecar keeps the SPID and `login_time` of the session that started
+  the manifest.** They are written once, in `Engine.freshState`, and a re-pin (0.33.0) makes
+  both stale for the rest of that manifest. A crash in that window leaves an orphan whose
+  recorded signature matches nothing, so `Recoverer` requeues the manifest instead of
+  adopting it. Safe — the signature is `SPID` + `login_time` + `CONTEXT_INFO` (SPECS §16), so
+  a stale triple fails closed and cannot be mistaken for somebody else's session — and
+  correct for a non-resumable operation, whose work rolled back anyway; a resumable one is
+  found through `sys.index_resumable_operations`, which is server-side. Deferred because the
+  fix is not "rewrite the sidecar on re-pin" but a decision about who owns that write: the
+  connection knows it re-pinned, the engine knows which manifest is in flight, and nothing
+  currently connects them.
+
 - [x] **Five config keys whose only statement of their default is the shipped file** — done in
   v0.31.0. `applyDefaults` (`internal/config/config.go`) now materializes all five:
   `monitoring.max_retry_attempts` 1, `preflight.require_data_free_space` true,

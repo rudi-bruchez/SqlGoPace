@@ -100,7 +100,7 @@ func TestLiveReloadFlipsBlocking(t *testing.T) {
 	src := newManifestSource(path, compiledFrom(t, path))
 
 	probe := fakeProbe{sessions: []mssql.Session{{SPID: 60, BlockingSPID: 57, Program: "ReportingService"}}}
-	sampler := NewServerSampler(probe, 57, 1000, 80)
+	sampler := NewServerSampler(probe, staticSession(57), 1000, 80)
 
 	if b, err := sampler.Blocking(context.Background(), src.Current()); err != nil || !b.Unignored {
 		t.Fatalf("Blocking() = (%+v, %v), want Unignored:true before the rule is added", b, err)

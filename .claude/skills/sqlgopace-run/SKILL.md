@@ -87,6 +87,8 @@ Read it before speculating.
 | `PARTIAL` | `on_failure: continue`: some operations were quarantined. A `.recovery.yaml` holds only those. |
 | `pause` / `cancel` / `abort` in the log | The reaction hierarchy acted. The detail line says what triggered it. |
 | `hold:` | The operation deliberately held its lock through a session an `ignore_blocked_sessions` rule named. |
+| `warn: execution connection re-pinned: SPID a -> b` | The statement before it left the pinned connection unusable, so the run continued on a new server session (0.33.0). Session ids before and after that line refer to different sessions. Not an error on its own; read the failure just above it. Only DDL operations emit it — a shrink or a batched DML is repaired the same way and stays silent. |
+| `is still running the abandoned statement after 2m0s` | The run cancelled an operation, could not confirm SQL Server stopped it, and the session would not clear. It refuses to run more DDL beside it, so the rest of the manifest fails the same way. This is a server-side rollback still in progress: check `sys.dm_exec_requests` for that session, let it finish, then re-run. Do not "fix" it by re-running immediately. |
 | `warn: stopped killing blockers matching rule …` | The repeat-offender cap hit. The blocker is returning faster than it can be cleared; that is an operator problem, not a tuning one. |
 
 **"It exits immediately saying another run holds the directory."** Not an error to work

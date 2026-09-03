@@ -199,6 +199,49 @@ SET DEADLOCK_PRIORITY LOW;   -- the DDL becomes the designated victim, not the u
 
 Do **not** set a `LOCK_TIMEOUT`: lock waiting is handled cleanly by `WAIT_AT_LOW_PRIORITY` (§11).
 
+**The pinned connection is repaired, not assumed (0.33.0).** This spec used to treat the execution
+connection as fixed for the life of a run. It is not: an attention the driver cannot complete leaves
+it poisoned, and everything issued on it afterwards fails instantly — `driver: bad connection`, then
+`sql: connection is already closed` once `database/sql` has retired it. A run of 827 operations lost
+its last twelve that way. The rule is now: before each statement, if the statement before it failed,
+ping the pinned connection and re-pin it when the ping fails. A re-pinned connection is a **new
+server session**, so it is hardened and re-stamped with the run marker (§16) *before* it is published,
+and its `@@SPID` is re-read under the same non-positive guard as at startup. The failed statement is
+never re-issued there — the server may still be running it, and retry policy belongs to
+`max_retry_attempts`.
+
+**The client giving up is not the server stopping, and the repair must settle that.** The driver
+sends an attention on cancellation and waits ~10 s for the `DONE_ATTN` confirmation
+(go-mssqldb `cancelDrainTimeout`, two attempts); past that it abandons the connection while the
+request may still be executing or rolling back. That is *inside* `kill_grace_seconds`, so the
+runner's fallback `KILL` (§11.3) does not fire. Re-pinning without settling it puts a second
+session on the same objects, blocked on the first's locks and invisible to monitoring, which keys
+on the new `@@SPID`. So before a new connection is pinned:
+
+1. read the old session's identity (§16: `SPID` + `login_time`) — **`login_time` must still match
+   the value recorded when we pinned it**, because SQL Server reuses session ids and a `KILL` on a
+   reassigned one terminates a stranger's work;
+2. if it is ours and has a live request, `KILL` it — best effort, since the login may lack
+   `ALTER ANY CONNECTION` — and wait, bounded, for the request to clear. **That wait owns its
+   own budget**, separate from the reconnect timeout: sharing one lets the shorter win
+   silently, and since an unanswerable probe means "cannot tell" (below), a truncated wait
+   reads as permission to continue — the very failure this rule exists to stop. The two are
+   not the same question either: `monitoring.reconnect_timeout_minutes` asks *is the server
+   back* and bounds the re-pin; the orphan wait asks *has our own statement finished* and is
+   fixed;
+3. if it will not clear, **fail the operation** naming the session. Refusing to continue is the
+   safe direction: the alternative is DDL running beside a request that still holds its locks.
+
+A probe that *errors* is "cannot tell", not "orphan", and lets the repair proceed — re-pinning is
+itself a liveness test, and refusing on an unanswerable probe would strand a run on a momentary
+network fault.
+
+**Therefore `DDL_SPID` is read, never cached.** Everything keyed on it — block attribution
+(§9), the blocker and victim killers, the console's kill key, the fallback `KILL` — must read it at
+the moment of use. A component holding the id captured at startup would attribute no blocking to us
+at all after a re-pin, and, because SQL Server reuses session ids, a `KILL` on it could name an
+unrelated session.
+
 Recommended driver: **`github.com/microsoft/go-mssqldb`**.
 
 ---
@@ -457,8 +500,11 @@ phase**. We combine them when possible.
    same index lock and makes the running statement return an error that is easily mistaken for a
    failure. The pause **keeps the work already done** *and* **relieves log pressure** (the log becomes
    truncatable again). We then wait until the pressure (blocking / log) drops and run
-   `ALTER INDEX … RESUME` **on the same pinned execution connection** (its SPID is unchanged because an
-   attention does not close the connection). Costs to know: ~10–15 % slower, more log overall, and the
+   `ALTER INDEX … RESUME` **on the pinned execution connection**. That connection usually survives the
+   attention with its SPID unchanged — this spec used to state that as a guarantee, and it is not one
+   (§3, 0.33.0): an attention the driver cannot complete poisons the connection, which is then
+   re-pinned onto a new session before the `RESUME` runs. The `RESUME` is correct either way, because
+   a resumable index keeps its progress **server-side**, not on the session. Costs to know: ~10–15 % slower, more log overall, and the
    partial index **consumes data space** until it completes or is aborted.
 
 2. **WAIT_AT_LOW_PRIORITY** (injected with ONLINE): lets SQL Server handle the **lock wait** without

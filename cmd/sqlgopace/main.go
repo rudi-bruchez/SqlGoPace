@@ -180,7 +180,7 @@ func dryRunConn(ctx context.Context, cfg *config.Config, db string, cache map[st
 	if c, ok := cache[key]; ok {
 		return c, nil
 	}
-	c, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	c, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, db, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return nil, err
 	}
@@ -201,7 +201,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	defer func() { notifyRunFailure(ctx, stdout, notifiers(cfg), err) }()
 
 	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return err
 	}
@@ -254,7 +254,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	// (recorded in its sidecar); other databases are reached via OpenDatabase.
 	recoverer := run.NewRecoverer(dirs, conn, stdout,
 		run.WithRecoveryProbes(info.Database, func(rctx context.Context, db string) (run.RecoveryProbe, func(), error) {
-			c, oerr := mssql.OpenDatabase(rctx, cfg.Database.ConnectionString, db, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+			c, oerr := mssql.OpenDatabase(rctx, cfg.Database.ConnectionString, db, version.Version(), connOptions(cfg)...)
 			if oerr != nil {
 				return nil, nil, oerr
 			}
@@ -353,7 +353,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 			}
 			break
 		}
-		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString, cfg.Database.LoginTimeout())
+		dbConn, dbInfo, reused, cerr := connForDatabase(runCtx, conn, info, db, cfg.Database.ConnectionString, connOptions(cfg)...)
 		if cerr != nil {
 			fmt.Fprintf(stdout, "-- skip database %s: %v\n", db, cerr)
 			runErr = cerr
@@ -416,11 +416,12 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		total.Incomplete += sum.Incomplete
 		total.Interrupted += sum.Interrupted
 		total.Deferred += sum.Deferred
+		total.Skipped += sum.Skipped
 		total.Failures = append(total.Failures, sum.Failures...)
 	}
 
-	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d incomplete, %d interrupted, %d deferred\n",
-		total.Done, total.Failed, total.Incomplete, total.Interrupted, total.Deferred)
+	fmt.Fprintf(stdout, "processed: %d done, %d failed, %d incomplete, %d interrupted, %d deferred, %d skipped\n",
+		total.Done, total.Failed, total.Incomplete, total.Interrupted, total.Deferred, total.Skipped)
 	// The TUI closes when the run ends, so echo each failure's reason here — the console's
 	// alert may have flashed by on a fast preflight rejection. This keeps the actionable
 	// detail (e.g. missing db_owner for a shrink) on screen without opening the .log.
@@ -438,6 +439,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 	}
 	if total.Deferred > 0 {
 		fmt.Fprintf(stdout, "-- %d manifest(s) deferred (outside their execution window); left in queue for a later run\n", total.Deferred)
+	}
+	if total.Skipped > 0 {
+		fmt.Fprintf(stdout, "-- %d manifest(s) claimed by another run sharing this 01.to_run; that run owns them\n", total.Skipped)
 	}
 	if runErr != nil {
 		return runErr
@@ -492,7 +496,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		cfg.KillAmplifyingMaintenance.Enabled ||
 		cfg.OptionsOverride.AllowAbortBlockers
 	checker := run.NewPreflightChecker(conn, info, thresholds, killArmed)
-	sampler := run.NewServerSampler(conn, conn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	sampler := run.NewServerSampler(conn, conn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
 	// sampler's per-poll session snapshot; the engine feeds it each manifest's kill rules.
 	var killOpt run.EngineOption
@@ -600,11 +604,11 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// -- reusing the primary sampler would watch the (idle) primary session and never
 	// see the tempdb DBCC SHRINKFILE blocking anyone. DMV reads are instance-wide, so
 	// probing stays on conn (avoids adding query load to the connection running the DBCC).
-	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
-	tempdbSampler := run.NewServerSampler(conn, tempdbConn.SPID(), cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	tempdbSampler := run.NewServerSampler(conn, tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	// The killers are per-run, not per-sampler: a tempdb shrink must be able to kill a
 	// blocker exactly like any other operation, and it is the sampler poll that consults
 	// them. The instances are shared with the primary sampler — safe, because the engine
@@ -741,15 +745,26 @@ func shrinkTuning(s config.ShrinkConfig) run.ShrinkTuning {
 	}
 }
 
+// connOptions returns the connection settings every command takes from config: how long
+// a connection attempt may take, and how long a repair may wait for the server to come
+// back. They travel together, so they are built in one place rather than at each of the
+// nine call sites.
+func connOptions(cfg *config.Config) []mssql.Option {
+	return []mssql.Option{
+		mssql.WithLoginTimeout(cfg.Database.LoginTimeout()),
+		mssql.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
+	}
+}
+
 // connForDatabase returns a connection in the target database's context. It reuses
 // the already-open base connection when the target is the connected database;
 // otherwise it opens a fresh connection (and detects its server facts). reused is
 // true when the base connection was returned (the caller must not close it).
-func connForDatabase(ctx context.Context, base *mssql.Conn, baseInfo mssql.ServerInfo, db, dsn string, loginTimeout time.Duration) (conn *mssql.Conn, info mssql.ServerInfo, reused bool, err error) {
+func connForDatabase(ctx context.Context, base *mssql.Conn, baseInfo mssql.ServerInfo, db, dsn string, opts ...mssql.Option) (conn *mssql.Conn, info mssql.ServerInfo, reused bool, err error) {
 	if strings.EqualFold(db, baseInfo.Database) {
 		return base, baseInfo, true, nil
 	}
-	conn, err = mssql.OpenDatabase(ctx, dsn, db, version.Version(), mssql.WithLoginTimeout(loginTimeout))
+	conn, err = mssql.OpenDatabase(ctx, dsn, db, version.Version(), opts...)
 	if err != nil {
 		return nil, mssql.ServerInfo{}, false, err
 	}
@@ -823,8 +838,8 @@ func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool,
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
-	go feedConsole(feedCtx, program, conn, conn.SPID(), pollInterval, blockingTimeout)
-	go dispatchActions(feedCtx, program, conn, conn.SPID(), current, drain, actions)
+	go feedConsole(feedCtx, program, conn, pollInterval, blockingTimeout)
+	go dispatchActions(feedCtx, program, conn, current, drain, actions)
 
 	// The engine runs under its own cancelable context so that if the console dies first
 	// (program.Run returns an error) we can unwind ProcessAll before the caller closes the
@@ -995,8 +1010,11 @@ func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
 // feedConsole polls the server and sends progress and blocker updates to the TUI. A
 // blocker is shown only once it has persisted for blockingTimeout (see blockerGate), so
 // transient blocks that clear on their own never reach the console.
-func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, interval, blockingTimeout time.Duration) {
-	program.Send(tui.SPIDMsg{SPID: ddlSPID}) // show which server session is ours
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, interval, blockingTimeout time.Duration) {
+	var spid spidAnnouncer
+	if msg, ok := spid.observe(conn.SPID()); ok { // show which server session is ours
+		program.Send(msg)
+	}
 	gate := newBlockerGate()
 	susp := newSuspensionTracker()
 	ticker := time.NewTicker(interval)
@@ -1007,9 +1025,14 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// A repaired execution connection is a new session. The header has to follow
+			// it, or the operator verifies one session in SSMS and k ends another.
+			if msg, ok := spid.observe(conn.SPID()); ok {
+				program.Send(msg)
+			}
 			if sessions, err := conn.ActiveSessions(ctx); err == nil {
 				var blockers []tui.Blocker
-				for _, s := range gate.persistent(sessions, ddlSPID, time.Now(), blockingTimeout) {
+				for _, s := range gate.persistent(sessions, conn.SPID(), time.Now(), blockingTimeout) {
 					blockers = append(blockers, tui.Blocker{
 						SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
 						WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
@@ -1020,7 +1043,7 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 
 				// Mirror: report whether OUR operation is itself blocked (the victim), from
 				// the same snapshot. Sent every poll so the indicator clears when unblocked.
-				sb := mssql.FindSelfBlock(sessions, ddlSPID)
+				sb := mssql.FindSelfBlock(sessions, conn.SPID())
 				program.Send(tui.BlockedByMsg{
 					Blocked: sb.Blocked, SPID: sb.SPID, Login: sb.Login, Program: sb.Program,
 					WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
@@ -1029,10 +1052,10 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, dd
 				susp.observe(sb.Blocked, sb.SPID, sb.Login, sb.Host, time.Now())
 				program.Send(susp.snapshot())
 			}
-			if p, found, err := conn.Progress(ctx, ddlSPID); err == nil && found {
+			if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
 				program.Send(progressMsg(p))
 			}
-			if waits, err := conn.SessionWaits(ctx, ddlSPID); err == nil {
+			if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
 				program.Send(waitsMsg(waits))
 			}
 		}
@@ -1195,9 +1218,31 @@ func (c *currentManifest) get() string {
 	return c.path
 }
 
+// spidAnnouncer emits a SPIDMsg the first time it sees a session id and whenever it
+// changes, so the console header tracks the execution session across a re-pin without
+// resending the same value every poll.
+type spidAnnouncer struct{ last int }
+
+func (a *spidAnnouncer) observe(spid int) (tui.SPIDMsg, bool) {
+	if spid <= 0 || spid == a.last {
+		return tui.SPIDMsg{}, false
+	}
+	a.last = spid
+	return tui.SPIDMsg{SPID: spid}, true
+}
+
+// killDDL ends our own execution session, reading its id at the moment of the kill
+// rather than from a value captured when the run started. A pinned connection an
+// aborted statement poisoned is re-pinned onto a new session, and SQL Server reuses
+// session ids: a captured id can name somebody else's session by the time the key is
+// pressed.
+func killDDL(ctx context.Context, sess run.Executor) error {
+	return sess.Kill(ctx, sess.SPID())
+}
+
 // dispatchActions routes operator intents to the server (kill) or to the running
 // manifest (ignore a blocked session).
-func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, ddlSPID int, current *currentManifest, drain *run.DrainFlag, actions <-chan tui.Action) {
+func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, current *currentManifest, drain *run.DrainFlag, actions <-chan tui.Action) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1207,8 +1252,8 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 			case tui.ActionKillDDL:
 				// The operator confirmed this one; a KILL that the server refuses (no
 				// ALTER ANY CONNECTION) must not look like it worked.
-				if err := conn.Kill(ctx, ddlSPID); err != nil {
-					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill DDL (SPID %d) failed: %v", ddlSPID, err)})
+				if err := killDDL(ctx, conn); err != nil {
+					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill DDL (SPID %d) failed: %v", conn.SPID(), err)})
 				}
 			case tui.ActionKillBlocker:
 				if err := conn.Kill(ctx, a.SPID); err != nil {
@@ -1335,7 +1380,7 @@ func dryRunSession(ctx context.Context, log io.Writer, visited map[string]bool, 
 		return t, nil, noop, err
 	}
 
-	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), mssql.WithLoginTimeout(cfg.Database.LoginTimeout()))
+	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return ddl.Target{}, nil, noop, err
 	}

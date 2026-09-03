@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -307,5 +308,56 @@ func TestAmplifierDwellWarning(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// killSpy records which session the console's kill key ended.
+type killSpy struct {
+	spid   int
+	killed []int
+}
+
+func (k *killSpy) SPID() int                             { return k.spid }
+func (k *killSpy) ExecDDL(context.Context, string) error { return nil }
+func (k *killSpy) Kill(_ context.Context, spid int) error {
+	k.killed = append(k.killed, spid)
+	return nil
+}
+
+// The console's k key ends our own DDL session. SQL Server reuses session ids, so
+// killing an id captured when the run started can name somebody else's session once
+// the execution connection has been re-pinned. Read it at the moment of the kill.
+func TestKillDDLUsesTheCurrentSessionID(t *testing.T) {
+	spy := &killSpy{spid: 57}
+	spy.spid = 88 // the execution connection was re-pinned onto session 88
+
+	if err := killDDL(context.Background(), spy); err != nil {
+		t.Fatalf("killDDL() error = %v", err)
+	}
+
+	if want := []int{88}; !cmp.Equal(spy.killed, want) {
+		t.Errorf("killed %v, want %v — the kill must name the live session", spy.killed, want)
+	}
+}
+
+// The console header names the session the operator will check in SSMS before pressing
+// k. 0.33.0 made the kill read the live session id, because a repaired connection is a
+// new session and SQL Server reuses the old id — but the header was still sent once, at
+// startup. The two must not disagree about which session is ours.
+func TestSPIDAnnouncerFollowsTheExecutionSession(t *testing.T) {
+	var a spidAnnouncer
+
+	msg, ok := a.observe(57)
+	if !ok || msg.SPID != 57 {
+		t.Fatalf("observe(57) = (%+v, %v), want the first session announced", msg, ok)
+	}
+
+	if _, ok := a.observe(57); ok {
+		t.Error("observe(57) again announced a second time; an unchanged session has nothing to say")
+	}
+
+	msg, ok = a.observe(88)
+	if !ok || msg.SPID != 88 {
+		t.Errorf("observe(88) = (%+v, %v), want the re-pinned session announced", msg, ok)
 	}
 }

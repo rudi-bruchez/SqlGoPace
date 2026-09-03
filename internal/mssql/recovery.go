@@ -48,7 +48,7 @@ const loginTimeSQL = `SELECT CONVERT(varchar(30), login_time, 126) FROM sys.dm_e
 // state so recovery can disambiguate a reused SPID.
 func (c *Conn) LoginTime(ctx context.Context) (string, error) {
 	var login string
-	if err := c.exec.QueryRowContext(ctx, loginTimeSQL).Scan(&login); err != nil {
+	if err := c.execSession().QueryRowContext(ctx, loginTimeSQL).Scan(&login); err != nil {
 		return "", fmt.Errorf("read login_time: %w", err)
 	}
 	return login, nil

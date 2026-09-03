@@ -176,6 +176,9 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 	execCtx, cancelExec := context.WithCancel(ctx)
 	defer cancelExec()
 
+	// The executor repairs a connection an earlier statement left unusable, which
+	// re-pins it onto a new session; noteRepin reports that once the statement is done.
+	spidBefore := r.exec.SPID()
 	done := make(chan error, 1)
 	go func() { done <- r.exec.ExecDDL(execCtx, sql) }()
 
@@ -186,6 +189,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 
 	action, pressure, err := supervise(ctx, r.clk, caps, r.blockingTimeout, samples, done)
 	if action == Continue {
+		noteRepin(sink, spidBefore, r.exec.SPID())
 		return Continue, err
 	}
 
