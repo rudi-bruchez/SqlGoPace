@@ -473,7 +473,7 @@ func TestModelKillTracksSPIDNotIndex(t *testing.T) {
 // TestKillDDLNeedsConfirmation pins the gate on `k`. It terminates OUR running DDL: on a
 // non-resumable operation that discards every hour of work and starts a rollback holding
 // the same locks, which cannot be stopped. It used to fire on one keystroke, while the
-// neighbouring `x` — strictly less damaging, since it only loses a foreign session's
+// neighboring `x` — strictly less damaging, since it only loses a foreign session's
 // transaction — was given a confirmation in 0.24.0.
 func TestKillDDLNeedsConfirmation(t *testing.T) {
 	actions := make(chan tui.Action, 4)
@@ -518,9 +518,9 @@ func TestKillDDLConfirmationCancels(t *testing.T) {
 		t.Fatalf("a key other than y emitted %+v; the prompt must cancel", a)
 	}
 	// And the console is usable again rather than stuck in the prompt.
-	m, _ = send(m, key("d"))
+	_, _ = send(m, key("d"))
 	if a, ok := drain(t, actions); !ok || a.Kind != tui.ActionDrain {
-		t.Errorf("after cancelling, d = %+v ok=%t, want Drain (prompt should have closed)", a, ok)
+		t.Errorf("after canceling, d = %+v ok=%t, want Drain (prompt should have closed)", a, ok)
 	}
 }
 

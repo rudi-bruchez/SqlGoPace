@@ -160,7 +160,7 @@ func (m MonitoringConfig) ReconnectTimeout() time.Duration {
 
 // defaultMaxRetryAttempts is what an absent max_retry_attempts means: one retry, two
 // attempts in all, which is what the shipped config.yaml advertises. An explicit 0
-// means one attempt and is honoured.
+// means one attempt and is honored.
 const defaultMaxRetryAttempts = 1
 
 // MaxRetries is how many times a failed operation is retried.

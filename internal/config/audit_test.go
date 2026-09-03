@@ -248,7 +248,7 @@ var requiredKeys = map[string]bool{
 // writes down. Delete an entry by giving the code the default the file advertises.
 var documentedDivergences = map[string]string{
 	// Intended: the default is applied by an accessor (MinBehind, After) rather than
-	// by applyDefaults, so the parsed field stays zero while the behaviour matches the
+	// by applyDefaults, so the parsed field stays zero while the behavior matches the
 	// file. Uniform defaulting would remove both entries; see docs/specs/TODO.md.
 	"kill_amplifying_maintenance.min_blocked_behind": "MinBehind() returns 1 for an unset field",
 	"kill_amplifying_maintenance.after_seconds":      "After() returns 60s for an unset field",
@@ -257,7 +257,7 @@ var documentedDivergences = map[string]string{
 // TestShippedConfigStatesTheRealDefaults fails when the config.yaml an operator is
 // handed by `sqlgopace init` advertises a value the code does not apply when the key
 // is absent. That divergence is silent in every other way: the file reads as
-// documentation, the key is optional, and deleting it changes behaviour.
+// documentation, the key is optional, and deleting it changes behavior.
 //
 // internal/scaffold pins the embedded twin byte-for-byte against this same file, so
 // auditing the repository copy audits what ships.

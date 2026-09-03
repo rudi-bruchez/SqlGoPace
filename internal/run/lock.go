@@ -43,7 +43,7 @@ type QueueLock struct {
 //
 // The lock is per processing directory, not per database: the race being closed is the
 // recovery sweep, and two runs on separate queues cannot sweep each other. It relies on
-// the filesystem honouring locks, so a queue on an NFSv3 share is not protected.
+// the filesystem honoring locks, so a queue on an NFSv3 share is not protected.
 func LockQueue(dir string) (*QueueLock, error) {
 	// The lock is taken before the engine builds the queue, so on a first run the
 	// directory is not there yet. Same mode as Queue.EnsureDirs, which creates the

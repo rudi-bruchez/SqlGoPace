@@ -4,7 +4,7 @@ package tui
 // classes that are found by walking a type rather than by reading a diff.
 //
 // The class: an action that kills, blocks or destroys, reachable with a weaker gesture
-// than a strictly less harmful neighbour. It is invisible in every diff that built it,
+// than a strictly less harmful neighbor. It is invisible in every diff that built it,
 // because each key handler is a few obviously-correct lines, and it is invisible to TDD,
 // because the test for a key asserts that the key does what it was meant to do. It is
 // visible only in a table of every action next to every gate — which nothing in the
@@ -181,7 +181,7 @@ func drain(actions chan Action, kind ActionKind) (Action, bool) {
 // TestEveryActionIsRanked fails when model.go declares an ActionKind the ledger does not
 // rank. Without it the audit would silently stop covering the console as it grows, which
 // is exactly how the four historical instances shipped: each new destructive action was
-// added on its own, next to correct-looking neighbours.
+// added on its own, next to correct-looking neighbors.
 func TestEveryActionIsRanked(t *testing.T) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "model.go", nil, 0)
@@ -226,7 +226,7 @@ func TestEveryActionIsRanked(t *testing.T) {
 		if !ranked[name] {
 			t.Errorf("%s is declared in model.go but not ranked in this audit's ledger. "+
 				"Add it with the harm it can do and how it is reached: an action nobody "+
-				"ranked is an action nobody compared against its neighbours.", name)
+				"ranked is an action nobody compared against its neighbors.", name)
 		}
 	}
 	for name := range ranked {
@@ -241,7 +241,7 @@ func TestEveryActionIsRanked(t *testing.T) {
 //
 // Stated as a pairwise comparison rather than as "these keys must confirm" on purpose.
 // The defect is never that one key lacks a prompt in the abstract — it is that it lacks
-// one *that its neighbour has*, which is why it survives review: the handler is correct
+// one *that its neighbor has*, which is why it survives review: the handler is correct
 // on its own terms, and only the comparison is wrong.
 func TestNoDestructiveActionIsCheaperThanALesserOne(t *testing.T) {
 	rows := ledger()

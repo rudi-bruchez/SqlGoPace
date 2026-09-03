@@ -14,14 +14,12 @@ import (
 // scriptedBatchDriver returns a scripted BatchDMLResult so the engine's handling of a
 // batch that stopped early can be verified without a database.
 type scriptedBatchDriver struct {
-	result   run.BatchDMLResult
-	err      error
-	calls    int
-	wmCalls  int
-	clearedW bool
+	result run.BatchDMLResult
+	err    error
+	calls  int
 }
 
-func (f *scriptedBatchDriver) Run(_ context.Context, op ddl.BatchDML, _ ddl.ResolvedOptions, _ run.IgnoreSource, wm run.WatermarkStore, _ run.ReactionSink) (run.BatchDMLResult, error) {
+func (f *scriptedBatchDriver) Run(_ context.Context, op ddl.BatchDML, _ ddl.ResolvedOptions, _ run.IgnoreSource, _ run.WatermarkStore, _ run.ReactionSink) (run.BatchDMLResult, error) {
 	f.calls++
 	f.result.Schema, f.result.Table, f.result.Verb = op.Schema, op.Table, op.Verb
 	return f.result, f.err

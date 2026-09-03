@@ -606,7 +606,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// own running DDL: a non-resumable rebuild loses every hour it has done and
 		// starts a rollback that holds the same locks and cannot be interrupted. `x`,
 		// which only costs a foreign session its transaction, was gated in 0.24.0 while
-		// the more destructive neighbour kept firing on one keystroke.
+		// the more destructive neighbor kept firing on one keystroke.
 		m.mode = modeKillDDLConfirm
 	case "d":
 		// Toggle: request a graceful stop, or cancel a pending one. The host performs the
@@ -658,7 +658,7 @@ func (m Model) handleKillDDLConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // asked since 0.28.0; arming terminates every session that later blocks the DDL and
 // matches an app_name / login_name / host_name — an unbounded set, chosen by attribute,
 // for the rest of the run — and fired on one keystroke until the ledger in
-// harm_audit_test.go put it next to its neighbours.
+// harm_audit_test.go put it next to its neighbors.
 func (m Model) handleArmKillConfirmKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if msg.String() == "y" && m.pendingArm.Value != "" {
 		g := m.pendingArm
