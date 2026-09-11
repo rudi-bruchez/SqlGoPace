@@ -683,6 +683,39 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   shares. The boolean `stopped` was chosen instead in v0.17.0 as a sufficient, already-computed
   proxy. Revisit only if field evidence shows the shrink backing off too late or too coarsely.
 
+- [ ] **The amplifying-command allow-list is documented nowhere an operator can read it.**
+  `config.yaml:123` says `commands: []  # empty = the built-in allow-list` and never names the
+  nine verbs. `mssql.DefaultAmplifyingCommands` (`internal/mssql/maintenance.go:42`) was added
+  for exactly that, "for config validation and for documenting the effective set"
+  ([2026-08-03-amplifying-maintenance-victim.md](superpowers/plans/2026-08-03-amplifying-maintenance-victim.md)),
+  and does neither: only its own copy-checking test calls it. It is the `TestNoInertConfigKey`
+  class one step out, a key whose default is unreadable rather than unread. Pick one direction,
+  not both: name the nine verbs in the comment of `config.yaml` *and* its byte-pinned twin
+  `internal/scaffold/assets/config.yaml`, or print the effective set under `--explain`. Then
+  delete the exported function and its copy-only test, which the remaining direction makes dead.
+  Deferred 2026-09-11 because the choice is editorial, about where an operator actually looks.
+
+- [x] **The 2026-09-11 ponytail (over-engineering) audit is closed out.** One of its five
+  findings landed: `writeManifest` in `internal/ddl/edit.go`, where the three manifest-editing
+  functions repeated the same marshal plus atomic-write tail. The report itself was not
+  committed; its four other findings were declined, and the reasoning is here so they are not
+  raised a second time.
+  - `trimLine` to `bytes.IndexAny` (`internal/run/lock.go:120`): three lines against an import,
+    on a loop that does not allocate. Worse, the spec wrote the set as `"\\n\\r\\x00"`, with the
+    backslashes doubled, which searches for `\`, `n`, `r`, `x` and `0`. Applied verbatim it
+    truncates the holder line at the `n` of `on`, and `TestQueueLockExcludesASecondHolder`
+    catches that only when the running process's pid happens to contain a zero.
+  - `sort.Strings` in `Queue.Discover` (`internal/run/queue.go:56`): redundant, `os.ReadDir`
+    does sort by filename. It stays anyway. Those two lines are the local statement of the
+    `010_`/`020_` execution-order contract, and once removed no test can observe their absence:
+    `TestQueueDiscoverSorted` is green either way, since the ordering would then live in the
+    standard library.
+  - the `tui.Program` wrapper (`internal/tui/program.go`): removing it moves the `bubbletea`
+    import into `cmd/sqlgopace/main.go` and rewrites nine signatures there, to save twenty
+    forwarding lines.
+  - deleting `DefaultAmplifyingCommands` on its own: right in isolation, but it is the entry
+    above, which has to be settled first.
+
 ## Iterations still to design / implement
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another

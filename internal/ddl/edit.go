@@ -57,14 +57,7 @@ func AppendIgnoredSession(path string, s IgnoredSession) error {
 		}
 	}
 	m.IgnoreBlockedSessions = append(m.IgnoreBlockedSessions, s)
-	data, err := MarshalManifest(m)
-	if err != nil {
-		return err
-	}
-	if err := fsutil.AtomicWrite(path, data); err != nil {
-		return fmt.Errorf("write manifest %q: %w", path, err)
-	}
-	return nil
+	return writeManifest(path, m)
 }
 
 // sameIgnoredSession reports whether two rules are field-for-field equal (the *int
@@ -106,14 +99,7 @@ func AppendKilledSession(path string, s KilledSession) error {
 		}
 	}
 	m.KillBlockingSessions = append(m.KillBlockingSessions, s)
-	data, err := MarshalManifest(m)
-	if err != nil {
-		return err
-	}
-	if err := fsutil.AtomicWrite(path, data); err != nil {
-		return fmt.Errorf("write manifest %q: %w", path, err)
-	}
-	return nil
+	return writeManifest(path, m)
 }
 
 // sameKilledSession reports whether two kill rules are field-for-field equal, including
@@ -138,6 +124,14 @@ func RemoveKilledSession(path string, s KilledSession) error {
 	if len(m.KillBlockingSessions) == before {
 		return nil // nothing matched: don't rewrite the file
 	}
+	return writeManifest(path, m)
+}
+
+// writeManifest re-renders the manifest and replaces the file at path atomically
+// (temp file + rename), so a concurrent reader (the live reload) never sees a torn
+// file. Rendering goes through MarshalManifest, so comments in the original file are
+// not preserved.
+func writeManifest(path string, m *Manifest) error {
 	data, err := MarshalManifest(m)
 	if err != nil {
 		return err
