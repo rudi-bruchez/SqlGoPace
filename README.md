@@ -44,7 +44,10 @@ mechanism available.
 >   `WAIT_AT_LOW_PRIORITY` are Enterprise/Azure only, so a `rebuild_index` on Standard runs
 >   offline holding `Sch-M` and the reaction hierarchy has one rung left: cancel. A one-minute
 >   block can therefore roll back a fifty-minute rebuild. Size the operations, and the
->   window, accordingly.
+>   window, accordingly. `rebuild_heap` and `alter_column` have no resumable form on any
+>   edition, and `--dry-run` flags every operation in this position. A canceled operation is
+>   retried once by default; in FULL recovery each attempt writes the log again, so set
+>   `max_retry_attempts: 0` for such a campaign and keep log backups running in the window.
 
 ## In short
 

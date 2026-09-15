@@ -190,6 +190,14 @@ type (
 	}
 	// LogMsg appends a narration line.
 	LogMsg struct{ Line string }
+	// LogFullAlertMsg carries the transaction-log-full alarm (run.LogFullAlarm crossing
+	// run.LogFullThresholdPercent). Unlike AlertMsg it REPLACES the current one rather
+	// than appending: a log oscillating across the threshold over a long campaign would
+	// otherwise accumulate alerts without bound and push the sticky failure alerts — the
+	// reason a manifest failed — off the top of the console (H3,
+	// docs/specs/REVIEW-2026-09-15-harm.md). Rendered in its own single slot, alongside
+	// but separate from the AlertMsg list.
+	LogFullAlertMsg struct{ Title string }
 	// ConflictingJobsMsg carries the SQL Agent jobs whose maintenance statements this
 	// run has terminated, for a sticky line above the dashboard. Unlike AlertMsg it
 	// REPLACES the current set rather than appending: the jobs are manifest-scoped, and
@@ -227,6 +235,19 @@ type (
 	KilledMsg struct {
 		SPID  int
 		Login string
+	}
+	// SpaceMsg carries the connected database's file-space snapshot for the header's
+	// third banner line: data files (summed over every ROWS file) and the transaction
+	// log. LogAlert is computed by the sender (the console stays dumb: it renders the
+	// flag, it does not know the threshold that set it) and drives the alert styling on
+	// the log part of the line.
+	SpaceMsg struct {
+		DataMB         int
+		DataFreeMB     int
+		LogBytes       int64
+		LogUsedPercent float64
+		ReuseWait      string
+		LogAlert       bool
 	}
 )
 
@@ -304,20 +325,28 @@ type Model struct {
 	hasShrink       bool
 	spid            int
 	alerts          []AlertMsg
-	blockedBy       BlockedByMsg  // set when our operation is itself blocked (the victim)
-	suspension      SuspensionMsg // cumulative suspension history (how long/often/by whom)
-	kills           map[int]int   // times each blocker SPID was killed (drives the "N× killed" tally)
-	blockers        []Blocker
-	waits           []WaitCategory
-	waitTotalMS     int64
-	conflictJobs    []string
-	cursor          int
-	mode            inputMode
-	notice          string // last host feedback line (e.g. "ignoring SPID 53 …")
-	actions         chan<- Action
-	quitting        bool
+	// logAlert is the transaction-log-full alarm's single slot (latest only, H3): unlike
+	// alerts it never accumulates. hasLogAlert distinguishes "no alert yet" from a
+	// zero-value Title, which a real alarm never sends (LogFullMessage always names a
+	// percent).
+	logAlert     LogFullAlertMsg
+	hasLogAlert  bool
+	blockedBy    BlockedByMsg  // set when our operation is itself blocked (the victim)
+	suspension   SuspensionMsg // cumulative suspension history (how long/often/by whom)
+	kills        map[int]int   // times each blocker SPID was killed (drives the "N× killed" tally)
+	blockers     []Blocker
+	waits        []WaitCategory
+	waitTotalMS  int64
+	conflictJobs []string
+	cursor       int
+	mode         inputMode
+	notice       string // last host feedback line (e.g. "ignoring SPID 53 …")
+	actions      chan<- Action
+	quitting     bool
 
 	server    ServerInfoMsg  // header banner; zero value renders no server line
+	space     SpaceMsg       // header banner's third line: data/log file space
+	hasSpace  bool           // whether a SpaceMsg has arrived yet (before then, no third line)
 	ops       []OperationRow // the running manifest's operations, with live status
 	width     int            // terminal width, from WindowSizeMsg (0 until first resize)
 	height    int            // terminal height, budgets the operations panel so lower panels stay visible
@@ -513,6 +542,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case ServerInfoMsg:
 		m.server = msg
+	case SpaceMsg:
+		m.space = msg
+		m.hasSpace = true
 	case OperationsMsg:
 		m.ops = msg.Ops
 	case StepDoneMsg:
@@ -529,6 +561,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.spid = msg.SPID
 	case AlertMsg:
 		m.alerts = append(m.alerts, msg)
+	case LogFullAlertMsg:
+		m.logAlert = msg
+		m.hasLogAlert = true
 	case KillerArmedMsg:
 		m.killerArmed = msg.Armed
 	case KilledMsg:

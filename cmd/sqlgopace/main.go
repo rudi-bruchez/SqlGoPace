@@ -384,7 +384,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		if useTUI {
 			current = &currentManifest{}
 			fwd = &tuiForwarder{}
-			extra = append(extra, run.WithManifestObserver(current.set), run.WithAlertSink(fwd.alert))
+			extra = append(extra, run.WithManifestObserver(current.set), run.WithAlertSink(fwd.alert), run.WithNoticeSink(fwd.notice))
 		}
 		engine, tempdbConn, berr := buildEngine(runCtx, cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
 		if berr != nil {
@@ -642,11 +642,13 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		run.WithProgress(conn),
 		run.WithWaits(conn),
 		run.WithBlockerReader(conn),
+		run.WithLogWatch(conn, cfg.Monitoring.LogPoll()),
 		run.WithLiveReload(),
 		run.WithResumeCheck(conn),
 		run.WithResumableAborter(conn),
 		run.WithReconnectTimeout(cfg.Monitoring.ReconnectTimeout()),
 		run.WithDatabase(info.Database),
+		run.WithMaxRetries(cfg.Monitoring.MaxRetries()),
 		run.WithShrinkRunner(shrinkRunner),
 		run.WithTempdbShrinkRunner(tempdbShrinkRunner),
 		run.WithBatchDMLRunner(batchRunner),
@@ -1017,6 +1019,7 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, in
 	}
 	gate := newBlockerGate()
 	susp := newSuspensionTracker()
+	logAlarm := run.NewLogFullAlarm()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -1058,6 +1061,16 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, in
 			if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
 				program.Send(waitsMsg(waits))
 			}
+			// Data/log space for the header's third line (see probeSpace for the
+			// best-effort read).
+			if dataFiles, ls, reuseWait, ok := probeSpace(ctx, conn); ok {
+				fire := logAlarm.Observe(ls.UsedPercent)
+				alert := ls.UsedPercent >= run.LogFullThresholdPercent
+				program.Send(spaceMsg(dataFiles, ls, reuseWait, alert))
+				if fire {
+					program.Send(logAlertMsg(ls.UsedPercent, reuseWait))
+				}
+			}
 		}
 	}
 }
@@ -1073,6 +1086,51 @@ func progressMsg(p mssql.Progress) tui.ProgressMsg {
 		msg.Percent = p.PercentComplete
 	}
 	return msg
+}
+
+// probeSpace best-effort reads the data/log space needed for the header's third line
+// (FileSpace, LogSpace, LogReuseWait). Any failed read — a transient connection hiccup —
+// reports ok=false so feedConsole skips this tick's update instead of stopping the feed;
+// the next tick tries again.
+func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, reuseWait string, ok bool) {
+	dataFiles, err := conn.FileSpace(ctx, mssql.FileTypeRows)
+	if err != nil {
+		return nil, mssql.LogSpace{}, "", false
+	}
+	ls, err = conn.LogSpace(ctx)
+	if err != nil {
+		return nil, mssql.LogSpace{}, "", false
+	}
+	reuseWait, err = conn.LogReuseWait(ctx)
+	if err != nil {
+		return nil, mssql.LogSpace{}, "", false
+	}
+	return dataFiles, ls, reuseWait, true
+}
+
+// spaceMsg maps a data-file space reading (summed over every ROWS file — files:all
+// expands over more than one), a transaction-log space reading, and the log's reuse wait
+// to the TUI's header space line. logAlert is computed by the caller (feedConsole, from a
+// run.LogFullAlarm): the TUI applies no threshold of its own.
+func spaceMsg(dataFiles []mssql.FileSpace, logSpace mssql.LogSpace, reuseWait string, logAlert bool) tui.SpaceMsg {
+	var totalMB, freeMB int
+	for _, f := range dataFiles {
+		totalMB += f.SizeMB
+		freeMB += f.FreeMB
+	}
+	return tui.SpaceMsg{
+		DataMB: totalMB, DataFreeMB: freeMB,
+		LogBytes: logSpace.TotalBytes, LogUsedPercent: logSpace.UsedPercent,
+		ReuseWait: reuseWait, LogAlert: logAlert,
+	}
+}
+
+// logAlertMsg builds the single-slot console alert for a transaction log crossing
+// run.LogFullThresholdPercent, naming the percent and what is preventing truncation.
+// It is a LogFullAlertMsg, not an AlertMsg (H3, docs/specs/REVIEW-2026-09-15-harm.md):
+// repeated crossings over a long campaign must replace the alert, not accumulate it.
+func logAlertMsg(usedPercent float64, reuseWait string) tui.LogFullAlertMsg {
+	return tui.LogFullAlertMsg{Title: run.LogFullMessage(usedPercent, reuseWait)}
 }
 
 // waitsMsg categorizes a session's cumulative waits into a TUI message showing
@@ -1159,6 +1217,15 @@ func (f *tuiForwarder) shrink(p run.ShrinkProgress) { f.send(shrinkMsg(p)) }
 // operator sees the reason (e.g. a shrink refused for lack of db_owner) on screen.
 func (f *tuiForwarder) alert(mf run.ManifestFailure) {
 	f.send(tui.AlertMsg{Title: "manifest failed: " + mf.Manifest + " — " + mf.Error, Lines: mf.Details})
+}
+
+// notice forwards the manifest-start rollback-on-cancel notice (CANCEL-ONLY.md §2) to
+// the console as a plain narration line. In TUI mode e.out is io.Discard, so without
+// this the notice reached only the .log — invisible to the operator until after the
+// run (H2, docs/specs/REVIEW-2026-09-15-harm.md). It is a LogMsg, not a sticky AlertMsg:
+// it fires once per manifest and is not a failure to keep pinned above the dashboard.
+func (f *tuiForwarder) notice(line string) {
+	f.send(tui.LogMsg{Line: line})
 }
 
 // stepStatusMsg maps a step event to a console status update. Only the started event
@@ -1433,12 +1500,12 @@ func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl
 	if err != nil {
 		return err
 	}
-	renderPlan(w, path, manifest, planned, explain)
+	renderPlan(w, path, manifest, planned, explain, target, matrix)
 	return nil
 }
 
 // renderPlan prints a manifest's planned operations as runnable, commented T-SQL.
-func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []ddl.PlannedOperation, explain bool) {
+func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []ddl.PlannedOperation, explain bool, target ddl.Target, matrix *ddl.Matrix) {
 	if manifest.Description != "" {
 		fmt.Fprintf(w, "-- manifest: %s — %s\n", source, manifest.Description)
 	} else {
@@ -1471,6 +1538,29 @@ func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []dd
 				fmt.Fprintf(w, "--     %s = %s  (%s)\n", d.Option, d.Value, d.Reason)
 			}
 		}
+		if run.RollbackOnCancel(step) {
+			fmt.Fprintf(w, "--     reaction = cancel only (%s): a cancel under pressure rolls back all work\n",
+				cancelOnlyCause(step, target, matrix))
+		}
 		fmt.Fprintln(w)
 	}
+}
+
+// cancelOnlyCause names why step has no RESUMABLE reaction available, for the
+// dry-run hazard line (CANCEL-ONLY.md §1): the resumable decision's own Reason when
+// one was emitted; otherwise "resumable not supported by <tier> major <n>" when the
+// matrix has a resumable entry for the command (an auto-resolved, unsupported target
+// emits no decision — pickBool marks it not relevant); otherwise "<command> has no
+// RESUMABLE form" when the command has no resumable option at all (e.g. rebuild_heap).
+func cancelOnlyCause(step ddl.PlannedOperation, target ddl.Target, matrix *ddl.Matrix) string {
+	for _, d := range step.Decisions {
+		if d.Option == "resumable" {
+			return d.Reason
+		}
+	}
+	cmd := step.Operation.CommandType()
+	if _, ok := matrix.Rule(cmd, "resumable"); ok {
+		return fmt.Sprintf("resumable not supported by %s major %d", target.Tier, target.MajorVersion)
+	}
+	return cmd + " has no RESUMABLE form"
 }

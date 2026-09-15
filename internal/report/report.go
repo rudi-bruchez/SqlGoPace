@@ -102,6 +102,14 @@ type RunReport struct {
 	Preflight  []CheckLine       `json:"preflight,omitempty"`
 	Operations []OperationReport `json:"operations,omitempty"`
 	Error      string            `json:"error,omitempty"`
+
+	// CancelOnlyNotice is the manifest-start line naming how many planned operations
+	// can only be canceled under pressure (a cancel rolls back all their work), empty
+	// when none can. See docs/specs/CANCEL-ONLY.md §2.
+	CancelOnlyNotice string `json:"cancel_only_notice,omitempty"`
+	// CancelOnlySummary names how many of those were actually canceled, split by
+	// whether a retry saved them, empty when none were. See CANCEL-ONLY.md §3.
+	CancelOnlySummary string `json:"cancel_only_summary,omitempty"`
 }
 
 // Write renders the report as a human summary followed by a JSON block.
@@ -110,6 +118,9 @@ func Write(w io.Writer, r RunReport) error {
 	fmt.Fprintf(w, "manifest: %s\n", r.Manifest)
 	fmt.Fprintf(w, "outcome: %s\n", r.Outcome)
 	fmt.Fprintf(w, "started: %s  finished: %s  duration: %dms\n", r.StartedAt, r.FinishedAt, r.DurationMS)
+	if r.CancelOnlyNotice != "" {
+		fmt.Fprintf(w, "%s\n", r.CancelOnlyNotice)
+	}
 
 	if len(r.Preflight) > 0 {
 		fmt.Fprintln(w, "\npreflight:")
@@ -162,6 +173,9 @@ func Write(w io.Writer, r RunReport) error {
 			}
 			fmt.Fprintf(w, "      %s\n", op.SQL)
 		}
+	}
+	if r.CancelOnlySummary != "" {
+		fmt.Fprintf(w, "\n%s\n", r.CancelOnlySummary)
 	}
 	if r.Error != "" {
 		fmt.Fprintf(w, "\nerror: %s\n", r.Error)

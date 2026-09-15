@@ -26,15 +26,23 @@ func (fakeExpander) RebuildableIndexes(context.Context, string, string) ([]mssql
 }
 
 // seqOpRunner returns errs[i] on call i (nil past the end), so a multi-operation
-// manifest can have specific operations fail while the rest succeed.
+// manifest can have specific operations fail while the rest succeed. Call i first
+// emits cancelsBefore[i] "cancel" reactions, standing in for MonitoredRunner.Run's
+// retried attempts without exercising the real retry loop.
 type seqOpRunner struct {
-	errs  []error
-	calls int
+	errs          []error
+	cancelsBefore []int
+	calls         int
 }
 
-func (f *seqOpRunner) Run(_ context.Context, _ ddl.Operation, _ string, _ run.Capabilities, _ run.ReactionSink) error {
+func (f *seqOpRunner) Run(_ context.Context, _ ddl.Operation, _ string, _ run.Capabilities, sink run.ReactionSink) error {
 	i := f.calls
 	f.calls++
+	if i < len(f.cancelsBefore) {
+		for range f.cancelsBefore[i] {
+			sink(run.ReactionEvent{Kind: "cancel", Detail: "blocking other sessions"})
+		}
+	}
 	if i < len(f.errs) {
 		return f.errs[i]
 	}

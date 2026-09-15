@@ -524,8 +524,23 @@ phase**. We combine them when possible.
 instantaneous → the cost/benefit shifts in favour of `KILL`, and the insistence on RESUMABLE can be
 relaxed. The tool factors the ADR state into the strategy choice.
 
-After a cancellation, we wait until there is no more blocking / the log has dropped, then we
-**retry the same operation** up to `max_retry_attempts` times.
+After a cancellation, we **retry the same operation immediately**, up to `max_retry_attempts`
+times — no wait (superseded 0.34.0; see `docs/specs/CANCEL-ONLY.md`). The rule this replaces —
+"wait until there is no more blocking / the log has dropped, then retry" — was never implemented
+(`MonitoredRunner.Run` has always retried immediately), and for blocking it was vacuous anyway:
+"no more blocking" is read from `BlockingOthers`, which counts only sessions blocked *by our own
+session*, and a cancel already ends that. Field evidence (two run reports, one PAGE-compression
+campaign on Standard) shows the retry is a bet that sometimes pays off and sometimes doesn't, with
+no reliable predictor found among the ones tried (see CANCEL-ONLY.md "Decision: no change to the
+retry") — so the retry itself is left exactly as it was; what changed is that a manifest whose plan
+holds a non-resumable heavy builder now says so before the run and in the report, because a cancel
+on one of those rolls back all its work, not just the wait for a lock.
+
+The retry is still immediate — no wait was added. What changed since 0.34.0 is that every monitored
+statement reads the transaction log as soon as it starts (`pumpSamples` in `internal/run/executor.go`),
+not only on the first `log_poll_seconds` tick, so a retry issued right after a log-pressure cancel is
+re-canceled within seconds instead of running blind against an already-over-cap log for up to
+`log_poll_seconds`.
 
 **Per-operation escape hatch — `options.ignore_blocking: true`.** The whole hierarchy above reacts
 to *blocking* and *log* pressure. Setting `ignore_blocking` on one operation removes **blocking**
@@ -702,6 +717,14 @@ estimated time, rollback % if a KILL is in progress), it enables **manual decisi
   into meaningful buckets — Locking, Data I/O, Transaction log, Parallelism, Memory, CPU &
   scheduling, Page latch (tempdb), Sort & spill I/O, Availability Group, Backup — with a total, so
   the operator sees *what* is slowing the operation.
+- **Header space line**: data-file space (summed over every ROWS file) and transaction-log
+  space (size, percent free, `log_reuse_wait_desc`), refreshed each monitoring poll. At 90%
+  log space used (a fixed constant, not a config key — `run.LogFullThresholdPercent`) the log
+  part switches to the alert style, a sticky console alert fires, and the manifest's `.log`
+  records a `warn` reaction — once per manifest (hysteresis re-arms only once used percent
+  drops back under 85%, `run.LogFullRearmPercent`), independent of `log_max_percent`'s own
+  (lower, configurable) reaction threshold. Seeing it means the log kept filling despite the
+  reaction hierarchy already having acted.
 - Actions (with **explicit confirmation**, clearly distinguishing the targets):
   - `KILL` a specific **user blocker**;
   - `KILL` **our DDL**;

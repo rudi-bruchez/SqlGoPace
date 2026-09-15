@@ -127,6 +127,40 @@ func TestProgressMsgForwardVsRollback(t *testing.T) {
 	}
 }
 
+func TestSpaceMsgSumsDataFilesAcrossFilegroups(t *testing.T) {
+	files := []mssql.FileSpace{
+		{Name: "PRODDB_Data1", SizeMB: 500_000, UsedMB: 450_000, FreeMB: 50_000},
+		{Name: "PRODDB_Data2", SizeMB: 300_000, UsedMB: 270_000, FreeMB: 30_000},
+	}
+	logSpace := mssql.LogSpace{TotalBytes: 64 * 1024 * 1024 * 1024, UsedPercent: 37}
+	msg := spaceMsg(files, logSpace, "LOG_BACKUP", false)
+
+	if msg.DataMB != 800_000 || msg.DataFreeMB != 80_000 {
+		t.Errorf("spaceMsg data = MB:%d FreeMB:%d, want 800000/80000", msg.DataMB, msg.DataFreeMB)
+	}
+	if msg.LogBytes != logSpace.TotalBytes || msg.LogUsedPercent != 37 || msg.ReuseWait != "LOG_BACKUP" {
+		t.Errorf("spaceMsg log fields = %+v, want the passed-through log space and reuse wait", msg)
+	}
+	if msg.LogAlert {
+		t.Errorf("spaceMsg LogAlert = true, want false (caller passed false)")
+	}
+}
+
+func TestSpaceMsgCarriesTheCallerComputedAlertFlag(t *testing.T) {
+	// The TUI is dumb about thresholds: spaceMsg just carries whatever the caller decided.
+	msg := spaceMsg(nil, mssql.LogSpace{UsedPercent: 95}, "ACTIVE_TRANSACTION", true)
+	if !msg.LogAlert {
+		t.Errorf("spaceMsg LogAlert = false, want true (caller passed true)")
+	}
+}
+
+func TestLogAlertMsgNamesPercentAndReuseWait(t *testing.T) {
+	a := logAlertMsg(93.4, "LOG_BACKUP")
+	if !strings.Contains(a.Title, "93") || !strings.Contains(a.Title, "LOG_BACKUP") {
+		t.Errorf("logAlertMsg title = %q, want it to name the percent and the reuse wait", a.Title)
+	}
+}
+
 func TestRunDryRunEnterprise2022(t *testing.T) {
 	var out bytes.Buffer
 	args := []string{"--dry-run", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, exampleManifest}
@@ -237,6 +271,113 @@ operations:
 	}
 	if !strings.Contains(out.String(), "window 01:00–05:00") {
 		t.Errorf("dry-run output missing window annotation:\n%s", out.String())
+	}
+}
+
+// TestDryRunCancelOnlyLineCauses pins the three causes CANCEL-ONLY.md §1 requires, in
+// order: (1) the resumable decision's own Reason when one was emitted (here, a
+// per-operation override); (2) "resumable not supported by <tier> major <n>" when the
+// matrix has a resumable entry for the command but no decision was emitted (Standard,
+// no override — pickBool marks it not relevant); (3) "<command> has no RESUMABLE form"
+// when the matrix has no resumable entry for the command at all (rebuild_heap, on any
+// target).
+func TestDryRunCancelOnlyLineCauses(t *testing.T) {
+	tests := []struct {
+		name  string
+		args  []string
+		yaml  string
+		wants []string
+	}{
+		{
+			name: "per-operation override",
+			args: []string{"--assume-version=16", "--assume-edition=enterprise"},
+			yaml: "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n" +
+				"    options:\n      resumable: false\n",
+			wants: []string{
+				"reaction = cancel only (per-operation override): a cancel under pressure rolls back all work",
+			},
+		},
+		{
+			name: "resumable not supported by target",
+			args: []string{"--assume-version=16", "--assume-edition=standard"},
+			yaml: "operations:\n  - operation: rebuild_index\n    schema: dbo\n    table: T\n    index: IX\n",
+			wants: []string{
+				"reaction = cancel only (resumable not supported by standard major 16): a cancel under pressure rolls back all work",
+			},
+		},
+		{
+			name: "command has no RESUMABLE form",
+			args: []string{"--assume-version=16", "--assume-edition=enterprise"},
+			yaml: "operations:\n  - operation: rebuild_heap\n    schema: dbo\n    table: T\n",
+			wants: []string{
+				"reaction = cancel only (rebuild_heap has no RESUMABLE form): a cancel under pressure rolls back all work",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "m.yaml")
+			if err := os.WriteFile(path, []byte(tt.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			var out bytes.Buffer
+			args := append([]string{"--dry-run", matrixFlag}, tt.args...)
+			args = append(args, path)
+			if err := cli(&out, io.Discard, args); err != nil {
+				t.Fatalf("run(dry-run) error = %v, want nil", err)
+			}
+			got := out.String()
+			for _, w := range tt.wants {
+				if !strings.Contains(got, w) {
+					t.Errorf("dry-run output missing %q\n--- output ---\n%s", w, got)
+				}
+			}
+			// The hazard line is a warning, not an explanation: it must appear even
+			// without --explain (already the case above), and must not depend on it.
+		})
+	}
+}
+
+// TestDryRunCancelOnlyLineAbsent covers the negative side of §1: the hazard line must
+// not appear for a resumable rebuild, a shrink, a batch DML, a reorganize, or an
+// add_column — none of these roll back all their work on cancel.
+func TestDryRunCancelOnlyLineAbsent(t *testing.T) {
+	const yaml = `
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T1
+    index: IX1
+  - operation: shrink
+    type: data
+    targetfreespace: 10%
+  - operation: batch_delete
+    schema: dbo
+    table: AuditLog
+    where:
+      - { column: CreatedAt, op: '<', value: '2024-01-01' }
+  - operation: reorganize_index
+    schema: dbo
+    table: T2
+    index: IX2
+  - operation: add_column
+    schema: dbo
+    table: T3
+    column: C
+    type: BIT
+`
+	path := filepath.Join(t.TempDir(), "m.yaml")
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	// Enterprise 2022: rebuild_index resolves Resumable=true here (auto, supported).
+	args := []string{"--dry-run", "--assume-version=16", "--assume-edition=enterprise", matrixFlag, path}
+	if err := cli(&out, io.Discard, args); err != nil {
+		t.Fatalf("run(dry-run) error = %v, want nil", err)
+	}
+	if strings.Contains(out.String(), "reaction = cancel only") {
+		t.Errorf("dry-run output has the cancel-only hazard line where none is expected:\n%s", out.String())
 	}
 }
 

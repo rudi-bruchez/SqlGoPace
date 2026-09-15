@@ -122,6 +122,15 @@ type BlockerReader interface {
 
 var _ BlockerReader = (*mssql.Conn)(nil)
 
+// LogWatchReader reads transaction-log space and its reuse wait, for the per-manifest
+// log-full watcher (WithLogWatch). *mssql.Conn satisfies it.
+type LogWatchReader interface {
+	LogSpace(ctx context.Context) (mssql.LogSpace, error)
+	LogReuseWait(ctx context.Context) (string, error)
+}
+
+var _ LogWatchReader = (*mssql.Conn)(nil)
+
 // Summary counts the outcome of a ProcessAll run.
 type Summary struct {
 	Done        int
@@ -192,15 +201,19 @@ type Engine struct {
 	amplifierSink    func([]string)              // notified with the distinct conflicting jobs (TUI)
 	manifestObserver func(path string)           // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration               // cadence for narrating held-through ignored sessions
+	logWatch         LogWatchReader              // when set, polls the transaction log for the full alarm
+	logWatchEvery    time.Duration               // poll cadence for the log-full watcher
 	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
 	opListSink       func([]OpInfo)              // full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
+	noticeSink       func(string)                // notified with the manifest-start rollback-on-cancel notice (TUI)
 	compression      CompressionReader           // reads current index compression for the intent: compression skip
 	drain            func() bool                 // reports a requested graceful stop (cancellable DrainFlag)
 	serverClock      ServerClock                 // reads SQL Server local time for manifest windows
 	checkpoint       func(context.Context) error // issues a CHECKPOINT between operations; nil = disabled
 	out              io.Writer
 	failures         []ManifestFailure // accumulated across the run, surfaced in Summary
+	maxRetries       int               // config's monitoring.max_retry_attempts, for the cancel-only notice (WithMaxRetries)
 }
 
 // defaultHoldPoll is how often the engine narrates the ignored sessions it is holding
@@ -303,6 +316,14 @@ func WithOpListSink(f func([]OpInfo)) EngineOption { return func(e *Engine) { e.
 // missing db_owner for a shrink) prominently instead of leaving it only in the .log.
 func WithAlertSink(f func(ManifestFailure)) EngineOption { return func(e *Engine) { e.alertSink = f } }
 
+// WithNoticeSink registers a callback fed the manifest-start rollback-on-cancel notice
+// (CANCEL-ONLY.md §2) whenever one is emitted, so a host that discards e.out — the TUI,
+// where narration would corrupt the console — can still show it (H2,
+// docs/specs/REVIEW-2026-09-15-harm.md: under --tui the notice reached only the .log,
+// invisible until after the run). Without it the notice is unaffected: it still goes to
+// e.out and the report.
+func WithNoticeSink(f func(string)) EngineOption { return func(e *Engine) { e.noticeSink = f } }
+
 // WithCompressionReader lets the engine honor a rebuild's intent: compression by
 // reading an index's current compression and skipping a rebuild already at its target.
 func WithCompressionReader(r CompressionReader) EngineOption {
@@ -363,6 +384,17 @@ func WithManifestObserver(f func(path string)) EngineOption {
 // blocker reader and a session.
 func WithHoldPoll(d time.Duration) EngineOption { return func(e *Engine) { e.holdPoll = d } }
 
+// WithLogWatch arms a per-manifest transaction-log-full alarm (LogFullAlarm): polling r
+// at every, a warn reaction is emitted through the running operation's sink once the log
+// crosses LogFullThresholdPercent, so the run's .log records that the log kept filling
+// despite the reaction hierarchy (log_max_percent, typically lower, has already had its
+// say by then). The alarm is armed once per manifest, not once per operation, so a log
+// that stays over threshold across several operations of the same manifest warns once.
+// Without this option (no reader wired), no watcher runs.
+func WithLogWatch(r LogWatchReader, every time.Duration) EngineOption {
+	return func(e *Engine) { e.logWatch = r; e.logWatchEvery = every }
+}
+
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
 func WithResumeCheck(p ResumableProbe) EngineOption { return func(e *Engine) { e.resumeCheck = p } }
@@ -384,6 +416,12 @@ func WithReconnectTimeout(d time.Duration) EngineOption {
 // the queue for the engine that owns it (spec §17.6). Empty (the default) processes
 // every manifest, regardless of its `database:` field.
 func WithDatabase(name string) EngineOption { return func(e *Engine) { e.database = name } }
+
+// WithMaxRetries tells the engine how many times a canceled operation is retried
+// (config's monitoring.max_retry_attempts), so the manifest-start rollback-on-cancel
+// notice (CANCEL-ONLY.md §2) can name it. It does not change retry behavior — the
+// MonitoredRunner is configured with the same value separately (RunnerConfig.MaxRetries).
+func WithMaxRetries(n int) EngineOption { return func(e *Engine) { e.maxRetries = n } }
 
 // NewEngine wires an Engine over the lifecycle directories and required
 // dependencies; optional behavior is supplied via options.
@@ -589,6 +627,19 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// operations (which would report SUCCESS having executed nothing).
 	resumeFrom = e.reconcileResumePlan(name, st, planned, resumeFrom, resumed)
 
+	// Name the rollback-on-cancel hazard once per manifest, not once per operation
+	// (CANCEL-ONLY.md §2): an 800-operation Standard manifest would otherwise repeat
+	// the same line 800 times. Counted from the resume cursor onward (H7,
+	// docs/specs/REVIEW-2026-09-15-harm.md): an operation already completed in a
+	// previous run is skipped below and is not exposure this run will incur.
+	if notice := rollbackOnCancelNotice(planned[resumeFrom:], e.maxRetries); notice != "" {
+		fmt.Fprintln(e.out, notice)
+		rep.CancelOnlyNotice = notice
+		if e.noticeSink != nil {
+			e.noticeSink(notice)
+		}
+	}
+
 	// Sessions the operator allows to stay blocked, applied to every operation in the
 	// manifest. The regexps were validated at load, so an error here is defensive.
 	ignore, err := e.ignoreSource(name, manifest.IgnoreBlockedSessions)
@@ -635,6 +686,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		captured:   &blockerCapture{},
 		contended:  &contendedCapture{},
 		amplifiers: &amplifierCapture{},
+		logAlarm:   NewLogFullAlarm(),
 		// cursor is the crash-resume watermark: the number of leading operations durably
 		// done. It is advanced and persisted after each completed operation, so a crash —
 		// not just a drain — resumes at the next operation instead of replaying.
@@ -645,7 +697,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			return *out
 		}
 	}
-	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps)
+	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps, r.cancelOnlyFailed)
 }
 
 // checkpointBetween issues the configured CHECKPOINT between two operations. A failure
@@ -683,6 +735,14 @@ type manifestRun struct {
 	captured   *blockerCapture
 	contended  *contendedCapture
 	amplifiers *amplifierCapture
+	// logAlarm is the transaction-log-full hysteresis latch (WithLogWatch), armed once
+	// per manifest so a log that stays over threshold across several operations of the
+	// same manifest warns once, not on every operation.
+	logAlarm *LogFullAlarm
+	// cancelOnlySucceeded and cancelOnlyFailed count rollback-on-cancel operations
+	// (RollbackOnCancel) that recorded at least one "cancel" reaction, split by whether
+	// a retry saved them, for the end-of-run summary (CANCEL-ONLY.md §3).
+	cancelOnlySucceeded, cancelOnlyFailed int
 }
 
 // endRun marks an outcome as terminal for the manifest, so runStep's nil return can
@@ -792,6 +852,12 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	holdDone := make(chan struct{})
 	go func() { defer close(holdDone); e.narrateHeld(holdCtx, r.ignore, sink) }()
 
+	// Watch the transaction log for the full alarm, stopped and joined the same way as
+	// the held-through narrator above. watchLog no-ops when no log watch reader is wired.
+	logWatchCtx, stopLogWatch := context.WithCancel(ctx)
+	logWatchDone := make(chan struct{})
+	go func() { defer close(logWatchDone); e.watchLog(logWatchCtx, r.logAlarm, sink) }()
+
 	// Resumable conflict handling before running the operation:
 	//   - an operation this manifest recorded as leaving its own paused resumable
 	//     continues with ALTER INDEX … RESUME (reusing the server-side progress) instead
@@ -891,6 +957,8 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	// state is read under reactionMu, on a copy, exactly as sink() writes it.
 	stopHold()
 	<-holdDone
+	stopLogWatch()
+	<-logWatchDone
 	waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
 	reactionMu.Lock()
 	opReactions := append([]report.ReactionLine(nil), reactions...)
@@ -946,6 +1014,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 			return endRun(e.finalizeInterrupted(ctx, r.name, r.rep, r.start))
 		}
 		opRep.Outcome = "failed"
+		r.noteCancelOnly(step, opReactions, false)
 		e.emitStep(stepEv.finished("failed", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		if !r.manifest.Continue() {
@@ -984,6 +1053,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	opRep.Outcome = "success"
+	r.noteCancelOnly(step, opReactions, true)
 	e.emitStep(stepEv.finished("success", opDuration(opRep)))
 	r.rep.Operations = append(r.rep.Operations, opRep)
 	// This operation completed, so clear any paused-resumable record it carried (a RESUME
@@ -1158,18 +1228,20 @@ func (e *Engine) finalizeIncomplete(ctx context.Context, name string, rep *repor
 // operations it is a plain success. With some failed operations (only reachable in
 // continue-on-failure mode) it is a PARTIAL run: a recovery manifest is written and
 // the original manifest is routed to failed for the operator to follow up.
-func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+// cancelOnlyFailed is r.cancelOnlyFailed, needed by finalizePartial to decide whether
+// the cancel-only summary should point at the recovery manifest (H4).
+func (e *Engine) finalizeAll(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation, cancelOnlyFailed int) runOutcome {
 	if len(failed) == 0 {
 		return e.finalize(ctx, name, rep, start, true)
 	}
-	return e.finalizePartial(ctx, name, m, rep, start, failed)
+	return e.finalizePartial(ctx, name, m, rep, start, failed, cancelOnlyFailed)
 }
 
 // finalizePartial records a PARTIAL outcome: some operations succeeded and some
 // were quarantined. It moves the original manifest to failed, writes a re-runnable
 // recovery manifest (the failed operations, carrying on_failure: continue) next to
 // it, and reports/records the run like a failure so the exit code reflects it.
-func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation) runOutcome {
+func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manifest, rep *report.RunReport, start time.Time, failed []ddl.Operation, cancelOnlyFailed int) runOutcome {
 	e.stopVictims()
 	e.removeSidecar(name)
 	e.removeInterimLog(name)
@@ -1198,8 +1270,20 @@ func (e *Engine) finalizePartial(ctx context.Context, name string, m *ddl.Manife
 	recovery.Operations = failed
 	recName := name + ".recovery.yaml"
 	rep.Error = fmt.Sprintf("%d of %d operation(s) failed; recovery manifest: %s", len(failed), len(rep.Operations), recName)
-	if err := e.writeRecovery(filepath.Join(e.dirs.Failed, recName), &recovery); err != nil {
-		fmt.Fprintf(e.out, "write recovery manifest %s: %v\n", recName, err)
+	recErr := e.writeRecovery(filepath.Join(e.dirs.Failed, recName), &recovery)
+	if recErr != nil {
+		fmt.Fprintf(e.out, "write recovery manifest %s: %v\n", recName, recErr)
+	}
+	// A rollback-on-cancel failure quarantined here is re-run through the recovery
+	// manifest, not by re-running the original — point the summary at it (CANCEL-ONLY.md
+	// §3). Only when the recovery manifest was actually written AND at least one
+	// rollback-on-cancel operation is why it exists (H4,
+	// docs/specs/REVIEW-2026-09-15-harm.md): rollback-on-cancel operations can all have
+	// recorded a cancel and still succeeded after a retry, leaving CancelOnlySummary
+	// non-empty while some unrelated operation is what actually failed — the recovery
+	// manifest then holds none of the operations the summary is about.
+	if rep.CancelOnlySummary != "" && recErr == nil && cancelOnlyFailed > 0 {
+		rep.CancelOnlySummary += "; recovery manifest: " + recName
 	}
 
 	if err := report.WriteFile(filepath.Join(e.dirs.Failed, name+".log"), *rep); err != nil {
@@ -1755,6 +1839,81 @@ func cancelSafe(op ddl.Operation) bool {
 	default:
 		return false
 	}
+}
+
+// RollbackOnCancel reports whether canceling op under pressure discards all its
+// work: one of the five heavy builders — REBUILD INDEX, REBUILD (heap), CREATE
+// INDEX, ALTER COLUMN, ADD CONSTRAINT — resolved without RESUMABLE. A resumable
+// build is excluded: it pauses under pressure instead of rolling back.
+//
+// Deliberately excluded (see docs/specs/CANCEL-ONLY.md "Definitions"): the shrink,
+// tempdb-shrink and batch-DML drivers, whose cancels keep committed work;
+// reorganize_index / check_db / update_statistics (cancelSafe); and
+// add_column / drop_column / drop_constraint / drop_index, whose common
+// metadata-only cost is the wait for Sch-M, not a rollback — a size-of-data
+// add_column and a clustered drop_index are a known gap.
+//
+// Exported for the dry-run renderer (cmd/sqlgopace), which warns about the hazard
+// before the run; the engine uses it to narrate at manifest start and summarize the
+// cancels at the end.
+func RollbackOnCancel(op ddl.PlannedOperation) bool {
+	if op.Options.Resumable {
+		return false
+	}
+	switch op.Operation.(type) {
+	case ddl.RebuildIndex, ddl.RebuildHeap, ddl.CreateIndex, ddl.AlterColumn, ddl.AddConstraint:
+		return true
+	default:
+		return false
+	}
+}
+
+// rollbackOnCancelNotice renders the manifest-start line naming how many of planned
+// are rollback-on-cancel, or "" when none are (CANCEL-ONLY.md §2).
+func rollbackOnCancelNotice(planned []ddl.PlannedOperation, maxRetries int) string {
+	n := 0
+	for _, p := range planned {
+		if RollbackOnCancel(p) {
+			n++
+		}
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d of %d operation(s) can only be canceled under pressure; a cancel rolls back all their work and is retried up to max_retry_attempts (%d)",
+		n, len(planned), maxRetries)
+}
+
+// hasReactionKind reports whether reactions contains at least one line of kind.
+func hasReactionKind(reactions []report.ReactionLine, kind string) bool {
+	for _, rx := range reactions {
+		if rx.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// noteCancelOnly counts step toward the end-of-run summary when it is rollback-on-cancel
+// and recorded at least one cancel, and refreshes the summary line (CANCEL-ONLY.md §3).
+func (r *manifestRun) noteCancelOnly(step ddl.PlannedOperation, reactions []report.ReactionLine, succeeded bool) {
+	if !RollbackOnCancel(step) || !hasReactionKind(reactions, "cancel") {
+		return
+	}
+	if succeeded {
+		r.cancelOnlySucceeded++
+	} else {
+		r.cancelOnlyFailed++
+	}
+	r.rep.CancelOnlySummary = formatCancelOnlySummary(r.cancelOnlySucceeded, r.cancelOnlyFailed)
+}
+
+// formatCancelOnlySummary renders the end-of-run summary of rollback-on-cancel
+// operations that were canceled under pressure, split by whether a retry saved them
+// (CANCEL-ONLY.md §3).
+func formatCancelOnlySummary(succeeded, failed int) string {
+	return fmt.Sprintf("%d rollback-on-cancel operation(s) were canceled under pressure: %d succeeded after a retry, %d failed",
+		succeeded+failed, succeeded, failed)
 }
 
 // isInterruption reports whether a reaction kind stops the running statement, so

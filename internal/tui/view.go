@@ -95,13 +95,19 @@ func (m Model) View() string {
 	return b.String()
 }
 
-// alertsBlock renders the sticky failure alerts and conflicting-job notices shown
-// above the dashboard, or "" when there are none.
+// alertsBlock renders the sticky failure alerts, the single-slot log-full alarm, and
+// conflicting-job notices shown above the dashboard, or "" when there are none. The
+// log-full alarm is rendered separately from m.alerts (H3, docs/specs/REVIEW-2026-09-15-harm.md):
+// it replaces itself in place instead of accumulating, so it never pushes a failure
+// alert off the top of the console.
 func (m Model) alertsBlock() string {
-	if len(m.alerts) == 0 && len(m.conflictJobs) == 0 {
+	if len(m.alerts) == 0 && !m.hasLogAlert && len(m.conflictJobs) == 0 {
 		return ""
 	}
 	var b strings.Builder
+	if m.hasLogAlert {
+		b.WriteString(alertStyle.Render("⚠ " + m.logAlert.Title))
+	}
 	for _, a := range m.alerts {
 		if b.Len() > 0 {
 			b.WriteByte('\n')
@@ -123,9 +129,10 @@ func (m Model) alertsBlock() string {
 	return b.String()
 }
 
-// serverBanner renders the two-line server-info body of the header's right box, right-aligned
-// to width columns (the box's inner text area) so it hugs the right edge; width <= 0 leaves it
-// unaligned (used before the box width is known).
+// serverBanner renders the server-info body of the header's right box (two lines, plus a
+// third once a SpaceMsg has arrived), right-aligned to width columns (the box's inner text
+// area) so it hugs the right edge; width <= 0 leaves it unaligned (used before the box
+// width is known).
 func (m Model) serverBanner(width int) string {
 	s := m.server
 	body := "server info pending…"
@@ -135,10 +142,33 @@ func (m Model) serverBanner(width int) string {
 			s.Edition, tf(s.ADR), s.Recovery, tf(s.RCSI), tf(s.SnapshotIso))
 		body = l1 + "\n" + l2
 	}
+	if m.hasSpace {
+		body += "\n" + m.spaceLine()
+	}
 	if width <= 0 {
 		return body
 	}
 	return lipgloss.NewStyle().Width(width).Align(lipgloss.Right).Render(body)
+}
+
+// spaceLine renders the header's third line: data-file space (summed over every ROWS
+// file), then the transaction log's size, percent free, and log_reuse_wait_desc. Sizes
+// escalate from MB to GB at 1024 MB (HumanizeMB). The log segment is styled as an alert
+// when the sender says so (SpaceMsg.LogAlert) — the console applies no threshold of its
+// own.
+func (m Model) spaceLine() string {
+	sp := m.space
+	dataFreePct := 0.0
+	if sp.DataMB > 0 {
+		dataFreePct = float64(sp.DataFreeMB) / float64(sp.DataMB) * 100
+	}
+	logMB := int(sp.LogBytes / (1024 * 1024))
+	logFreePct := 100 - sp.LogUsedPercent
+	logSeg := fmt.Sprintf("log %s, %.0f%% free, reuse=%s", HumanizeMB(logMB), logFreePct, sp.ReuseWait)
+	if sp.LogAlert {
+		logSeg = alertStyle.Render(logSeg)
+	}
+	return fmt.Sprintf("data %s, %.1f%% free   %s", HumanizeMB(sp.DataMB), dataFreePct, logSeg)
 }
 
 // minOpsRows is the fewest operation rows the panel ever shows, even on a tiny terminal, so

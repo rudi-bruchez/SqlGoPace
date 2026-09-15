@@ -227,15 +227,27 @@ common thread, and it is why they are grouped rather than filed one by one.
   the cost again. That is what produced the 20 cancellations, and the run report explained each
   one individually (`operation canceled under pressure`) without ever stating the shared cause.
   `Resolve` already knows the edition and already emits `Decision`s; preflight already knows the
-  object's size, and a previous run's measured throughput is in the history DB. The verdict is
-  computable *before the first statement*: "no reaction is available on this target; this
-  operation is expected to exceed the blocking timeout; it will be cancelled".
+  object's size. Predicting whether a *specific* operation will exceed the blocking timeout still
+  needs a previous run's measured throughput, which the history DB does **not** store — `runs`
+  records one duration per manifest, not per operation (see "The history DB is a run ledger"
+  below). The verdict is computable *before the first statement*: "no reaction is available on
+  this target; this operation is expected to exceed the blocking timeout; it will be cancelled".
   *Why it is worth doing rather than documenting:* the operator who most needs it is the one who
   wrote a manifest that looks exactly like a working one. Nothing in the manifest, the `--explain`
   output or the plan distinguishes an operation that will finish from one that structurally
   cannot, and the cost of finding out is hours of production locking for no result.
   *Open question the design has to answer:* what the tool should then do — refuse, warn, or
   reorder. Refusing is wrong for a genuine maintenance window where nothing is writing.
+  **0.34.0 shipped the narration half of this** (`docs/specs/CANCEL-ONLY.md`): a plan holding a
+  rollback-on-cancel operation (a heavy builder with no `RESUMABLE`) says so in `--dry-run`, once
+  at manifest start, and in the run report's summary — naming the cause, and how many were
+  actually canceled and how many a retry saved. It does **not** change `DecideReaction`: every
+  cancel this entry describes still happens exactly as before. The cancel itself — the 2026-09-01
+  production harm review, finding 10 (SEVERE), which proposes not canceling a non-resumable,
+  non-cancel-safe operation on blocking pressure alone and letting `max_block_minutes` be the
+  operator's explicit opt-in to paying for one — is deferred, not rejected, and stays open here:
+  it is a change to the reaction hierarchy that needs its own design (what "hold and narrate" does
+  to the sessions queued behind a Sch-M).
 
 - [ ] **`max_block_minutes` means the opposite thing on a rebuild and on a shrink, under one
   key.** On a shrink, yielding at the cap is nearly free: the pages already moved stay moved and a
@@ -424,6 +436,32 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   writes* below, whose reasoning is better than the finding's and which already corrects the
   claim the finding repeated. Two reviewers have now reached the same wrong conclusion about
   it; read that entry before raising it a third time.
+
+- [ ] **The log-full warning reaches no notifier.** From the 2026-09-15 harm review
+  ([REVIEW-2026-09-15-harm.md](REVIEW-2026-09-15-harm.md), H6): `feedConsole`/`watchLog` fire
+  a log-full alarm (`LogFullAlarm` crossing `LogFullThresholdPercent`) into the console and the
+  `.log`, but `e.notify` only fans a webhook/email out for `pause`/`cancel`/`abort`, so a
+  scheduled unattended run with a notifier configured learns of a filling log only by reading
+  the `.log` afterward. *Why deferred:* on the shipped `log_max_percent: 80`, a notified
+  `cancel` or `pause` has normally already fired by the time the alarm's (higher, fixed) 90%
+  threshold crosses — so the gap mostly matters exactly where H1's retry window used to bite
+  (log pressure surviving a cancel unnoticed), and that window is now closed by the immediate
+  log sample (H1, fixed). *What it needs:* a distinct `log_full` event so
+  `notifications.on_events` can subscribe to it independently of `cancel` — a config surface
+  change (the shipped `config.yaml`, its embedded twin, and the two config audits), not a
+  one-line fix.
+
+- [ ] **Wait for the log to drain before retrying after a log-pressure cancel** (the review's
+  second, narrower fix for H1, `REVIEW-2026-09-15-harm.md`): when a `Cancel` was for
+  `LogOverCap`, have `MonitoredRunner.Run` call the existing `awaitRelief` (bounded by
+  `log_drain_timeout_minutes`) before retrying, instead of retrying immediately. *Why
+  deferred:* the immediate log sample landed instead (`pumpSamples` now reads the log before
+  its ticker loop) and already stops a *blind* retry — a retry after a log-pressure cancel is
+  re-canceled within seconds rather than running for up to `log_poll_seconds`. The user
+  decided not to change the retry policy itself for this pass (see CANCEL-ONLY.md "Decision:
+  no change to the retry", which this note extends). Revisit if FULL-recovery campaigns show
+  retries being repeatedly re-canceled on log pressure rather than succeeding once the log has
+  actually drained — the immediate sample prevents the *outage*, not the wasted retry.
 
 - [ ] **A fourth audit: the statement-executing drivers against the rules that must hold on
   all of them.** Deferred deliberately on 2026-09-03 — the work is wanted, not urgent. What

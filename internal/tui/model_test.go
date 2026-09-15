@@ -264,6 +264,9 @@ func TestModelOperationsWindowsToFitViewport(t *testing.T) {
 	}
 	m, _ = send(m, tui.BlockersMsg{Blockers: []tui.Blocker{{SPID: 58, Login: "app"}}})
 	m, _ = send(m, tui.WaitsMsg{TotalMS: 1000, Categories: []tui.WaitCategory{{Name: "Locking", WaitMS: 1000, Tasks: 3}}})
+	// The header's third line (data/log space) makes the header box taller; the operations
+	// budget is computed from the other blocks' rendered heights, so this must still fit.
+	m, _ = send(m, tui.SpaceMsg{DataMB: 1000, DataFreeMB: 100, LogBytes: 1000 * 1024 * 1024, LogUsedPercent: 95, ReuseWait: "LOG_BACKUP", LogAlert: true})
 	v := m.View()
 
 	// The whole dashboard fits the viewport — the lower, actionable panels are not clipped.
@@ -295,6 +298,69 @@ func TestModelServerBanner(t *testing.T) {
 		if !strings.Contains(v, want) {
 			t.Errorf("server banner missing %q:\n%s", want, v)
 		}
+	}
+}
+
+func TestModelServerBannerNoSpaceLineBeforeFirstMsg(t *testing.T) {
+	// Before any SpaceMsg arrives, the header shows only the two original lines: no
+	// stray "data"/"log" line, and no crash reading zero-value fields.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.ServerInfoMsg{Name: "SQLPROD01", Product: "SQL Server 2022", Database: "PRODDB"})
+	v := m.View()
+	if strings.Contains(v, "data ") || strings.Contains(v, "log ") {
+		t.Errorf("space line should not render before a SpaceMsg arrives:\n%s", v)
+	}
+}
+
+func TestModelServerBannerSpaceLine(t *testing.T) {
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.ServerInfoMsg{Name: "SQLPROD01", Product: "SQL Server 2022", Database: "PRODDB"})
+	m, _ = send(m, tui.SpaceMsg{
+		DataMB: 1_000_000, DataFreeMB: 92_000,
+		LogBytes: 64 * 1024 * 1024 * 1024, LogUsedPercent: 63,
+		ReuseWait: "LOG_BACKUP",
+	})
+	v := m.View()
+	for _, want := range []string{"data 976.6 GB, 9.2% free", "log 64.0 GB, 37% free, reuse=LOG_BACKUP"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("space line missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelServerBannerSpaceLineSmallSizesInMB(t *testing.T) {
+	// Below 1024 MB, sizes stay in MB rather than escalating to a fraction of a GB.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.SpaceMsg{
+		DataMB: 500, DataFreeMB: 100,
+		LogBytes: 200 * 1024 * 1024, LogUsedPercent: 10,
+		ReuseWait: "NOTHING",
+	})
+	v := m.View()
+	for _, want := range []string{"data 500 MB, 20.0% free", "log 200 MB, 90% free, reuse=NOTHING"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("space line missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelServerBannerLogAlertLine(t *testing.T) {
+	// LogAlert is computed by the sender; the model/view render it as-is, no threshold
+	// logic of its own. Regardless of styling (untestable here — lipgloss no-ops
+	// outside a real terminal), the alerted line still carries the same facts.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.SpaceMsg{
+		DataMB: 1000, DataFreeMB: 100,
+		LogBytes: 1000 * 1024 * 1024, LogUsedPercent: 95,
+		ReuseWait: "ACTIVE_TRANSACTION", LogAlert: true,
+	})
+	v := m.View()
+	if !strings.Contains(v, "log 1000 MB, 5% free, reuse=ACTIVE_TRANSACTION") {
+		t.Errorf("alerted space line missing expected facts:\n%s", v)
 	}
 }
 
@@ -411,6 +477,30 @@ func TestModelShowsAlertAndKeepsItSticky(t *testing.T) {
 		if !strings.Contains(v, want) {
 			t.Errorf("View() missing alert %q:\n%s", want, v)
 		}
+	}
+}
+
+// TestModelKeepsOnlyLatestLogFullAlert pins H3 (docs/specs/REVIEW-2026-09-15-harm.md):
+// repeated log-full alerts must not accumulate — only the latest is ever shown — and
+// they must not push failure alerts (the sticky AlertMsg list) out of the way.
+func TestModelKeepsOnlyLatestLogFullAlert(t *testing.T) {
+	m := tui.New("rebuild_heap dbo.T1", nil)
+	m, _ = send(m, tui.AlertMsg{Title: "manifest failed: 020_shrink.yaml — preflight failed"})
+	m, _ = send(m, tui.LogFullAlertMsg{Title: "transaction log 91% full (reuse_wait=LOG_BACKUP)"})
+	m, _ = send(m, tui.LogFullAlertMsg{Title: "transaction log 96% full (reuse_wait=LOG_BACKUP)"})
+
+	v := m.View()
+	if strings.Count(v, "transaction log") != 1 {
+		t.Errorf("View() should show exactly one log-full alert (latest only), got:\n%s", v)
+	}
+	if strings.Contains(v, "91% full") {
+		t.Errorf("View() should show only the latest log-full alert, not the superseded one:\n%s", v)
+	}
+	if !strings.Contains(v, "96% full") {
+		t.Errorf("View() missing the latest log-full alert:\n%s", v)
+	}
+	if !strings.Contains(v, "manifest failed: 020_shrink.yaml") {
+		t.Errorf("the log-full alert must not displace the failure alert:\n%s", v)
 	}
 }
 

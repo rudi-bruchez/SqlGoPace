@@ -67,6 +67,53 @@ func TestWriteHumanAndJSON(t *testing.T) {
 	}
 }
 
+// TestReportRendersCancelOnlyLines pins CANCEL-ONLY.md §2/§3: the manifest-start
+// notice and the end-of-run summary each appear once in the human text and round-trip
+// through the JSON block, same as every other report field.
+func TestReportRendersCancelOnlyLines(t *testing.T) {
+	r := sampleReport()
+	r.CancelOnlyNotice = "1 of 1 operation(s) can only be canceled under pressure; a cancel rolls back all their work and is retried up to max_retry_attempts (1)"
+	r.CancelOnlySummary = "1 rollback-on-cancel operation(s) were canceled under pressure: 1 succeeded after a retry, 0 failed"
+
+	var buf bytes.Buffer
+	if err := report.Write(&buf, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	out := buf.String()
+
+	for _, want := range []string{r.CancelOnlyNotice, r.CancelOnlySummary} {
+		if !strings.Contains(out, want) {
+			t.Errorf("human report missing %q\n%s", want, out)
+		}
+	}
+
+	_, jsonPart, found := strings.Cut(out, report.JSONDelimiter)
+	if !found {
+		t.Fatalf("report has no JSON section")
+	}
+	var got report.RunReport
+	if err := json.Unmarshal([]byte(jsonPart), &got); err != nil {
+		t.Fatalf("JSON section does not parse: %v", err)
+	}
+	if diff := cmp.Diff(r, got); diff != "" {
+		t.Errorf("JSON round-trip mismatch (-want +got):\n%s", diff)
+	}
+}
+
+// TestReportOmitsCancelOnlyLinesWhenEmpty covers the common case (no rollback-on-cancel
+// operation in the manifest, or none canceled): neither line appears.
+func TestReportOmitsCancelOnlyLinesWhenEmpty(t *testing.T) {
+	r := sampleReport()
+	var buf bytes.Buffer
+	if err := report.Write(&buf, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "can only be canceled") || strings.Contains(out, "rollback-on-cancel operation(s) were canceled") {
+		t.Errorf("report has a cancel-only line where none was set:\n%s", out)
+	}
+}
+
 func TestReportRendersContendedPointer(t *testing.T) {
 	r := report.RunReport{
 		Manifest: "020_shrink.yaml",

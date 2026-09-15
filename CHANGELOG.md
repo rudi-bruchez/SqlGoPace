@@ -13,6 +13,30 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.34.0] - 2026-09-15
+
+### Added
+
+- The `--tui` header has a third line under the database and recovery model: data file size
+  and percent free, then log size, percent free and `log_reuse_wait_desc`. At 90 % log used the
+  console raises an alert and the manifest `.log` records a warning; neither repeats until the
+  log drops back under 85 %. The console keeps only the latest log alert, so it never pushes a
+  manifest-failure alert off the screen.
+- Operations a cancel rolls back entirely are named before they run: a non-resumable
+  `rebuild_index`, `rebuild_heap`, `create_index`, `alter_column` or `add_constraint`.
+  `--dry-run` prints the cause on each one, the run counts them at manifest start (in the `.log`
+  and on the console), and the report says how many were canceled under pressure and how many
+  the retry saved, pointing at the recovery manifest when some failed. The retry is unchanged;
+  `docs/configuration.md` says when `max_retry_attempts: 0` is the better setting.
+
+### Fixed
+
+- A monitored statement read the transaction log only on its first `log_poll_seconds` tick
+  (60 s by default). A retry issued right after a log-pressure cancel could write into an
+  over-cap log for that whole interval. The log is now sampled as the statement starts. Found
+  by the harm review in [docs/specs/REVIEW-2026-09-15-harm.md](docs/specs/REVIEW-2026-09-15-harm.md),
+  finding H1.
+
 ## [0.33.0] - 2026-09-03
 
 ### Fixed

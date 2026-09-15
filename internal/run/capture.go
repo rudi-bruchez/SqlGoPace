@@ -85,34 +85,47 @@ func (e *Engine) captureBlockers(ctx context.Context, ignore IgnoreSource, acc *
 	return blocked
 }
 
-// narrateHeld periodically narrates, once each, the ignored sessions our DDL is
-// holding its lock through, so the run log shows we are deliberately blocking them
-// (otherwise it is a silent non-event). It runs for the duration of one operation and
-// is a no-op without a blocker reader, a session, or a positive poll interval.
-func (e *Engine) narrateHeld(ctx context.Context, ignore IgnoreSource, sink ReactionSink) {
-	if e.blockers == nil || e.session == nil || e.holdPoll <= 0 {
+// pollWhileRunning calls poll every interval until ctx is done. It backs the pollers that
+// run for the duration of one operation, stopped and joined by runStep the same way
+// (narrateHeld, watchLog): a positive interval is required, since a zero one disables the
+// poller rather than busy-looping.
+func pollWhileRunning(ctx context.Context, interval time.Duration, poll func()) {
+	if interval <= 0 {
 		return
 	}
-	ticker := time.NewTicker(e.holdPoll)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	seen := make(map[string]bool)
-	spid := e.session.SPID()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			sessions, err := e.blockers.ActiveSessions(ctx)
-			if err != nil {
-				continue
-			}
-			for _, s := range newHeldBlockers(sessions, spid, currentRules(ignore), seen) {
-				sink(ReactionEvent{Kind: "hold", Detail: fmt.Sprintf(
-					"holding the lock through ignored session SPID %d (login=%s host=%s app=%s)",
-					s.SPID, s.Login, s.Host, s.Program)})
-			}
+			poll()
 		}
 	}
+}
+
+// narrateHeld periodically narrates, once each, the ignored sessions our DDL is
+// holding its lock through, so the run log shows we are deliberately blocking them
+// (otherwise it is a silent non-event). It runs for the duration of one operation and
+// is a no-op without a blocker reader, a session, or a positive poll interval.
+func (e *Engine) narrateHeld(ctx context.Context, ignore IgnoreSource, sink ReactionSink) {
+	if e.blockers == nil || e.session == nil {
+		return
+	}
+	seen := make(map[string]bool)
+	spid := e.session.SPID()
+	pollWhileRunning(ctx, e.holdPoll, func() {
+		sessions, err := e.blockers.ActiveSessions(ctx)
+		if err != nil {
+			return
+		}
+		for _, s := range newHeldBlockers(sessions, spid, currentRules(ignore), seen) {
+			sink(ReactionEvent{Kind: "hold", Detail: fmt.Sprintf(
+				"holding the lock through ignored session SPID %d (login=%s host=%s app=%s)",
+				s.SPID, s.Login, s.Host, s.Program)})
+		}
+	})
 }
 
 // newHeldBlockers returns the ignored sessions our DDL (spid) is currently blocking

@@ -708,6 +708,67 @@ func TestNarrateHeldThroughIgnored(t *testing.T) {
 	}
 }
 
+// fakeLogWatchReader returns a fixed used-percent and reuse wait on every read, so a test
+// can drive a sustained high (or low) transaction log without a real connection.
+type fakeLogWatchReader struct {
+	usedPercent float64
+	reuseWait   string
+}
+
+func (f fakeLogWatchReader) LogSpace(context.Context) (mssql.LogSpace, error) {
+	return mssql.LogSpace{UsedPercent: f.usedPercent}, nil
+}
+
+func (f fakeLogWatchReader) LogReuseWait(context.Context) (string, error) {
+	return f.reuseWait, nil
+}
+
+func TestLogWatchWarnsOncePerManifestAcrossOperations(t *testing.T) {
+	// A sustained 95%-full log across a 3-operation manifest must warn exactly once —
+	// the alarm is armed per manifest (manifestRun), not per operation, and the used
+	// percent never drops below the re-arm level here.
+	buf := &syncBuffer{}
+	runner := waitForOutputRunner{buf: buf, sub: "transaction log"}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithLogWatch(fakeLogWatchReader{usedPercent: 95, reuseWait: "LOG_BACKUP"}, 2*time.Millisecond),
+		run.WithOutput(buf))
+	writeOnly(t, dirs, "500_log.yaml", continueManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "500_log.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	out := string(data)
+	if !strings.Contains(out, "reaction: warn") || !strings.Contains(out, "transaction log 95% full (reuse_wait=LOG_BACKUP)") {
+		t.Errorf("log missing the log-full warn:\n%s", out)
+	}
+	if n := strings.Count(out, "reaction: warn"); n != 1 {
+		t.Errorf("warn fired %d times across the manifest's operations, want 1 (armed once per manifest)", n)
+	}
+}
+
+func TestNoLogWatchWiredMeansNoWatcher(t *testing.T) {
+	// Without WithLogWatch, the operation must run and finish normally — watchLog is a
+	// silent no-op, not a hang or a panic.
+	runner := &fakeOpRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_a.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if strings.Contains(string(data), "transaction log") {
+		t.Errorf("no log watch reader wired, but a log-full warn was emitted:\n%s", data)
+	}
+}
+
 func mustExist(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Stat(path); err != nil {

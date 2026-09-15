@@ -112,6 +112,9 @@ evaluated: `RESUMABLE` is refused in `tempdb`, and an offline plan cannot know i
 heading there. The output says so. A manifest that names its own `database:` still gets
 those restrictions applied.
 
+A dry run, and the run's `.log`, also flag the operations whose cancel rolls back all their
+work; see [blocking-and-kills.md](blocking-and-kills.md#rollback-on-cancel-operations).
+
 ## Flags
 
 | Flag | Effect |
@@ -132,6 +135,28 @@ those restrictions applied.
 
 `--tui` replaces the silent run with a live console: the running operation and its
 progress, the sessions it is blocking, the sessions blocking it, and the reaction feed.
+
+The header's right-hand box carries a third line, once the first poll has landed:
+
+```
+data 812.4 GB, 9.2% free   log 64.0 GB, 37% free, reuse=LOG_BACKUP
+```
+
+Data is summed across every ROWS file of the connected database; the log size is the total
+of its log files. Sizes switch from MB to GB at 1024 MB. At 90% log space used, the log part
+switches to the alert style, a sticky console alert names the percent and
+`log_reuse_wait_desc`, and a `warn` is written to the running manifest's `.log`. Neither
+repeats while the log stays high: both re-arm only once it has dropped back under 85%. The
+console alert is tracked per database (a multi-database `--tui` run re-arms it for each
+one), the `.log` warning once per manifest. Two things
+worth knowing about the 90% mark:
+
+- with the shipped `log_max_percent: 80`, the reaction hierarchy has already tried to
+  relieve pressure before the alarm fires — seeing it means the log kept filling *despite*
+  the reaction, not that nothing reacted;
+- the percent is of the log's *current* file size (`used_log_space_in_percent`), which
+  autogrowth can still extend — 90% full is not 90% of the eventual ceiling if the file
+  keeps growing.
 
 | Key | Action |
 |---|---|

@@ -563,7 +563,7 @@ reaction loop does the right thing without new branches in the engine where avoi
 | `reorganize_index` | no (but **incremental**)    | **cancel is safe** — commits incrementally, no rollback storm; retry/skip remaining | cheap |
 | `update_statistics`| no                          | cancel → cheap rollback; retry                  | cheap |
 | `check_db`         | no                          | duration/tempdb-driven; on pressure **KILL** and report (read-only snapshot → nothing to roll back) | cheap |
-| `rebuild_heap`     | no                          | like `rebuild_index` minus pause/resume — WALP/RESUMABLE unavailable, so on pressure: wait then cancel→KILL (and retry) | rollback (rebuilds all NC indexes too) |
+| `rebuild_heap`     | no                          | like `rebuild_index` minus pause/resume — WALP/RESUMABLE unavailable (no matrix entry, on any target), so on pressure: cancel→KILL, retried immediately, no wait (superseded 0.34.0 — see `docs/specs/CANCEL-ONLY.md`) | rollback (rebuilds all NC indexes too) — `run.RollbackOnCancel` flags it, and the engine/dry-run narrate the hazard before it happens |
 
 This is implemented as a `CancelSafe` flag on `run.Capabilities` (alongside `Resumable`, `ADR`), set by
 `cancelSafe(op)` for `reorganize_index` / `check_db` / `update_statistics`. It does **not** change which

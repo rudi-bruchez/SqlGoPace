@@ -21,6 +21,32 @@ what the server is telling us, not by a clock.
 `reorganize_index` has neither of the first two to fall back on, so it paces by cancelling
 and re-issuing the statement, which SQL Server permits without losing progress.
 
+### Rollback-on-cancel operations
+
+For most operation types `reorganize_index`'s trick does not apply: when the target has
+neither `WAIT_AT_LOW_PRIORITY` nor `RESUMABLE` to fall back on, the only reaction left under
+pressure is cancel — and for a heavy builder (`rebuild_index`, `rebuild_heap`, `create_index`,
+`alter_column`, `add_constraint`) run without `RESUMABLE`, a cancel rolls back **all** the work
+done so far, not just the wait for a lock. This is common: it is every offline rebuild on
+Standard, and every ONLINE-but-not-`RESUMABLE` build even on Enterprise (a heap or `ALTER
+COLUMN` rebuild, a `CREATE INDEX` before 2019, `ADD CONSTRAINT` before 2022).
+
+Since 0.34.0, SqlGoPace says so instead of leaving it to be discovered in the `.log`:
+
+- `--dry-run` prints, under every such operation, `-- reaction = cancel only (<cause>): a
+  cancel under pressure rolls back all work` — whether or not `--explain` is set, because it
+  is a hazard, not an explanation.
+- At the start of a run whose plan holds at least one, the console and the `.log` get one line:
+  `N of M operation(s) can only be canceled under pressure; a cancel rolls back all their work
+  and is retried up to max_retry_attempts (K)`.
+- If any of them are actually canceled, the `.log` gets a closing line naming how many, split
+  by whether a retry saved them — and, under `on_failure: continue`, pointing at the
+  `<name>.recovery.yaml` that holds the ones that didn't.
+
+This changes nothing about *when* a cancel happens or whether it is retried — see
+[`max_retry_attempts`](configuration.md#monitoring) for that trade-off and the field evidence
+behind it. It only makes the cost visible before you pay it.
+
 ## The three directions
 
 Three features look alike, share matcher fields, and do opposite things. Getting the

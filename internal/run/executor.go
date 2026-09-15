@@ -299,6 +299,19 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, bl
 		case <-ctx.Done():
 		}
 	}
+	// Take one log sample immediately, before the ticker loop, so a statement never
+	// runs blind to log pressure for up to log_poll_seconds (H1,
+	// docs/specs/REVIEW-2026-09-15-harm.md): without this, a retry issued right after a
+	// log-pressure cancel starts with cur.LogOverCap assumed false and only learns
+	// otherwise on the first tick, writing into an already-over-cap log for the whole
+	// interval. Only the log sample jumps the queue — the blocking path's reaction is
+	// already debounced by blocking_timeout, so an extra immediate blocking poll buys
+	// nothing and would also drive the blocker/victim killers a poll early.
+	if l, err := sampler.Log(ctx); err == nil {
+		cur.LogOverCap = l.OverCap
+		cur.LogReuseWait = l.ReuseWait
+		send()
+	}
 	for {
 		select {
 		case <-ctx.Done():

@@ -99,12 +99,33 @@ when a scheduler launches the binary from somewhere else than you do.
 | `log_max_percent` | required | Log-usage percentage ceiling, 1 to 100. |
 | `blocking_timeout_minutes` | 1 | How long we may block another session before yielding. |
 | `log_drain_timeout_minutes` | 30 | How long to wait for the log to drain before giving up cleanly. |
-| `max_retry_attempts` | 1 | Retries after a *pressure cancel* only. A failing statement is not retried. |
+| `max_retry_attempts` | 1 | Retries after a *pressure cancel* only, immediately — no wait. A failing statement is not retried. |
 | `kill_grace_seconds` | 30 | Grace between cancelling a statement and the fallback `KILL`. |
 | `reconnect_timeout_minutes` | 2 | How long to wait for the server to come back. Two paths use it: re-pinning the execution connection after a statement left it unusable, and deciding whether a lost connection was an interruption or a failure. It does **not** bound the wait for an *abandoned* session to stop — that asks whether our own statement has finished, and is a fixed two minutes. |
 | `checkpoint_between_operations` | false | Issue a `CHECKPOINT` after each operation that has another behind it. Only under SIMPLE recovery, where a `CHECKPOINT` releases log space; under FULL or BULK_LOGGED it frees nothing, so the run warns at startup and issues none. A failed `CHECKPOINT` is reported and does not fail the manifest. |
 
 A poll interval of zero is rejected rather than accepted as a spin loop.
+
+`max_retry_attempts` is a bet, not a safety net, for a **rollback-on-cancel** operation — one of
+the five heavy builders (`rebuild_index`, `rebuild_heap`, `create_index`, `alter_column`,
+`add_constraint`) run without `RESUMABLE`: its cancel rolls back all the work done so far, and the
+retry pays that cost again for no guaranteed return. Field evidence from one PAGE-compression
+campaign on Standard (33 offline rebuilds, `max_retry_attempts: 1`): 44 cancels, all from blocking.
+The retry saved 2 of the 22 retried operations; the other 20 failed on both attempts, paying a
+second cancel and rollback for nothing. Nothing found in that data predicts which retry pays off —
+not the length of the canceled attempt, not the kind of pressure (see
+`docs/specs/CANCEL-ONLY.md`, "Decision: no change to the retry"). Set `max_retry_attempts: 0` when
+a campaign is mostly rollback-on-cancel operations against a server you expect to stay busy: it
+quarantines a blocked operation into the recovery manifest (`on_failure: continue`) after one
+cancel instead of two, halving the time spent failing. Leave it at the default when the manifest is
+mostly resumable rebuilds or cancel-safe operations (`reorganize_index`, `check_db`,
+`update_statistics`), where a cancel is cheap or does not happen at all. Since 0.34.0, a manifest
+holding at least one rollback-on-cancel operation says so before the run (dry run and the run's
+first log line) and reports, per manifest, how many were actually canceled and how many of those
+the retry saved. Also since 0.34.0, every monitored statement reads the transaction log as soon as
+it starts, not only on the next `log_poll_seconds` tick, so a retry issued right after a
+log-pressure cancel is re-canceled within seconds instead of running blind against an
+already-over-cap log for up to `log_poll_seconds`.
 
 ## `preflight`
 
