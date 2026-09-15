@@ -780,6 +780,14 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   WRITELOG/PAGEIOLATCH throttle already exists per driver. Reuses `SessionWaits` / `DiffWaits` /
   `CategorizeWaits`; `internal/tui` does not read them yet.
 
+- [ ] **Object sizes: `OBJECT-SIZES.md` is missing from the tree.** The resumable-pause probe
+  ([OBJECT-SIZES-resume-probe.sql](OBJECT-SIZES-resume-probe.sql)) ran on 2026-09-15 and closed
+  open question 1: the size read returns the source index alone while a rebuild is paused
+  ([OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md)). The design document it answers was
+  never committed, so the three edits the result calls for (close question 1, remove the §5.2
+  exception, add the note that the paused target holds real data-file space) are listed at the
+  end of the analysis. Apply them when the design document is restored.
+
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
