@@ -11,15 +11,15 @@ import (
 
 // RunRecord is one row of run history.
 type RunRecord struct {
-	Manifest    string
-	Outcome     string
-	StartedAt   string
-	FinishedAt  string
-	Operations  int
-	DurationMS  int64
-	PeakBlocked int // most sessions any one operation blocked at once during the run
-	Skipped     int // operations skipped as already-satisfied (intent: compression at target); excludes resume-cursor skips
-	Error       string
+	Manifest     string
+	Outcome      string
+	StartedAt    string
+	FinishedAt   string
+	Operations   int
+	DurationMS   int64
+	PeakBlocked  int // most sessions any one operation blocked at once during the run
+	Skipped      int // operations skipped as already-satisfied (intent: compression at target); excludes resume-cursor skips
+	Error        string
 	SizeBeforeKB int64 // used size of every structure this run measured on both sides, before
 	SizeAfterKB  int64 // ... and after; 0 when nothing was fully measured
 }
