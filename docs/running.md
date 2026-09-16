@@ -226,12 +226,13 @@ which a campaign total does not detect — the de-duplication is per manifest.
 the gain of the operation alone: an `ONLINE` rebuild or a reorganize runs while the workload
 writes, and on a busy table those writes are in the difference.
 
-Four cases print no percentage, deliberately:
+Five cases print no percentage, deliberately:
 
 | Case | What you see |
 | --- | --- |
 | A rebuild that failed or was canceled | `-> unknown`: it rolled back, so there is no new size |
-| A reorganize that was canceled | the real, partial result, marked `partial` — REORGANIZE keeps committed work |
+| A reorganize the tool canceled | the real, partial result, marked `partial` — REORGANIZE keeps committed work |
+| A reorganize stopped by Ctrl+C | `-> unknown`: the compaction it committed is kept, but reading its new size needs the connection you just told the tool to stop using |
 | An index the rebuild re-enabled | `0 KB -> 452.0 MB`: it had no pages to start from |
 | A login without `VIEW DEFINITION` | one `sizes not measured: …` line for the manifest, instead of `unknown` everywhere |
 
@@ -239,7 +240,14 @@ Four cases print no percentage, deliberately:
 covers — how many nonclustered indexes it rebuilds with the heap and how much that adds up to —
 in the `.log`, on stdout, and on the operation's own row in the console, next to `cancel only`
 where both apply. The row keeps its note for the whole run, and is replaced by the size result
-when the operation finishes.
+when the operation finishes. In `--tui` the whole set also appears in its own block above the
+dashboard — replaced at each manifest, and capped at five lines with a `+N more` tail, so a
+campaign full of heaps cannot push a manifest failure off the screen.
+
+When the structures cannot be read — most often a login without `VIEW DEFINITION`, which
+returns no rows rather than an error — the line says the scope is **unknown** instead of saying
+nothing. Silence there would have read as "this rebuild touches only the heap", which is the one
+conclusion the tool cannot support.
 
 ## Stopping a run
 

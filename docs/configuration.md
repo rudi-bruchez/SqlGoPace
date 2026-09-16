@@ -155,8 +155,13 @@ Three limits remain. **`create_index` is not checked**, because the index does n
 and there is nothing to size. **Filegroups are not modelled**: the check sums free space
 across every `ROWS` file in the database, so on a multi-filegroup database it can pass a
 rebuild whose own filegroup is full while another has room. And **the size read is
-optional** — it needs `VIEW DEFINITION` (see [Permissions](permissions.md)); without it the
-object reports as unknown size and the check passes rather than failing the run.
+optional** — it needs `VIEW DEFINITION` (see [Permissions](permissions.md)). Without it the
+object reports an unknown size and the space check **warns**, rather than reporting as
+satisfied a requirement it never verified. The disabled-index check does the opposite and
+**fails**: a login that cannot read index metadata sees zero rows rather than an error, so
+silence there must not be read as an all-clear for a change that cannot be undone. Grant
+`VIEW DEFINITION`, or set `allow_reenable_disabled_indexes: true` to accept the rebuild
+unverified.
 
 ### The `file growth` check
 

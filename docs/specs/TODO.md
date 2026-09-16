@@ -418,6 +418,25 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **A reflection audit for `internal/maint`, in the spirit of `internal/config/audit_test.go`.**
+  From the 2026-09-16 harm review. `HeapMeasurement.DisabledIndexes` shipped parsed, documented by
+  its own comment as deciding the outcome, and populated by nobody: the guard in `DecideHeap` that
+  read it was unreachable in production for a whole release. That is the same defect class
+  `TestNoInertConfigKey` exists to catch — a field a type presents as load-bearing that nothing
+  upstream ever sets — and it survived TDD (every test set the field by hand) and a diff-scoped
+  review (each half is correct on its own). Fixed in `internal/plan/plan.go` for this one field;
+  the audit that would have caught it, and would catch the next one, is not written. It would walk
+  `maint.Input`'s measurement types and fail on a field no planner code path assigns.
+
+- [ ] **`TestTailAndMaintWarningsAreIndependent` is flaky under load.** Seen failing once during
+  the 2026-09-16 verification run (`tailWarn=true maintWarn=false`) under a full `-race ./...`,
+  then green on five consecutive runs of the package alone and two more full-suite passes. It
+  drives goroutines through `sampledOnce` and `newSelfBlockTestRunner`/`runHeld`, so the likely
+  cause is the maintenance warning racing the release rather than a defect in the warning itself.
+  Not chased at the time because nothing in that change touches the shrink driver. A flake that
+  fires once a suite is worse than a failure: it teaches the next reader to re-run rather than
+  look.
+
 - [x] **The 2026-09-03 harm review is closed out** — findings 1, 2, 3 and 4 fixed in 0.33.0
   ([REVIEW-2026-09-03-harm.md](REVIEW-2026-09-03-harm.md); it is a historical record and is
   not updated as items are fixed). Evidence: `(*mssql.Conn).stopOrphan` and its four tests in

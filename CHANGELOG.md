@@ -22,22 +22,35 @@ history, so a report can always name the build that produced it.
   heap rebuild gets one line per structure plus a total; the manifest ends with its own total, and
   `runs.size_before_kb` / `runs.size_after_kb` in the history make a campaign one `SUM`. The figure
   is a net change between two reads: an `ONLINE` rebuild measured under a live workload includes
-  that workload's writes.
+  that workload's writes. A structure measured on only one side is left out of the total, which
+  then reads `total (2 of 3 measured)` rather than silently understating the change.
 - A manifest holding a `rebuild_heap` says before it runs what the statement really covers — how
   many nonclustered indexes it rebuilds with the heap, and how much that is — in the `.log`, on
-  stdout, on the row in the console, and in a connected `--dry-run`.
+  stdout, on the row in the console, and in a connected `--dry-run`. `--tui` shows the set in its
+  own block above the dashboard, replaced at each manifest and capped at five lines, so it cannot
+  push a failure alert off the screen. When the structures cannot be read at all, the tool says the
+  scope is unknown rather than staying silent, which would have read as "nothing else to rewrite".
+- A run says `preflight: checking N operation(s)` before it starts. Preflight reads metadata for
+  every operation, before the monitoring loop exists, so on a manifest expanded to hundreds of
+  operations it was a pause with nothing on screen. The same expanded list is now read once rather
+  than twice: the preflight report carries its structure reads on to the manifest-start scope
+  check, which no longer repeats them seconds later.
 
 ### Fixed
 
 - The preflight data-free-space check sized a heap rebuild from the heap alone. `ALTER TABLE …
   REBUILD` rewrites every nonclustered index of the table in the same statement, so a 5 GB heap
   carrying 20 GB of indexes was checked against 5 GB. It now counts the whole rewrite, as
-  `MAINTENANCE.md` §9 had required since the planner shipped.
+  `MAINTENANCE.md` §9 had required since the planner shipped. A size it cannot read warns instead
+  of passing quietly, so a check configured as required is never reported as satisfied unchecked.
 - A `rebuild_heap` on a table holding a **disabled** nonclustered index now fails preflight. The
   rebuild re-enables that index and rebuilds it without its compression (measured; see
   `docs/specs/OBJECT-SIZES-ANALYSIS.md`), silently undoing a deliberate decision. Migration: set
   `allow_reenable_disabled_indexes: true` on the operation to accept it, or drop the index. The
-  maintenance planner never emits such a rebuild.
+  check fails closed: a login that cannot read index metadata sees zero rows rather than an error,
+  so an unreadable state is refused with both remedies named — grant `VIEW DEFINITION`, or set the
+  key. The maintenance planner never emits such a rebuild, and its analysis trail says why it
+  skipped the heap.
 - The maintenance planner weighed a heap by its **first partition** and ignored its nonclustered
   indexes. `heap.min_size_mb` now compares the heap alone, summed over partitions; `heap.max_size_mb`
   compares heap plus indexes, which is what the statement rewrites. Migration: revisit
