@@ -469,3 +469,36 @@ operations:
 		}
 	}
 }
+
+// TestRebuildHeapAllowReenableDecodes: the key exists on rebuild_heap, and strict decoding
+// still rejects it on an operation that has no such field.
+func TestRebuildHeapAllowReenableDecodes(t *testing.T) {
+	m, err := ddl.ParseManifest(strings.NewReader(`
+operations:
+  - operation: rebuild_heap
+    schema: dbo
+    table: MEASUREMENT
+    allow_reenable_disabled_indexes: true
+`))
+	if err != nil {
+		t.Fatalf("ParseManifest() error = %v", err)
+	}
+	op, ok := m.Operations[0].(ddl.RebuildHeap)
+	if !ok {
+		t.Fatalf("operation = %T, want ddl.RebuildHeap", m.Operations[0])
+	}
+	if !op.AllowReenableDisabledIndexes {
+		t.Error("AllowReenableDisabledIndexes = false, want true")
+	}
+
+	if _, err := ddl.ParseManifest(strings.NewReader(`
+operations:
+  - operation: reorganize_index
+    schema: dbo
+    table: MEASUREMENT
+    index: IX_MEASUREMENT_TS
+    allow_reenable_disabled_indexes: true
+`)); err == nil {
+		t.Error("ParseManifest() accepted the key on reorganize_index, want a strict-decoding error")
+	}
+}

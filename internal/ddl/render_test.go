@@ -139,3 +139,26 @@ func TestMarshalManifestUnannotatedUnchanged(t *testing.T) {
 		t.Errorf("nil-annotated output differs from MarshalManifest")
 	}
 }
+
+// TestRenderRebuildHeapOptIn: the key round-trips when set, and a heap that does not set it
+// renders no key at all (omitempty) — a generated plan must not be noisy with false flags.
+func TestRenderRebuildHeapOptIn(t *testing.T) {
+	with, err := ddl.MarshalManifest(&ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT", AllowReenableDisabledIndexes: true},
+	}})
+	if err != nil {
+		t.Fatalf("MarshalManifest() error = %v", err)
+	}
+	if !strings.Contains(string(with), "allow_reenable_disabled_indexes: true") {
+		t.Errorf("rendered manifest missing the opt-in:\n%s", with)
+	}
+	without, err := ddl.MarshalManifest(&ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"},
+	}})
+	if err != nil {
+		t.Fatalf("MarshalManifest() error = %v", err)
+	}
+	if strings.Contains(string(without), "allow_reenable_disabled_indexes") {
+		t.Errorf("rendered manifest carries the opt-in when unset:\n%s", without)
+	}
+}

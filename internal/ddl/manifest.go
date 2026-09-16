@@ -904,6 +904,13 @@ type RebuildHeap struct {
 	Table           string          `yaml:"table"`
 	DataCompression string          `yaml:"data_compression"`
 	Options         OptionOverrides `yaml:"options"`
+	// AllowReenableDisabledIndexes accepts the one irreversible side effect of a heap
+	// rebuild: ALTER TABLE ... REBUILD rebuilds every nonclustered index of the table,
+	// which re-enables a disabled one and rebuilds it uncompressed ("compression settings
+	// metadata is lost when nonclustered indexes are disabled"). Verified on a server, see
+	// docs/specs/OBJECT-SIZES-ANALYSIS.md. Preflight refuses such a rebuild unless this is
+	// set; the maintenance planner never sets it.
+	AllowReenableDisabledIndexes bool `yaml:"allow_reenable_disabled_indexes,omitempty"`
 }
 
 func (o RebuildHeap) CommandType() string { return "rebuild_heap" }
