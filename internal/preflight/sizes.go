@@ -28,6 +28,16 @@ func SizedOperation(op ddl.Operation) (schema, table string, partition *int, ok 
 	}
 }
 
+// SizeKey identifies one structure-size read: a table, or one of its partitions. A nil
+// partition and partition 0 cannot collide: the partition form always carries a "#",
+// which no bare schema.table key does.
+func SizeKey(schema, table string, partition *int) string {
+	if partition == nil {
+		return schema + "." + table
+	}
+	return fmt.Sprintf("%s.%s#%d", schema, table, *partition)
+}
+
 // Rewritten returns the structures op rewrites, out of one table's sizes.
 //
 // A heap rebuild takes them all: "If the table is a heap, all nonclustered indexes are

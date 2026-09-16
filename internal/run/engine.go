@@ -326,12 +326,13 @@ func WithOpListSink(f func([]OpInfo)) EngineOption { return func(e *Engine) { e.
 // missing db_owner for a shrink) prominently instead of leaving it only in the .log.
 func WithAlertSink(f func(ManifestFailure)) EngineOption { return func(e *Engine) { e.alertSink = f } }
 
-// WithNoticeSink registers a callback fed the manifest-start rollback-on-cancel notice
-// (CANCEL-ONLY.md §2) whenever one is emitted, so a host that discards e.out — the TUI,
-// where narration would corrupt the console — can still show it (H2,
-// docs/specs/REVIEW-2026-09-15-harm.md: under --tui the notice reached only the .log,
-// invisible until after the run). Without it the notice is unaffected: it still goes to
-// e.out and the report.
+// WithNoticeSink registers a callback fed the manifest-start notices — the preflight
+// phase line, then the rollback-on-cancel notice (CANCEL-ONLY.md §2) — so a host that
+// discards e.out — the TUI, where narration would corrupt the console — can still show
+// them (H2, docs/specs/REVIEW-2026-09-15-harm.md: under --tui the notice reached only the
+// .log, invisible until after the run). The sink holds one line at a time, and they are
+// sent in the order they happen, so the later notice replaces the earlier. Without it the
+// notices are unaffected: they still go to e.out and the report.
 func WithNoticeSink(f func(string)) EngineOption { return func(e *Engine) { e.noticeSink = f } }
 
 // WithCompressionReader lets the engine honor a rebuild's intent: compression by
@@ -608,6 +609,16 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalizeWindowClosed(ctx, name, rep, start, windowStopReason(err, "before this run's operations"), nil)
 	}
 
+	// Preflight reads server and object metadata for every operation. On a manifest
+	// expanded to hundreds of operations that is a real pause, and it happens before the
+	// monitoring loop exists, so without this line nothing at all would appear between
+	// the manifest starting and its first operation.
+	pfNotice := fmt.Sprintf("preflight: checking %d operation(s)", len(manifest.Operations))
+	fmt.Fprintln(e.out, pfNotice)
+	if e.noticeSink != nil {
+		e.noticeSink(pfNotice)
+	}
+
 	pfReport, err := e.pf.Check(ctx, manifest)
 	rep.Preflight = checkLines(pfReport)
 	if err != nil {
@@ -645,7 +656,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		if !ok {
 			continue
 		}
-		sizes, err := readSizes(ctx, e.sizes, heap)
+		sizes, err := cachedSizes(ctx, e.sizes, heap, pfReport.Sizes)
 		switch {
 		case e.sizes == nil:
 			// No size reader wired at all (tests, or an engine built without one): there

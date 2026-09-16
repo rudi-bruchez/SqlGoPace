@@ -1130,3 +1130,63 @@ func TestCanceledReorganizeDoesNotReportSizeFailure(t *testing.T) {
 		t.Errorf("log should not report the size-read failure (the read should have been skipped):\n%s", log)
 	}
 }
+
+// TestManifestStartHeapScopeUsesPreflightRead pins H5 (REVIEW-2026-09-16-harm.md): the
+// manifest-start scope loop reuses the structure sizes preflight already read seconds
+// earlier over the same expanded operation list, instead of paying a second unmonitored
+// DMV round trip per heap. The size reader here fails, so a notice naming the real scope
+// can only have come from the preflight report.
+func TestManifestStartHeapScopeUsesPreflightRead(t *testing.T) {
+	cached := preflight.Report{Sizes: map[string][]mssql.StructureSize{
+		"dbo.T1": {
+			{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},
+			{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024 * 1024},
+		},
+	}}
+	sizes := &fakeSizeReader{err: errors.New("permission denied")}
+	var out syncBuffer
+	eng, dirs := setupEngine(t, fakePreflighter{report: cached}, &seqOpRunner{},
+		run.WithSizeReader(sizes), run.WithOutput(&out))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log"))
+	if !strings.Contains(log, "also rebuilds 1 nonclustered index(es) (IX_A): 7.0 GB rewritten in one transaction") {
+		t.Errorf("log missing the scope line built from preflight's read:\n%s", log)
+	}
+	// dbo.T2 is not in the cache, so it still falls back to the reader, which fails.
+	if !strings.Contains(log, "could not be read") {
+		t.Errorf("log missing the fallback read's unreadable notice for the uncached table:\n%s", log)
+	}
+}
+
+// TestPreflightPhaseIsNarrated pins the other half of H5: preflight reads metadata for
+// every operation before the monitoring loop exists, so without a line saying so the
+// console shows nothing between the manifest starting and its first operation.
+func TestPreflightPhaseIsNarrated(t *testing.T) {
+	var out syncBuffer
+	var mu sync.Mutex
+	var notices []string
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{}, run.WithOutput(&out),
+		run.WithNoticeSink(func(s string) {
+			mu.Lock()
+			notices = append(notices, s)
+			mu.Unlock()
+		}))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	want := "preflight: checking 2 operation(s)"
+	if !strings.Contains(out.String(), want) {
+		t.Errorf("stdout missing %q:\n%s", want, out.String())
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(notices) == 0 || notices[0] != want {
+		t.Errorf("notice sink got %v, want it to start with %q", notices, want)
+	}
+}

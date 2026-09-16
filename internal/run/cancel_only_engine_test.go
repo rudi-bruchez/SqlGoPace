@@ -121,26 +121,38 @@ func TestNoticeSinkReceivesManifestStartNotice(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
+	// The sink carries every manifest-start notice in the order they happen, so the
+	// preflight phase line comes first and this one replaces it on screen.
 	want := "2 of 2 operation(s) can only be canceled under pressure; a cancel rolls back all their work and is retried up to max_retry_attempts (3)"
-	if len(notices) != 1 || notices[0] != want {
-		t.Errorf("notice sink got %v, want exactly one notice %q", notices, want)
+	if len(notices) == 0 || notices[len(notices)-1] != want {
+		t.Errorf("notice sink got %v, want it to end with %q", notices, want)
 	}
 }
 
 // TestNoticeSinkNotCalledWhenNoOperationQualifies covers the negative case: a manifest
-// with no rollback-on-cancel operation calls the sink zero times, matching the .log
-// notice's own absence (TestManifestStartNoticeAbsentWhenNoOperationQualifies).
+// with no rollback-on-cancel operation never sends that notice, matching the .log
+// notice's own absence (TestManifestStartNoticeAbsentWhenNoOperationQualifies). Other
+// manifest-start notices still travel on the same sink, so this asserts on content.
 func TestNoticeSinkNotCalledWhenNoOperationQualifies(t *testing.T) {
 	runner := &seqOpRunner{}
-	called := false
+	var mu sync.Mutex
+	var notices []string
 	eng, _ := setupEngine(t, fakePreflighter{}, runner,
-		run.WithNoticeSink(func(string) { called = true }))
+		run.WithNoticeSink(func(s string) {
+			mu.Lock()
+			notices = append(notices, s)
+			mu.Unlock()
+		}))
 
 	if _, err := eng.ProcessAll(context.Background()); err != nil {
 		t.Fatalf("ProcessAll() error = %v", err)
 	}
-	if called {
-		t.Error("notice sink was called where no operation qualifies")
+	mu.Lock()
+	defer mu.Unlock()
+	for _, n := range notices {
+		if strings.Contains(n, "can only be canceled") {
+			t.Errorf("notice sink got %q where no operation qualifies", n)
+		}
 	}
 }
 

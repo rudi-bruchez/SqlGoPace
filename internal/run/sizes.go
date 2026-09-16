@@ -33,6 +33,19 @@ func readSizes(ctx context.Context, r SizeReader, op ddl.Operation) ([]mssql.Str
 	return preflight.Rewritten(op, sizes), nil
 }
 
+// cachedSizes returns preflight's already-paid read for this operation when it has one,
+// and reads otherwise. Preflight ran seconds earlier over the same expanded operation
+// list, so a hit saves an unmonitored DMV round trip per heap; a miss means preflight
+// could not read it either, or did not need to, and the caller still gets a real answer.
+func cachedSizes(ctx context.Context, r SizeReader, op ddl.Operation, cache map[string][]mssql.StructureSize) ([]mssql.StructureSize, error) {
+	if schema, table, partition, ok := preflight.SizedOperation(op); ok {
+		if sizes, hit := cache[preflight.SizeKey(schema, table, partition)]; hit {
+			return preflight.Rewritten(op, sizes), nil
+		}
+	}
+	return readSizes(ctx, r, op)
+}
+
 // sizeLines pairs a before and an after read into the report's lines. A structure present
 // on one side only still gets a line, with SizeUnknown on the missing side; a structure
 // that had no pages before (a disabled index the rebuild re-enabled) is marked.

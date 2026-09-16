@@ -1178,3 +1178,52 @@ func anyCheckContains(rep preflight.Report, sev preflight.Severity, fragment str
 	}
 	return false
 }
+
+// TestReportCarriesTheSizeRead pins H5 (REVIEW-2026-09-16-harm.md): preflight hands on the
+// structure sizes it already paid for, so the engine's manifest-start scope loop does not
+// repeat the same DMV read seconds later, unmonitored and with nothing on the console.
+func TestReportCarriesTheSizeRead(t *testing.T) {
+	structures := []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024},
+		{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024},
+	}
+	p := fakeProber{structures: structures, dataFreeMB: 60000}
+	m := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, m,
+		preflight.Thresholds{RequireDataFreeSpace: true}, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	got, ok := rep.Sizes[preflight.SizeKey("dbo", "MEASUREMENT", nil)]
+	if !ok {
+		t.Fatalf("Report.Sizes = %v, want an entry for dbo.MEASUREMENT", rep.Sizes)
+	}
+	if len(got) != len(structures) {
+		t.Errorf("Report.Sizes entry = %d structures, want %d", len(got), len(structures))
+	}
+}
+
+// TestReportOmitsAnUnreadableSize: only a successful, non-empty read is worth handing on. A
+// missing key must mean "not known", so the engine falls back to reading rather than take an
+// unreadable table for a bare heap.
+func TestReportOmitsAnUnreadableSize(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		p    fakeProber
+	}{
+		{"read error", fakeProber{structuresErr: errors.New("permission denied"), dataFreeMB: 60000}},
+		{"zero rows", fakeProber{structures: nil, dataFreeMB: 60000}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+			rep, err := preflight.Run(context.Background(), tc.p, batchServerInfo, m,
+				preflight.Thresholds{RequireDataFreeSpace: true}, false)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if _, ok := rep.Sizes[preflight.SizeKey("dbo", "MEASUREMENT", nil)]; ok {
+				t.Errorf("Report.Sizes carries an entry for an unreadable table: %v", rep.Sizes)
+			}
+		})
+	}
+}

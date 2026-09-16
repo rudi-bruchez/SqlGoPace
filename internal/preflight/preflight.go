@@ -50,6 +50,13 @@ type Check struct {
 // Report aggregates all checks for one manifest.
 type Report struct {
 	Checks []Check
+	// Sizes holds the structure-size reads this preflight already paid for, keyed by
+	// SizeKey. The engine's manifest-start scope loop needs the same rows seconds later;
+	// without this it pays a second identical DMV round trip per heap, unmonitored and
+	// with nothing on the console. Only successful, non-empty reads are recorded: a
+	// missing key means "not known", which is what makes the engine fall back to reading
+	// rather than mistake an unreadable table for a bare heap.
+	Sizes map[string][]mssql.StructureSize
 }
 
 func (r *Report) add(c Check) { r.Checks = append(r.Checks, c) }
@@ -466,6 +473,17 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 				// the same permission-gap case as a read error, not proof the table has
 				// nothing. Collapse it here so every check below takes its readErr branch.
 				err = fmt.Errorf("no structure rows returned for %s.%s (VIEW DEFINITION may be missing)", schema, table)
+			}
+
+			// Record the read for the engine's manifest-start scope loop, which walks the
+			// same expanded operation list seconds later (ExpandAll runs before preflight,
+			// and before ddl.Plan). Only a successful, non-empty read is worth reusing —
+			// see the H1 handling above, which already routes a zero-row read through err.
+			if err == nil && len(sizes) > 0 {
+				if rep.Sizes == nil {
+					rep.Sizes = map[string][]mssql.StructureSize{}
+				}
+				rep.Sizes[SizeKey(schema, table, partition)] = sizes
 			}
 
 			if needsSpaceCheck {
