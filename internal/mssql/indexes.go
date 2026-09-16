@@ -150,3 +150,30 @@ func (c *Conn) TableStructureSizes(ctx context.Context, schema, table string, pa
 	}
 	return out, rows.Err()
 }
+
+const disabledIndexesSQL = `
+SELECT i.name
+FROM sys.indexes i
+WHERE i.object_id = @object_id AND i.is_disabled = 1 AND i.name IS NOT NULL
+ORDER BY i.index_id;`
+
+// DisabledIndexes lists the disabled indexes of one object. The maintenance planner needs
+// it because its inventory reads sys.dm_db_partition_stats, where a disabled index has no
+// row: disabling a nonclustered index physically deletes its data.
+func (c *Conn) DisabledIndexes(ctx context.Context, objectID int64) ([]string, error) {
+	rows, err := c.pool.QueryContext(ctx, disabledIndexesSQL, sql.Named("object_id", objectID))
+	if err != nil {
+		return nil, fmt.Errorf("disabled indexes for object %d: %w", objectID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan disabled index row: %w", err)
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}

@@ -62,3 +62,37 @@ func TestTableStructureSizesIntegration(t *testing.T) {
 		t.Errorf("missing object returned %d rows, want 0", len(none))
 	}
 }
+
+// TestDisabledIndexesIntegration: the planner needs this because its inventory joins
+// sys.dm_db_partition_stats, where a disabled index has no row at all.
+func TestDisabledIndexesIntegration(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	table := "sqlgopace_disabled_probe"
+	exec(t, conn, ctx, "DROP TABLE IF EXISTS dbo."+table)
+	exec(t, conn, ctx, "CREATE TABLE dbo."+table+" (id INT NOT NULL, v CHAR(50) NOT NULL)")
+	exec(t, conn, ctx, "CREATE INDEX IX_"+table+"_off ON dbo."+table+" (v)")
+	exec(t, conn, ctx, "ALTER INDEX IX_"+table+"_off ON dbo."+table+" DISABLE")
+	t.Cleanup(func() { exec(t, conn, ctx, "DROP TABLE IF EXISTS dbo."+table) })
+
+	inv, err := conn.ObjectInventory(ctx)
+	if err != nil {
+		t.Fatalf("ObjectInventory() error = %v", err)
+	}
+	var objectID int64
+	for _, o := range inv {
+		if o.Table == table && o.Schema == "dbo" {
+			objectID = o.ObjectID
+			break
+		}
+	}
+	if objectID == 0 {
+		t.Fatalf("table %s not found in inventory", table)
+	}
+	got, err := conn.DisabledIndexes(ctx, objectID)
+	if err != nil {
+		t.Fatalf("DisabledIndexes: %v", err)
+	}
+	if len(got) != 1 || got[0] != "IX_"+table+"_off" {
+		t.Errorf("DisabledIndexes() = %v, want one disabled index", got)
+	}
+}
