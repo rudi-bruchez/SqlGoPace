@@ -111,6 +111,43 @@ func TestHeapRebuildSizedFromWholeTable(t *testing.T) {
 	}
 }
 
+// TestZeroRowSizeReadIsTreatedAsUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
+// REVIEW-2026-09-16-harm-agy.md finding 1): metadata visibility filters rows rather than
+// raising when VIEW DEFINITION is missing, so a read that succeeds with zero rows is the
+// same permission-gap case as a read that errors — it must not be read as "the table has
+// nothing". CheckReenabledIndexes must take its readErr branch (Fail), and
+// CheckHeapRebuildScope must not run at all.
+func TestZeroRowSizeReadIsTreatedAsUnreadable(t *testing.T) {
+	p := fakeProber{structures: nil, dataFreeMB: 6000} // success, zero rows: the permission-gap case
+	m := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, m,
+		preflight.Thresholds{RequireDataFreeSpace: true}, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var reenable *preflight.Check
+	for i := range rep.Checks {
+		switch rep.Checks[i].Name {
+		case "heap rebuild re-enables indexes":
+			reenable = &rep.Checks[i]
+		case "heap rebuild scope":
+			t.Errorf("heap rebuild scope check emitted for an unreadable table: %+v", rep.Checks[i])
+		}
+	}
+	if reenable == nil {
+		t.Fatal("no heap rebuild re-enables indexes check emitted")
+	}
+	if reenable.Severity != preflight.Fail {
+		t.Errorf("Severity = %v, want Fail — a zero-row read is unreadable, not proof the table is empty", reenable.Severity)
+	}
+	if !strings.Contains(reenable.Detail, "VIEW DEFINITION") {
+		t.Errorf("Detail = %q, want it to name VIEW DEFINITION as the likely cause", reenable.Detail)
+	}
+	if !strings.Contains(reenable.Detail, "dbo.MEASUREMENT") {
+		t.Errorf("Detail = %q, want it to name the table", reenable.Detail)
+	}
+}
+
 // TestCheckReenabledIndexes pins the guard: a heap rebuild that would re-enable a disabled
 // index fails until the operation opts in, and says what the operator loses.
 func TestCheckReenabledIndexes(t *testing.T) {

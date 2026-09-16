@@ -452,8 +452,17 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 			// A size we cannot read is reported as unknown (0) for the space check, never
 			// as a failed run: sys.dm_db_partition_stats also wants VIEW DEFINITION, which
 			// the documented VIEW SERVER STATE does not imply, so a legitimate login can be
-			// refused it. The disabled-index guard sees the same error directly and warns.
+			// refused it. The disabled-index guard sees the same error directly and, unlike
+			// the space check, fails closed on it (H2) — it guards an irreversible side effect.
 			sizes, err := p.TableStructureSizes(ctx, schema, table, partition)
+			if err == nil && len(sizes) == 0 {
+				// Metadata visibility filters rows rather than raising when VIEW
+				// DEFINITION is missing (H1, REVIEW-2026-09-16-harm.md and
+				// REVIEW-2026-09-16-harm-agy.md finding 1): a success with zero rows is
+				// the same permission-gap case as a read error, not proof the table has
+				// nothing. Collapse it here so every check below takes its readErr branch.
+				err = fmt.Errorf("no structure rows returned for %s.%s (VIEW DEFINITION may be missing)", schema, table)
+			}
 
 			if needsSpaceCheck {
 				spaceSizes := sizes

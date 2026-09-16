@@ -959,3 +959,63 @@ func TestManifestStartHeapScope(t *testing.T) {
 		t.Errorf("OpInfo.Detail = %q, want the rollback-on-cancel marker too (rebuild_heap has no RESUMABLE form)", ops[0][0].Detail)
 	}
 }
+
+// TestManifestStartHeapScopeUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
+// REVIEW-2026-09-16-harm-agy.md finding 1): a read that failed must not be read as "nothing
+// to rewrite" the way it was before — the manifest-start loop used to `continue` silently on
+// err != nil exactly like a genuine bare heap. It must say the scope could not be read,
+// naming the table and the error, on e.out and in the report.
+func TestManifestStartHeapScopeUnreadable(t *testing.T) {
+	sizes := &fakeSizeReader{err: errors.New("permission denied")}
+	var out syncBuffer
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
+		run.WithSizeReader(sizes), run.WithOutput(&out))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "could not be read") || !strings.Contains(out.String(), "permission denied") {
+		t.Errorf("stdout missing the unreadable-scope notice:\n%s", out.String())
+	}
+	log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log"))
+	if !strings.Contains(log, "could not be read") {
+		t.Errorf("log missing the unreadable-scope notice:\n%s", log)
+	}
+}
+
+// TestManifestStartHeapScopeZeroRowsIsUnreadable: a read that succeeds with zero rows is the
+// same permission-gap case as a read error (metadata visibility filters rows rather than
+// raising when VIEW DEFINITION is missing) — it must not be read as "a bare heap".
+func TestManifestStartHeapScopeZeroRowsIsUnreadable(t *testing.T) {
+	sizes := &fakeSizeReader{} // success, zero structures
+	var out syncBuffer
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
+		run.WithSizeReader(sizes), run.WithOutput(&out))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "could not be read") {
+		t.Errorf("stdout missing the unreadable-scope notice for a zero-row read:\n%s", out.String())
+	}
+}
+
+// TestManifestStartHeapScopeBareHeapStaysSilent: a successful read of fewer than two
+// structures is a genuine bare heap (no nonclustered index) — that stays silent, unlike the
+// unreadable cases above.
+func TestManifestStartHeapScopeBareHeapStaysSilent(t *testing.T) {
+	sizes := &fakeSizeReader{sizes: []mssql.StructureSize{{IndexID: 0, TypeDesc: "HEAP", UsedKB: 4000}}}
+	var out syncBuffer
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
+		run.WithSizeReader(sizes), run.WithOutput(&out))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if strings.Contains(out.String(), "could not be read") {
+		t.Errorf("a genuine bare heap must stay silent, not report as unreadable:\n%s", out.String())
+	}
+}

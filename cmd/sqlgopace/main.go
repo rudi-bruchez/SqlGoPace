@@ -1514,9 +1514,11 @@ func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl
 }
 
 // heapScopes reads, for every planned rebuild_heap, the table's structure sizes for the
-// dry run's scope lines, keyed by the operation's index in planned. A nil reader (offline)
-// or a failed read both leave the entry unset; renderPlan/heapScopeLines then fall back to
-// the "not listed offline" wording rather than the dry run failing over a size read.
+// dry run's scope lines, keyed by the operation's index in planned. A nil reader means the
+// dry run is offline, which gets its own wording; connected, a failed or empty read is a
+// different case — the connection works but the read did not, most often a login without
+// VIEW DEFINITION (H1, REVIEW-2026-09-16-harm.md and REVIEW-2026-09-16-harm-agy.md finding
+// 1) — and must not be reported with wording that claims an offline run.
 func heapScopes(ctx context.Context, sizes run.SizeReader, planned []ddl.PlannedOperation) map[int][]string {
 	scopes := map[int][]string{}
 	for i, step := range planned {
@@ -1524,11 +1526,14 @@ func heapScopes(ctx context.Context, sizes run.SizeReader, planned []ddl.Planned
 		if !ok {
 			continue
 		}
-		var structs []mssql.StructureSize
-		if sizes != nil {
-			if s, err := sizes.TableStructureSizes(ctx, heap.Schema, heap.Table, nil); err == nil {
-				structs = s
-			}
+		if sizes == nil {
+			scopes[i] = heapScopeLines(nil, heap.AllowReenableDisabledIndexes)
+			continue
+		}
+		structs, err := sizes.TableStructureSizes(ctx, heap.Schema, heap.Table, nil)
+		if err != nil || len(structs) == 0 {
+			scopes[i] = unreadableHeapScopeLines(heap.Schema, heap.Table, err)
+			continue
 		}
 		if lines := heapScopeLines(structs, heap.AllowReenableDisabledIndexes); len(lines) > 0 {
 			scopes[i] = lines
@@ -1537,9 +1542,23 @@ func heapScopes(ctx context.Context, sizes run.SizeReader, planned []ddl.Planned
 	return scopes
 }
 
+// unreadableHeapScopeLines is the dry run's note for a rebuild_heap when the connection is
+// live but the structure read failed or returned nothing — distinct from the offline
+// wording, which would wrongly claim there is no connection at all.
+func unreadableHeapScopeLines(schema, table string, err error) []string {
+	cause := "no structure rows returned; VIEW DEFINITION may be missing"
+	if err != nil {
+		cause = err.Error()
+	}
+	return []string{fmt.Sprintf(
+		"--     also rebuilds every nonclustered index on the table, and re-enables any disabled one "+
+			"(structure sizes for %s.%s could not be read: %s)", schema, table, cause)}
+}
+
 // heapScopeLines renders the dry run's note under a rebuild_heap: what else the statement
-// rewrites, and the disabled indexes it would re-enable. sizes is nil for an offline dry
-// run or a failed read, where the lines say so instead of guessing.
+// rewrites, and the disabled indexes it would re-enable. sizes is nil only for the
+// genuinely offline dry run (heapScopes never calls this with nil for a failed or empty
+// read while connected), where the lines say so instead of guessing.
 func heapScopeLines(sizes []mssql.StructureSize, allowed bool) []string {
 	if len(sizes) == 0 {
 		return []string{"--     also rebuilds every nonclustered index on the table, and re-enables any disabled one (not listed offline)"}

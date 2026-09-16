@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"github.com/google/go-cmp/cmp"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
@@ -538,5 +540,46 @@ func TestDryRunHeapScopeLinesNoNonclusteredIndex(t *testing.T) {
 	}
 	if lines := heapScopeLines(sizes, false); len(lines) != 0 {
 		t.Errorf("heapScopeLines() = %v, want no lines for a heap with no nonclustered index", lines)
+	}
+}
+
+// fakeDrySizeReader answers TableStructureSizes with a fixed result, for heapScopes tests.
+type fakeDrySizeReader struct {
+	sizes []mssql.StructureSize
+	err   error
+}
+
+func (f fakeDrySizeReader) TableStructureSizes(context.Context, string, string, *int) ([]mssql.StructureSize, error) {
+	return f.sizes, f.err
+}
+
+// TestHeapScopesDistinguishesOfflineFromUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
+// REVIEW-2026-09-16-harm-agy.md finding 1): a failed or empty read while connected must not
+// say "not listed offline" — that claims an offline run while online. The offline wording is
+// reserved for the genuinely offline case, a nil size reader.
+func TestHeapScopesDistinguishesOfflineFromUnreadable(t *testing.T) {
+	planned := []ddl.PlannedOperation{{Operation: ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+
+	offline := heapScopes(context.Background(), nil, planned)
+	if got := strings.Join(offline[0], "\n"); !strings.Contains(got, "not listed offline") {
+		t.Errorf("nil reader (offline) = %q, want the offline wording", got)
+	}
+
+	failed := heapScopes(context.Background(), fakeDrySizeReader{err: errors.New("permission denied")}, planned)
+	got := strings.Join(failed[0], "\n")
+	if strings.Contains(got, "not listed offline") {
+		t.Errorf("failed read while connected = %q, must not claim an offline run", got)
+	}
+	if !strings.Contains(got, "could not be read") || !strings.Contains(got, "permission denied") {
+		t.Errorf("failed read while connected = %q, want it to say the read could not be read and why", got)
+	}
+
+	zeroRows := heapScopes(context.Background(), fakeDrySizeReader{}, planned)
+	got = strings.Join(zeroRows[0], "\n")
+	if strings.Contains(got, "not listed offline") {
+		t.Errorf("zero-row read while connected = %q, must not claim an offline run", got)
+	}
+	if !strings.Contains(got, "could not be read") {
+		t.Errorf("zero-row read while connected = %q, want it to say the sizes could not be read", got)
 	}
 }

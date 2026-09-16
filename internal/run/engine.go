@@ -636,13 +636,26 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			continue
 		}
 		sizes, err := readSizes(ctx, e.sizes, heap)
-		if err != nil || len(sizes) < 2 {
+		switch {
+		case e.sizes == nil:
+			// No size reader wired at all (tests, or an engine built without one): there
+			// is nothing to say, same as before this fix.
 			continue
+		case err != nil || len(sizes) == 0:
+			// A failed read and a zero-row read are the same "cannot tell" case (H1,
+			// REVIEW-2026-09-16-harm.md): say the scope could not be read, rather than
+			// staying silent the way a genuine bare heap does below.
+			notice := heapScopeUnreadableNotice(i+1, heap, err)
+			fmt.Fprintln(e.out, notice)
+			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
+		case len(sizes) < 2:
+			// A successful read of the heap alone: a genuine bare heap, nothing to warn about.
+		default:
+			notice := heapScopeNotice(i+1, heap, sizes)
+			fmt.Fprintln(e.out, notice)
+			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
+			scopes[i] = heapScopeDetail(sizes)
 		}
-		notice := heapScopeNotice(i+1, heap, sizes)
-		fmt.Fprintln(e.out, notice)
-		rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
-		scopes[i] = heapScopeDetail(sizes)
 	}
 
 	// Surface the whole operation list once, so the console can show pending operations
