@@ -57,7 +57,7 @@ func TestCheckDataFreeSpace(t *testing.T) {
 		{"room to spare", 100, 500, preflight.Pass},
 		{"exactly enough", 100, 100, preflight.Pass},
 		{"short", 500, 100, preflight.Fail},
-		{"unknown size does not fail", 0, 100, preflight.Pass},
+		{"unknown size does not fail", 0, 100, preflight.Warn},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -67,6 +67,21 @@ func TestCheckDataFreeSpace(t *testing.T) {
 				t.Errorf("CheckDataFreeSpace(need=%d, free=%d) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCheckDataFreeSpaceUnknownSizeWarns pins H6 (REVIEW-2026-09-16-harm.md): an unread size
+// must not read as PASS on a 400-line .log — it is not "checked and fine", it is "not
+// checked". Still not Fail: the read is documented as optional, and failing here would block
+// every rebuild for a login without VIEW DEFINITION, including where space is plentiful.
+func TestCheckDataFreeSpaceUnknownSizeWarns(t *testing.T) {
+	c := preflight.CheckDataFreeSpace("dbo.MEASUREMENT (heap)", 0, 0,
+		preflight.DataSpace{FreeMB: 412000, GrowthKnown: true})
+	if c.Severity != preflight.Warn {
+		t.Fatalf("Severity = %v, want Warn", c.Severity)
+	}
+	if !strings.Contains(c.Detail, "size could not be read, not checked") {
+		t.Errorf("Detail = %q, want it worded as unchecked rather than passed", c.Detail)
 	}
 }
 

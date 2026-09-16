@@ -147,7 +147,11 @@ func CheckDataFreeSpace(target string, needMB, unsizedDisabled int, sp DataSpace
 	}
 	switch {
 	case needMB <= 0:
-		return Check{name, Pass, fmt.Sprintf("%s: size unknown, not checked (%d MB free in data files)%s", target, freeMB, extra)}
+		// An unread size is not "checked and fine" — it is not checked at all (H6,
+		// REVIEW-2026-09-16-harm.md). Still not Fail: the read is documented as optional,
+		// and failing here would block every rebuild for a login without VIEW DEFINITION,
+		// including where space is plentiful.
+		return Check{name, Warn, fmt.Sprintf("%s: size could not be read, not checked (%d MB free in data files)%s", target, freeMB, extra)}
 	case freeMB >= needMB:
 		return Check{name, Pass, fmt.Sprintf("%s: %d MB free, ~%d MB needed%s", target, freeMB, needMB, extra)}
 	case !sp.GrowthKnown:
