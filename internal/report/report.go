@@ -79,10 +79,14 @@ type OperationReport struct {
 	WaitTotalMS    int64              `json:"wait_total_ms,omitempty"`
 	Shrink         []ShrinkFileReport `json:"shrink,omitempty"`
 	BatchDML       *BatchDMLReport    `json:"batch_dml,omitempty"`
-	Outcome        string             `json:"outcome"`
-	Detail         string             `json:"detail,omitempty"` // context for the outcome, e.g. a skip reason
-	Error          string             `json:"error,omitempty"`
-	DurationMS     int64              `json:"duration_ms"`
+	Sizes          []SizeLine         `json:"sizes,omitempty"`
+	// SizesPartial marks a reorganize that did not succeed but kept its committed work:
+	// the "after" size is real, not the size of a completed operation.
+	SizesPartial bool   `json:"sizes_partial,omitempty"`
+	Outcome      string `json:"outcome"`
+	Detail       string `json:"detail,omitempty"` // context for the outcome, e.g. a skip reason
+	Error        string `json:"error,omitempty"`
+	DurationMS   int64  `json:"duration_ms"`
 }
 
 // CheckLine is one preflight check result.
@@ -110,6 +114,36 @@ type RunReport struct {
 	// CancelOnlySummary names how many of those were actually canceled, split by
 	// whether a retry saved them, empty when none were. See CANCEL-ONLY.md §3.
 	CancelOnlySummary string `json:"cancel_only_summary,omitempty"`
+
+	// HeapScopeNotices records, per rebuild_heap operation, that the rebuild also
+	// rewrites the table's nonclustered indexes — visible in the .log even though the
+	// console-facing warning (preflight's "heap rebuild scope" check) only ever shows
+	// once. See OBJECT-SIZES.md §5.
+	HeapScopeNotices []string `json:"heap_scope_notices,omitempty"`
+	// SizeBeforeKB, SizeAfterKB and SizeStructures are the manifest total from §5.5: one
+	// "before" and one "after" per distinct structure (first measured, last measured),
+	// so a structure touched twice in one manifest is not double-counted.
+	SizeBeforeKB   int64 `json:"size_before_kb,omitempty"`
+	SizeAfterKB    int64 `json:"size_after_kb,omitempty"`
+	SizeStructures int   `json:"size_structures,omitempty"`
+	// SizesUnread names the first size-read failure of the manifest, printed once
+	// instead of "unknown -> unknown" under every operation.
+	SizesUnread string `json:"sizes_unread,omitempty"`
+}
+
+// SizeUnknown marks a side of a size line that was not measured: the read failed, or the
+// operation did not reach the point where that side is meaningful.
+const SizeUnknown int64 = -1
+
+// SizeLine is one structure's used size before and after an operation. Name is "heap" for
+// the heap itself. WasDisabled marks an index the operation re-enabled: it had no pages
+// before, so its growth is real and its "before" is not a shrinkable figure.
+type SizeLine struct {
+	Name        string `json:"name"`
+	Type        string `json:"type"`
+	WasDisabled bool   `json:"was_disabled,omitempty"`
+	BeforeKB    int64  `json:"before_kb"`
+	AfterKB     int64  `json:"after_kb"`
 }
 
 // HumanizeKB renders a size in kilobytes, escalating the unit so large values stay
@@ -129,6 +163,61 @@ func HumanizeKB(kb int64) string {
 	}
 }
 
+// sizeChange renders "before -> after (-p%)", dropping the percentage when either side is
+// unknown or the before size is zero (a re-enabled index grew from nothing; there is no
+// percentage to state).
+func sizeChange(beforeKB, afterKB int64) string {
+	before, after := "unknown", "unknown"
+	if beforeKB != SizeUnknown {
+		before = HumanizeKB(beforeKB)
+	}
+	if afterKB != SizeUnknown {
+		after = HumanizeKB(afterKB)
+	}
+	out := before + " -> " + after
+	if beforeKB > 0 && afterKB != SizeUnknown {
+		out += fmt.Sprintf(" (%+.1f%%)", (float64(afterKB)-float64(beforeKB))/float64(beforeKB)*100)
+	}
+	return out
+}
+
+// renderSizes prints an operation's size lines: one line for a single structure, a block
+// with a total when the operation rewrote several (a heap rebuild).
+func renderSizes(w io.Writer, op OperationReport) {
+	partial := ""
+	if op.SizesPartial {
+		partial = ", partial"
+	}
+	switch len(op.Sizes) {
+	case 0:
+		return
+	case 1:
+		s := op.Sizes[0]
+		fmt.Fprintf(w, "      size: %s %s%s\n", sizeName(s), sizeChange(s.BeforeKB, s.AfterKB), partial)
+		return
+	}
+	fmt.Fprintf(w, "      size (heap and %d nonclustered index(es))%s:\n", len(op.Sizes)-1, partial)
+	var totalBefore, totalAfter int64
+	for _, s := range op.Sizes {
+		fmt.Fprintf(w, "        %-34s %s\n", sizeName(s), sizeChange(s.BeforeKB, s.AfterKB))
+		if s.BeforeKB != SizeUnknown {
+			totalBefore += s.BeforeKB
+		}
+		if s.AfterKB != SizeUnknown {
+			totalAfter += s.AfterKB
+		}
+	}
+	fmt.Fprintf(w, "        %-34s %s\n", "total", sizeChange(totalBefore, totalAfter))
+}
+
+// sizeName names a size line for the .log, marking an index the operation re-enabled.
+func sizeName(s SizeLine) string {
+	if s.WasDisabled {
+		return s.Name + " (was disabled)"
+	}
+	return s.Name
+}
+
 // Write renders the report as a human summary followed by a JSON block.
 func Write(w io.Writer, r RunReport) error {
 	fmt.Fprintln(w, "SqlGoPace run report")
@@ -137,6 +226,9 @@ func Write(w io.Writer, r RunReport) error {
 	fmt.Fprintf(w, "started: %s  finished: %s  duration: %dms\n", r.StartedAt, r.FinishedAt, r.DurationMS)
 	if r.CancelOnlyNotice != "" {
 		fmt.Fprintf(w, "%s\n", r.CancelOnlyNotice)
+	}
+	for _, notice := range r.HeapScopeNotices {
+		fmt.Fprintf(w, "%s\n", notice)
 	}
 
 	if len(r.Preflight) > 0 {
@@ -185,11 +277,18 @@ func Write(w io.Writer, r RunReport) error {
 				}
 				fmt.Fprintln(w)
 			}
+			renderSizes(w, op)
 			if op.Error != "" {
 				fmt.Fprintf(w, "      error: %s\n", op.Error)
 			}
 			fmt.Fprintf(w, "      %s\n", op.SQL)
 		}
+	}
+	if r.SizesUnread != "" {
+		fmt.Fprintf(w, "\nsizes not measured: %s\n", r.SizesUnread)
+	}
+	if r.SizeStructures > 0 {
+		fmt.Fprintf(w, "\nsize: %s over %d structure(s)\n", sizeChange(r.SizeBeforeKB, r.SizeAfterKB), r.SizeStructures)
 	}
 	if r.CancelOnlySummary != "" {
 		fmt.Fprintf(w, "\n%s\n", r.CancelOnlySummary)

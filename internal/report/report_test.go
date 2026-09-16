@@ -160,3 +160,61 @@ func TestHumanizeKB(t *testing.T) {
 		}
 	}
 }
+
+// TestWriteRendersSizes covers the three shapes: one structure, a heap block with a total,
+// and the states that have no percentage (unknown, a re-enabled index that had no pages).
+func TestWriteRendersSizes(t *testing.T) {
+	r := report.RunReport{
+		Manifest: "100_h.yaml", Outcome: "SUCCESS",
+		HeapScopeNotices: []string{"operation 1 rebuild_heap dbo.MEASUREMENT also rebuilds 2 nonclustered index(es)"},
+		Operations: []report.OperationReport{
+			{Index: 1, CommandType: "rebuild_index", Target: "dbo.MEASUREMENT.IX_TS", Outcome: "success",
+				Sizes: []report.SizeLine{{Name: "IX_TS", Type: "NONCLUSTERED", BeforeKB: 2_097_152, AfterKB: 1_468_006}}},
+			{Index: 2, CommandType: "rebuild_heap", Target: "dbo.MEASUREMENT", Outcome: "success",
+				Sizes: []report.SizeLine{
+					{Name: "heap", Type: "HEAP", BeforeKB: 5_242_880, AfterKB: 3_250_586},
+					{Name: "IX_OLD", Type: "NONCLUSTERED", WasDisabled: true, BeforeKB: 0, AfterKB: 462_848},
+					{Name: "IX_TS", Type: "NONCLUSTERED", BeforeKB: 2_097_152, AfterKB: report.SizeUnknown},
+				}},
+		},
+		SizeBeforeKB: 7_340_032, SizeAfterKB: 4_718_592, SizeStructures: 2,
+	}
+	var b strings.Builder
+	if err := report.Write(&b, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	out := b.String()
+	for _, want := range []string{
+		"also rebuilds 2 nonclustered index(es)",
+		"size: IX_TS 2.0 GB -> 1.4 GB (-30.0%)",
+		"size (heap and 2 nonclustered index(es)):",
+		"IX_OLD (was disabled)",
+		"-> unknown",
+		"total",
+		"size: 7.0 GB -> 4.5 GB (-35.7%) over 2 structure(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("report missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "IX_OLD (was disabled)   0 KB -> 452.0 MB (") {
+		t.Error("a structure with no pages before must not get a percentage")
+	}
+}
+
+// TestWriteSizesUnread: when nothing could be measured, the manifest says so once instead
+// of printing "unknown -> unknown" under every operation.
+func TestWriteSizesUnread(t *testing.T) {
+	var b strings.Builder
+	err := report.Write(&b, report.RunReport{
+		Manifest: "100_h.yaml", Outcome: "SUCCESS",
+		SizesUnread: "structure sizes dbo.MEASUREMENT: permission denied",
+		Operations:  []report.OperationReport{{Index: 1, CommandType: "rebuild_index", Outcome: "success"}},
+	})
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if !strings.Contains(b.String(), "sizes not measured: structure sizes dbo.MEASUREMENT: permission denied") {
+		t.Errorf("report missing the manifest-level unread line:\n%s", b.String())
+	}
+}
