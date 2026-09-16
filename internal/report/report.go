@@ -198,16 +198,25 @@ func renderSizes(w io.Writer, op OperationReport) {
 	}
 	fmt.Fprintf(w, "      size (heap and %d nonclustered index(es))%s:\n", len(op.Sizes)-1, partial)
 	var totalBefore, totalAfter int64
+	var measured int
 	for _, s := range op.Sizes {
 		fmt.Fprintf(w, "        %-34s %s\n", sizeName(s), sizeChange(s.BeforeKB, s.AfterKB))
-		if s.BeforeKB != SizeUnknown {
-			totalBefore += s.BeforeKB
+		// Skip a structure unless both sides are known — the same rule sizeTotals.add
+		// (internal/run/sizes.go) uses. Adding a known side on its own lets the total show
+		// growth that is an artifact of a half-measured set rather than a real change (H7,
+		// first bullet, REVIEW-2026-09-16-harm.md).
+		if s.BeforeKB == SizeUnknown || s.AfterKB == SizeUnknown {
+			continue
 		}
-		if s.AfterKB != SizeUnknown {
-			totalAfter += s.AfterKB
-		}
+		totalBefore += s.BeforeKB
+		totalAfter += s.AfterKB
+		measured++
 	}
-	fmt.Fprintf(w, "        %-34s %s\n", "total", sizeChange(totalBefore, totalAfter))
+	label := "total"
+	if measured < len(op.Sizes) {
+		label = fmt.Sprintf("total (%d of %d measured)", measured, len(op.Sizes))
+	}
+	fmt.Fprintf(w, "        %-34s %s\n", label, sizeChange(totalBefore, totalAfter))
 }
 
 // sizeName names a size line for the .log, marking an index the operation re-enabled.

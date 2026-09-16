@@ -190,7 +190,9 @@ func TestWriteRendersSizes(t *testing.T) {
 		"size (heap and 2 nonclustered index(es)):",
 		"IX_OLD (was disabled)",
 		"-> unknown",
-		"total",
+		// IX_TS's after size is unknown, so the total (H7, REVIEW-2026-09-16-harm.md) sums
+		// only heap + IX_OLD (both known) and says it skipped one of the three structures.
+		"total (2 of 3 measured)",
 		"size: 7.0 GB -> 4.5 GB (-35.7%) over 2 structure(s)",
 	} {
 		if !strings.Contains(out, want) {
@@ -199,6 +201,38 @@ func TestWriteRendersSizes(t *testing.T) {
 	}
 	if strings.Contains(out, "IX_OLD (was disabled)   0 KB -> 452.0 MB (") {
 		t.Error("a structure with no pages before must not get a percentage")
+	}
+}
+
+// TestRenderSizesTotalSkipsHalfMeasuredStructures pins H7, first bullet
+// (REVIEW-2026-09-16-harm.md): the total row must use the same rule as sizeTotals.add
+// (internal/run/sizes.go) — skip a structure unless both sides are known — or it can show
+// growth that is an artifact of a half-measured set. When it skips any structure, the total
+// line says so rather than presenting a silently partial number.
+func TestRenderSizesTotalSkipsHalfMeasuredStructures(t *testing.T) {
+	r := report.RunReport{
+		Manifest: "100_h.yaml", Outcome: "SUCCESS",
+		Operations: []report.OperationReport{
+			{Index: 1, CommandType: "rebuild_heap", Target: "dbo.MEASUREMENT", Outcome: "success",
+				Sizes: []report.SizeLine{
+					{Name: "heap", Type: "HEAP", BeforeKB: 1000, AfterKB: 800},
+					{Name: "IX_A", Type: "NONCLUSTERED", BeforeKB: 500, AfterKB: 400},
+					{Name: "IX_B", Type: "NONCLUSTERED", BeforeKB: 2000, AfterKB: report.SizeUnknown},
+				}},
+		},
+	}
+	var b strings.Builder
+	if err := report.Write(&b, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	out := b.String()
+	if !strings.Contains(out, "total (2 of 3 measured)") {
+		t.Errorf("report missing the partial-total marker:\n%s", out)
+	}
+	// heap (1000->800) + IX_A (500->400) = 1500->1200. IX_B's known "before" (2000) must
+	// not inflate the total the way the old unconditional accumulation did.
+	if !strings.Contains(out, "1.5 MB -> 1.2 MB") {
+		t.Errorf("total should sum only the two fully-measured structures:\n%s", out)
 	}
 }
 
