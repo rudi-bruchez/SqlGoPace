@@ -463,6 +463,22 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   retries being repeatedly re-canceled on log pressure rather than succeeding once the log has
   actually drained — the immediate sample prevents the *outage*, not the wasted retry.
 
+- [ ] **A paused resumable rebuild holds a hidden copy that no object-size read shows.** From the
+  resumable-pause probe ([OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md), 2026-09-15): while a
+  1 GB clustered index rebuild was paused at 95.67%, the data file's used space was about twice
+  the table, yet `sys.indexes` and `sys.dm_db_partition_stats` showed the source index alone. The
+  partial target sits under internal index ids visible only through `sys.partitions` joined to
+  `sys.allocation_units`. File-level reads (`FileSpace`) include those pages, so the header and the
+  data-free-space check see the space as used; what does not is anything reasoning from object
+  sizes. Nothing in `internal/preflight` or the shrink driver reads
+  `sys.index_resumable_operations`. *Why deferred:* no failure has been observed, and the question
+  is where it could bite, not how to fix a known defect. *What to check:* a shrink run while a
+  resumable is paused (SqlGoPace pauses by canceling and resumes on the next run, so a drained or
+  crashed manifest can leave one for days) cannot move the hidden target's pages and has no object
+  to name for the stall; the pre-shrink tail-object and heap advisories, which read partition
+  stats, would not point at it. A preflight line naming paused resumables and their `page_count`
+  may be enough.
+
 - [ ] **A fourth audit: the statement-executing drivers against the rules that must hold on
   all of them.** Deferred deliberately on 2026-09-03 — the work is wanted, not urgent. What
   follows is the analysis, so whoever picks it up does not have to re-derive it.

@@ -65,7 +65,10 @@ GO
 
 -------------------------------------------------------------------------------
 -- Step 3 (terminal A): start the resumable rebuild. It blocks this terminal until
--- step 4 pauses it (the statement then returns an error saying it was paused; expected).
+-- step 4 pauses it. This session does not get a "paused" message: it is disconnected with
+-- Msg 1219 ("Your session has been disconnected because of a high priority DDL operation")
+-- and a severity 21 "session is in the kill state" (observed 2026-09-15, see
+-- OBJECT-SIZES-ANALYSIS.md). Expected; reconnect terminal A for step 5.
 -------------------------------------------------------------------------------
 ALTER INDEX CIX_resume_probe ON dbo.sqlgopace_resume_probe
 REBUILD WITH (ONLINE = ON, RESUMABLE = ON);
