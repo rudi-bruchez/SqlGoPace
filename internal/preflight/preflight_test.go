@@ -129,8 +129,21 @@ func TestCheckReenabledIndexes(t *testing.T) {
 	if got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, nil); got.Severity != preflight.Pass {
 		t.Errorf("no disabled index: Severity = %v, want Pass", got.Severity)
 	}
-	if got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, errors.New("permission denied")); got.Severity != preflight.Warn {
-		t.Errorf("unreadable index state: Severity = %v, want Warn (never fail a run on a permission)", got.Severity)
+}
+
+// TestCheckReenabledIndexesFailsClosedOnUnreadableState pins H2 (REVIEW-2026-09-16-harm.md,
+// REVIEW-2026-09-16-harm-agy.md finding 1): a guard against an irreversible side effect must
+// fail closed when it cannot read the state it guards, not warn and let the run proceed. The
+// detail must name both ways out: the missing permission, and the explicit opt-in.
+func TestCheckReenabledIndexesFailsClosedOnUnreadableState(t *testing.T) {
+	got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, errors.New("permission denied"))
+	if got.Severity != preflight.Fail {
+		t.Fatalf("unreadable index state: Severity = %v, want Fail — a guard that cannot run must stop, not shrug", got.Severity)
+	}
+	for _, want := range []string{"VIEW DEFINITION", "allow_reenable_disabled_indexes"} {
+		if !strings.Contains(got.Detail, want) {
+			t.Errorf("Detail = %q, want it to name %q as a way out", got.Detail, want)
+		}
 	}
 }
 
