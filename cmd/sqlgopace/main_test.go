@@ -502,3 +502,41 @@ func TestSPIDAnnouncerFollowsTheExecutionSession(t *testing.T) {
 		t.Errorf("observe(88) = (%+v, %v), want the re-pinned session announced", msg, ok)
 	}
 }
+
+// TestDryRunHeapScopeLines: connected, the dry run lists what else the heap rebuild
+// rewrites and warns about a disabled index; offline it says it cannot list them.
+func TestDryRunHeapScopeLines(t *testing.T) {
+	sizes := []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},
+		{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024 * 1024},
+		{IndexID: 3, Name: "IX_OLD", TypeDesc: "NONCLUSTERED", Disabled: true},
+	}
+	got := strings.Join(heapScopeLines(sizes, false), "\n")
+	for _, want := range []string{
+		"also rebuilds 2 nonclustered index(es): IX_A 2.0 GB, IX_OLD 0 KB",
+		"7.0 GB rewritten",
+		"re-enables disabled index IX_OLD without its compression",
+		"allow_reenable_disabled_indexes",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("dry-run heap lines missing %q:\n%s", want, got)
+		}
+	}
+	if allowed := strings.Join(heapScopeLines(sizes, true), "\n"); !strings.Contains(allowed, "allowed by allow_reenable_disabled_indexes") {
+		t.Errorf("opted-in wording missing:\n%s", allowed)
+	}
+	if offline := strings.Join(heapScopeLines(nil, false), "\n"); !strings.Contains(offline, "not listed offline") {
+		t.Errorf("offline wording missing:\n%s", offline)
+	}
+}
+
+// TestDryRunHeapScopeLinesNoNonclusteredIndex: a heap alone (no nonclustered index)
+// gets no extra line — there is nothing else the rebuild touches to report.
+func TestDryRunHeapScopeLinesNoNonclusteredIndex(t *testing.T) {
+	sizes := []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},
+	}
+	if lines := heapScopeLines(sizes, false); len(lines) != 0 {
+		t.Errorf("heapScopeLines() = %v, want no lines for a heap with no nonclustered index", lines)
+	}
+}

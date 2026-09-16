@@ -166,7 +166,13 @@ func dryRunAll(ctx context.Context, stdout io.Writer, manifests []string, visite
 			}
 			ex = c
 		}
-		if err := dryRunManifest(ctx, stdout, path, manifest, base.InDatabase(manifest.Database), matrix, policy, explain, ex); err != nil {
+		// ex is the connection (nil offline); it is also the size reader, so reuse it
+		// rather than opening a second one (OBJECT-SIZES.md §4).
+		var sizes run.SizeReader
+		if sr, ok := ex.(run.SizeReader); ok {
+			sizes = sr
+		}
+		if err := dryRunManifest(ctx, stdout, path, manifest, base.InDatabase(manifest.Database), matrix, policy, explain, ex, sizes); err != nil {
 			return err
 		}
 	}
@@ -643,6 +649,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		run.WithWaits(conn),
 		run.WithBlockerReader(conn),
 		run.WithLogWatch(conn, cfg.Monitoring.LogPoll()),
+		run.WithSizeReader(conn),
 		run.WithLiveReload(),
 		run.WithResumeCheck(conn),
 		run.WithResumableAborter(conn),
@@ -1186,7 +1193,7 @@ func (f *tuiForwarder) send(msg any) {
 // or its terminal outcome (as a StepDoneMsg, so the operations panel can mark it DONE/FAILED).
 func (f *tuiForwarder) step(ev run.StepEvent) {
 	if ev.Phase == run.StepFinished {
-		f.send(tui.StepDoneMsg{Index: ev.Index, Outcome: ev.Outcome})
+		f.send(tui.StepDoneMsg{Index: ev.Index, Outcome: ev.Outcome, Detail: ev.Detail})
 		return
 	}
 	if msg, ok := stepStatusMsg(ev); ok {
@@ -1198,7 +1205,7 @@ func (f *tuiForwarder) step(ev run.StepEvent) {
 func (f *tuiForwarder) ops(list []run.OpInfo) {
 	rows := make([]tui.OperationRow, len(list))
 	for i, o := range list {
-		rows[i] = tui.OperationRow{Index: o.Index, Label: opLabel(o.Command, o.Target), Status: "TO RUN"}
+		rows[i] = tui.OperationRow{Index: o.Index, Label: opLabel(o.Command, o.Target), Status: "TO RUN", Detail: o.Detail}
 	}
 	f.send(tui.OperationsMsg{Ops: rows})
 }
@@ -1487,8 +1494,10 @@ func visitedFlags(fs *flag.FlagSet) map[string]bool {
 }
 
 // dryRunManifest loads, optionally expands ALL rebuilds, plans, and renders one
-// manifest to w. expander is nil for an offline dry-run.
-func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl.Manifest, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool, expander run.IndexExpander) error {
+// manifest to w. expander is nil for an offline dry-run; sizes is nil the same way,
+// which is also what a failed size read falls back to (OBJECT-SIZES.md §4) — a dry
+// run must never fail because a size could not be read.
+func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl.Manifest, target ddl.Target, matrix *ddl.Matrix, policy ddl.Policy, explain bool, expander run.IndexExpander, sizes run.SizeReader) error {
 	var err error
 	if expander != nil {
 		manifest, err = run.ExpandAll(ctx, expander, manifest)
@@ -1500,12 +1509,70 @@ func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl
 	if err != nil {
 		return err
 	}
-	renderPlan(w, path, manifest, planned, explain, target, matrix)
+	renderPlan(w, path, manifest, planned, explain, target, matrix, heapScopes(ctx, sizes, planned))
 	return nil
 }
 
-// renderPlan prints a manifest's planned operations as runnable, commented T-SQL.
-func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []ddl.PlannedOperation, explain bool, target ddl.Target, matrix *ddl.Matrix) {
+// heapScopes reads, for every planned rebuild_heap, the table's structure sizes for the
+// dry run's scope lines, keyed by the operation's index in planned. A nil reader (offline)
+// or a failed read both leave the entry unset; renderPlan/heapScopeLines then fall back to
+// the "not listed offline" wording rather than the dry run failing over a size read.
+func heapScopes(ctx context.Context, sizes run.SizeReader, planned []ddl.PlannedOperation) map[int][]string {
+	scopes := map[int][]string{}
+	for i, step := range planned {
+		heap, ok := step.Operation.(ddl.RebuildHeap)
+		if !ok {
+			continue
+		}
+		var structs []mssql.StructureSize
+		if sizes != nil {
+			if s, err := sizes.TableStructureSizes(ctx, heap.Schema, heap.Table, nil); err == nil {
+				structs = s
+			}
+		}
+		if lines := heapScopeLines(structs, heap.AllowReenableDisabledIndexes); len(lines) > 0 {
+			scopes[i] = lines
+		}
+	}
+	return scopes
+}
+
+// heapScopeLines renders the dry run's note under a rebuild_heap: what else the statement
+// rewrites, and the disabled indexes it would re-enable. sizes is nil for an offline dry
+// run or a failed read, where the lines say so instead of guessing.
+func heapScopeLines(sizes []mssql.StructureSize, allowed bool) []string {
+	if len(sizes) == 0 {
+		return []string{"--     also rebuilds every nonclustered index on the table, and re-enables any disabled one (not listed offline)"}
+	}
+	var parts []string
+	var heapKB int64
+	for _, s := range sizes {
+		if s.IndexID == 0 {
+			heapKB = s.UsedKB
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s %s", s.Name, report.HumanizeKB(s.UsedKB)))
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	lines := []string{fmt.Sprintf("--     also rebuilds %d nonclustered index(es): %s (heap %s; %s rewritten)",
+		len(parts), strings.Join(parts, ", "), report.HumanizeKB(heapKB), report.HumanizeKB(preflight.SumKB(sizes)))}
+	if disabled := preflight.DisabledNames(sizes); len(disabled) > 0 {
+		tail := "preflight refuses this unless allow_reenable_disabled_indexes: true"
+		if allowed {
+			tail = "allowed by allow_reenable_disabled_indexes"
+		}
+		lines = append(lines, fmt.Sprintf("--     re-enables disabled index %s without its compression — %s",
+			strings.Join(disabled, ", "), tail))
+	}
+	return lines
+}
+
+// renderPlan prints a manifest's planned operations as runnable, commented T-SQL. scopes
+// carries each rebuild_heap's dry-run notes (heapScopeLines), keyed by index in planned,
+// so this stays free of I/O: dryRunManifest reads them, the way it reads the expander.
+func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []ddl.PlannedOperation, explain bool, target ddl.Target, matrix *ddl.Matrix, scopes map[int][]string) {
 	if manifest.Description != "" {
 		fmt.Fprintf(w, "-- manifest: %s — %s\n", source, manifest.Description)
 	} else {
@@ -1541,6 +1608,9 @@ func renderPlan(w io.Writer, source string, manifest *ddl.Manifest, planned []dd
 		if run.RollbackOnCancel(step) {
 			fmt.Fprintf(w, "--     reaction = cancel only (%s): a cancel under pressure rolls back all work\n",
 				cancelOnlyCause(step, target, matrix))
+		}
+		for _, line := range scopes[i] {
+			fmt.Fprintln(w, line)
 		}
 		fmt.Fprintln(w)
 	}
