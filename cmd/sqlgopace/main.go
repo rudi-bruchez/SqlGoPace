@@ -1198,7 +1198,7 @@ func (f *tuiForwarder) send(msg any) {
 // or its terminal outcome (as a StepDoneMsg, so the operations panel can mark it DONE/FAILED).
 func (f *tuiForwarder) step(ev run.StepEvent) {
 	if ev.Phase == run.StepFinished {
-		f.send(tui.StepDoneMsg{Index: ev.Index, Outcome: ev.Outcome, Detail: ev.Detail})
+		f.send(stepDoneMsg(ev))
 		return
 	}
 	if msg, ok := stepStatusMsg(ev); ok {
@@ -1238,6 +1238,17 @@ func (f *tuiForwarder) alert(mf run.ManifestFailure) {
 // it fires once per manifest and is not a failure to keep pinned above the dashboard.
 func (f *tuiForwarder) notice(line string) {
 	f.send(tui.LogMsg{Line: line})
+}
+
+// stepDoneMsg maps a finished step event to the console's terminal-outcome update, carrying
+// the operation's total run time so the row can show it once the manifest has moved on.
+func stepDoneMsg(ev run.StepEvent) tui.StepDoneMsg {
+	return tui.StepDoneMsg{
+		Index:    ev.Index,
+		Outcome:  ev.Outcome,
+		Detail:   ev.Detail,
+		Duration: ev.Duration,
+	}
 }
 
 // stepStatusMsg maps a step event to a console status update. Only the started event

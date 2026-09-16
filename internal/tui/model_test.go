@@ -892,3 +892,41 @@ func TestOperationRowKeepsItsDetail(t *testing.T) {
 		t.Errorf("finished row still shows the start detail:\n%s", v)
 	}
 }
+
+func TestFinishedOperationRowShowsItsTotalDuration(t *testing.T) {
+	// A finished row must carry its own total duration: the live "elapsed" counter tracks the
+	// running operation only and is reset when the next one starts, so without this the row
+	// loses its timing the moment the manifest moves on.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{
+		{Index: 1, Label: "shrink_data all", Status: "TO RUN"},
+		{Index: 2, Label: "rebuild_index dbo.T.IX", Status: "TO RUN"},
+		{Index: 3, Label: "update_stats dbo.T", Status: "TO RUN"},
+	}})
+
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 1, StepTotal: 3, StartedAt: time.Now()})
+	m, _ = send(m, tui.StepDoneMsg{Index: 1, Outcome: "success", Duration: 83 * time.Second})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 2, StepTotal: 3, StartedAt: time.Now()})
+	m, _ = send(m, tui.StepDoneMsg{Index: 2, Outcome: "failed", Duration: 2 * time.Hour})
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusRunning, StepIndex: 3, StepTotal: 3, StartedAt: time.Now()})
+
+	v := m.View()
+	if !strings.Contains(v, "(01:23)") {
+		t.Errorf("finished row should keep its total duration after the next op starts:\n%s", v)
+	}
+	if !strings.Contains(v, "(2:00:00)") {
+		t.Errorf("failed row should carry its total duration too:\n%s", v)
+	}
+}
+
+func TestOperationRowWithoutDurationShowsNoParentheses(t *testing.T) {
+	// A duration the engine never reported must render as nothing, not "(00:00)".
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{{Index: 1, Label: "shrink_data all", Status: "TO RUN"}}})
+	m, _ = send(m, tui.StepDoneMsg{Index: 1, Outcome: "skipped"})
+	if v := m.View(); strings.Contains(v, "(00:00)") {
+		t.Errorf("row with no reported duration should show no timing:\n%s", v)
+	}
+}

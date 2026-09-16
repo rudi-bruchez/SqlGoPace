@@ -13,6 +13,15 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.36.0] - 2026-09-16
+
+### Added
+
+- The console's operations panel shows each finished operation's total run time in parentheses
+  on its row, for every terminal outcome. The live `elapsed` counter follows the running
+  operation and is reset when the next one starts, so on a manifest with several operations the
+  timing of the one that just ended was gone the moment the next began.
+
 ## [0.35.0] - 2026-09-16
 
 ### Added

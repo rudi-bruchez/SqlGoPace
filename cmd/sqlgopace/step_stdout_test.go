@@ -101,3 +101,18 @@ func TestShrinkMsgMapsProgress(t *testing.T) {
 		t.Errorf("Percent = %v, want ~0.32", got)
 	}
 }
+
+func TestStepDoneMsgCarriesTheOperationDuration(t *testing.T) {
+	// The engine already measures each operation; the console row shows that total, so the
+	// forwarder must not drop it.
+	msg := stepDoneMsg(run.StepEvent{
+		Index: 3, Total: 9, Phase: run.StepFinished, Outcome: "success",
+		Detail: "8.1 GB -> 5.4 GB (-33.3%)", Duration: 94 * time.Minute,
+	})
+	if msg.Index != 3 || msg.Outcome != "success" || msg.Detail != "8.1 GB -> 5.4 GB (-33.3%)" {
+		t.Errorf("stepDoneMsg = %+v, want index/outcome/detail mapped through", msg)
+	}
+	if msg.Duration != 94*time.Minute {
+		t.Errorf("Duration = %v, want 94m", msg.Duration)
+	}
+}

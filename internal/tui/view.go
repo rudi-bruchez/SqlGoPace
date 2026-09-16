@@ -228,8 +228,9 @@ func (m Model) operationsBody(budget int) string {
 	return strings.Join(out, "\n")
 }
 
-// opRow renders one operation's row: "N - label  [STATUS]" plus SPID/elapsed on the running
-// row. The running row reflects the live lifecycle status (SUSPENDED while blocked, or
+// opRow renders one operation's row: "N - label  [STATUS]", the total run time in
+// parentheses once the operation has finished, plus SPID/elapsed on the running row. The
+// running row reflects the live lifecycle status (SUSPENDED while blocked, or
 // DRAINING/CANCELING/PAUSED when set), not just RUNNING.
 func (m Model) opRow(o OperationRow) string {
 	status := o.Status
@@ -240,6 +241,9 @@ func (m Model) opRow(o OperationRow) string {
 		status = m.displayStatus().String()
 	}
 	line := fmt.Sprintf("%d - %s   %s", o.Index, o.Label, opStatusStyled(status))
+	if o.Duration > 0 {
+		line += "   (" + formatElapsed(o.Duration) + ")"
+	}
 	if o.Detail != "" {
 		line += "   " + helpStyle.Render(o.Detail)
 	}

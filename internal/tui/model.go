@@ -84,10 +84,11 @@ type WaitCategory struct {
 // operations panel. Status is a display label: "TO RUN" | "RUNNING" | "SUSPENDED" | "DONE"
 // | "FAILED" | "INTERRUPTED" | "INCOMPLETE" | "SKIPPED".
 type OperationRow struct {
-	Index  int
-	Label  string // "<command> <target>", e.g. "shrink_data all"
-	Status string
-	Detail string // manifest-start note, replaced by the size result when the operation finishes
+	Index    int
+	Label    string // "<command> <target>", e.g. "shrink_data all"
+	Status   string
+	Detail   string        // manifest-start note, replaced by the size result when the operation finishes
+	Duration time.Duration // total run time, set when the operation finishes; zero while pending or running
 }
 
 // Messages the host feeds from the monitor stream.
@@ -233,9 +234,10 @@ type (
 	// (Outcome mirrors run.StepEvent.Outcome: "success"|"failed"|"interrupted"|
 	// "incomplete"|"skipped").
 	StepDoneMsg struct {
-		Index   int
-		Outcome string
-		Detail  string
+		Index    int
+		Outcome  string
+		Detail   string
+		Duration time.Duration // total wall-clock time the operation ran
 	}
 	// KillerArmedMsg tells the console whether kill_blockers is enabled in config, so the roster
 	// can warn that armed rules will not fire until it is. Sent once at startup.
@@ -560,13 +562,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ops = msg.Ops
 	case StepDoneMsg:
 		m.setOpStatus(msg.Index, opStatusLabel(msg.Outcome))
-		if msg.Detail != "" {
-			for i := range m.ops {
-				if m.ops[i].Index == msg.Index {
-					m.ops[i].Detail = msg.Detail
-					break
-				}
+		for i := range m.ops {
+			if m.ops[i].Index != msg.Index {
+				continue
 			}
+			if msg.Detail != "" {
+				m.ops[i].Detail = msg.Detail
+			}
+			// The live elapsed counter follows the running operation and is reset when the
+			// next one starts, so a finished row keeps its own total here.
+			m.ops[i].Duration = msg.Duration
+			break
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
