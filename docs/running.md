@@ -142,7 +142,10 @@ for each manifest, so the counter says where the run is inside one and the title
 A session this run blocks appears in the blocked-sessions panel on the poll that sees it
 (`blocking_poll_seconds`), with how long it has waited on the row. That wait is the evidence to
 judge it by: nothing is filtered out for being too recent, so a block that clears on its own is
-visible while it lasts.
+visible while it lasts. A shrink's page-reclaim latch is the common one — it appears, waits a
+few seconds and goes. Killing a blocker with `x` frees nothing (it is waiting on us, not the
+other way round) and costs that session its transaction, so a short wait on the row is a reason
+to leave it alone.
 
 The header's right-hand box carries a third line, once the first poll has landed:
 

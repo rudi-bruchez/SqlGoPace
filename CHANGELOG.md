@@ -26,6 +26,10 @@ history, so a report can always name the build that produced it.
 - The console's blocked-sessions panel now refreshes on `blocking_poll_seconds` (10 s) rather
   than `progress_poll_seconds` (30 s), which had been driving it. Progress, session waits and
   data/log space stay on `progress_poll_seconds`.
+- The blocker roster's episode counts and per-login counts are sampled at that same faster
+  cadence, so the same server behaviour reports more episodes than it did before 0.38.0. They
+  are not comparable with earlier runs — read them as a shape, not as a measurement, before
+  arming a kill rule from them.
 
 **Migration.** No key changes value, but one changes meaning. If you raised
 `blocking_timeout_minutes` to keep the console from listing short-lived blockers, it was not

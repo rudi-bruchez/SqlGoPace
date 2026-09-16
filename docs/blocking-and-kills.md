@@ -174,6 +174,15 @@ already been there when we first saw it. The first matching rule decides, so ord
 from most to least specific: a broad rule with a short delay placed first shadows a narrower
 one behind it. Each blocker is killed at most once per episode.
 
+**The delay is therefore `after_seconds` plus up to one `blocking_poll_seconds`, per
+episode.** That is the price of not guessing when the blocker started, and it has two
+consequences worth knowing before you tune either number. Lowering `blocking_poll_seconds`
+makes **every** kill rule in every manifest fire sooner, without a rule being edited. Raising
+it can stop an intermittent blocker — a dashboard blocking in short stabs, a connection pool
+retrying — from ever reaching its delay at all: an identity absent from a poll loses its mark,
+so its next sighting is a first sighting again and banks nothing. Re-read your kill rules when
+you change the poll interval.
+
 ### A returning offender does not buy a fresh delay
 
 The delay is served by the *rule*, not by the session id. A blocker killed and coming

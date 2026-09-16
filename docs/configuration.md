@@ -127,6 +127,13 @@ it starts, not only on the next `log_poll_seconds` tick, so a retry issued right
 log-pressure cancel is re-canceled within seconds instead of running blind against an
 already-over-cap log for up to `log_poll_seconds`.
 
+`blocking_poll_seconds` is not only a sampling rate. A kill rule's `after_seconds` is measured
+over the polls on which the rule matched, and each blocking episode's first poll banks nothing,
+so the effective delay is `after_seconds` plus up to one poll interval per episode. Lowering
+this value tightens every `kill_blocking_sessions` rule; raising it can keep an intermittent
+blocker below its delay indefinitely. See
+[blocking-and-kills.md](blocking-and-kills.md#a-returning-offender-does-not-buy-a-fresh-delay).
+
 ## `preflight`
 
 | Key | Default | Meaning |
