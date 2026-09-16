@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"testing"
 
@@ -23,13 +24,19 @@ type fakeReader struct {
 	stats       map[int64][]mssql.StatProperty       // objectID
 	disabled    map[int64][]string                   // objectID -> disabled index names
 	disabledErr map[int64]error                      // objectID -> DisabledIndexes error
+
+	// physicalStatsKeys records every PhysicalStats call, same key shape as physical,
+	// so a test can assert a scan was never paid for.
+	physicalStatsKeys []string
 }
 
 func (f *fakeReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
 	return f.inventory, nil
 }
 func (f *fakeReader) PhysicalStats(_ context.Context, objectID int64, indexID int, _ *int, mode string) ([]mssql.PhysicalStats, error) {
-	return f.physical[fmt.Sprintf("%d:%d:%s", objectID, indexID, mode)], nil
+	key := fmt.Sprintf("%d:%d:%s", objectID, indexID, mode)
+	f.physicalStatsKeys = append(f.physicalStatsKeys, key)
+	return f.physical[key], nil
 }
 func (f *fakeReader) EstimateCompression(_ context.Context, schema, table string, indexID int, _ *int, setting string) ([]mssql.CompressionSaving, error) {
 	return f.estimate[fmt.Sprintf("%s.%s:%d:%s", schema, table, indexID, setting)], nil
@@ -226,26 +233,51 @@ func TestHeapMeasurementSumsPartitionsAndIndexes(t *testing.T) {
 	}
 }
 
-// TestHeapMeasurementSkipsDisabledIndex: buildInput must never emit a heap measurement
-// (and so never a manifest) for a table with a disabled nonclustered index; preflight
-// would refuse the rebuild that re-enables it. The skip is logged with the index name.
-func TestHeapMeasurementSkipsDisabledIndex(t *testing.T) {
+// TestHeapMeasurementDisabledIndexReachesTheDecision: a heap carrying a disabled
+// nonclustered index is measured, not dropped by the planner — the list travels in
+// the measurement so DecideHeap refuses it and states the remedy in the analysis
+// trail. The SAMPLED scan is not paid for a heap that will be refused.
+func TestHeapMeasurementDisabledIndexReachesTheDecision(t *testing.T) {
 	r := &fakeReader{
 		inventory: []mssql.InventoryObject{
-			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0, PartitionNumber: 1, SizeMB: 500},
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0,
+				PartitionNumber: 1, SizeMB: 500},
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 2, IndexName: "IX_A",
+				Type: 2, PartitionNumber: 1, SizeMB: 150},
 		},
 		disabled: map[int64][]string{1: {"IX_MEASUREMENT_OLD"}},
 	}
+	p := profileWithHeapBounds(10, 100000)
 	var logbuf bytes.Buffer
-	in, err := buildInput(context.Background(), r, profileWithHeapBounds(10, 100000), Categories{}, "PRODDB", &logbuf)
+	in, err := buildInput(context.Background(), r, p, Categories{}, "PRODDB", &logbuf)
 	if err != nil {
 		t.Fatalf("buildInput() error = %v", err)
 	}
-	if len(in.Heaps) != 0 {
-		t.Fatalf("heaps = %d, want 0 (disabled index)", len(in.Heaps))
+	if len(in.Heaps) != 1 {
+		t.Fatalf("heaps = %d, want 1 (measured, with the disabled index listed)", len(in.Heaps))
+	}
+	h := in.Heaps[0]
+	if !slices.Equal(h.DisabledIndexes, []string{"IX_MEASUREMENT_OLD"}) {
+		t.Errorf("heap.DisabledIndexes = %v, want [IX_MEASUREMENT_OLD]", h.DisabledIndexes)
+	}
+	if h.SizeMB != 500 || h.NonclusteredMB != 150 || h.RewriteMB != 650 {
+		t.Errorf("heap sizing: sizeMB=%d nonclusteredMB=%d rewriteMB=%d, want 500, 150, 650",
+			h.SizeMB, h.NonclusteredMB, h.RewriteMB)
 	}
 	if !strings.Contains(logbuf.String(), "IX_MEASUREMENT_OLD") {
-		t.Errorf("skip log = %q, want it to name the disabled index", logbuf.String())
+		t.Errorf("log = %q, want it to name the disabled index", logbuf.String())
+	}
+	if slices.Contains(r.physicalStatsKeys, "1:0:"+mssql.PhysicalSampled) {
+		t.Errorf("PhysicalStats(SAMPLED) = called, want skipped for a heap that will be refused")
+	}
+
+	d := maint.DecideHeap(h, p)
+	if d.Op != nil || d.Kind != "skip" {
+		t.Errorf("decision = %q %#v, want a skip with no operation", d.Kind, d.Op)
+	}
+	if !strings.Contains(d.Reason, "IX_MEASUREMENT_OLD") ||
+		!strings.Contains(d.Reason, "allow_reenable_disabled_indexes") {
+		t.Errorf("decision.Reason = %q, want the index name and the remedy", d.Reason)
 	}
 }
 

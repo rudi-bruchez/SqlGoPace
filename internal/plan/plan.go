@@ -185,14 +185,16 @@ func indexMeasurements(ctx context.Context, r Reader, p *maint.Profile, cats Cat
 	return []maint.IndexMeasurement{m}
 }
 
-// heapMeasurement sizes the heap and the whole rewrite, rejects a heap that would
-// silently re-enable a disabled index, then gathers the SAMPLED scan (forwarded
-// records) for survivors. table is every row of the object (the heap's own
+// heapMeasurement sizes the heap and the whole rewrite, measures any disabled
+// indexes that a rebuild would re-enable, then gathers the SAMPLED scan (forwarded
+// records) for heaps that pass. table is every row of the object (the heap's own
 // partitions plus every nonclustered index's, all partitions): ALTER TABLE ...
 // REBUILD on a heap rebuilds them all in one statement, so the cost gate
 // (heap.max_size_mb) has to weigh that whole rewrite, not the heap alone. ok is
-// false when the heap is out of bounds, carries a disabled index, or a read fails;
-// every such skip is logged with its reason (never a bare false with no trace).
+// false when the heap is out of bounds or a read fails; every such skip is logged
+// with its reason (never a bare false with no trace). When disabled indexes are
+// found, the measurement is returned with the list populated, so DecideHeap can
+// refuse it with the remedy in the analysis trail; the SAMPLED scan is not paid.
 func heapMeasurement(ctx context.Context, r Reader, p *maint.Profile, wantComp bool, head mssql.InventoryObject, table []mssql.InventoryObject, logw io.Writer) (maint.HeapMeasurement, bool) {
 	var sizeMB int64
 	ncSizeMB := map[int]int64{}
@@ -225,16 +227,24 @@ func heapMeasurement(ctx context.Context, r Reader, p *maint.Profile, wantComp b
 	// sys.dm_db_partition_stats row), so a heap candidate that survives the size
 	// bounds gets one extra read. A rebuild re-enables such an index uncompressed;
 	// preflight refuses that unless the manifest opts in, and the planner never
-	// sets that key, so a heap with one is never planned at all.
+	// sets that key. DecideHeap owns the refusal and logs the remedy.
 	disabled, err := r.DisabledIndexes(ctx, head.ObjectID)
 	if err != nil {
 		fmt.Fprintf(logw, "-- skip heap %s.%s: disabled indexes: %v\n", head.Schema, head.Table, err)
 		return maint.HeapMeasurement{}, false
 	}
 	if len(disabled) > 0 {
-		fmt.Fprintf(logw, "-- skip heap %s.%s: rebuild would re-enable disabled index(es) %s; rebuild it by hand with allow_reenable_disabled_indexes, or drop the index\n",
+		// Hand the list to the decision instead of dropping the heap here: DecideHeap
+		// owns the refusal and its reason, which is what the analysis trail prints.
+		// The sampled scan below is skipped — the decision never reaches the triggers.
+		fmt.Fprintf(logw, "-- heap %s.%s: rebuild would re-enable disabled index(es) %s; not planned\n",
 			head.Schema, head.Table, strings.Join(disabled, ", "))
-		return maint.HeapMeasurement{}, false
+		return maint.HeapMeasurement{
+			Schema: head.Schema, Table: head.Table, SizeMB: sizeMB,
+			NonclusteredMB: nonclusteredMB, NonclusteredCount: nonclusteredCount,
+			RewriteMB: rewriteMB, DisabledIndexes: disabled,
+			Current: parseCompression(head.Compression),
+		}, true
 	}
 
 	ps, err := r.PhysicalStats(ctx, head.ObjectID, 0, nil, mssql.PhysicalSampled)
