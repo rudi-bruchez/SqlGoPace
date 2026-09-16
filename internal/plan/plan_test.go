@@ -1,9 +1,11 @@
 package plan
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
@@ -14,11 +16,13 @@ import (
 // fakeReader serves canned analysis results, keyed so buildInput's orchestration
 // can be exercised without a database.
 type fakeReader struct {
-	inventory []mssql.InventoryObject
-	physical  map[string][]mssql.PhysicalStats     // "objectID:indexID:mode"
-	estimate  map[string][]mssql.CompressionSaving // "schema.table:indexID:setting"
-	opstats   map[string][]mssql.OperationalStats  // "objectID:indexID"
-	stats     map[int64][]mssql.StatProperty       // objectID
+	inventory   []mssql.InventoryObject
+	physical    map[string][]mssql.PhysicalStats     // "objectID:indexID:mode"
+	estimate    map[string][]mssql.CompressionSaving // "schema.table:indexID:setting"
+	opstats     map[string][]mssql.OperationalStats  // "objectID:indexID"
+	stats       map[int64][]mssql.StatProperty       // objectID
+	disabled    map[int64][]string                   // objectID -> disabled index names
+	disabledErr map[int64]error                      // objectID -> DisabledIndexes error
 }
 
 func (f *fakeReader) ObjectInventory(context.Context) ([]mssql.InventoryObject, error) {
@@ -35,6 +39,12 @@ func (f *fakeReader) IndexOperationalStats(_ context.Context, objectID int64, in
 }
 func (f *fakeReader) StatsProperties(_ context.Context, objectID int64) ([]mssql.StatProperty, error) {
 	return f.stats[objectID], nil
+}
+func (f *fakeReader) DisabledIndexes(_ context.Context, objectID int64) ([]string, error) {
+	if err := f.disabledErr[objectID]; err != nil {
+		return nil, err
+	}
+	return f.disabled[objectID], nil
 }
 
 // scenarioReader builds a small but representative database state.
@@ -174,6 +184,89 @@ func TestShrinkMeasurementsCarryObjectID(t *testing.T) {
 	}
 	if hm.ObjectID != 20 {
 		t.Errorf("heap measurement ObjectID = %d, want 20 (the inventory head's object id)", hm.ObjectID)
+	}
+}
+
+// profileWithHeapBounds returns a profile with heap maintenance enabled and the given
+// min/max size bounds, for the heap-measurement tests below.
+func profileWithHeapBounds(minMB, maxMB int64) *maint.Profile {
+	p, err := maint.Parse([]byte(fmt.Sprintf("heap:\n  enabled: true\n  min_size_mb: %d\n  max_size_mb: %d\n", minMB, maxMB)))
+	if err != nil {
+		panic(err)
+	}
+	return p
+}
+
+// TestHeapMeasurementSumsPartitionsAndIndexes: the fixed defect. The heap's own size is the
+// sum over its partitions (plan.go read partition 1 only), and the rewrite adds every
+// nonclustered index of the table.
+func TestHeapMeasurementSumsPartitionsAndIndexes(t *testing.T) {
+	r := &fakeReader{
+		inventory: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0, PartitionNumber: 1, SizeMB: 3000},
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0, PartitionNumber: 2, SizeMB: 2000},
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 2, IndexName: "IX_A", Type: 2, PartitionNumber: 1, SizeMB: 1500},
+		},
+		// The SAMPLED scan (forwarded records) runs after the size and disabled-index
+		// checks pass; a heap needs at least one row here to survive buildInput.
+		physical: map[string][]mssql.PhysicalStats{
+			"1:0:SAMPLED": {{PartitionNumber: 1, RecordCount: 100, ForwardedRecordCount: 10, AvgPageSpaceUsedPercent: 90}},
+		},
+	}
+	in, err := buildInput(context.Background(), r, profileWithHeapBounds(10, 100000), Categories{}, "PRODDB", io.Discard)
+	if err != nil {
+		t.Fatalf("buildInput() error = %v", err)
+	}
+	if len(in.Heaps) != 1 {
+		t.Fatalf("heaps = %d, want 1", len(in.Heaps))
+	}
+	h := in.Heaps[0]
+	if h.SizeMB != 5000 || h.NonclusteredMB != 1500 || h.RewriteMB != 6500 || h.NonclusteredCount != 1 {
+		t.Errorf("heap measurement = %+v, want heap 5000, nonclustered 1500 (1 index), rewrite 6500", h)
+	}
+}
+
+// TestHeapMeasurementSkipsDisabledIndex: buildInput must never emit a heap measurement
+// (and so never a manifest) for a table with a disabled nonclustered index; preflight
+// would refuse the rebuild that re-enables it. The skip is logged with the index name.
+func TestHeapMeasurementSkipsDisabledIndex(t *testing.T) {
+	r := &fakeReader{
+		inventory: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0, PartitionNumber: 1, SizeMB: 500},
+		},
+		disabled: map[int64][]string{1: {"IX_MEASUREMENT_OLD"}},
+	}
+	var logbuf bytes.Buffer
+	in, err := buildInput(context.Background(), r, profileWithHeapBounds(10, 100000), Categories{}, "PRODDB", &logbuf)
+	if err != nil {
+		t.Fatalf("buildInput() error = %v", err)
+	}
+	if len(in.Heaps) != 0 {
+		t.Fatalf("heaps = %d, want 0 (disabled index)", len(in.Heaps))
+	}
+	if !strings.Contains(logbuf.String(), "IX_MEASUREMENT_OLD") {
+		t.Errorf("skip log = %q, want it to name the disabled index", logbuf.String())
+	}
+}
+
+// TestHeapMeasurementSkipsOnDisabledIndexReadError: an unverifiable heap is not planned.
+func TestHeapMeasurementSkipsOnDisabledIndexReadError(t *testing.T) {
+	r := &fakeReader{
+		inventory: []mssql.InventoryObject{
+			{Schema: "dbo", Table: "MEASUREMENT", ObjectID: 1, IndexID: 0, Type: 0, PartitionNumber: 1, SizeMB: 500},
+		},
+		disabledErr: map[int64]error{1: fmt.Errorf("permission denied")},
+	}
+	var logbuf bytes.Buffer
+	in, err := buildInput(context.Background(), r, profileWithHeapBounds(10, 100000), Categories{}, "PRODDB", &logbuf)
+	if err != nil {
+		t.Fatalf("buildInput() error = %v", err)
+	}
+	if len(in.Heaps) != 0 {
+		t.Fatalf("heaps = %d, want 0 (unverifiable heap)", len(in.Heaps))
+	}
+	if !strings.Contains(logbuf.String(), "permission denied") {
+		t.Errorf("skip log = %q, want it to name the read error", logbuf.String())
 	}
 }
 

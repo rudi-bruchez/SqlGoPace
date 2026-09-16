@@ -208,6 +208,9 @@ func (f *fakePlanReader) IndexOperationalStats(context.Context, int64, int, *int
 func (f *fakePlanReader) StatsProperties(context.Context, int64) ([]mssql.StatProperty, error) {
 	return nil, nil
 }
+func (f *fakePlanReader) DisabledIndexes(context.Context, int64) ([]string, error) {
+	return nil, nil
+}
 
 func TestPlanShrinkEndToEnd(t *testing.T) {
 	p := dataShrinkProfile(t, "  reorganize_below_density_percent: 65\nindex:\n  page_count_floor: 1000\n")
@@ -328,5 +331,8 @@ func (panicReader) IndexOperationalStats(context.Context, int64, int, *int) ([]m
 	panic("unexpected")
 }
 func (panicReader) StatsProperties(context.Context, int64) ([]mssql.StatProperty, error) {
+	panic("unexpected")
+}
+func (panicReader) DisabledIndexes(context.Context, int64) ([]string, error) {
 	panic("unexpected")
 }

@@ -43,6 +43,10 @@ type IndexMeasurement struct {
 type HeapMeasurement struct {
 	Schema, Table        string
 	SizeMB               int64
+	NonclusteredMB       int64    // every nonclustered index of the table, summed over partitions
+	NonclusteredCount    int      // how many, for the reason line
+	RewriteMB            int64    // SizeMB + NonclusteredMB: what ALTER TABLE REBUILD rewrites
+	DisabledIndexes      []string // disabled indexes the rebuild would re-enable; any means skip
 	ForwardedRecordCount int64
 	RecordCount          int64
 	FragmentationPercent float64
@@ -280,10 +284,17 @@ func decideHeap(m HeapMeasurement, p *Profile) Decision {
 		return skipDecision("heap", target, "override forbids rebuild (a heap cannot be reorganized)")
 	}
 	if m.SizeMB < p.Heap.MinSizeMB {
-		return skipDecision("heap", target, fmt.Sprintf("size %d MB below min %d MB", m.SizeMB, p.Heap.MinSizeMB))
+		return skipDecision("heap", target, fmt.Sprintf("heap %d MB below min %d MB", m.SizeMB, p.Heap.MinSizeMB))
 	}
-	if m.SizeMB > p.Heap.MaxSizeMB {
-		return skipDecision("heap", target, fmt.Sprintf("size %d MB above max %d MB", m.SizeMB, p.Heap.MaxSizeMB))
+	if m.RewriteMB > p.Heap.MaxSizeMB {
+		return skipDecision("heap", target, fmt.Sprintf(
+			"rebuild rewrites %d MB (heap %d MB + %d nonclustered %d MB), above max %d MB",
+			m.RewriteMB, m.SizeMB, m.NonclusteredCount, m.NonclusteredMB, p.Heap.MaxSizeMB))
+	}
+	if len(m.DisabledIndexes) > 0 {
+		return skipDecision("heap", target, fmt.Sprintf(
+			"rebuild would re-enable disabled index(es) %s without their compression; drop them, or rebuild by hand with allow_reenable_disabled_indexes",
+			strings.Join(m.DisabledIndexes, ", ")))
 	}
 
 	forwardedPct := ratioPercent(m.ForwardedRecordCount, m.RecordCount)
@@ -306,7 +317,12 @@ func decideHeap(m HeapMeasurement, p *Profile) Decision {
 		Schema: m.Schema, Table: m.Table, DataCompression: dataCompression,
 		Options: ddl.OptionOverrides{Online: boolCopy(p.Heap.Online)},
 	}
-	return Decision{Category: "heap", Target: target, Kind: "rebuild_heap", Reason: reason + "; " + comp.reason, Op: op}
+	finalReason := reason + "; " + comp.reason
+	if m.NonclusteredCount > 0 {
+		finalReason += fmt.Sprintf("; also rebuilds %d nonclustered index(es) (%d MB; %d MB rewritten)",
+			m.NonclusteredCount, m.NonclusteredMB, m.RewriteMB)
+	}
+	return Decision{Category: "heap", Target: target, Kind: "rebuild_heap", Reason: finalReason, Op: op}
 }
 
 // DecideStatistic resolves the UPDATE STATISTICS decision for one statistic

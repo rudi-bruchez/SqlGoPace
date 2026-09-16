@@ -2,6 +2,7 @@ package maint_test
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -263,7 +264,7 @@ func TestDecideIndexPartitionCarried(t *testing.T) {
 func TestDecideHeap(t *testing.T) {
 	p := baseProfile(t)
 	rebuildable := maint.HeapMeasurement{
-		Schema: "dbo", Table: "H", SizeMB: 500, RecordCount: 1000,
+		Schema: "dbo", Table: "H", SizeMB: 500, RewriteMB: 500, RecordCount: 1000,
 		ForwardedRecordCount: 200, PageSpaceUsedPercent: 90, FragmentationPercent: 1,
 	}
 	tests := []struct {
@@ -273,7 +274,7 @@ func TestDecideHeap(t *testing.T) {
 	}{
 		{"forwarded trigger", func(*maint.HeapMeasurement) {}, "rebuild_heap"},
 		{"below min size", func(m *maint.HeapMeasurement) { m.SizeMB = 1 }, "skip"},
-		{"above max size", func(m *maint.HeapMeasurement) { m.SizeMB = 99999 }, "skip"},
+		{"above max size", func(m *maint.HeapMeasurement) { m.SizeMB = 99999; m.RewriteMB = 99999 }, "skip"},
 		{"no trigger", func(m *maint.HeapMeasurement) {
 			m.ForwardedRecordCount = 0
 			m.PageSpaceUsedPercent = 95
@@ -306,6 +307,56 @@ func TestDecideHeapOverrides(t *testing.T) {
 	}
 	if d := maint.DecideHeap(m, forbid); d.Kind != "skip" {
 		t.Errorf("forbid override: Kind = %q, want skip (heap cannot reorganize)", d.Kind)
+	}
+}
+
+// TestDecideHeapBoundsUseDifferentFigures: min_size_mb is the "worth it" gate and reads the
+// heap alone; max_size_mb is the cost gate and reads the whole rewrite, because
+// ALTER TABLE REBUILD rewrites every nonclustered index in the same statement.
+func TestDecideHeapBoundsUseDifferentFigures(t *testing.T) {
+	p := baseProfile(t) // heap bounds 10 MB .. 10000 MB (defaults)
+	big := maint.HeapMeasurement{
+		Schema: "dbo", Table: "MEASUREMENT", SizeMB: 5000,
+		NonclusteredMB: 20000, NonclusteredCount: 2, RewriteMB: 25000,
+		RecordCount: 1000, ForwardedRecordCount: 500, PageSpaceUsedPercent: 90,
+	}
+	if d := maint.DecideHeap(big, p); d.Kind != "skip" {
+		t.Errorf("Kind = %q, want skip: the rewrite is 25000 MB, above max_size_mb", d.Kind)
+	}
+	small := big
+	small.SizeMB, small.NonclusteredMB, small.RewriteMB = 5, 0, 5
+	if d := maint.DecideHeap(small, p); d.Kind != "skip" {
+		t.Errorf("Kind = %q, want skip: the heap is below min_size_mb", d.Kind)
+	}
+	ok := big
+	ok.NonclusteredMB, ok.RewriteMB = 2000, 7000
+	d := maint.DecideHeap(ok, p)
+	if d.Kind != "rebuild_heap" {
+		t.Fatalf("Kind = %q, want rebuild_heap", d.Kind)
+	}
+	if !strings.Contains(d.Reason, "also rebuilds 2 nonclustered index(es)") {
+		t.Errorf("Reason = %q, want it to name the indexes it rewrites", d.Reason)
+	}
+	if d.Metrics.SizeMB != 5000 {
+		t.Errorf("Metrics.SizeMB = %d, want the heap alone (5000)", d.Metrics.SizeMB)
+	}
+}
+
+// TestDecideHeapSkipsDisabledIndex: the planner never emits a manifest preflight would
+// refuse, and never sets the opt-in itself.
+func TestDecideHeapSkipsDisabledIndex(t *testing.T) {
+	p := baseProfile(t)
+	m := maint.HeapMeasurement{
+		Schema: "dbo", Table: "MEASUREMENT", SizeMB: 500, RewriteMB: 700,
+		RecordCount: 1000, ForwardedRecordCount: 500, PageSpaceUsedPercent: 90,
+		DisabledIndexes: []string{"IX_MEASUREMENT_OLD"},
+	}
+	d := maint.DecideHeap(m, p)
+	if d.Kind != "skip" {
+		t.Fatalf("Kind = %q, want skip", d.Kind)
+	}
+	if !strings.Contains(d.Reason, "IX_MEASUREMENT_OLD") {
+		t.Errorf("Reason = %q, want it to name the disabled index", d.Reason)
 	}
 }
 

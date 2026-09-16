@@ -46,6 +46,9 @@ func (f *fakeShrinkReader) IndexOperationalStats(context.Context, int64, int, *i
 func (f *fakeShrinkReader) StatsProperties(context.Context, int64) ([]mssql.StatProperty, error) {
 	return nil, nil
 }
+func (f *fakeShrinkReader) DisabledIndexes(context.Context, int64) ([]string, error) {
+	return nil, nil
+}
 
 func TestAnalyzePreShrink(t *testing.T) {
 	p, err := maint.Parse([]byte("index:\n  page_count_floor: 1000\nheap:\n  min_size_mb: 10\nshrink:\n  enabled: true\n  type: data\n  files: all\n  targetfreespace: 10%\n  reorganize_below_density_percent: 65\n"))

@@ -24,6 +24,7 @@ type Reader interface {
 	EstimateCompression(ctx context.Context, schema, table string, indexID int, partition *int, setting string) ([]mssql.CompressionSaving, error)
 	IndexOperationalStats(ctx context.Context, objectID int64, indexID int, partition *int) ([]mssql.OperationalStats, error)
 	StatsProperties(ctx context.Context, objectID int64) ([]mssql.StatProperty, error)
+	DisabledIndexes(ctx context.Context, objectID int64) ([]string, error)
 }
 
 // AllCategories is the set of selectable analysis categories.
@@ -78,13 +79,21 @@ func buildInput(ctx context.Context, r Reader, p *maint.Profile, cats Categories
 	wantIndex := cats.Has("index")
 	wantComp := cats.Has("compression") && p.Compression.Enabled
 
+	// byObject groups every structure of a table (heap and every index, all
+	// partitions) by object id, so heapMeasurement can size the whole rewrite:
+	// ALTER TABLE ... REBUILD on a heap rebuilds every nonclustered index too.
+	byObject := map[int64][]mssql.InventoryObject{}
+	for _, o := range inv {
+		byObject[o.ObjectID] = append(byObject[o.ObjectID], o)
+	}
+
 	groups, tables := groupInventory(inv)
 	for _, g := range groups {
 		head := g[0]
 		switch {
 		case head.IsHeap():
 			if cats.Has("heaps") && p.Heap.Enabled {
-				if hm, ok := heapMeasurement(ctx, r, p, wantComp, head, logw); ok {
+				if hm, ok := heapMeasurement(ctx, r, p, wantComp, head, byObject[head.ObjectID], logw); ok {
 					in.Heaps = append(in.Heaps, hm)
 				}
 			}
@@ -176,14 +185,58 @@ func indexMeasurements(ctx context.Context, r Reader, p *maint.Profile, cats Cat
 	return []maint.IndexMeasurement{m}
 }
 
-// heapMeasurement gathers the SAMPLED scan (forwarded records) for one heap, after
-// a cheap size pre-filter. ok is false when the heap is out of size bounds or the
-// scan fails.
-func heapMeasurement(ctx context.Context, r Reader, p *maint.Profile, wantComp bool, head mssql.InventoryObject, logw io.Writer) (maint.HeapMeasurement, bool) {
-	sizeMB := int64(head.SizeMB)
-	if sizeMB < p.Heap.MinSizeMB || sizeMB > p.Heap.MaxSizeMB {
+// heapMeasurement sizes the heap and the whole rewrite, rejects a heap that would
+// silently re-enable a disabled index, then gathers the SAMPLED scan (forwarded
+// records) for survivors. table is every row of the object (the heap's own
+// partitions plus every nonclustered index's, all partitions): ALTER TABLE ...
+// REBUILD on a heap rebuilds them all in one statement, so the cost gate
+// (heap.max_size_mb) has to weigh that whole rewrite, not the heap alone. ok is
+// false when the heap is out of bounds, carries a disabled index, or a read fails;
+// every such skip is logged with its reason (never a bare false with no trace).
+func heapMeasurement(ctx context.Context, r Reader, p *maint.Profile, wantComp bool, head mssql.InventoryObject, table []mssql.InventoryObject, logw io.Writer) (maint.HeapMeasurement, bool) {
+	var sizeMB int64
+	ncSizeMB := map[int]int64{}
+	for _, o := range table {
+		if o.IndexID == 0 {
+			sizeMB += int64(o.SizeMB)
+			continue
+		}
+		ncSizeMB[o.IndexID] += int64(o.SizeMB)
+	}
+	var nonclusteredMB int64
+	for _, mb := range ncSizeMB {
+		nonclusteredMB += mb
+	}
+	nonclusteredCount := len(ncSizeMB)
+	rewriteMB := sizeMB + nonclusteredMB
+
+	if sizeMB < p.Heap.MinSizeMB {
+		fmt.Fprintf(logw, "-- skip heap %s.%s: heap %d MB below heap.min_size_mb %d\n",
+			head.Schema, head.Table, sizeMB, p.Heap.MinSizeMB)
 		return maint.HeapMeasurement{}, false
 	}
+	if rewriteMB > p.Heap.MaxSizeMB {
+		fmt.Fprintf(logw, "-- skip heap %s.%s: rebuild rewrites %d MB (heap %d MB + %d nonclustered %d MB), above heap.max_size_mb %d\n",
+			head.Schema, head.Table, rewriteMB, sizeMB, nonclusteredCount, nonclusteredMB, p.Heap.MaxSizeMB)
+		return maint.HeapMeasurement{}, false
+	}
+
+	// The cheap inventory cannot see a disabled index (disabling one deletes its
+	// sys.dm_db_partition_stats row), so a heap candidate that survives the size
+	// bounds gets one extra read. A rebuild re-enables such an index uncompressed;
+	// preflight refuses that unless the manifest opts in, and the planner never
+	// sets that key, so a heap with one is never planned at all.
+	disabled, err := r.DisabledIndexes(ctx, head.ObjectID)
+	if err != nil {
+		fmt.Fprintf(logw, "-- skip heap %s.%s: disabled indexes: %v\n", head.Schema, head.Table, err)
+		return maint.HeapMeasurement{}, false
+	}
+	if len(disabled) > 0 {
+		fmt.Fprintf(logw, "-- skip heap %s.%s: rebuild would re-enable disabled index(es) %s; rebuild it by hand with allow_reenable_disabled_indexes, or drop the index\n",
+			head.Schema, head.Table, strings.Join(disabled, ", "))
+		return maint.HeapMeasurement{}, false
+	}
+
 	ps, err := r.PhysicalStats(ctx, head.ObjectID, 0, nil, mssql.PhysicalSampled)
 	if err != nil {
 		fmt.Fprintf(logw, "-- skip heap %s.%s: sampled scan: %v\n", head.Schema, head.Table, err)
@@ -207,6 +260,7 @@ func heapMeasurement(ctx context.Context, r Reader, p *maint.Profile, wantComp b
 	}
 	m := maint.HeapMeasurement{
 		Schema: head.Schema, Table: head.Table, SizeMB: sizeMB,
+		NonclusteredMB: nonclusteredMB, NonclusteredCount: nonclusteredCount, RewriteMB: rewriteMB,
 		ForwardedRecordCount: forwarded, RecordCount: records,
 		FragmentationPercent: maxFrag, PageSpaceUsedPercent: minPageSpace,
 		Current: parseCompression(head.Compression),
