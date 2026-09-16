@@ -154,9 +154,9 @@ func CheckDataFreeSpace(target string, needMB, unsizedDisabled int, sp DataSpace
 	}
 	switch {
 	case needMB <= 0:
-		// An unread size is not "checked and fine" — it is not checked at all (H6,
-		// REVIEW-2026-09-16-harm.md). Still not Fail: the read is documented as optional,
-		// and failing here would block every rebuild for a login without VIEW DEFINITION,
+		// An unread size is not "checked and fine" — it is not checked at all (H6, the
+		// 2026-09-16 harm review). Still not Fail: the read is documented as optional, and
+		// failing here would block every rebuild for a login without VIEW DEFINITION,
 		// including where space is plentiful.
 		return Check{name, Warn, fmt.Sprintf("%s: size could not be read, not checked (%d MB free in data files)%s", target, freeMB, extra)}
 	case freeMB >= needMB:
@@ -467,11 +467,10 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 			// the space check, fails closed on it (H2) — it guards an irreversible side effect.
 			sizes, err := p.TableStructureSizes(ctx, schema, table, partition)
 			if err == nil && len(sizes) == 0 {
-				// Metadata visibility filters rows rather than raising when VIEW
-				// DEFINITION is missing (H1, REVIEW-2026-09-16-harm.md and
-				// REVIEW-2026-09-16-harm-agy.md finding 1): a success with zero rows is
-				// the same permission-gap case as a read error, not proof the table has
-				// nothing. Collapse it here so every check below takes its readErr branch.
+				// Metadata visibility filters rows rather than raising when VIEW DEFINITION is
+				// missing (H1, both 2026-09-16 harm reviews): a success with zero rows is the
+				// same permission-gap case as a read error, not proof the table has nothing.
+				// Collapse it here so every check below takes its readErr branch.
 				err = fmt.Errorf("no structure rows returned for %s.%s (VIEW DEFINITION may be missing)", schema, table)
 			}
 

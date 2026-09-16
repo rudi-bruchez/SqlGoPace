@@ -70,7 +70,7 @@ func TestCheckDataFreeSpace(t *testing.T) {
 	}
 }
 
-// TestCheckDataFreeSpaceUnknownSizeWarns pins H6 (REVIEW-2026-09-16-harm.md): an unread size
+// TestCheckDataFreeSpaceUnknownSizeWarns pins H6 (the 2026-09-16 harm review): an unread size
 // must not read as PASS on a 400-line .log — it is not "checked and fine", it is "not
 // checked". Still not Fail: the read is documented as optional, and failing here would block
 // every rebuild for a login without VIEW DEFINITION, including where space is plentiful.
@@ -126,12 +126,11 @@ func TestHeapRebuildSizedFromWholeTable(t *testing.T) {
 	}
 }
 
-// TestZeroRowSizeReadIsTreatedAsUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
-// REVIEW-2026-09-16-harm-agy.md finding 1): metadata visibility filters rows rather than
-// raising when VIEW DEFINITION is missing, so a read that succeeds with zero rows is the
-// same permission-gap case as a read that errors — it must not be read as "the table has
-// nothing". CheckReenabledIndexes must take its readErr branch (Fail), and
-// CheckHeapRebuildScope must not run at all.
+// TestZeroRowSizeReadIsTreatedAsUnreadable pins H1 (both 2026-09-16 harm reviews): metadata
+// visibility filters rows rather than raising when VIEW DEFINITION is missing, so a read that
+// succeeds with zero rows is the same permission-gap case as a read that errors — it must not
+// be read as "the table has nothing". CheckReenabledIndexes must take its readErr branch
+// (Fail), and CheckHeapRebuildScope must not run at all.
 func TestZeroRowSizeReadIsTreatedAsUnreadable(t *testing.T) {
 	p := fakeProber{structures: nil, dataFreeMB: 6000} // success, zero rows: the permission-gap case
 	m := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
@@ -183,10 +182,10 @@ func TestCheckReenabledIndexes(t *testing.T) {
 	}
 }
 
-// TestCheckReenabledIndexesFailsClosedOnUnreadableState pins H2 (REVIEW-2026-09-16-harm.md,
-// REVIEW-2026-09-16-harm-agy.md finding 1): a guard against an irreversible side effect must
-// fail closed when it cannot read the state it guards, not warn and let the run proceed. The
-// detail must name both ways out: the missing permission, and the explicit opt-in.
+// TestCheckReenabledIndexesFailsClosedOnUnreadableState pins H2 (both 2026-09-16 harm
+// reviews): a guard against an irreversible side effect must fail closed when it cannot read
+// the state it guards, not warn and let the run proceed. The detail must name both ways out:
+// the missing permission, and the explicit opt-in.
 func TestCheckReenabledIndexesFailsClosedOnUnreadableState(t *testing.T) {
 	got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, errors.New("permission denied"))
 	if got.Severity != preflight.Fail {
@@ -1179,7 +1178,7 @@ func anyCheckContains(rep preflight.Report, sev preflight.Severity, fragment str
 	return false
 }
 
-// TestReportCarriesTheSizeRead pins H5 (REVIEW-2026-09-16-harm.md): preflight hands on the
+// TestReportCarriesTheSizeRead pins H5 (the 2026-09-16 harm review): preflight hands on the
 // structure sizes it already paid for, so the engine's manifest-start scope loop does not
 // repeat the same DMV read seconds later, unmonitored and with nothing on the console.
 func TestReportCarriesTheSizeRead(t *testing.T) {

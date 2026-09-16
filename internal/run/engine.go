@@ -663,9 +663,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			// is nothing to say, same as before this fix.
 			continue
 		case err != nil || len(sizes) == 0:
-			// A failed read and a zero-row read are the same "cannot tell" case (H1,
-			// REVIEW-2026-09-16-harm.md): say the scope could not be read, rather than
-			// staying silent the way a genuine bare heap does below.
+			// A failed read and a zero-row read are the same "cannot tell" case (H1, the
+			// 2026-09-16 harm review): say the scope could not be read, rather than staying
+			// silent the way a genuine bare heap does below.
 			notice := heapScopeUnreadableNotice(i+1, heap, err)
 			fmt.Fprintln(e.out, notice)
 			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)

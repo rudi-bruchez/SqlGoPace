@@ -973,11 +973,10 @@ func TestManifestStartHeapScope(t *testing.T) {
 	}
 }
 
-// TestManifestStartHeapScopeUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
-// REVIEW-2026-09-16-harm-agy.md finding 1): a read that failed must not be read as "nothing
-// to rewrite" the way it was before — the manifest-start loop used to `continue` silently on
-// err != nil exactly like a genuine bare heap. It must say the scope could not be read,
-// naming the table and the error, on e.out and in the report.
+// TestManifestStartHeapScopeUnreadable pins H1 (both 2026-09-16 harm reviews): a read that
+// failed must not be read as "nothing to rewrite" the way it was before — the manifest-start
+// loop used to `continue` silently on err != nil exactly like a genuine bare heap. It must say
+// the scope could not be read, naming the table and the error, on e.out and in the report.
 func TestManifestStartHeapScopeUnreadable(t *testing.T) {
 	sizes := &fakeSizeReader{err: errors.New("permission denied")}
 	var out syncBuffer
@@ -1131,11 +1130,11 @@ func TestCanceledReorganizeDoesNotReportSizeFailure(t *testing.T) {
 	}
 }
 
-// TestManifestStartHeapScopeUsesPreflightRead pins H5 (REVIEW-2026-09-16-harm.md): the
-// manifest-start scope loop reuses the structure sizes preflight already read seconds
-// earlier over the same expanded operation list, instead of paying a second unmonitored
-// DMV round trip per heap. The size reader here fails, so a notice naming the real scope
-// can only have come from the preflight report.
+// TestManifestStartHeapScopeUsesPreflightRead pins H5 (the 2026-09-16 harm review): the
+// manifest-start scope loop reuses the structure sizes preflight already read seconds earlier
+// over the same expanded operation list, instead of paying a second unmonitored DMV round trip
+// per heap. The size reader here fails, so a notice naming the real scope can only have come
+// from the preflight report.
 func TestManifestStartHeapScopeUsesPreflightRead(t *testing.T) {
 	cached := preflight.Report{Sizes: map[string][]mssql.StructureSize{
 		"dbo.T1": {

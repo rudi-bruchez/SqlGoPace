@@ -204,7 +204,7 @@ func renderSizes(w io.Writer, op OperationReport) {
 		// Skip a structure unless both sides are known — the same rule sizeTotals.add
 		// (internal/run/sizes.go) uses. Adding a known side on its own lets the total show
 		// growth that is an artifact of a half-measured set rather than a real change (H7,
-		// first bullet, REVIEW-2026-09-16-harm.md).
+		// first bullet, the 2026-09-16 harm review).
 		if s.BeforeKB == SizeUnknown || s.AfterKB == SizeUnknown {
 			continue
 		}

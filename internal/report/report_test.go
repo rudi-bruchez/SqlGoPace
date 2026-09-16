@@ -190,7 +190,7 @@ func TestWriteRendersSizes(t *testing.T) {
 		"size (heap and 2 nonclustered index(es)):",
 		"IX_OLD (was disabled)",
 		"-> unknown",
-		// IX_TS's after size is unknown, so the total (H7, REVIEW-2026-09-16-harm.md) sums
+		// IX_TS's after size is unknown, so the total (H7, the 2026-09-16 harm review) sums
 		// only heap + IX_OLD (both known) and says it skipped one of the three structures.
 		"total (2 of 3 measured)",
 		"size: 7.0 GB -> 4.5 GB (-35.7%) over 2 structure(s)",
@@ -204,11 +204,11 @@ func TestWriteRendersSizes(t *testing.T) {
 	}
 }
 
-// TestRenderSizesTotalSkipsHalfMeasuredStructures pins H7, first bullet
-// (REVIEW-2026-09-16-harm.md): the total row must use the same rule as sizeTotals.add
-// (internal/run/sizes.go) — skip a structure unless both sides are known — or it can show
-// growth that is an artifact of a half-measured set. When it skips any structure, the total
-// line says so rather than presenting a silently partial number.
+// TestRenderSizesTotalSkipsHalfMeasuredStructures pins H7, first bullet (the 2026-09-16 harm
+// review): the total row must use the same rule as sizeTotals.add (internal/run/sizes.go) —
+// skip a structure unless both sides are known — or it can show growth that is an artifact of
+// a half-measured set. When it skips any structure, the total line says so rather than
+// presenting a silently partial number.
 func TestRenderSizesTotalSkipsHalfMeasuredStructures(t *testing.T) {
 	r := report.RunReport{
 		Manifest: "100_h.yaml", Outcome: "SUCCESS",

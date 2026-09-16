@@ -87,16 +87,15 @@ func DisabledNames(sizes []mssql.StructureSize) []string {
 	return out
 }
 
-// CheckReenabledIndexes guards the one irreversible side effect of a heap rebuild. The
-// rebuild recreates every nonclustered index of the table, so a disabled one comes back
-// live and uncompressed (measured on a server: docs/specs/OBJECT-SIZES-ANALYSIS.md).
-// That undoes a deliberate operator decision, so it fails unless the operation opted in.
-// A read error fails closed too: sys.dm_db_partition_stats wants VIEW DEFINITION, which
-// the documented VIEW SERVER STATE does not imply, so this is the reachable case for the
-// tool's own documented permission floor — and a guard against an irreversible side effect
-// that cannot be checked must stop, not shrug (H2, REVIEW-2026-09-16-harm.md and
-// REVIEW-2026-09-16-harm-agy.md finding 1). The way out is named directly: grant VIEW
-// DEFINITION, or opt in with allow_reenable_disabled_indexes knowing what it costs.
+// CheckReenabledIndexes guards the one irreversible side effect of a heap rebuild. The rebuild
+// recreates every nonclustered index of the table, so a disabled one comes back live and
+// uncompressed (measured on a server: docs/specs/OBJECT-SIZES-ANALYSIS.md). That undoes a
+// deliberate operator decision, so it fails unless the operation opted in. A read error fails
+// closed too: sys.dm_db_partition_stats wants VIEW DEFINITION, which the documented VIEW
+// SERVER STATE does not imply, so this is the reachable case for the tool's own documented
+// permission floor — and a guard against an irreversible side effect that cannot be checked
+// must stop, not shrug (H2, both 2026-09-16 harm reviews). The way out is named directly:
+// grant VIEW DEFINITION, or opt in with allow_reenable_disabled_indexes knowing what it costs.
 func CheckReenabledIndexes(target string, disabled []string, allowed bool, readErr error) Check {
 	const name = "heap rebuild re-enables indexes"
 	switch {

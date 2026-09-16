@@ -1518,12 +1518,12 @@ func dryRunManifest(ctx context.Context, w io.Writer, path string, manifest *ddl
 	return nil
 }
 
-// heapScopes reads, for every planned rebuild_heap, the table's structure sizes for the
-// dry run's scope lines, keyed by the operation's index in planned. A nil reader means the
-// dry run is offline, which gets its own wording; connected, a failed or empty read is a
-// different case — the connection works but the read did not, most often a login without
-// VIEW DEFINITION (H1, REVIEW-2026-09-16-harm.md and REVIEW-2026-09-16-harm-agy.md finding
-// 1) — and must not be reported with wording that claims an offline run.
+// heapScopes reads, for every planned rebuild_heap, the table's structure sizes for the dry
+// run's scope lines, keyed by the operation's index in planned. A nil reader means the dry run
+// is offline, which gets its own wording; connected, a failed or empty read is a different
+// case — the connection works but the read did not, most often a login without VIEW DEFINITION
+// (H1, both 2026-09-16 harm reviews) — and must not be reported with wording that claims an
+// offline run.
 func heapScopes(ctx context.Context, sizes run.SizeReader, planned []ddl.PlannedOperation) map[int][]string {
 	scopes := map[int][]string{}
 	for i, step := range planned {

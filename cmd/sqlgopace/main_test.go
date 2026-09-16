@@ -553,10 +553,10 @@ func (f fakeDrySizeReader) TableStructureSizes(context.Context, string, string, 
 	return f.sizes, f.err
 }
 
-// TestHeapScopesDistinguishesOfflineFromUnreadable pins H1 (REVIEW-2026-09-16-harm.md,
-// REVIEW-2026-09-16-harm-agy.md finding 1): a failed or empty read while connected must not
-// say "not listed offline" — that claims an offline run while online. The offline wording is
-// reserved for the genuinely offline case, a nil size reader.
+// TestHeapScopesDistinguishesOfflineFromUnreadable pins H1 (both 2026-09-16 harm reviews): a
+// failed or empty read while connected must not say "not listed offline" — that claims an
+// offline run while online. The offline wording is reserved for the genuinely offline case, a
+// nil size reader.
 func TestHeapScopesDistinguishesOfflineFromUnreadable(t *testing.T) {
 	planned := []ddl.PlannedOperation{{Operation: ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
 

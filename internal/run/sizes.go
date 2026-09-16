@@ -134,10 +134,9 @@ func heapScopeNotice(index int, op ddl.RebuildHeap, sizes []mssql.StructureSize)
 
 // heapScopeUnreadableNotice is the manifest-start line for a heap rebuild whose structure
 // sizes could not be established: the read failed, or it succeeded with zero rows, which is
-// the same permission-gap case (metadata visibility filters rows rather than raising when
-// VIEW DEFINITION is missing — H1, REVIEW-2026-09-16-harm.md and
-// REVIEW-2026-09-16-harm-agy.md finding 1). Either way the scope is unknown, not empty, and
-// staying silent read as "nothing to rewrite" — say so instead.
+// the same permission-gap case (metadata visibility filters rows rather than raising when VIEW
+// DEFINITION is missing — H1, both 2026-09-16 harm reviews). Either way the scope is unknown,
+// not empty, and staying silent read as "nothing to rewrite" — say so instead.
 func heapScopeUnreadableNotice(index int, op ddl.RebuildHeap, err error) string {
 	cause := "no structure rows returned (VIEW DEFINITION may be missing)"
 	if err != nil {
