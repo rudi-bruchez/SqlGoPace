@@ -439,20 +439,38 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 	}
 
 	for _, op := range m.Operations {
-		if th.RequireDataFreeSpace {
-			if schema, table, partition, ok := SizedOperation(op); ok {
-				if _, isReorg := op.(ddl.ReorganizeIndex); !isReorg {
-					// A size we cannot read is reported as unknown (0), never as a failed run:
-					// sys.dm_db_partition_stats also wants VIEW DEFINITION, which the documented
-					// VIEW SERVER STATE does not imply, so a legitimate login can be refused it.
-					sizes, err := p.TableStructureSizes(ctx, schema, table, partition)
-					if err != nil {
-						sizes = nil
-					}
-					rewritten := Rewritten(op, sizes)
-					needMB := int((SumKB(rewritten) + 1023) / 1024)
-					rep.add(CheckDataFreeSpace(rewrittenLabel(op), needMB, len(DisabledNames(rewritten)),
-						DataSpace{FreeMB: dataFreeMB, Growth: dataGrowth, GrowthKnown: growthKnown}))
+		heap, isHeap := op.(ddl.RebuildHeap)
+		schema, table, partition, sizedOK := SizedOperation(op)
+		_, isReorg := op.(ddl.ReorganizeIndex)
+		needsSpaceCheck := th.RequireDataFreeSpace && sizedOK && !isReorg
+
+		// The disabled-index guard runs for every rebuild_heap regardless of
+		// RequireDataFreeSpace — it is not a space check. Where both it and the space
+		// check want the same table's sizes, the read is hoisted above both so a heap
+		// costs one query, not two.
+		if needsSpaceCheck || isHeap {
+			// A size we cannot read is reported as unknown (0) for the space check, never
+			// as a failed run: sys.dm_db_partition_stats also wants VIEW DEFINITION, which
+			// the documented VIEW SERVER STATE does not imply, so a legitimate login can be
+			// refused it. The disabled-index guard sees the same error directly and warns.
+			sizes, err := p.TableStructureSizes(ctx, schema, table, partition)
+
+			if needsSpaceCheck {
+				spaceSizes := sizes
+				if err != nil {
+					spaceSizes = nil
+				}
+				rewritten := Rewritten(op, spaceSizes)
+				needMB := int((SumKB(rewritten) + 1023) / 1024)
+				rep.add(CheckDataFreeSpace(rewrittenLabel(op), needMB, len(DisabledNames(rewritten)),
+					DataSpace{FreeMB: dataFreeMB, Growth: dataGrowth, GrowthKnown: growthKnown}))
+			}
+
+			if isHeap {
+				label := rewrittenLabel(op)
+				rep.add(CheckReenabledIndexes(label, DisabledNames(sizes), heap.AllowReenableDisabledIndexes, err))
+				if err == nil {
+					rep.add(CheckHeapRebuildScope(label, sizes))
 				}
 			}
 		}

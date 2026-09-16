@@ -1,10 +1,12 @@
 package preflight
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 )
 
 // SizedOperation reports the table an operation's size is read from, and whether it is
@@ -73,4 +75,54 @@ func DisabledNames(sizes []mssql.StructureSize) []string {
 		}
 	}
 	return out
+}
+
+// CheckReenabledIndexes guards the one irreversible side effect of a heap rebuild. The
+// rebuild recreates every nonclustered index of the table, so a disabled one comes back
+// live and uncompressed (verified on a server: docs/specs/OBJECT-SIZES.md "Verified
+// behaviour"). That undoes a deliberate operator decision, so it fails unless the operation
+// opted in. A read error warns rather than fails: sys.dm_db_partition_stats wants VIEW
+// DEFINITION, which the documented VIEW SERVER STATE does not imply, and a login missing it
+// must not be blocked by a guard that cannot run.
+func CheckReenabledIndexes(target string, disabled []string, allowed bool, readErr error) Check {
+	const name = "heap rebuild re-enables indexes"
+	switch {
+	case readErr != nil:
+		return Check{name, Warn, fmt.Sprintf(
+			"%s: index state could not be read: %v; a disabled index would be re-enabled by the rebuild", target, readErr)}
+	case len(disabled) == 0:
+		return Check{name, Pass, target + ": no disabled index on the table"}
+	case allowed:
+		return Check{name, Warn, fmt.Sprintf(
+			"%s: rebuild re-enables disabled index(es) %s and rebuilds it live and without its compression (compression metadata is dropped when an index is disabled) — allowed by allow_reenable_disabled_indexes",
+			target, strings.Join(disabled, ", "))}
+	default:
+		return Check{name, Fail, fmt.Sprintf(
+			"%s: ALTER TABLE REBUILD re-enables disabled index(es) %s and rebuilds it live and without its compression (compression metadata is dropped when an index is disabled); drop the index, or set allow_reenable_disabled_indexes: true on this operation",
+			target, strings.Join(disabled, ", "))}
+	}
+}
+
+// CheckHeapRebuildScope records, in the .log, what else a heap rebuild rewrites. It is a
+// record, not the warning: only FAIL lines reach the console, so the operator is told before
+// the fact by the engine's manifest-start line and the dry run, not by this check.
+func CheckHeapRebuildScope(target string, rewritten []mssql.StructureSize) Check {
+	const name = "heap rebuild scope"
+	var (
+		parts []string
+		count int
+	)
+	for _, s := range rewritten {
+		if s.IndexID == 0 {
+			continue
+		}
+		count++
+		parts = append(parts, fmt.Sprintf("%s %s", s.Name, report.HumanizeKB(s.UsedKB)))
+	}
+	if count == 0 {
+		return Check{name, Pass, target + ": no nonclustered index; the rebuild rewrites the heap alone"}
+	}
+	return Check{name, Warn, fmt.Sprintf(
+		"%s: ALTER TABLE REBUILD also rebuilds %d nonclustered index(es): %s; %s rewritten in one transaction",
+		target, count, strings.Join(parts, ", "), report.HumanizeKB(SumKB(rewritten)))}
 }

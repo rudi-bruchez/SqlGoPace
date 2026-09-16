@@ -111,6 +111,45 @@ func TestHeapRebuildSizedFromWholeTable(t *testing.T) {
 	}
 }
 
+// TestCheckReenabledIndexes pins the guard: a heap rebuild that would re-enable a disabled
+// index fails until the operation opts in, and says what the operator loses.
+func TestCheckReenabledIndexes(t *testing.T) {
+	c := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", []string{"IX_MEASUREMENT_OLD"}, false, nil)
+	if c.Severity != preflight.Fail {
+		t.Fatalf("Severity = %v, want Fail", c.Severity)
+	}
+	for _, want := range []string{"IX_MEASUREMENT_OLD", "without its compression", "allow_reenable_disabled_indexes"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("Detail = %q, want it to contain %q", c.Detail, want)
+		}
+	}
+	if got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", []string{"IX_MEASUREMENT_OLD"}, true, nil); got.Severity != preflight.Warn {
+		t.Errorf("with the opt-in: Severity = %v, want Warn", got.Severity)
+	}
+	if got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, nil); got.Severity != preflight.Pass {
+		t.Errorf("no disabled index: Severity = %v, want Pass", got.Severity)
+	}
+	if got := preflight.CheckReenabledIndexes("dbo.MEASUREMENT (heap)", nil, false, errors.New("permission denied")); got.Severity != preflight.Warn {
+		t.Errorf("unreadable index state: Severity = %v, want Warn (never fail a run on a permission)", got.Severity)
+	}
+}
+
+// TestCheckHeapRebuildScope records what else the statement rewrites, for the .log.
+func TestCheckHeapRebuildScope(t *testing.T) {
+	c := preflight.CheckHeapRebuildScope("dbo.MEASUREMENT (heap)", probeSizes)
+	if c.Severity != preflight.Warn {
+		t.Fatalf("Severity = %v, want Warn", c.Severity)
+	}
+	for _, want := range []string{"3 nonclustered index(es)", "IX_MEASUREMENT_TS", "one transaction"} {
+		if !strings.Contains(c.Detail, want) {
+			t.Errorf("Detail = %q, want it to contain %q", c.Detail, want)
+		}
+	}
+	if got := preflight.CheckHeapRebuildScope("dbo.T (heap)", []mssql.StructureSize{{IndexID: 0, UsedKB: 10}}); got.Severity != preflight.Pass {
+		t.Errorf("heap with no index: Severity = %v, want Pass", got.Severity)
+	}
+}
+
 // Free space inside the files is not the whole story: a file that can still grow has
 // headroom the check must count, or it fails runs that would have succeeded. Relying on
 // growth is a Warn rather than a Pass, because the growth itself is a blocking zero-fill.
@@ -781,6 +820,33 @@ func TestRunSurvivesAnObjectSizeReadFailure(t *testing.T) {
 	}
 	if rep.HasFailure() {
 		t.Errorf("an unreadable object size failed the run:\n%v", rep.Checks)
+	}
+}
+
+// TestRunRefusesHeapRebuildWithDisabledIndex is the end-to-end gate. RequireDataFreeSpace is
+// left off to prove the guard is not gated by the space check — it is not a space check.
+func TestRunRefusesHeapRebuildWithDisabledIndex(t *testing.T) {
+	p := healthyProber()
+	p.structures = probeSizes
+	// batchThresholds carries no RequireDataFreeSpace: the guard must fire without it.
+	refused := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, refused, batchThresholds, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !rep.HasFailure() {
+		t.Fatalf("preflight passed a heap rebuild that re-enables a disabled index:\n%+v", rep.Checks)
+	}
+
+	allowed := &ddl.Manifest{Operations: []ddl.Operation{
+		ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT", AllowReenableDisabledIndexes: true},
+	}}
+	rep, err = preflight.Run(context.Background(), p, batchServerInfo, allowed, batchThresholds, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if rep.HasFailure() {
+		t.Errorf("preflight refused an opted-in heap rebuild:\n%+v", rep.Checks)
 	}
 }
 
