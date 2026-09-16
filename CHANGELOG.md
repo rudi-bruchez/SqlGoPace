@@ -13,6 +13,26 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.38.0] - 2026-09-16
+
+### Changed
+
+- The console shows a session this run is blocking on the poll that sees it, instead of hiding
+  it until it had blocked continuously for `blocking_timeout_minutes`. With the shipped
+  defaults a blocker was invisible for 60 to 90 seconds, and the timer reset per session id, so
+  every kill bought another minute of blindness on the next link of the chain. No reaction
+  timer changes: the debounce had exactly one consumer, the console feed, and the engine
+  samples separately. See `docs/specs/BLOCKER-VISIBILITY.md`.
+- The console's blocked-sessions panel now refreshes on `blocking_poll_seconds` (10 s) rather
+  than `progress_poll_seconds` (30 s), which had been driving it. Progress, session waits and
+  data/log space stay on `progress_poll_seconds`.
+
+**Migration.** No key changes value, but one changes meaning. If you raised
+`blocking_timeout_minutes` to keep the console from listing short-lived blockers, it was not
+the console you were configuring: that key delayed the display *and* the reaction, and only the
+reaction was intended. It now governs the reaction alone — revisit the value you chose, because
+its real cost was a minute of blindness after each kill.
+
 ## [0.37.0] - 2026-09-16
 
 ### Added

@@ -789,6 +789,17 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   - deleting `DefaultAmplifyingCommands` on its own: right in isolation, but it is the entry
     above, which has to be settled first.
 
+- [ ] **`feedConsole` cannot be unit-tested, so its cadence is verified by reading.**
+  `cmd/sqlgopace/main.go` — it takes a concrete `*mssql.Conn` and drives its own tickers, so
+  nothing asserts that blockers refresh on `blocking_poll_seconds` and progress on
+  `progress_poll_seconds`. The 0.38.0 change split those two cadences
+  ([BLOCKER-VISIBILITY.md](BLOCKER-VISIBILITY.md)) and only the pure part (`blockersOf`) is
+  covered by a test; the wiring is covered by the eye.
+  *Deferred because:* the seam is a narrow reader interface over the three reads the loop makes,
+  which is a small refactor but a real one, and this change did not need it to be correct. Take
+  it the next time the console feed is opened — the same seam would let the suspension tracker's
+  accrual be tested, which is also currently uncovered.
+
 ## Iterations still to design / implement
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another

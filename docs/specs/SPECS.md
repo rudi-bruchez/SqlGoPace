@@ -403,9 +403,10 @@ type Matrix struct {
 The monitoring thread polls the server on **decoupled intervals** (a single 60 s interval is too
 coarse: 60 s of blocking in production = an incident):
 
-- `blocking_poll_seconds` (default **10**) — blocking detection.
+- `blocking_poll_seconds` (default **10**) — blocking detection, and the console's
+  blocked-sessions panel (BLOCKER-VISIBILITY.md).
 - `log_poll_seconds` (default **60**) — log pressure.
-- `progress_poll_seconds` (default **30**) — DDL progress.
+- `progress_poll_seconds` (default **30**) — DDL progress, session waits, data/log space.
 
 ### 8.1 Transaction log
 

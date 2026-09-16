@@ -139,6 +139,11 @@ progress, the sessions it is blocking, the sessions blocking it, and the reactio
 The operations panel is titled with the manifest being run. The `op i/N` counter restarts at 1
 for each manifest, so the counter says where the run is inside one and the title says which.
 
+A session this run blocks appears in the blocked-sessions panel on the poll that sees it
+(`blocking_poll_seconds`), with how long it has waited on the row. That wait is the evidence to
+judge it by: nothing is filtered out for being too recent, so a block that clears on its own is
+visible while it lasts.
+
 The header's right-hand box carries a third line, once the first poll has landed:
 
 ```

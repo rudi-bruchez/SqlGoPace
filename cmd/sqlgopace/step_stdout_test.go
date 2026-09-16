@@ -9,37 +9,6 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/run"
 )
 
-func TestBlockerGateDebounces(t *testing.T) {
-	gate := newBlockerGate()
-	base := time.Unix(1000, 0)
-	const timeout = 30 * time.Second
-	blocked := []mssql.Session{{SPID: 52, BlockingSPID: 102}}
-
-	// Freshly seen, then still within the window: hidden both times.
-	if got := gate.persistent(blocked, 102, base, timeout); len(got) != 0 {
-		t.Fatalf("a freshly-seen blocker must be hidden, got %+v", got)
-	}
-	if got := gate.persistent(blocked, 102, base.Add(10*time.Second), timeout); len(got) != 0 {
-		t.Fatalf("a blocker below the timeout must stay hidden, got %+v", got)
-	}
-	// Past the timeout: shown.
-	if got := gate.persistent(blocked, 102, base.Add(31*time.Second), timeout); len(got) != 1 || got[0].SPID != 52 {
-		t.Fatalf("a blocker past the timeout must show, got %+v", got)
-	}
-	// It clears, then reappears: the debounce timer resets, so it is hidden again.
-	if got := gate.persistent(nil, 102, base.Add(40*time.Second), timeout); len(got) != 0 {
-		t.Fatalf("no sessions → nothing shown, got %+v", got)
-	}
-	if got := gate.persistent(blocked, 102, base.Add(41*time.Second), timeout); len(got) != 0 {
-		t.Fatalf("a reappearing blocker restarts its debounce, got %+v", got)
-	}
-	// A session not blocked by us (bs_id 0) is never shown, even with no debounce.
-	idle := []mssql.Session{{SPID: 60, BlockingSPID: 0}}
-	if got := gate.persistent(idle, 102, base.Add(100*time.Second), 0); len(got) != 0 {
-		t.Fatalf("an unblocked session must never show, got %+v", got)
-	}
-}
-
 func TestStepSinkToFormatsStartedAndFinished(t *testing.T) {
 	var b strings.Builder
 	sink := stepSinkTo(&b)
@@ -132,5 +101,25 @@ func TestOperationsMsgNamesTheManifest(t *testing.T) {
 	}
 	if msg.Ops[0].Label != "rebuild_index dbo.T.IX" || msg.Ops[0].Status != "TO RUN" || msg.Ops[0].Detail != "cancel only" {
 		t.Errorf("Ops[0] = %+v, want the label, TO RUN and the manifest-start detail", msg.Ops[0])
+	}
+}
+
+func TestBlockersSurfaceOnSight(t *testing.T) {
+	// BLOCKER-VISIBILITY.md: a blocker is shown on the poll that sees it. The minute-long
+	// debounce this replaces hid the chain an operator was working, and reset itself after
+	// every kill, so each kill bought another minute of blindness.
+	blocked := []mssql.Session{{SPID: 52, BlockingSPID: 102}}
+	got := blockersOf(blocked, 102)
+	if len(got) != 1 || got[0].SPID != 52 {
+		t.Fatalf("a freshly-seen blocker must be shown at once, got %+v", got)
+	}
+	// A session blocked by somebody else, or by nobody, is never ours to show.
+	mixed := []mssql.Session{{SPID: 60, BlockingSPID: 0}, {SPID: 61, BlockingSPID: 999}, {SPID: 62, BlockingSPID: 102}}
+	got = blockersOf(mixed, 102)
+	if len(got) != 1 || got[0].SPID != 62 {
+		t.Fatalf("only sessions blocked by our SPID may show, got %+v", got)
+	}
+	if got := blockersOf(nil, 102); len(got) != 0 {
+		t.Fatalf("no sessions -> nothing shown, got %+v", got)
 	}
 }

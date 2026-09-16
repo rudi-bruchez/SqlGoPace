@@ -404,7 +404,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var sum run.Summary
 		if useTUI {
 			banner := serverBanner(dbInfo, matrix)
-			sum, err = runWithTUI(runCtx, stdout, &consoleLive, dbConn, engine, current, fwd, drain, banner, cfg.KillBlockers.Enabled, cfg.Monitoring.ProgressPoll(), cfg.Monitoring.BlockingTimeout())
+			sum, err = runWithTUI(runCtx, stdout, &consoleLive, dbConn, engine, current, fwd, drain, banner, cfg.KillBlockers.Enabled, cfg.Monitoring.BlockingPoll(), cfg.Monitoring.ProgressPoll())
 		} else {
 			sum, err = engine.ProcessAll(runCtx)
 		}
@@ -838,7 +838,7 @@ func isYAMLManifest(name string) bool {
 // runWithTUI runs the incident console in the foreground while the engine runs
 // in the background. The console is fed live from the monitoring connection, and
 // operator actions (kill DDL, kill a blocker) are dispatched to the server.
-func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, killerArmed bool, pollInterval, blockingTimeout time.Duration) (run.Summary, error) {
+func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool, conn *mssql.Conn, engine *run.Engine, current *currentManifest, fwd *tuiForwarder, drain *run.DrainFlag, banner tui.ServerInfoMsg, killerArmed bool, blockingInterval, progressInterval time.Duration) (run.Summary, error) {
 	actions := make(chan tui.Action, 8)
 	program := tui.NewProgram(tui.New("(running)", actions))
 	fwd.attach(program) // engine step/batch/shrink progress now reaches the console
@@ -852,7 +852,7 @@ func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool,
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
-	go feedConsole(feedCtx, program, conn, pollInterval, blockingTimeout)
+	go feedConsole(feedCtx, program, conn, blockingInterval, progressInterval)
 	go dispatchActions(feedCtx, program, conn, current, drain, actions)
 
 	// The engine runs under its own cancelable context so that if the console dies first
@@ -910,37 +910,15 @@ func summaryOf(r result, runErr error) (run.Summary, error) {
 	return r.summary, r.err
 }
 
-// blockerGate debounces blocker visibility: a session is surfaced only once it has been
-// continuously blocked by our DDL for at least the blocking timeout — the same threshold
-// the reaction engine acts on — so a fleeting block (e.g. a page-reclaim latch during a
-// shrink) never prompts the operator. firstSeen tracks when each session was first seen
-// blocked; entries are pruned once a session is no longer blocked, so its timer resets.
-type blockerGate struct {
-	firstSeen map[int]time.Time
-}
-
-func newBlockerGate() *blockerGate { return &blockerGate{firstSeen: make(map[int]time.Time)} }
-
-// persistent returns the sessions blocked by ddlSPID that have persisted for at least
-// timeout, updating the first-seen bookkeeping against now.
-func (g *blockerGate) persistent(sessions []mssql.Session, ddlSPID int, now time.Time, timeout time.Duration) []mssql.Session {
-	live := make(map[int]bool)
+// blockersOf returns the sessions blocked by ddlSPID, in the order the server reported
+// them. No debounce: the console shows a blocker on the poll that sees it, and the
+// operator reads how long it has waited from the row (BLOCKER-VISIBILITY.md). Kill timers
+// are unaffected — they live in the reaction path, which never read this.
+func blockersOf(sessions []mssql.Session, ddlSPID int) []mssql.Session {
 	var out []mssql.Session
 	for _, s := range sessions {
-		if !s.BlockedBy(ddlSPID) {
-			continue
-		}
-		live[s.SPID] = true
-		if _, ok := g.firstSeen[s.SPID]; !ok {
-			g.firstSeen[s.SPID] = now
-		}
-		if now.Sub(g.firstSeen[s.SPID]) >= timeout {
+		if s.BlockedBy(ddlSPID) {
 			out = append(out, s)
-		}
-	}
-	for spid := range g.firstSeen {
-		if !live[spid] {
-			delete(g.firstSeen, spid) // no longer blocked: its debounce timer resets
 		}
 	}
 	return out
@@ -956,7 +934,7 @@ type blockerAgg struct {
 
 // suspensionTracker accumulates how long and how often the operation has been blocked
 // (suspended) and by which sessions, fed one observation per poll. It is the inverse of
-// blockerGate (our op as victim, not aggressor). Durations are sampled at the poll
+// blockersOf (our op as victim, not aggressor). Durations are sampled at the poll
 // cadence, so totals are accurate to within one interval.
 type suspensionTracker struct {
 	episodes  int
@@ -1021,68 +999,88 @@ func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
 	return msg
 }
 
-// feedConsole polls the server and sends progress and blocker updates to the TUI. A
-// blocker is shown only once it has persisted for blockingTimeout (see blockerGate), so
-// transient blocks that clear on their own never reach the console.
-func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, interval, blockingTimeout time.Duration) {
+// feedConsole polls the server and sends progress and blocker updates to the TUI on two
+// independent cadences: the session reads (who we block, who blocks us, the suspension
+// history) on blockingInterval, and progress, waits and space on the coarser
+// progressInterval. Splitting them is what lets blockers be fresh without tripling the
+// progress reads, and mirrors the shape pumpSamples already has for the reaction path.
+//
+// A blocker is shown on the poll that sees it. The minute-long debounce this replaced left
+// the console blind for 60-90s and reset itself after every kill, so each kill bought
+// another minute of blindness on the next link of the chain (BLOCKER-VISIBILITY.md). No
+// kill timer lives here: the reaction path samples separately and is unchanged.
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, blockingInterval, progressInterval time.Duration) {
 	var spid spidAnnouncer
 	if msg, ok := spid.observe(conn.SPID()); ok { // show which server session is ours
 		program.Send(msg)
 	}
-	gate := newBlockerGate()
 	susp := newSuspensionTracker()
 	logAlarm := run.NewLogFullAlarm()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+
+	readSessions := func() {
+		// A repaired execution connection is a new session. The header has to follow
+		// it, or the operator verifies one session in SSMS and k ends another.
+		if msg, ok := spid.observe(conn.SPID()); ok {
+			program.Send(msg)
+		}
+		sessions, err := conn.ActiveSessions(ctx)
+		if err != nil {
+			return
+		}
+		var blockers []tui.Blocker
+		for _, s := range blockersOf(sessions, conn.SPID()) {
+			blockers = append(blockers, tui.Blocker{
+				SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
+				WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
+				OpenTransactions: s.OpenTransactions,
+			})
+		}
+		program.Send(tui.BlockersMsg{Blockers: blockers})
+
+		// Mirror: report whether OUR operation is itself blocked (the victim), from
+		// the same snapshot. Sent every poll so the indicator clears when unblocked.
+		sb := mssql.FindSelfBlock(sessions, conn.SPID())
+		program.Send(tui.BlockedByMsg{
+			Blocked: sb.Blocked, SPID: sb.SPID, Login: sb.Login, Program: sb.Program,
+			WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
+		})
+		// Accumulate the suspension history (how long/often/by whom) and send it.
+		susp.observe(sb.Blocked, sb.SPID, sb.Login, sb.Host, time.Now())
+		program.Send(susp.snapshot())
+	}
+
+	readProgress := func() {
+		if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
+			program.Send(progressMsg(p))
+		}
+		if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
+			program.Send(waitsMsg(waits))
+		}
+		// Data/log space for the header's third line (see probeSpace for the
+		// best-effort read).
+		if dataFiles, ls, reuseWait, ok := probeSpace(ctx, conn); ok {
+			fire := logAlarm.Observe(ls.UsedPercent)
+			alert := ls.UsedPercent >= run.LogFullThresholdPercent
+			program.Send(spaceMsg(dataFiles, ls, reuseWait, alert))
+			if fire {
+				program.Send(logAlertMsg(ls.UsedPercent, reuseWait))
+			}
+		}
+	}
+
+	blockTicker := time.NewTicker(blockingInterval)
+	defer blockTicker.Stop()
+	progressTicker := time.NewTicker(progressInterval)
+	defer progressTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
-			// A repaired execution connection is a new session. The header has to follow
-			// it, or the operator verifies one session in SSMS and k ends another.
-			if msg, ok := spid.observe(conn.SPID()); ok {
-				program.Send(msg)
-			}
-			if sessions, err := conn.ActiveSessions(ctx); err == nil {
-				var blockers []tui.Blocker
-				for _, s := range gate.persistent(sessions, conn.SPID(), time.Now(), blockingTimeout) {
-					blockers = append(blockers, tui.Blocker{
-						SPID: s.SPID, Login: s.Login, Host: s.Host, Program: s.Program,
-						WaitType: s.WaitType, WaitMS: s.WaitMS, Query: s.ActiveQuery,
-						OpenTransactions: s.OpenTransactions,
-					})
-				}
-				program.Send(tui.BlockersMsg{Blockers: blockers})
-
-				// Mirror: report whether OUR operation is itself blocked (the victim), from
-				// the same snapshot. Sent every poll so the indicator clears when unblocked.
-				sb := mssql.FindSelfBlock(sessions, conn.SPID())
-				program.Send(tui.BlockedByMsg{
-					Blocked: sb.Blocked, SPID: sb.SPID, Login: sb.Login, Program: sb.Program,
-					WaitType: sb.WaitType, WaitMS: sb.WaitMS, Query: sb.Query,
-				})
-				// Accumulate the suspension history (how long/often/by whom) and send it.
-				susp.observe(sb.Blocked, sb.SPID, sb.Login, sb.Host, time.Now())
-				program.Send(susp.snapshot())
-			}
-			if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
-				program.Send(progressMsg(p))
-			}
-			if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
-				program.Send(waitsMsg(waits))
-			}
-			// Data/log space for the header's third line (see probeSpace for the
-			// best-effort read).
-			if dataFiles, ls, reuseWait, ok := probeSpace(ctx, conn); ok {
-				fire := logAlarm.Observe(ls.UsedPercent)
-				alert := ls.UsedPercent >= run.LogFullThresholdPercent
-				program.Send(spaceMsg(dataFiles, ls, reuseWait, alert))
-				if fire {
-					program.Send(logAlertMsg(ls.UsedPercent, reuseWait))
-				}
-			}
+		case <-blockTicker.C:
+			readSessions()
+		case <-progressTicker.C:
+			readProgress()
 		}
 	}
 }
