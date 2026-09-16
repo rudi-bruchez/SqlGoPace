@@ -781,3 +781,26 @@ func TestKillAndRememberIsGone(t *testing.T) {
 		t.Errorf("the footer still offers [X]:\n%s", m.View())
 	}
 }
+
+// TestOperationRowKeepsItsDetail: the row is the only per-operation line the console keeps
+// for the whole run. A LogMsg — a kill, an ignore answer — must not disturb it, which is
+// exactly how the 0.34.0 rollback-on-cancel notice got erased (single notice slot).
+func TestOperationRowKeepsItsDetail(t *testing.T) {
+	m := tui.New("rebuild_heap dbo.MEASUREMENT", nil)
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{
+		{Index: 1, Label: "rebuild_heap dbo.MEASUREMENT", Status: "TO RUN", Detail: "cancel only · +2 nonclustered, 8.1 GB rewritten"},
+	}})
+	m, _ = send(m, tui.LogMsg{Line: "killed blocker SPID 53"})
+	if v := m.View(); !strings.Contains(v, "cancel only · +2 nonclustered, 8.1 GB rewritten") {
+		t.Errorf("row detail lost after a LogMsg:\n%s", v)
+	}
+
+	m, _ = send(m, tui.StepDoneMsg{Index: 1, Outcome: "success", Detail: "8.1 GB -> 5.4 GB (-33.3%)"})
+	v := m.View()
+	if !strings.Contains(v, "8.1 GB -> 5.4 GB (-33.3%)") {
+		t.Errorf("finished row missing the size result:\n%s", v)
+	}
+	if strings.Contains(v, "cancel only") {
+		t.Errorf("finished row still shows the start detail:\n%s", v)
+	}
+}

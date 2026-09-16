@@ -224,6 +224,9 @@ func (m Model) opRow(o OperationRow) string {
 		status = m.displayStatus().String()
 	}
 	line := fmt.Sprintf("%d - %s   %s", o.Index, o.Label, opStatusStyled(status))
+	if o.Detail != "" {
+		line += "   " + helpStyle.Render(o.Detail)
+	}
 	if o.Index == m.stepIndex {
 		if m.spid > 0 {
 			line += fmt.Sprintf("   SPID %d", m.spid)

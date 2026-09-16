@@ -87,6 +87,7 @@ type OperationRow struct {
 	Index  int
 	Label  string // "<command> <target>", e.g. "shrink_data all"
 	Status string
+	Detail string // manifest-start note, replaced by the size result when the operation finishes
 }
 
 // Messages the host feeds from the monitor stream.
@@ -226,6 +227,7 @@ type (
 	StepDoneMsg struct {
 		Index   int
 		Outcome string
+		Detail  string
 	}
 	// KillerArmedMsg tells the console whether kill_blockers is enabled in config, so the roster
 	// can warn that armed rules will not fire until it is. Sent once at startup.
@@ -549,6 +551,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ops = msg.Ops
 	case StepDoneMsg:
 		m.setOpStatus(msg.Index, opStatusLabel(msg.Outcome))
+		if msg.Detail != "" {
+			for i := range m.ops {
+				if m.ops[i].Index == msg.Index {
+					m.ops[i].Detail = msg.Detail
+					break
+				}
+			}
+		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 	case BatchMsg:
