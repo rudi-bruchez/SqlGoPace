@@ -1206,13 +1206,19 @@ func (f *tuiForwarder) step(ev run.StepEvent) {
 	}
 }
 
-// ops forwards the manifest's full operation list to the console's operations panel.
-func (f *tuiForwarder) ops(list []run.OpInfo) {
+// operationsMsg maps a manifest's full operation list to the console's operations-panel
+// update. Pure, and tested as such beside stepDoneMsg: the forwarder's job is to send.
+func operationsMsg(manifest string, list []run.OpInfo) tui.OperationsMsg {
 	rows := make([]tui.OperationRow, len(list))
 	for i, o := range list {
 		rows[i] = tui.OperationRow{Index: o.Index, Label: opLabel(o.Command, o.Target), Status: "TO RUN", Detail: o.Detail}
 	}
-	f.send(tui.OperationsMsg{Ops: rows})
+	return tui.OperationsMsg{Manifest: manifest, Ops: rows}
+}
+
+// ops forwards the manifest's full operation list to the console's operations panel.
+func (f *tuiForwarder) ops(manifest string, list []run.OpInfo) {
+	f.send(operationsMsg(manifest, list))
 }
 
 // opLabel is the "<command> <target>" display label an operation shows in the console, used

@@ -76,7 +76,14 @@ func (m Model) View() string {
 		}
 		opsBudget = max(m.height-used-(blocks-1)-3-1, minOpsRows)
 	}
-	ops := panel("operations", m.operationsBody(opsBudget), accentColor, full)
+	// The "op i/N" counter restarts at 1 for every manifest, so on a queue of several it says
+	// where you are inside one and never which one. The name goes on the panel that is itself
+	// manifest-scoped.
+	opsTitle := "operations"
+	if m.manifest != "" {
+		opsTitle += " — " + m.manifest
+	}
+	ops := panel(opsTitle, m.operationsBody(opsBudget), accentColor, full)
 
 	// Assemble top to bottom, blocks separated by a single newline.
 	var b strings.Builder

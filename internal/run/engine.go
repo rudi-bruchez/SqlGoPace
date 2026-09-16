@@ -206,7 +206,7 @@ type Engine struct {
 	logWatchEvery    time.Duration               // poll cadence for the log-full watcher
 	sizes            SizeReader                  // reads structure sizes before/after a rebuild/reorganize (WithSizeReader)
 	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
-	opListSink       func([]OpInfo)              // full operation list, once per manifest (TUI operations panel)
+	opListSink       func(string, []OpInfo)      // manifest name + its full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
 	noticeSink       func(string)                // notified with the manifest-start rollback-on-cancel notice (TUI)
 	compression      CompressionReader           // reads current index compression for the intent: compression skip
@@ -317,9 +317,12 @@ func WithOutput(w io.Writer) EngineOption { return func(e *Engine) { e.out = w }
 // (op i/N, per-op timing, outcome). Independent of the text narration on WithOutput.
 func WithStepSink(f func(StepEvent)) EngineOption { return func(e *Engine) { e.stepSink = f } }
 
-// WithOpListSink receives the full operation list of each manifest once, before its
-// operations run, so the TUI can show pending operations, not just the current one.
-func WithOpListSink(f func([]OpInfo)) EngineOption { return func(e *Engine) { e.opListSink = f } }
+// WithOpListSink receives each manifest's name and full operation list once, before its
+// operations run, so the TUI can title its panel and show pending operations, not just the
+// current one.
+func WithOpListSink(f func(string, []OpInfo)) EngineOption {
+	return func(e *Engine) { e.opListSink = f }
+}
 
 // WithAlertSink registers a callback fed one ManifestFailure whenever a manifest fails,
 // so the incident console can show the reason (notably a preflight rejection like a
@@ -701,7 +704,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 				Detail: opDetail(step, scopes[i]),
 			}
 		}
-		e.emitOpList(ops)
+		e.emitOpList(name, ops)
 	}
 
 	// Name the rollback-on-cancel hazard once per manifest, not once per operation

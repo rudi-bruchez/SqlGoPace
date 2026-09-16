@@ -83,7 +83,7 @@ func TestStepSinkEmitsStartedAndFinishedPerOp(t *testing.T) {
 
 func TestOpListSinkEmitsFullListOnce(t *testing.T) {
 	var got [][]run.OpInfo
-	sink := func(ops []run.OpInfo) { got = append(got, ops) }
+	sink := func(_ string, ops []run.OpInfo) { got = append(got, ops) }
 	eng, dirs := setupEngine(t, fakePreflighter{}, &fakeOpRunner{}, run.WithOpListSink(sink))
 	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
 		t.Fatal(err)
@@ -131,5 +131,24 @@ func TestStepSinkReportsFailedOutcome(t *testing.T) {
 	}
 	if rec.events[1].Phase != run.StepFinished || rec.events[1].Outcome != "failed" {
 		t.Errorf("finished event = %+v, want Phase=StepFinished Outcome=failed", rec.events[1])
+	}
+}
+
+func TestOpListSinkNamesTheManifest(t *testing.T) {
+	// The console titles its operations panel with this name; without it a queue of several
+	// manifests shows an "op i/N" counter that restarts at 1 and names nothing.
+	var gotName string
+	sink := func(manifest string, _ []run.OpInfo) { gotName = manifest }
+	eng, dirs := setupEngine(t, fakePreflighter{}, &fakeOpRunner{}, run.WithOpListSink(sink))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	if gotName != "010_a.yaml" {
+		t.Errorf("op list manifest = %q, want %q", gotName, "010_a.yaml")
 	}
 }

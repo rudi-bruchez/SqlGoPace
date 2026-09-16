@@ -930,3 +930,30 @@ func TestOperationRowWithoutDurationShowsNoParentheses(t *testing.T) {
 		t.Errorf("row with no reported duration should show no timing:\n%s", v)
 	}
 }
+
+func TestOperationsPanelNamesTheRunningManifest(t *testing.T) {
+	// A campaign queues several manifests, and the console's only manifest-level cue was the
+	// "op i/N" counter — which restarts at 1 for each one, so it says where you are inside a
+	// manifest and never which manifest that is.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{
+		Manifest: "030_compress_indexes.yaml",
+		Ops:      []tui.OperationRow{{Index: 1, Label: "rebuild_index dbo.T.IX", Status: "TO RUN"}},
+	})
+	if v := m.View(); !strings.Contains(v, "operations — 030_compress_indexes.yaml") {
+		t.Errorf("operations panel should name the running manifest:\n%s", v)
+	}
+}
+
+func TestOperationsPanelTitleWithoutAManifestName(t *testing.T) {
+	// The panel predates the name and is fed by tests and by any caller that has none; a
+	// missing name leaves the title bare rather than trailing a separator.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	m, _ = send(m, tui.OperationsMsg{Ops: []tui.OperationRow{{Index: 1, Label: "shrink_data all", Status: "TO RUN"}}})
+	v := m.View()
+	if !strings.Contains(v, "operations") || strings.Contains(v, "operations —") {
+		t.Errorf("a nameless manifest should leave the title bare:\n%s", v)
+	}
+}

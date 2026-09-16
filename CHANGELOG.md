@@ -13,6 +13,14 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.37.0] - 2026-09-16
+
+### Added
+
+- The console's operations panel is titled with the manifest it is running. On a queue of
+  several manifests the `op i/N` counter restarts at 1 for each one, so it said where the run
+  was inside a manifest and never which manifest that was.
+
 ## [0.36.0] - 2026-09-16
 
 ### Added

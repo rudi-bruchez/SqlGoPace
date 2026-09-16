@@ -952,7 +952,7 @@ func TestManifestStartHeapScope(t *testing.T) {
 	}}
 	var ops [][]run.OpInfo
 	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
-		run.WithSizeReader(sizes), run.WithOpListSink(func(l []run.OpInfo) { ops = append(ops, l) }))
+		run.WithSizeReader(sizes), run.WithOpListSink(func(_ string, l []run.OpInfo) { ops = append(ops, l) }))
 	writeOnly(t, dirs, "100_h.yaml", heapManifest)
 
 	if _, err := eng.ProcessAll(context.Background()); err != nil {

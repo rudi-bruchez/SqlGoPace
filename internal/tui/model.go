@@ -229,7 +229,12 @@ type (
 	}
 	// OperationsMsg carries the full operation list of the running manifest, sent once when
 	// it starts, so the operations panel can show pending ops (not just the current one).
-	OperationsMsg struct{ Ops []OperationRow }
+	// Manifest is that manifest's file name; it titles the panel, and is empty for a caller
+	// that has none.
+	OperationsMsg struct {
+		Manifest string
+		Ops      []OperationRow
+	}
 	// StepDoneMsg reports an operation's terminal outcome so its row can show DONE/FAILED/…
 	// (Outcome mirrors run.StepEvent.Outcome: "success"|"failed"|"interrupted"|
 	// "incomplete"|"skipped").
@@ -324,6 +329,7 @@ const (
 type Model struct {
 	operation       string
 	status          Status
+	manifest        string // file name of the running manifest, titling the operations panel
 	stepIndex       int
 	stepTotal       int
 	startedAt       time.Time     // current operation's start; anchors the elapsed timer
@@ -559,6 +565,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.space = msg
 		m.hasSpace = true
 	case OperationsMsg:
+		// Both are manifest-scoped and replaced together: the engine sends this once as each
+		// manifest starts, so a stale name can never outlive the list it belongs to.
+		m.manifest = msg.Manifest
 		m.ops = msg.Ops
 	case StepDoneMsg:
 		m.setOpStatus(msg.Index, opStatusLabel(msg.Outcome))

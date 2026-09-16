@@ -116,3 +116,21 @@ func TestStepDoneMsgCarriesTheOperationDuration(t *testing.T) {
 		t.Errorf("Duration = %v, want 94m", msg.Duration)
 	}
 }
+
+func TestOperationsMsgNamesTheManifest(t *testing.T) {
+	// The console titles its operations panel with the manifest name, so the forwarder has to
+	// carry it alongside the rows it builds.
+	msg := operationsMsg("030_compress_indexes.yaml", []run.OpInfo{
+		{Index: 1, Command: "rebuild_index", Target: "dbo.T.IX", Detail: "cancel only"},
+		{Index: 2, Command: "shrink_data", Target: "all"},
+	})
+	if msg.Manifest != "030_compress_indexes.yaml" {
+		t.Errorf("Manifest = %q, want the manifest file name", msg.Manifest)
+	}
+	if len(msg.Ops) != 2 {
+		t.Fatalf("Ops = %d rows, want 2", len(msg.Ops))
+	}
+	if msg.Ops[0].Label != "rebuild_index dbo.T.IX" || msg.Ops[0].Status != "TO RUN" || msg.Ops[0].Detail != "cancel only" {
+		t.Errorf("Ops[0] = %+v, want the label, TO RUN and the manifest-start detail", msg.Ops[0])
+	}
+}

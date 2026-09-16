@@ -62,9 +62,9 @@ func (e *Engine) emitStep(ev StepEvent) {
 }
 
 // emitOpList delivers the full operation list to the sink when one is wired.
-func (e *Engine) emitOpList(ops []OpInfo) {
+func (e *Engine) emitOpList(manifest string, ops []OpInfo) {
 	if e.opListSink != nil {
-		e.opListSink(ops)
+		e.opListSink(manifest, ops)
 	}
 }
 

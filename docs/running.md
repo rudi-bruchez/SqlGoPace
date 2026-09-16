@@ -136,6 +136,9 @@ work; see [blocking-and-kills.md](blocking-and-kills.md#rollback-on-cancel-opera
 `--tui` replaces the silent run with a live console: the running operation and its
 progress, the sessions it is blocking, the sessions blocking it, and the reaction feed.
 
+The operations panel is titled with the manifest being run. The `op i/N` counter restarts at 1
+for each manifest, so the counter says where the run is inside one and the title says which.
+
 The header's right-hand box carries a third line, once the first poll has landed:
 
 ```
