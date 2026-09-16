@@ -203,6 +203,7 @@ type Engine struct {
 	holdPoll         time.Duration               // cadence for narrating held-through ignored sessions
 	logWatch         LogWatchReader              // when set, polls the transaction log for the full alarm
 	logWatchEvery    time.Duration               // poll cadence for the log-full watcher
+	sizes            SizeReader                  // reads structure sizes before/after a rebuild/reorganize (WithSizeReader)
 	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
 	opListSink       func([]OpInfo)              // full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
@@ -394,6 +395,12 @@ func WithHoldPoll(d time.Duration) EngineOption { return func(e *Engine) { e.hol
 func WithLogWatch(r LogWatchReader, every time.Duration) EngineOption {
 	return func(e *Engine) { e.logWatch = r; e.logWatchEvery = every }
 }
+
+// WithSizeReader lets the engine measure the used size of every structure a
+// rebuild_index, rebuild_heap or reorganize_index rewrites, before and after
+// (OBJECT-SIZES.md §5). Without it (nil, the default) no size work happens at all: no
+// scope line, no size lines, no report totals.
+func WithSizeReader(r SizeReader) EngineOption { return func(e *Engine) { e.sizes = r } }
 
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
@@ -697,6 +704,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			return *out
 		}
 	}
+	applySizeTotals(rep, r)
 	return e.finalizeAll(ctx, name, manifest, rep, start, r.failedOps, r.cancelOnlyFailed)
 }
 
@@ -743,6 +751,21 @@ type manifestRun struct {
 	// (RollbackOnCancel) that recorded at least one "cancel" reaction, split by whether
 	// a retry saved them, for the end-of-run summary (CANCEL-ONLY.md §3).
 	cancelOnlySucceeded, cancelOnlyFailed int
+	// sizeTotals accumulates the manifest's before/after size figure across operations
+	// (OBJECT-SIZES.md §5.5); sizesUnread holds the first size-read failure, printed once.
+	sizeTotals  sizeTotals
+	sizesUnread string
+}
+
+// applySizeTotals fills rep's manifest-total size fields from r's accumulator: the first
+// measured "before" and the last measured "after" per distinct structure (§5.5), and the
+// first size-read failure message (§5.4). One helper, called wherever a manifest finishes
+// its normal operation loop — finalizeAll (which also covers finalizePartial, since it
+// shares the same rep) and finalizeDrained — instead of the same two-line assignment three
+// times over.
+func applySizeTotals(rep *report.RunReport, r *manifestRun) {
+	rep.SizeBeforeKB, rep.SizeAfterKB, rep.SizeStructures = r.sizeTotals.totals()
+	rep.SizesUnread = r.sizesUnread
 }
 
 // endRun marks an outcome as terminal for the manifest, so runStep's nil return can
@@ -757,6 +780,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	// Graceful stop: the operation in flight has finished (we are at the top of the
 	// loop); stop before starting the next one and leave the manifest for recovery.
 	if e.draining() {
+		applySizeTotals(r.rep, r)
 		return endRun(e.finalizeDrained(ctx, r.name, r.rep, r.start, r.cursor, len(r.planned), r.failedOps))
 	}
 	opStart := e.clk.Now()
@@ -885,6 +909,11 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, r.manifest.AbortBlockingResumable)
 	}
 
+	// Size before: for a RESUME too. A paused resumable's partial target lives under
+	// internal index ids that neither sys.indexes nor sys.dm_db_partition_stats shows, so
+	// this read returns the source index — the true old size (docs/specs/OBJECT-SIZES-ANALYSIS.md).
+	sizesBefore, sizeErr := readSizes(ctx, e.sizes, step.Operation)
+
 	var (
 		runErr        error
 		shrinkResults []ShrinkResult
@@ -960,6 +989,21 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	stopLogWatch()
 	<-logWatchDone
 	waitLines, waitTotal := e.operationWaits(ctx, waitsBefore)
+	// Size after: only when the operation succeeded, except for a reorganize, which
+	// commits incrementally and keeps its work when canceled ("committed work preserved,
+	// no rollback") — its partial compaction is real and worth reporting.
+	_, isReorg := step.Operation.(ddl.ReorganizeIndex)
+	var sizesAfter []mssql.StructureSize
+	if runErr == nil || isReorg {
+		var err error
+		sizesAfter, err = readSizes(ctx, e.sizes, step.Operation)
+		if err != nil && sizeErr == nil {
+			sizeErr = err
+		}
+	}
+	if sizeErr != nil && r.sizesUnread == "" {
+		r.sizesUnread = sizeErr.Error()
+	}
 	reactionMu.Lock()
 	opReactions := append([]report.ReactionLine(nil), reactions...)
 	opPeakBlocked := peakBlocked
@@ -978,7 +1022,12 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		WaitTotalMS:    waitTotal,
 		Shrink:         shrinkReport(shrinkResults),
 		BatchDML:       batchDMLReport(batchResult),
+		Sizes:          sizeLines(sizesBefore, sizesAfter),
+		SizesPartial:   isReorg && runErr != nil,
 		DurationMS:     e.msSince(opStart),
+	}
+	if ref := step.Operation.Target(); len(opRep.Sizes) > 0 {
+		r.sizeTotals.add(ref.Schema, ref.Table, opRep.Sizes)
 	}
 	if opRep.ContendedCount > 0 {
 		opRep.ContendedFile = r.name + contendedCaptureSuffix
@@ -1586,15 +1635,17 @@ func (e *Engine) record(ctx context.Context, rep report.RunReport) {
 		}
 	}
 	rec := report.RunRecord{
-		Manifest:    rep.Manifest,
-		Outcome:     rep.Outcome,
-		StartedAt:   rep.StartedAt,
-		FinishedAt:  rep.FinishedAt,
-		Operations:  len(rep.Operations),
-		DurationMS:  rep.DurationMS,
-		PeakBlocked: peak,
-		Skipped:     skipped,
-		Error:       rep.Error,
+		Manifest:     rep.Manifest,
+		Outcome:      rep.Outcome,
+		StartedAt:    rep.StartedAt,
+		FinishedAt:   rep.FinishedAt,
+		Operations:   len(rep.Operations),
+		DurationMS:   rep.DurationMS,
+		PeakBlocked:  peak,
+		Skipped:      skipped,
+		Error:        rep.Error,
+		SizeBeforeKB: rep.SizeBeforeKB,
+		SizeAfterKB:  rep.SizeAfterKB,
 	}
 	if err := e.history.Record(ctx, rec); err != nil {
 		fmt.Fprintf(e.out, "history %s: %v\n", rep.Manifest, err)

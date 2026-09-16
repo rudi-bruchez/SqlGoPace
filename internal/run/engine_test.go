@@ -2,6 +2,7 @@ package run_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -776,6 +777,15 @@ func mustExist(t *testing.T, path string) {
 	}
 }
 
+func readLog(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read log %s: %v", path, err)
+	}
+	return string(data)
+}
+
 // peerClaimingRunner simulates the other run taking a manifest out of the shared
 // 01.to_run while this run is busy with the previous one: it deletes onClaim the
 // first time it is asked to execute anything.
@@ -818,5 +828,104 @@ func TestAManifestClaimedByAPeerIsNotAFailure(t *testing.T) {
 	}
 	if sum.Skipped != 1 {
 		t.Errorf("Skipped = %d, want 1 — the manifest a peer took must be counted apart", sum.Skipped)
+	}
+}
+
+// fakeSizeReader answers with a fixed table shape, and can fail on demand.
+type fakeSizeReader struct {
+	sizes []mssql.StructureSize
+	err   error
+	calls int
+}
+
+func (f *fakeSizeReader) TableStructureSizes(_ context.Context, _, _ string, _ *int) ([]mssql.StructureSize, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	// Shrink on every call after the first, so before != after.
+	out := make([]mssql.StructureSize, len(f.sizes))
+	copy(out, f.sizes)
+	if f.calls > 1 {
+		for i := range out {
+			out[i].UsedKB /= 2
+		}
+	}
+	return out, nil
+}
+
+// TestSizesRecordedForSuccessfulOperation: both sides measured, one line per structure.
+func TestSizesRecordedForSuccessfulOperation(t *testing.T) {
+	sizes := &fakeSizeReader{sizes: []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 4000},
+		{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2000},
+	}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{}, run.WithSizeReader(sizes))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log"))
+	if !strings.Contains(log, "size (heap and 1 nonclustered index(es))") {
+		t.Errorf("log missing the heap size block:\n%s", log)
+	}
+	// heapManifest rebuilds two DIFFERENT tables (T1, T2); sizeTotals keys on
+	// schema+table+name (OBJECT-SIZES.md §5.5), so heap+IX_A on each table are four
+	// distinct structures, not two — the plan's own draft assertion here undercounted.
+	if !strings.Contains(log, "over 4 structure(s)") {
+		t.Errorf("log missing the manifest size total:\n%s", log)
+	}
+}
+
+// TestNoAfterSizeOnFailedRebuild: a rebuild that failed rolled back, so there is no
+// meaningful "after" and none is recorded.
+func TestNoAfterSizeOnFailedRebuild(t *testing.T) {
+	sizes := &fakeSizeReader{sizes: []mssql.StructureSize{{IndexID: 0, TypeDesc: "HEAP", UsedKB: 4000}}}
+	runner := &seqOpRunner{errs: []error{os.ErrDeadlineExceeded, nil}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithSizeReader(sizes))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	log := readLog(t, filepath.Join(dirs.Failed, "100_h.yaml.log"))
+	if !strings.Contains(log, "-> unknown") {
+		t.Errorf("failed operation should record an unknown after size:\n%s", log)
+	}
+}
+
+// TestSizeReaderErrorDoesNotFailTheRun, and the manifest says once why nothing was measured.
+func TestSizeReaderErrorDoesNotFailTheRun(t *testing.T) {
+	sizes := &fakeSizeReader{err: errors.New("permission denied")}
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{}, run.WithSizeReader(sizes))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Failed != 0 {
+		t.Fatalf("Summary = %+v, want no failure from a size read", sum)
+	}
+	log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log"))
+	if !strings.Contains(log, "sizes not measured: permission denied") {
+		t.Errorf("log missing the manifest-level unread line:\n%s", log)
+	}
+	if strings.Contains(log, "size: ") {
+		t.Errorf("log printed a per-operation size line with nothing measured:\n%s", log)
+	}
+}
+
+// TestNoSizeReaderMeansNoSizeLines guards the nil case (every existing test builds an
+// engine without one).
+func TestNoSizeReaderMeansNoSizeLines(t *testing.T) {
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{})
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log")); strings.Contains(log, "size") {
+		t.Errorf("engine with no size reader wrote size output:\n%s", log)
 	}
 }
