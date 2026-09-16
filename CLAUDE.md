@@ -127,6 +127,18 @@ mandatory for monitoring).
   ineffassign/unused are in the v2 default set and are not listed. Comments/identifiers use **US
   spelling** (normalized in 46cf1f4).
 
+- **Run the linter on every change, not just the tests.** `make lint` (or `golangci-lint run ./...`)
+  belongs in the same breath as `make test` and `go vet`, before a change is called done and before
+  a commit — and that applies to a subagent's task as much as to a session's own work: say so in the
+  task, because `go build` plus `go test` passing says nothing about what the linter sees. Two
+  environment quirks make the output confusing on a Windows checkout, and neither is a code problem:
+  `core.autocrlf=true` means every file is CRLF on disk, so `gofmt` flags **all** of them —
+  currently ~118 findings, all `gofmt`, which is the floor to compare against rather than a
+  regression. Anything that is *not* `gofmt` is a real finding. Check a file's real formatting by
+  stripping the CR first, through a temp file — `tr -d '\r' < FILE > /tmp/chk.go; gofmt -l /tmp/chk.go`
+  — because `gofmt -l -` reading stdin fails outright here (`GetFileAttributesEx`), whatever it is
+  fed.
+
 ## Architecture
 
 CLI dispatch is in `cmd/sqlgopace/main.go` (`cli()` parses flags and routes). Three entry paths:
