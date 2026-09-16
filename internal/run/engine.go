@@ -199,6 +199,7 @@ type Engine struct {
 	victimPolicy     AmplifierPolicy             // the armed policy for that killer
 	asyncStats       AsyncStatsSetting           // ASYNC_STATS_UPDATE_WAIT_AT_LOW_PRIORITY on the target
 	amplifierSink    func([]string)              // notified with the distinct conflicting jobs (TUI)
+	heapScopeSink    func([]string)              // notified with the manifest's heap rebuild scope notices (TUI)
 	manifestObserver func(path string)           // notified of the in-flight manifest path (TUI editing)
 	holdPoll         time.Duration               // cadence for narrating held-through ignored sessions
 	logWatch         LogWatchReader              // when set, polls the transaction log for the full alarm
@@ -277,6 +278,14 @@ func WithAsyncStatsSetting(s AsyncStatsSetting) EngineOption {
 // run has killed, whenever that set changes, and with nil at the end of each manifest.
 func WithAmplifierSink(f func([]string)) EngineOption {
 	return func(e *Engine) { e.amplifierSink = f }
+}
+
+// WithHeapScopeSink is notified with the manifest's heap-rebuild scope notices: each
+// line names a table whose rebuild rewrites more than the manifest names. Sent once per
+// manifest, with an empty slice when the manifest has no heap rebuilds, replacing the
+// previous manifest's set (manifest-scoped, unlike AlertSink which accumulates).
+func WithHeapScopeSink(f func([]string)) EngineOption {
+	return func(e *Engine) { e.heapScopeSink = f }
 }
 
 // WithBatchDMLRunner routes ddl.BatchDML operations to the batch-DML driver instead
@@ -630,6 +639,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// resume cursor onward, like the rollback-on-cancel notice below: an operation
 	// already completed in a previous run is not exposure this run will incur.
 	scopes := map[int]string{}
+	consoleScopes := []string{}
 	for i := resumeFrom; i < len(planned); i++ {
 		heap, ok := planned[i].Operation.(ddl.RebuildHeap)
 		if !ok {
@@ -648,6 +658,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			notice := heapScopeUnreadableNotice(i+1, heap, err)
 			fmt.Fprintln(e.out, notice)
 			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
+			consoleScopes = append(consoleScopes, fmt.Sprintf("operation %d %s.%s: scope unknown, structure sizes could not be read", i+1, heap.Schema, heap.Table))
 		case len(sizes) < 2:
 			// A successful read of the heap alone: a genuine bare heap, nothing to warn about.
 		default:
@@ -655,7 +666,13 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			fmt.Fprintln(e.out, notice)
 			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
 			scopes[i] = heapScopeDetail(sizes)
+			consoleScopes = append(consoleScopes, fmt.Sprintf("operation %d %s.%s: %s", i+1, heap.Schema, heap.Table, heapScopeDetail(sizes)))
 		}
+	}
+
+	// Notify the TUI with the console-friendly scope lines (manifest-scoped: replaces the previous set).
+	if e.heapScopeSink != nil {
+		e.heapScopeSink(consoleScopes)
 	}
 
 	// Surface the whole operation list once, so the console can show pending operations
@@ -1031,7 +1048,10 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	// no rollback") — its partial compaction is real and worth reporting.
 	_, isReorg := step.Operation.(ddl.ReorganizeIndex)
 	var sizesAfter []mssql.StructureSize
-	if runErr == nil || isReorg {
+	// After Ctrl+C the context is already canceled, so this read would fail on the
+	// operator's own gesture and report "sizes not measured: context canceled" — noise,
+	// not a finding. Leave the after side unmeasured instead.
+	if (runErr == nil || isReorg) && ctx.Err() == nil {
 		var err error
 		sizesAfter, err = readSizes(ctx, e.sizes, step.Operation)
 		if err != nil && sizeErr == nil {

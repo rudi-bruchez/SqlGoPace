@@ -670,6 +670,11 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 				fwd.send(tui.ConflictingJobsMsg{Jobs: jobs})
 			}
 		}),
+		run.WithHeapScopeSink(func(lines []string) {
+			if fwd != nil {
+				fwd.send(tui.HeapScopeMsg{Lines: lines})
+			}
+		}),
 	}
 	if killOpt != nil {
 		opts = append(opts, killOpt)

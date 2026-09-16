@@ -3,6 +3,7 @@ package run_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -195,6 +196,18 @@ operations:
     schema: dbo
     table: MEASUREMENT
     index: PK_MEASUREMENT
+`
+
+const twoHeapsManifest = `
+description: two heaps test
+on_failure: continue
+operations:
+  - operation: rebuild_heap
+    schema: dbo
+    table: T1
+  - operation: rebuild_heap
+    schema: dbo
+    table: T2
 `
 
 func TestProcessAllReorgWarnsWhenRCSIOff(t *testing.T) {
