@@ -1032,3 +1032,101 @@ func TestManifestStartHeapScopeBareHeapStaysSilent(t *testing.T) {
 		t.Errorf("a genuine bare heap must stay silent, not report as unreadable:\n%s", out.String())
 	}
 }
+
+// TestManifestStartHeapScopeSink: the engine notifies the heapScopeSink with short console
+// lines for each heap rebuild, replacing the previous manifest's set (manifest-scoped).
+// twoHeapsManifest has 2 heap rebuilds, so we expect 2 lines in the sink.
+func TestManifestStartHeapScopeSink(t *testing.T) {
+	sizes := &fakeSizeReader{sizes: []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},
+		{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024 * 1024},
+	}}
+	var sinkCalls [][]string
+	root := t.TempDir()
+	dirs := run.Dirs{
+		ToRun:      filepath.Join(root, "01.to_run"),
+		Processing: filepath.Join(root, "02.processing"),
+		Done:       filepath.Join(root, "03.done"),
+		Failed:     filepath.Join(root, "04.failed"),
+	}
+	for _, d := range []string{dirs.ToRun, dirs.Processing, dirs.Done, dirs.Failed} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", d, err)
+		}
+	}
+	// Write only the twoHeapsManifest, no default manifest.
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "100_h.yaml"), []byte(twoHeapsManifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+
+	matrix, err := ddl.LoadFile(filepath.FromSlash("../../ddl_compatibility.yaml"))
+	if err != nil {
+		t.Fatalf("load matrix: %v", err)
+	}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierEnterprise}
+	eng := run.NewEngine(dirs, target, matrix, ddl.Policy{}, fakePreflighter{}, &seqOpRunner{},
+		run.WithSizeReader(sizes),
+		run.WithHeapScopeSink(func(lines []string) { sinkCalls = append(sinkCalls, lines) }))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(sinkCalls) != 1 {
+		t.Fatalf("heapScopeSink called %d times, want 1", len(sinkCalls))
+	}
+	if len(sinkCalls[0]) != 2 {
+		t.Fatalf("heapScopeSink got %d lines, want 2 (twoHeapsManifest has 2 heaps)", len(sinkCalls[0]))
+	}
+	// Both lines should mention their tables T1 and T2.
+	for i, line := range sinkCalls[0] {
+		if !strings.Contains(line, fmt.Sprintf("dbo.T%d", i+1)) {
+			t.Errorf("heapScopeSink line %d missing table: %q", i, line)
+		}
+	}
+}
+
+// TestManifestStartHeapScopeSinkEmptyWhenNoHeap: when a manifest has no heap rebuilds,
+// the heapScopeSink receives an empty slice, replacing the previous manifest's set.
+func TestManifestStartHeapScopeSinkEmptyWhenNoHeap(t *testing.T) {
+	var sinkCalls [][]string
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
+		run.WithHeapScopeSink(func(lines []string) { sinkCalls = append(sinkCalls, lines) }))
+	// Use a manifest with a reorganize_index, not a rebuild_heap.
+	writeOnly(t, dirs, "100_r.yaml", reorgManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(sinkCalls) != 1 {
+		t.Fatalf("heapScopeSink called %d times, want 1", len(sinkCalls))
+	}
+	if len(sinkCalls[0]) != 0 {
+		t.Errorf("heapScopeSink got %d lines for a non-heap manifest, want 0", len(sinkCalls[0]))
+	}
+}
+
+// TestCanceledReorganizeDoesNotReportSizeFailure: when a reorganize_index is canceled via
+// context (Ctrl+C), the after-size read is skipped to avoid reporting "context canceled" as
+// a finding. The operator asked to stop, not a real error. We verify this by checking that
+// the log does NOT contain "sizes not measured: context canceled".
+func TestCanceledReorganizeDoesNotReportSizeFailure(t *testing.T) {
+	// A fake size reader that would fail if called (proving the fix avoids calling it).
+	sizes := &fakeSizeReader{err: errors.New("should not be called after context cancel")}
+	// Runner that returns context.Canceled to simulate an interrupted operation.
+	canceledRunner := &seqOpRunner{errs: []error{context.Canceled}}
+
+	eng, dirs := setupEngine(t, fakePreflighter{}, canceledRunner, run.WithSizeReader(sizes))
+	writeOnly(t, dirs, "100_r.yaml", reorgManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+
+	// After a context cancel, the log should report the operation error but NOT report a
+	// sizes-read failure with "context canceled". The absence of "sizes not measured" is the
+	// proof that we skipped the read (since we have a failing size reader wired).
+	log := readLog(t, filepath.Join(dirs.Failed, "100_r.yaml.log"))
+	if strings.Contains(log, "sizes not measured: should not be called after context cancel") {
+		t.Errorf("log should not report the size-read failure (the read should have been skipped):\n%s", log)
+	}
+}
