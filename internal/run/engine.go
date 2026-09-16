@@ -639,7 +639,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// resume cursor onward, like the rollback-on-cancel notice below: an operation
 	// already completed in a previous run is not exposure this run will incur.
 	scopes := map[int]string{}
-	consoleScopes := []string{}
+	var consoleScopes []string
 	for i := resumeFrom; i < len(planned); i++ {
 		heap, ok := planned[i].Operation.(ddl.RebuildHeap)
 		if !ok {
@@ -658,7 +658,9 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			notice := heapScopeUnreadableNotice(i+1, heap, err)
 			fmt.Fprintln(e.out, notice)
 			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
-			consoleScopes = append(consoleScopes, fmt.Sprintf("operation %d %s.%s: scope unknown, structure sizes could not be read", i+1, heap.Schema, heap.Table))
+			consoleScopes = append(consoleScopes, fmt.Sprintf(
+				"operation %d %s.%s: scope unknown, structure sizes could not be read",
+				i+1, heap.Schema, heap.Table))
 		case len(sizes) < 2:
 			// A successful read of the heap alone: a genuine bare heap, nothing to warn about.
 		default:
@@ -666,11 +668,14 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 			fmt.Fprintln(e.out, notice)
 			rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
 			scopes[i] = heapScopeDetail(sizes)
-			consoleScopes = append(consoleScopes, fmt.Sprintf("operation %d %s.%s: %s", i+1, heap.Schema, heap.Table, heapScopeDetail(sizes)))
+			consoleScopes = append(consoleScopes, fmt.Sprintf(
+				"operation %d %s.%s: %s", i+1, heap.Schema, heap.Table, heapScopeDetail(sizes)))
 		}
 	}
 
-	// Notify the TUI with the console-friendly scope lines (manifest-scoped: replaces the previous set).
+	// The console gets the short form: the .log notice above runs past 150 characters and
+	// the console clips the tail, which is exactly where the disabled-index warning sits.
+	// Sent for every manifest, empty included, so the previous manifest's set is replaced.
 	if e.heapScopeSink != nil {
 		e.heapScopeSink(consoleScopes)
 	}
