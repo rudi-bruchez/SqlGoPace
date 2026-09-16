@@ -528,6 +528,94 @@ func TestModelShowsConflictingJobsAndReplacesThem(t *testing.T) {
 	}
 }
 
+func TestModelShowsHeapScopesAndReplacesThem(t *testing.T) {
+	m := tui.New("rebuild_heap dbo.T1", nil)
+	m, _ = send(m, tui.HeapScopeMsg{Lines: []string{"operation 1 dbo.T1: +2 nonclustered, 5.0 GB rewritten"}})
+	got := m.View()
+	if !strings.Contains(got, "heap rebuild scope") || !strings.Contains(got, "dbo.T1") {
+		t.Errorf("view does not show the heap scope\n---\n%s", got)
+	}
+
+	// Replace semantics, not append: a second message supersedes the first.
+	m, _ = send(m, tui.HeapScopeMsg{Lines: []string{"operation 2 dbo.T2: +1 nonclustered, 10.0 GB rewritten"}})
+	got = m.View()
+	if strings.Contains(got, "dbo.T1") && strings.Contains(got, "2 nonclustered") {
+		// T1 might still appear in the operations panel, but the scope line should be gone
+		// Check that the specific scope (with the nonclustered count) is gone from the alerts
+		alertSection := got[:strings.Index(got, "operations")+1]
+		if strings.Contains(alertSection, "dbo.T1") {
+			t.Errorf("view still shows the superseded scope in alerts\n---\n%s", got)
+		}
+	}
+	if !strings.Contains(got, "dbo.T2") || !strings.Contains(got, "heap rebuild scope") {
+		t.Errorf("view does not show the replacement scope\n---\n%s", got)
+	}
+
+	// An empty set clears the block at the end of a manifest.
+	m, _ = send(m, tui.HeapScopeMsg{Lines: nil})
+	if got := m.View(); strings.Contains(got, "heap rebuild scope") {
+		t.Errorf("view still shows heap scope after the set was cleared\n---\n%s", got)
+	}
+}
+
+func TestModelHeapScopesDoNotDisplaceAlerts(t *testing.T) {
+	m := tui.New("op", nil)
+	m, _ = send(m, tui.AlertMsg{Title: "manifest failed: 010_rebuild.yaml", Lines: []string{"permission denied"}})
+	m, _ = send(m, tui.HeapScopeMsg{Lines: []string{"operation 1 dbo.T: +1 nonclustered, 2.0 GB rewritten"}})
+	got := m.View()
+	if !strings.Contains(got, "manifest failed") {
+		t.Errorf("view lost the failure alert when adding heap scope\n---\n%s", got)
+	}
+	if !strings.Contains(got, "permission denied") {
+		t.Errorf("view lost the failure detail when adding heap scope\n---\n%s", got)
+	}
+	if !strings.Contains(got, "+1 nonclustered") {
+		t.Errorf("view does not show the heap scope\n---\n%s", got)
+	}
+}
+
+func TestModelHeapScopesCappedAtFive(t *testing.T) {
+	// Seven scope lines: should show 5 + 1 "+2 more" line.
+	lines := []string{
+		"operation 1 dbo.T1: +1 nonclustered",
+		"operation 2 dbo.T2: +2 nonclustered",
+		"operation 3 dbo.T3: +3 nonclustered",
+		"operation 4 dbo.T4: +4 nonclustered",
+		"operation 5 dbo.T5: +5 nonclustered",
+		"operation 6 dbo.T6: +6 nonclustered",
+		"operation 7 dbo.T7: +7 nonclustered",
+	}
+	m := tui.New("op", nil)
+	m, _ = send(m, tui.HeapScopeMsg{Lines: lines})
+	got := m.View()
+	// Check first 5 are shown.
+	for i := 1; i <= 5; i++ {
+		if !strings.Contains(got, fmt.Sprintf("dbo.T%d", i)) {
+			t.Errorf("view missing scope line for T%d\n---\n%s", i, got)
+		}
+	}
+	// Check "more" line is shown.
+	if !strings.Contains(got, "+2 more") {
+		t.Errorf("view missing '+2 more' indicator\n---\n%s", got)
+	}
+	// Check last 2 are NOT shown (they're beyond the cap).
+	for i := 6; i <= 7; i++ {
+		if strings.Contains(got, fmt.Sprintf("dbo.T%d", i)) {
+			t.Errorf("view should not show scope line for T%d (beyond cap)\n---\n%s", i, got)
+		}
+	}
+}
+
+func TestModelHeapScopesEmptyDoesNotAffectAlerts(t *testing.T) {
+	m := tui.New("op", nil)
+	m, _ = send(m, tui.AlertMsg{Title: "manifest failed", Lines: []string{"error"}})
+	m, _ = send(m, tui.HeapScopeMsg{Lines: []string{}})
+	got := m.View()
+	if !strings.Contains(got, "manifest failed") {
+		t.Errorf("view lost the failure alert when sending empty heap scope\n---\n%s", got)
+	}
+}
+
 func TestModelKillBlockerAction(t *testing.T) {
 	actions := make(chan tui.Action, 4)
 	m := tui.New("op", actions)

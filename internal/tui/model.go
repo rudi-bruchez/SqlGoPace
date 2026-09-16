@@ -205,6 +205,14 @@ type (
 	// the engine sends an empty set when it finishes a manifest. Reusing AlertMsg would
 	// mean teaching a never-cleared slice to clear, changing every existing alert.
 	ConflictingJobsMsg struct{ Jobs []string }
+	// HeapScopeMsg carries the manifest's heap-rebuild scope notices: an ALTER TABLE
+	// REBUILD on a heap also rewrites every nonclustered index, and the manifest names
+	// only the table. Like ConflictingJobsMsg and unlike AlertMsg it REPLACES the current
+	// set rather than appending — the set is manifest-scoped, and the engine sends the
+	// next manifest's set (empty when it has no heap) as it starts. Accumulating them
+	// would push the failure alerts off the top of a long campaign's console, which is
+	// the defect LogFullAlertMsg already documents.
+	HeapScopeMsg struct{ Lines []string }
 	// ServerInfoMsg carries the target's identity for the header banner. Sent once at
 	// startup; App is the SqlGoPace version, Product the SQL Server year label.
 	ServerInfoMsg struct {
@@ -340,6 +348,7 @@ type Model struct {
 	waits        []WaitCategory
 	waitTotalMS  int64
 	conflictJobs []string
+	heapScopes   []string
 	cursor       int
 	mode         inputMode
 	notice       string // last host feedback line (e.g. "ignoring SPID 53 …")
@@ -589,6 +598,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.notice = msg.Line
 	case ConflictingJobsMsg:
 		m.conflictJobs = msg.Jobs
+	case HeapScopeMsg:
+		m.heapScopes = msg.Lines
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}

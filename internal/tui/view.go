@@ -95,13 +95,13 @@ func (m Model) View() string {
 	return b.String()
 }
 
-// alertsBlock renders the sticky failure alerts, the single-slot log-full alarm, and
-// conflicting-job notices shown above the dashboard, or "" when there are none. The
-// log-full alarm is rendered separately from m.alerts (H3, docs/specs/REVIEW-2026-09-15-harm.md):
-// it replaces itself in place instead of accumulating, so it never pushes a failure
-// alert off the top of the console.
+// alertsBlock renders the sticky failure alerts, the single-slot log-full alarm,
+// conflicting-job notices, and heap-rebuild scope notices shown above the dashboard,
+// or "" when there are none. The log-full alarm is rendered separately from m.alerts
+// (H3, docs/specs/REVIEW-2026-09-15-harm.md): it replaces itself in place instead of
+// accumulating, so it never pushes a failure alert off the top of the console.
 func (m Model) alertsBlock() string {
-	if len(m.alerts) == 0 && !m.hasLogAlert && len(m.conflictJobs) == 0 {
+	if len(m.alerts) == 0 && !m.hasLogAlert && len(m.conflictJobs) == 0 && len(m.heapScopes) == 0 {
 		return ""
 	}
 	var b strings.Builder
@@ -124,6 +124,22 @@ func (m Model) alertsBlock() string {
 		b.WriteString(alertStyle.Render("⚠ conflicting SQL Agent jobs terminated this run"))
 		for _, j := range m.conflictJobs {
 			b.WriteString("\n" + alertStyle.Render("    "+j+" — consider disabling it during maintenance"))
+		}
+	}
+	if len(m.heapScopes) > 0 {
+		if b.Len() > 0 {
+			b.WriteByte('\n')
+		}
+		b.WriteString(alertStyle.Render("⚠ heap rebuild scope — each rewrites more than the manifest names"))
+		rendered := len(m.heapScopes)
+		if rendered > maxHeapScopeLines {
+			rendered = maxHeapScopeLines
+		}
+		for i := 0; i < rendered; i++ {
+			b.WriteString("\n" + alertStyle.Render("    "+m.heapScopes[i]))
+		}
+		if len(m.heapScopes) > maxHeapScopeLines {
+			b.WriteString("\n" + alertStyle.Render(fmt.Sprintf("    +%d more — see the run log", len(m.heapScopes)-maxHeapScopeLines)))
 		}
 	}
 	return b.String()
@@ -174,6 +190,10 @@ func (m Model) spaceLine() string {
 // minOpsRows is the fewest operation rows the panel ever shows, even on a tiny terminal, so
 // the running op and a summary always remain visible.
 const minOpsRows = 3
+
+// maxHeapScopeLines caps the heap rebuild scope lines rendered in the alerts block; an
+// unbounded set would push the failure alerts off the top of a long campaign's console.
+const maxHeapScopeLines = 5
 
 // operationsBody renders the operations panel body. Before the full list arrives it falls
 // back to the single current operation. When the list has more rows than budget allows
