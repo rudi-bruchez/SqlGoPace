@@ -61,12 +61,53 @@ func TestCheckDataFreeSpace(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB,
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, 0,
 				preflight.DataSpace{FreeMB: tt.freeMB, GrowthKnown: true}).Severity
 			if got != tt.want {
 				t.Errorf("CheckDataFreeSpace(need=%d, free=%d) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCheckDataFreeSpaceCountsUnsizedDisabled: a disabled index cannot be sized (it has no
+// pages) but the rebuild recreates it, so the check must say the figure is incomplete
+// instead of passing on an understated need.
+func TestCheckDataFreeSpaceCountsUnsizedDisabled(t *testing.T) {
+	c := preflight.CheckDataFreeSpace("dbo.MEASUREMENT (heap)", 500, 1,
+		preflight.DataSpace{FreeMB: 5000, GrowthKnown: true})
+	if c.Severity != preflight.Pass {
+		t.Fatalf("Severity = %v, want Pass", c.Severity)
+	}
+	if !strings.Contains(c.Detail, "1 disabled index") {
+		t.Errorf("Detail = %q, want it to name the unsized disabled index", c.Detail)
+	}
+}
+
+// TestHeapRebuildSizedFromWholeTable is the defect this fixes: the heap rebuild needs room
+// for the heap AND every nonclustered index, not for the heap alone (MAINTENANCE.md §9).
+func TestHeapRebuildSizedFromWholeTable(t *testing.T) {
+	p := fakeProber{
+		structures: []mssql.StructureSize{
+			{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},                       // 5 GB
+			{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024 * 1024}, // 2 GB
+		},
+		dataFreeMB: 6000,
+	}
+	m := &ddl.Manifest{Operations: []ddl.Operation{ddl.RebuildHeap{Schema: "dbo", Table: "MEASUREMENT"}}}
+	rep, err := preflight.Run(context.Background(), p, batchServerInfo, m,
+		preflight.Thresholds{RequireDataFreeSpace: true}, false)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	var detail string
+	for _, c := range rep.Checks {
+		if c.Name == "data free space" {
+			detail = c.Detail
+		}
+	}
+	if !strings.Contains(detail, "7168 MB") {
+		t.Errorf("data free space detail = %q, want the 7168 MB rewrite (5 GB heap + 2 GB index)", detail)
 	}
 }
 
@@ -95,7 +136,7 @@ func TestCheckDataFreeSpaceCountsGrowthHeadroom(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB,
+			got := preflight.CheckDataFreeSpace("dbo.MEASUREMENT.PK_MEASUREMENT", tt.needMB, 0,
 				preflight.DataSpace{FreeMB: tt.freeMB, Growth: tt.growth, GrowthKnown: true}).Severity
 			if got != tt.want {
 				t.Errorf("CheckDataFreeSpace(need=%d, free=%d, growth) = %v, want %v", tt.needMB, tt.freeMB, got, tt.want)
@@ -235,27 +276,29 @@ func TestCheckOperation(t *testing.T) {
 
 // fakeProber is a scripted Prober for testing Run without a database.
 type fakeProber struct {
-	logSpace             mssql.LogSpace
-	reuseWait            string
-	sessions             []mssql.Session
-	tableExists          bool
-	indexExists          bool
-	elevatedAccess       bool
-	alterAnyConn         bool
-	sysadmin             bool
-	dmlPermission        bool
-	dmlDenied            map[string]bool // perms this login lacks, overriding dmlPermission
-	dataFreeMB           int
-	growth               []mssql.FileGrowth
-	growthByType         map[string][]mssql.FileGrowth
-	growthErr            error
-	indexSizeErr         error
-	indexSizeMB          int
-	unmatchedRows        int64
-	clusterKey           []mssql.KeyColumn
-	clusterKeyErr        error
-	queries              *int // probe call count, a pointer so a value copy still counts
-	indexSizeByPartition map[int]int
+	logSpace       mssql.LogSpace
+	reuseWait      string
+	sessions       []mssql.Session
+	tableExists    bool
+	indexExists    bool
+	elevatedAccess bool
+	alterAnyConn   bool
+	sysadmin       bool
+	dmlPermission  bool
+	dmlDenied      map[string]bool // perms this login lacks, overriding dmlPermission
+	dataFreeMB     int
+	growth         []mssql.FileGrowth
+	growthByType   map[string][]mssql.FileGrowth
+	growthErr      error
+	structuresErr  error
+	structures     []mssql.StructureSize
+	// structuresByPartition, when set, overrides structures for a specific partition
+	// number — the fake equivalent of the server summing pages within one partition.
+	structuresByPartition map[int][]mssql.StructureSize
+	unmatchedRows         int64
+	clusterKey            []mssql.KeyColumn
+	clusterKeyErr         error
+	queries               *int // probe call count, a pointer so a value copy still counts
 }
 
 func (f fakeProber) FileSpace(context.Context, string) ([]mssql.FileSpace, error) {
@@ -278,14 +321,14 @@ func (f fakeProber) ClusteringKeyColumns(context.Context, string, string) ([]mss
 	return f.clusterKey, f.clusterKeyErr
 }
 
-func (f fakeProber) IndexSizeMB(_ context.Context, _, _, _ string, partition *int) (int, error) {
-	if f.indexSizeErr != nil {
-		return 0, f.indexSizeErr
+func (f fakeProber) TableStructureSizes(_ context.Context, _, _ string, partition *int) ([]mssql.StructureSize, error) {
+	if f.structuresErr != nil {
+		return nil, f.structuresErr
 	}
-	if partition != nil {
-		return f.indexSizeByPartition[*partition], nil
+	if partition != nil && f.structuresByPartition != nil {
+		return f.structuresByPartition[*partition], nil
 	}
-	return f.indexSizeMB, nil
+	return f.structures, nil
 }
 
 func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) { return f.logSpace, nil }
@@ -566,7 +609,7 @@ func TestRunDataFreeSpace(t *testing.T) {
 	}}
 	shortOfRoom := func() fakeProber {
 		p := healthyProber()
-		p.indexSizeMB = 5000
+		p.structures = []mssql.StructureSize{{IndexID: 1, Name: "PK_MEASUREMENT", TypeDesc: "CLUSTERED", UsedKB: 5000 * 1024}}
 		p.dataFreeMB = 100
 		return p
 	}
@@ -643,8 +686,10 @@ func TestRunSizesRebuildByPartition(t *testing.T) {
 
 	p := healthyProber()
 	p.dataFreeMB = 500
-	p.indexSizeMB = 5000                          // the whole index does not fit
-	p.indexSizeByPartition = map[int]int{37: 100} // the one partition does
+	p.structures = []mssql.StructureSize{{IndexID: 1, Name: "PK_MEASUREMENT", TypeDesc: "CLUSTERED", UsedKB: 5000 * 1024}} // the whole index does not fit
+	p.structuresByPartition = map[int][]mssql.StructureSize{
+		37: {{IndexID: 1, Name: "PK_MEASUREMENT", TypeDesc: "CLUSTERED", UsedKB: 100 * 1024}}, // the one partition does
+	}
 	p.growth = []mssql.FileGrowth{{Name: "data", TypeDesc: "ROWS", SizeMB: 1000, Growth: 0, MaxSizeMB: 0}}
 
 	manifest := &ddl.Manifest{Operations: []ddl.Operation{
@@ -725,7 +770,7 @@ func TestRunSurvivesAnObjectSizeReadFailure(t *testing.T) {
 	th := preflight.Thresholds{LogMaxBytes: 1000, LogMaxPercent: 80, RequireDataFreeSpace: true}
 
 	p := healthyProber()
-	p.indexSizeErr = errors.New("The SELECT permission was denied on the object 'dm_db_partition_stats'")
+	p.structuresErr = errors.New("The SELECT permission was denied on the object 'dm_db_partition_stats'")
 	manifest := &ddl.Manifest{Operations: []ddl.Operation{
 		ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"},
 	}}

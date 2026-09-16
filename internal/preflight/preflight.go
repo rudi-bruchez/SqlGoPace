@@ -136,18 +136,24 @@ type DataSpace struct {
 	GrowthKnown bool
 }
 
-func CheckDataFreeSpace(target string, needMB int, sp DataSpace) Check {
+// unsizedDisabled counts disabled indexes the rewrite recreates: they have no pages, so
+// needMB cannot include them, and a check that stayed silent would understate the need.
+func CheckDataFreeSpace(target string, needMB, unsizedDisabled int, sp DataSpace) Check {
 	const name = "data free space"
 	freeMB := sp.FreeMB
+	extra := ""
+	if unsizedDisabled > 0 {
+		extra = fmt.Sprintf("; + %d disabled index(es) of unknown size, rebuilt from the table", unsizedDisabled)
+	}
 	switch {
 	case needMB <= 0:
-		return Check{name, Pass, fmt.Sprintf("%s: size unknown, not checked (%d MB free in data files)", target, freeMB)}
+		return Check{name, Pass, fmt.Sprintf("%s: size unknown, not checked (%d MB free in data files)%s", target, freeMB, extra)}
 	case freeMB >= needMB:
-		return Check{name, Pass, fmt.Sprintf("%s: %d MB free, ~%d MB needed", target, freeMB, needMB)}
+		return Check{name, Pass, fmt.Sprintf("%s: %d MB free, ~%d MB needed%s", target, freeMB, needMB, extra)}
 	case !sp.GrowthKnown:
 		return Check{name, Warn, fmt.Sprintf(
-			"%s needs ~%d MB, data files have %d MB free, and their autogrowth could not be read — cannot tell whether it fits",
-			target, needMB, freeMB)}
+			"%s needs ~%d MB, data files have %d MB free, and their autogrowth could not be read — cannot tell whether it fits%s",
+			target, needMB, freeMB, extra)}
 	}
 
 	headroomMB := 0
@@ -156,8 +162,8 @@ func CheckDataFreeSpace(target string, needMB int, sp DataSpace) Check {
 		// We cannot prove the run will fail, so we must not fail it.
 		if f.Unlimited() {
 			return Check{name, Warn, fmt.Sprintf(
-				"%s needs ~%d MB, data files have %d MB free; %q grows until the disk fills, so expect an autogrowth of ~%d MB",
-				target, needMB, freeMB, f.Name, f.NextGrowthMB())}
+				"%s needs ~%d MB, data files have %d MB free; %q grows until the disk fills, so expect an autogrowth of ~%d MB%s",
+				target, needMB, freeMB, f.Name, f.NextGrowthMB(), extra)}
 		}
 		if mb, ok := f.HeadroomMB(); ok {
 			headroomMB += mb
@@ -165,12 +171,12 @@ func CheckDataFreeSpace(target string, needMB int, sp DataSpace) Check {
 	}
 	if headroomMB >= needMB-freeMB {
 		return Check{name, Warn, fmt.Sprintf(
-			"%s needs ~%d MB, data files have %d MB free; autogrowth can add %d MB more, so the rebuild will grow the files",
-			target, needMB, freeMB, headroomMB)}
+			"%s needs ~%d MB, data files have %d MB free; autogrowth can add %d MB more, so the rebuild will grow the files%s",
+			target, needMB, freeMB, headroomMB, extra)}
 	}
 	return Check{name, Fail, fmt.Sprintf(
-		"%s needs ~%d MB free, data files have %d MB and can grow by only %d MB more",
-		target, needMB, freeMB, headroomMB)}
+		"%s needs ~%d MB free, data files have %d MB and can grow by only %d MB more%s",
+		target, needMB, freeMB, headroomMB, extra)}
 }
 
 // growthOf reads one file type's autogrowth, reporting ok=false rather than an error: every
@@ -183,36 +189,23 @@ func growthOf(ctx context.Context, p Prober, fileType string) ([]mssql.FileGrowt
 	return g, true
 }
 
-// rebuiltObject reports the object an operation rebuilds in place, and whether it is such
-// an operation. Only a rebuild needs room for a second copy of something that already
-// exists: create_index cannot be sized in advance (the index is not there yet) and is
-// deliberately not checked, and the remaining operations are metadata-only.
-//
-// partition is carried through because `REBUILD PARTITION = n` rebuilds one partition and
-// needs room for that partition alone. Sizing the whole index there would fail a
-// partitioned rebuild of a large table that has ample room for the partition in hand.
-func rebuiltObject(op ddl.Operation) (schema, table, index string, partition *int, ok bool) {
+// rewrittenLabel names the object for a check detail, distinguishing a heap (which has no
+// index name) from a named index, and naming the partition when only one is rewritten.
+func rewrittenLabel(op ddl.Operation) string {
 	switch o := op.(type) {
-	case ddl.RebuildIndex:
-		return o.Schema, o.Table, o.Index, o.Partition, true
 	case ddl.RebuildHeap:
-		return o.Schema, o.Table, "", nil, true // empty index = the heap itself
+		return fmt.Sprintf("%s.%s (heap)", o.Schema, o.Table)
+	case ddl.RebuildIndex:
+		name := fmt.Sprintf("%s.%s.%s", o.Schema, o.Table, o.Index)
+		if o.Partition != nil {
+			name += fmt.Sprintf(" partition %d", *o.Partition)
+		}
+		return name
+	case ddl.ReorganizeIndex:
+		return fmt.Sprintf("%s.%s.%s", o.Schema, o.Table, o.Index)
 	default:
-		return "", "", "", nil, false
+		return op.Target().String()
 	}
-}
-
-// rebuiltObjectLabel names the object for the check detail, distinguishing a heap (which
-// has no index name) from a named index, and naming the partition when only one is rebuilt.
-func rebuiltObjectLabel(schema, table, index string, partition *int) string {
-	name := fmt.Sprintf("%s.%s.%s", schema, table, index)
-	if index == "" {
-		name = fmt.Sprintf("%s.%s (heap)", schema, table)
-	}
-	if partition != nil {
-		name += fmt.Sprintf(" partition %d", *partition)
-	}
-	return name
 }
 
 // shrunkFileTypes reports which file types the manifest shrinks, keyed by the same
@@ -338,7 +331,7 @@ type Prober interface {
 	HasDMLPermission(ctx context.Context, schema, table, perm string) (bool, error)
 	FileSpace(ctx context.Context, fileType string) ([]mssql.FileSpace, error)
 	FileGrowths(ctx context.Context, fileType string) ([]mssql.FileGrowth, error)
-	IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error)
+	TableStructureSizes(ctx context.Context, schema, table string, partition *int) ([]mssql.StructureSize, error)
 	ClusteringKeyColumns(ctx context.Context, schema, table string) ([]mssql.KeyColumn, error)
 	// QueryInt runs a scalar query built by internal/ddl. Only the batched-DML
 	// selectivity probe uses it; nothing here composes SQL of its own.
@@ -447,16 +440,20 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 
 	for _, op := range m.Operations {
 		if th.RequireDataFreeSpace {
-			if schema, table, index, partition, ok := rebuiltObject(op); ok {
-				// A size we cannot read is reported as unknown (0), never as a failed run:
-				// sys.dm_db_partition_stats also wants VIEW DEFINITION, which the documented
-				// VIEW SERVER STATE does not imply, so a legitimate login can be refused it.
-				sizeMB, err := p.IndexSizeMB(ctx, schema, table, index, partition)
-				if err != nil {
-					sizeMB = 0
+			if schema, table, partition, ok := SizedOperation(op); ok {
+				if _, isReorg := op.(ddl.ReorganizeIndex); !isReorg {
+					// A size we cannot read is reported as unknown (0), never as a failed run:
+					// sys.dm_db_partition_stats also wants VIEW DEFINITION, which the documented
+					// VIEW SERVER STATE does not imply, so a legitimate login can be refused it.
+					sizes, err := p.TableStructureSizes(ctx, schema, table, partition)
+					if err != nil {
+						sizes = nil
+					}
+					rewritten := Rewritten(op, sizes)
+					needMB := int((SumKB(rewritten) + 1023) / 1024)
+					rep.add(CheckDataFreeSpace(rewrittenLabel(op), needMB, len(DisabledNames(rewritten)),
+						DataSpace{FreeMB: dataFreeMB, Growth: dataGrowth, GrowthKnown: growthKnown}))
 				}
-				rep.add(CheckDataFreeSpace(rebuiltObjectLabel(schema, table, index, partition), sizeMB,
-					DataSpace{FreeMB: dataFreeMB, Growth: dataGrowth, GrowthKnown: growthKnown}))
 			}
 		}
 
