@@ -200,6 +200,47 @@ To act on a session that is blocking *you*, use `b` — the roster — which arm
 `X` key on the blocked list that wrote into that same list from the wrong side; the rule it
 produced could never fire, and it has been removed.
 
+## Sizes, before and after
+
+Every `rebuild_index`, `rebuild_heap` and `reorganize_index` is measured: the used size of
+each structure it rewrites is read as the statement starts, and read again when it succeeds.
+One structure gets one line in the `.log`; a heap rebuild gets a block, because the statement
+rewrites the whole table:
+
+```
+      size: IX_MEASUREMENT_TS 2.0 GB -> 1.4 GB (-30.0%)
+
+      size (heap and 2 nonclustered index(es)):
+        heap                               5.0 GB -> 3.1 GB (-38.0%)
+        IX_MEASUREMENT_TS                  2.0 GB -> 1.4 GB (-30.0%)
+        IX_MEASUREMENT_OLD (was disabled)    0 KB -> 452.0 MB
+        total                              7.0 GB -> 4.9 GB (-30.0%)
+```
+
+The manifest ends with its own total, over each distinct structure it touched, and the run's
+two figures are stored in the SQLite history (`runs.size_before_kb`, `runs.size_after_kb`), so
+a campaign is one `SUM` over its runs. Two manifests that rebuild the same index both count it,
+which a campaign total does not detect — the de-duplication is per manifest.
+
+**Read the figure for what it is.** It is the net change in used pages between two reads, not
+the gain of the operation alone: an `ONLINE` rebuild or a reorganize runs while the workload
+writes, and on a busy table those writes are in the difference.
+
+Four cases print no percentage, deliberately:
+
+| Case | What you see |
+| --- | --- |
+| A rebuild that failed or was canceled | `-> unknown`: it rolled back, so there is no new size |
+| A reorganize that was canceled | the real, partial result, marked `partial` — REORGANIZE keeps committed work |
+| An index the rebuild re-enabled | `0 KB -> 452.0 MB`: it had no pages to start from |
+| A login without `VIEW DEFINITION` | one `sizes not measured: …` line for the manifest, instead of `unknown` everywhere |
+
+**Before anything runs**, a manifest holding a `rebuild_heap` says what that statement really
+covers — how many nonclustered indexes it rebuilds with the heap and how much that adds up to —
+in the `.log`, on stdout, and on the operation's own row in the console, next to `cancel only`
+where both apply. The row keeps its note for the whole run, and is replaced by the size result
+when the operation finishes.
+
 ## Stopping a run
 
 The first Ctrl+C drains: a running resumable operation is paused with its work preserved,

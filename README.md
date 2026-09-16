@@ -48,6 +48,12 @@ mechanism available.
 >   edition, and `--dry-run` flags every operation in this position. A canceled operation is
 >   retried once by default; in FULL recovery each attempt writes the log again, so set
 >   `max_retry_attempts: 0` for such a campaign and keep log backups running in the window.
+> - **A heap rebuild rewrites the whole table, not just the heap.** `ALTER TABLE … REBUILD`
+>   rebuilds every nonclustered index of the table in the same statement — a columnstore one
+>   included — so budget the space, the log and the window for all of them. It also re-enables
+>   a disabled index and rebuilds it *without* its compression, which is why a `rebuild_heap`
+>   on a table holding one is refused until the operation sets
+>   `allow_reenable_disabled_indexes: true`.
 
 ## In short
 

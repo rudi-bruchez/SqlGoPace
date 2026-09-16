@@ -145,6 +145,12 @@ until the disk fills) can never be proven short — those cases **warn** rather 
 silently, because the growth itself is a blocking zero-fill unless instant file
 initialization applies. Only a rebuild that cannot fit *and* cannot grow fails.
 
+Since 0.35.0 a `rebuild_heap` is sized from the **whole table** — the heap plus every
+nonclustered index — because `ALTER TABLE … REBUILD` rewrites them all in one statement. The
+same read feeds a second check that **fails** the run when the table holds a *disabled*
+nonclustered index: the rebuild would re-enable it and rebuild it without its compression, so
+the operation must say `allow_reenable_disabled_indexes: true` to accept that.
+
 Three limits remain. **`create_index` is not checked**, because the index does not exist yet
 and there is nothing to size. **Filegroups are not modelled**: the check sums free space
 across every `ROWS` file in the database, so on a multi-filegroup database it can pass a

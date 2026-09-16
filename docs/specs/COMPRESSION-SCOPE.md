@@ -195,6 +195,11 @@ the log line it already writes at `plan.go:183`:
 -- skip heap dbo.BigLog: size 42000 MB outside [10, 10000] MB (compress it in a dedicated manifest)
 ```
 
+> Amended 2026-09-16: [OBJECT-SIZES.md](OBJECT-SIZES.md) §6 shipped the loud skip in 0.35.0 and owns
+> the wording, which names the two figures separately (`rebuild rewrites 25000 MB (heap 5000 MB +
+> 2 nonclustered 20000 MB), above heap.max_size_mb 10000`). The rule above stands; only the line
+> differs. Whatever lands from this spec must not reintroduce a second format.
+
 `estimable()` (`plan.go:257-263`) and `parseCompression` (`plan.go:274`) drop non-rowstore objects
 the same silent way and get the same treatment. Without this, §2's "nothing skipped silently" is
 unreachable: no amount of `decide.go` work sees those objects.
@@ -215,7 +220,9 @@ the planner collapses it:
   (`plan.go:206`); `sizeMB` is partition 1's size, not the sum (`plan.go:177`, unlike the index
   path at `plan.go:156`); and `ddl.RebuildHeap` has no `Partition` field (`manifest.go:710-715`).
   A partitioned heap cannot be compressed per partition even in principle. Heaps are
-  all-or-nothing, judged by partition 1.
+  all-or-nothing. They were also *judged* by partition 1 until 0.35.0, which sums the partitions
+  (and adds the table's nonclustered indexes for the `max_size_mb` gate); the compression state
+  is still read from `head` alone, so the rest of this point stands.
 
 ### 4.6 Intent, and the heap gap
 
@@ -274,7 +281,9 @@ and `OperationsByCategory`.
   this spec exists to fix); at target it skips; its fragmentation decision stays suppressed; a
   frag-12% index still returns `reorganize_index` (guards the restructure).
 - **Heap**: clean heap below target → `rebuild_heap` emitted; clean heap at target → skip; heap
-  outside the size bounds → skipped **with the size in the reason**.
+  outside the size bounds → skipped **with the size in the reason**. The skip lines themselves are
+  owned by [OBJECT-SIZES.md](OBJECT-SIZES.md) §6, which shipped them in 0.35.0 with the two bounds
+  comparing different figures (the heap alone, then the whole rewrite); assert against that wording.
 - **Mode**: `raise_to_target` ignores `min_gain_percent`, `page_min_extra_gain_percent` and the
   write-intensity downgrade; `gain_based` honors all three, unchanged.
 - **Objects scope**: an excluded object below target is not selected; `objects.exclude` beats an

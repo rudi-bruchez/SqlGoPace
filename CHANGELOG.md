@@ -13,6 +13,41 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.35.0] - 2026-09-16
+
+### Added
+
+- Every `rebuild_index`, `rebuild_heap` and `reorganize_index` reports the used size of each
+  structure it rewrites, before and after, in the `.log` and on the console's operation row. A
+  heap rebuild gets one line per structure plus a total; the manifest ends with its own total, and
+  `runs.size_before_kb` / `runs.size_after_kb` in the history make a campaign one `SUM`. The figure
+  is a net change between two reads: an `ONLINE` rebuild measured under a live workload includes
+  that workload's writes.
+- A manifest holding a `rebuild_heap` says before it runs what the statement really covers — how
+  many nonclustered indexes it rebuilds with the heap, and how much that is — in the `.log`, on
+  stdout, on the row in the console, and in a connected `--dry-run`.
+
+### Fixed
+
+- The preflight data-free-space check sized a heap rebuild from the heap alone. `ALTER TABLE …
+  REBUILD` rewrites every nonclustered index of the table in the same statement, so a 5 GB heap
+  carrying 20 GB of indexes was checked against 5 GB. It now counts the whole rewrite, as
+  `MAINTENANCE.md` §9 had required since the planner shipped.
+- A `rebuild_heap` on a table holding a **disabled** nonclustered index now fails preflight. The
+  rebuild re-enables that index and rebuilds it without its compression (measured; see
+  `docs/specs/OBJECT-SIZES-ANALYSIS.md`), silently undoing a deliberate decision. Migration: set
+  `allow_reenable_disabled_indexes: true` on the operation to accept it, or drop the index. The
+  maintenance planner never emits such a rebuild.
+- The maintenance planner weighed a heap by its **first partition** and ignored its nonclustered
+  indexes. `heap.min_size_mb` now compares the heap alone, summed over partitions; `heap.max_size_mb`
+  compares heap plus indexes, which is what the statement rewrites. Migration: revisit
+  `heap.max_size_mb` in `maintenance_profile.yaml` if heaps you expect disappear from the plan — the
+  skip line names both figures. `maintenance_analysis.size_mb` keeps its meaning (the heap alone)
+  but, for a partitioned heap, now holds the sum rather than partition 1.
+- The console kept one notice line that thirteen senders overwrote, so the rollback-on-cancel notice
+  added in 0.34.0 was erased by the first blocker kill. Each operation's note now lives on its own
+  row for the whole run, and is replaced by the size result when the operation finishes.
+
 ## [0.34.0] - 2026-09-15
 
 ### Added

@@ -425,7 +425,12 @@ For each candidate:
 
 Per heap (after the cheap size pre-filter of §4.6):
 
-1. **Skip** if size is outside `[min_size_mb, max_size_mb]`, or an override marks the table `skip`.
+1. **Skip** if an override marks the table `skip`; if the **heap alone** (summed over its partitions)
+   is below `min_size_mb` — the "worth it" gate, since forwarded records and page density are
+   properties of the heap; if **heap + every nonclustered index** exceeds `max_size_mb` — the cost
+   gate, since one `ALTER TABLE … REBUILD` rewrites them all; or if the table holds a **disabled**
+   nonclustered index, which the rebuild would re-enable and rebuild uncompressed. Each skip names
+   its reason and its figures (0.35.0, [OBJECT-SIZES.md](OBJECT-SIZES.md)).
 2. **Rebuild** when **any** trigger fires: forwarded-record ratio ≥ `forwarded_record_percent`, **or**
    `avg_fragmentation_in_percent` ≥ `fragmentation_percent`, **or** free-space deviation ≥
    `free_space_deviation_percent`. Forwarded records are the primary motivation; the other two catch
@@ -586,7 +591,9 @@ validity, recovery model, log health, data/tempdb free space, AG, ADR. Maintenan
   copy).
 - **`rebuild_heap`**: needs free space for a copy of the heap **plus** its nonclustered indexes (the
   rebuild re-creates them all); confirm the table is genuinely a heap; act on the **primary** replica
-  only (reuses the existing AG/replica-state check).
+  only (reuses the existing AG/replica-state check). Implemented in 0.35.0, together with the guard
+  that refuses a heap rebuild which would re-enable a disabled index — see
+  [OBJECT-SIZES.md](OBJECT-SIZES.md).
 
 Analysis itself runs **before** any manifest exists, so it has its own light guard: confirm
 `VIEW DATABASE STATE` / the ability to run `sp_estimate_data_compression_savings`, and that the target

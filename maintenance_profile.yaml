@@ -30,8 +30,8 @@ compression:
 
 heap:
   enabled: true
-  min_size_mb: 10                  # skip heaps smaller than this
-  max_size_mb: 10000               # skip heaps larger than this (needs a maintenance window)
+  min_size_mb: 10                  # skip heaps smaller than this (the heap alone, summed over its partitions)
+  max_size_mb: 10000               # skip when heap + its nonclustered indexes exceed this: one rebuild rewrites them all
   forwarded_record_percent: 10     # rebuild when forwarded_record_count / record_count ≥ this
   fragmentation_percent: 15        # OR avg_fragmentation_in_percent ≥ this
   free_space_deviation_percent: 30 # OR (100 − avg_page_space_used_in_percent) ≥ this

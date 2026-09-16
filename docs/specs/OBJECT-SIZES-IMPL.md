@@ -31,7 +31,8 @@ are in [OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md).
 - **TDD**: write the failing test, run it, implement, run it, commit. One commit per task.
 - **Idiomatic Go, KISS.** No new abstraction the task does not need.
 - **The checkout is CRLF** (`core.autocrlf=true`), so plain `gofmt -l` flags every file. Check a file
-  with `tr -d '\r' < FILE | gofmt -l -`; `golangci-lint run ./...` currently reports ~118 `gofmt`
+  through a temp file: `tr -d '\r' < FILE > /tmp/chk.go; gofmt -l /tmp/chk.go` — `gofmt -l -` on stdin fails outright here.
+  `golangci-lint run ./...` currently reports ~118 `gofmt`
   issues that are this noise and nothing else.
 - **A size read never changes an outcome.** Every failure degrades to "unknown"; the only new
   failure in the whole plan is the preflight disabled-index guard (Task 6).
@@ -2273,8 +2274,8 @@ one bullet per change, with these facts and no essay:
 ```bash
 go build ./... && go vet ./...
 go test -race ./...
-for f in $(git diff --name-only HEAD | grep '\.go$'); do tr -d '\r' < "$f" | gofmt -l - ; done   # expect no output
-golangci-lint run ./...   # expect only the pre-existing gofmt/CRLF noise
+for f in $(git diff --name-only HEAD | grep '\.go$'); do tr -d '\r' < "$f" > /tmp/chk.go; gofmt -l /tmp/chk.go; done   # expect no output
+golangci-lint run ./...   # expect only the ~118 pre-existing gofmt/CRLF findings, nothing else
 ```
 
 - [ ] **Step 5: Commit**

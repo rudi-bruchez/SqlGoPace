@@ -4,7 +4,8 @@ Status: design, 2026-09-15, revised after two adversarial reviews
 ([REVIEW-OBJECT-SIZES-claude.md](REVIEW-OBJECT-SIZES-claude.md),
 [REVIEW-OBJECT-SIZES-agy.md](REVIEW-OBJECT-SIZES-agy.md)) and a server test of what a heap rebuild
 does to disabled and columnstore indexes (§ Verified behaviour), and a resumable-pause probe
-([OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md)). Not implemented. Target version 0.35.0.
+([OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md)). Implemented in 0.35.0; the task-by-task
+record is [OBJECT-SIZES-IMPL.md](OBJECT-SIZES-IMPL.md).
 
 ## Why
 
@@ -325,11 +326,11 @@ A heap, one line per structure and a total:
 
 ```text
       size (heap and 3 nonclustered index(es)):
-        heap                              5.0 GB -> 3.1 GB  (-38.0%)
-        IX_MEASUREMENT_TS                 2.0 GB -> 1.4 GB  (-30.0%)
-        IX_MEASUREMENT_SITE               1.1 GB -> 0.9 GB  (-18.2%)
-        IX_MEASUREMENT_OLD (was disabled)   0 KB -> 452 MB
-        total                             8.1 GB -> 5.8 GB  (-28.4%)
+        heap                              5.0 GB -> 3.1 GB (-38.0%)
+        IX_MEASUREMENT_TS                 2.0 GB -> 1.4 GB (-30.0%)
+        IX_MEASUREMENT_SITE               1.1 GB -> 0.9 GB (-18.2%)
+        IX_MEASUREMENT_OLD (was disabled)   0 KB -> 452.0 MB
+        total                             8.1 GB -> 5.8 GB (-28.4%)
 ```
 
 A missing side renders `unknown`; a percentage needs both sides and a non-zero "before". When

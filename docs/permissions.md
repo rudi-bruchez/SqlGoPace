@@ -35,7 +35,15 @@ refused this one read.
 
 It is deliberately optional. Without the grant the check reports the object's size as
 unknown and passes, and the autogrowth advisory reports that it could not read the
-settings — neither fails the run. Nothing else in the tool needs it.
+settings — neither fails the run.
+
+Since 0.35.0 the same read serves three more things, whatever `require_data_free_space`
+says: the size of each structure a `rebuild_index`, `rebuild_heap` or `reorganize_index`
+rewrites, before and after; the connected `--dry-run` line naming what a heap rebuild
+rewrites besides the heap; and the guard that refuses a heap rebuild which would re-enable
+a disabled index. Without the grant each of them degrades — one `sizes not measured` line
+for the run, the offline wording in the dry run, and a warning that the guard could not
+check — and none of them fails a run.
 
 ## By operation
 

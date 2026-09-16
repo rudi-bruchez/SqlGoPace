@@ -796,14 +796,6 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   WRITELOG/PAGEIOLATCH throttle already exists per driver. Reuses `SessionWaits` / `DiffWaits` /
   `CategorizeWaits`; `internal/tui` does not read them yet.
 
-- [ ] **Object sizes: `OBJECT-SIZES.md` is missing from the tree.** The resumable-pause probe
-  ([OBJECT-SIZES-resume-probe.sql](OBJECT-SIZES-resume-probe.sql)) ran on 2026-09-15 and closed
-  open question 1: the size read returns the source index alone while a rebuild is paused
-  ([OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md)). The design document it answers was
-  never committed, so the three edits the result calls for (close question 1, remove the §5.2
-  exception, add the note that the paused target holds real data-file space) are listed at the
-  end of the analysis. Apply them when the design document is restored.
-
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
@@ -811,6 +803,14 @@ Kept so the entries above are not re-proposed. Each names the evidence in the tr
 - [x] **Batched DML** ([BATCH-DML.md](BATCH-DML.md)) — `internal/run/batch_dml.go`,
   `batch_calc.go`; `batch_update` / `batch_delete` documented in `docs/operations.md`. See the
   follow-ups above for what its controller still owes.
+- [x] **Object sizes before and after** ([OBJECT-SIZES.md](OBJECT-SIZES.md), 0.35.0) —
+  `internal/mssql/indexes.go` (`TableStructureSizes`, `DisabledIndexes`),
+  `internal/preflight/sizes.go`, `internal/run/sizes.go`, the size rendering in
+  `internal/report/report.go` and the two `runs` columns in `history.go`. It also fixed two
+  long-specified gaps: the preflight space check and the planner's `heap.max_size_mb` now count
+  everything `ALTER TABLE … REBUILD` rewrites, not the heap alone. The probe behind the design's
+  last open question is [OBJECT-SIZES-resume-probe.sql](OBJECT-SIZES-resume-probe.sql), its result
+  [OBJECT-SIZES-ANALYSIS.md](OBJECT-SIZES-ANALYSIS.md).
 - [x] **Graceful stop / drain** ([graceful-stop.md](graceful-stop.md)) — `internal/run/drain.go`.
 - [x] **Resume after interruption / metadata skip** ([crash-resumable.md](crash-resumable.md)) —
   `internal/run/skip.go`. The `skip_if_satisfied` flag it proposed was superseded by the
