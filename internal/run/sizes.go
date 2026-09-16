@@ -3,6 +3,7 @@ package run
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
@@ -104,4 +105,51 @@ func (t *sizeTotals) totals() (beforeKB, afterKB int64, structures int) {
 		structures++
 	}
 	return beforeKB, afterKB, len(t.order)
+}
+
+// heapScopeNotice is the manifest-start line for one heap rebuild: what else it rewrites,
+// and how much, in one transaction (OBJECT-SIZES.md §5.1).
+func heapScopeNotice(index int, op ddl.RebuildHeap, sizes []mssql.StructureSize) string {
+	names, count := nonclusteredNames(sizes)
+	notice := fmt.Sprintf("operation %d rebuild_heap %s.%s also rebuilds %d nonclustered index(es) (%s): %s rewritten in one transaction",
+		index, op.Schema, op.Table, count, strings.Join(names, ", "), report.HumanizeKB(preflight.SumKB(sizes)))
+	if disabled := preflight.DisabledNames(sizes); len(disabled) > 0 {
+		notice += fmt.Sprintf("; it re-enables disabled index(es) %s, rebuilt without their compression", strings.Join(disabled, ", "))
+	}
+	return notice
+}
+
+// heapScopeDetail is the same fact, short enough for a console row.
+func heapScopeDetail(sizes []mssql.StructureSize) string {
+	_, count := nonclusteredNames(sizes)
+	detail := fmt.Sprintf("+%d nonclustered, %s rewritten", count, report.HumanizeKB(preflight.SumKB(sizes)))
+	if n := len(preflight.DisabledNames(sizes)); n > 0 {
+		detail += fmt.Sprintf(", re-enables %d disabled", n)
+	}
+	return detail
+}
+
+// opDetail joins the manifest-start notes for one operation's console row.
+func opDetail(step ddl.PlannedOperation, scope string) string {
+	var parts []string
+	if RollbackOnCancel(step) {
+		parts = append(parts, "cancel only")
+	}
+	if scope != "" {
+		parts = append(parts, scope)
+	}
+	return strings.Join(parts, " · ")
+}
+
+// nonclusteredNames returns the names and count of every structure with IndexID != 0
+// (the heap itself, index_id 0, is excluded — this is what "also rebuilds" is naming).
+func nonclusteredNames(sizes []mssql.StructureSize) ([]string, int) {
+	var names []string
+	for _, s := range sizes {
+		if s.IndexID == 0 {
+			continue
+		}
+		names = append(names, s.Name)
+	}
+	return names, len(names)
 }

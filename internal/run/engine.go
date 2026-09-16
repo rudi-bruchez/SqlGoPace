@@ -618,21 +618,45 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 		return e.finalize(ctx, name, rep, start, false)
 	}
 
-	// Surface the whole operation list once, so the console can show pending operations
-	// (not just the running one). Per-op status then follows from the step events.
-	if e.opListSink != nil {
-		ops := make([]OpInfo, len(planned))
-		for i, step := range planned {
-			ops[i] = OpInfo{Index: i + 1, Command: step.Operation.CommandType(), Target: opTarget(step.Operation)}
-		}
-		e.emitOpList(ops)
-	}
-
 	// Validate the resume cursor against the current plan: a cursor past the plan length, or a
 	// plan that no longer matches the fingerprint the cursor was recorded against, means the
 	// manifest changed since it was interrupted — restart clean rather than silently skip
 	// operations (which would report SUCCESS having executed nothing).
 	resumeFrom = e.reconcileResumePlan(name, st, planned, resumeFrom, resumed)
+
+	// A heap rebuild rewrites every nonclustered index of its table, in one transaction,
+	// and the manifest names only the table. Say so before anything runs — the .log is
+	// read after the damage (H2 class, REVIEW-2026-09-15-harm.md). Counted from the
+	// resume cursor onward, like the rollback-on-cancel notice below: an operation
+	// already completed in a previous run is not exposure this run will incur.
+	scopes := map[int]string{}
+	for i := resumeFrom; i < len(planned); i++ {
+		heap, ok := planned[i].Operation.(ddl.RebuildHeap)
+		if !ok {
+			continue
+		}
+		sizes, err := readSizes(ctx, e.sizes, heap)
+		if err != nil || len(sizes) < 2 {
+			continue
+		}
+		notice := heapScopeNotice(i+1, heap, sizes)
+		fmt.Fprintln(e.out, notice)
+		rep.HeapScopeNotices = append(rep.HeapScopeNotices, notice)
+		scopes[i] = heapScopeDetail(sizes)
+	}
+
+	// Surface the whole operation list once, so the console can show pending operations
+	// (not just the running one). Per-op status then follows from the step events.
+	if e.opListSink != nil {
+		ops := make([]OpInfo, len(planned))
+		for i, step := range planned {
+			ops[i] = OpInfo{
+				Index: i + 1, Command: step.Operation.CommandType(), Target: opTarget(step.Operation),
+				Detail: opDetail(step, scopes[i]),
+			}
+		}
+		e.emitOpList(ops)
+	}
 
 	// Name the rollback-on-cancel hazard once per manifest, not once per operation
 	// (CANCEL-ONLY.md §2): an 800-operation Standard manifest would otherwise repeat

@@ -49,6 +49,9 @@ type OpInfo struct {
 	Index   int    // 1-based position, after plan/expansion
 	Command string // operation CommandType, e.g. "shrink_data"
 	Target  string // schema.table[.name] / file / database label
+	// Detail is the manifest-start note for the console row: "cancel only", the heap
+	// rewrite scope, or both joined with " · " (OBJECT-SIZES.md §5.3).
+	Detail string
 }
 
 // emitStep delivers a step event to the sink when one is wired.

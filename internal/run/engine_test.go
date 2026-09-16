@@ -929,3 +929,33 @@ func TestNoSizeReaderMeansNoSizeLines(t *testing.T) {
 		t.Errorf("engine with no size reader wrote size output:\n%s", log)
 	}
 }
+
+// TestManifestStartHeapScope: before anything runs, the log, the report and the operation
+// list say the heap rebuild rewrites more than the manifest names.
+func TestManifestStartHeapScope(t *testing.T) {
+	sizes := &fakeSizeReader{sizes: []mssql.StructureSize{
+		{IndexID: 0, TypeDesc: "HEAP", UsedKB: 5 * 1024 * 1024},
+		{IndexID: 2, Name: "IX_A", TypeDesc: "NONCLUSTERED", UsedKB: 2 * 1024 * 1024},
+	}}
+	var ops [][]run.OpInfo
+	eng, dirs := setupEngine(t, fakePreflighter{}, &seqOpRunner{},
+		run.WithSizeReader(sizes), run.WithOpListSink(func(l []run.OpInfo) { ops = append(ops, l) }))
+	writeOnly(t, dirs, "100_h.yaml", heapManifest)
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	log := readLog(t, filepath.Join(dirs.Done, "100_h.yaml.log"))
+	if !strings.Contains(log, "also rebuilds 1 nonclustered index(es) (IX_A): 7.0 GB rewritten in one transaction") {
+		t.Errorf("log missing the manifest-start heap scope line:\n%s", log)
+	}
+	if len(ops) != 1 {
+		t.Fatalf("op list emitted %d times, want 1", len(ops))
+	}
+	if !strings.Contains(ops[0][0].Detail, "+1 nonclustered, 7.0 GB rewritten") {
+		t.Errorf("OpInfo.Detail = %q, want the heap scope", ops[0][0].Detail)
+	}
+	if !strings.Contains(ops[0][0].Detail, "cancel only") {
+		t.Errorf("OpInfo.Detail = %q, want the rollback-on-cancel marker too (rebuild_heap has no RESUMABLE form)", ops[0][0].Detail)
+	}
+}
