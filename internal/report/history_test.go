@@ -165,3 +165,34 @@ func TestHistoryReopenIsAdditive(t *testing.T) {
 		t.Errorf("RecordMaintenance after reopen error = %v", err)
 	}
 }
+
+// TestRecordStoresSizes: the two columns are added to an existing database by the additive
+// migration and carry the manifest totals, so a campaign is one SUM over its runs.
+func TestRecordStoresSizes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history.db")
+	h, err := report.OpenHistory(path)
+	if err != nil {
+		t.Fatalf("OpenHistory() error = %v", err)
+	}
+	if err := h.Record(context.Background(), report.RunRecord{
+		Manifest: "100_h.yaml", Outcome: "SUCCESS", SizeBeforeKB: 7_340_032, SizeAfterKB: 4_718_592,
+	}); err != nil {
+		t.Fatalf("Record() error = %v", err)
+	}
+	if err := h.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	var before, after int64
+	if err := db.QueryRow(`SELECT size_before_kb, size_after_kb FROM runs`).Scan(&before, &after); err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	if before != 7_340_032 || after != 4_718_592 {
+		t.Errorf("stored (%d, %d), want (7340032, 4718592)", before, after)
+	}
+}

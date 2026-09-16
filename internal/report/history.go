@@ -20,6 +20,8 @@ type RunRecord struct {
 	PeakBlocked int // most sessions any one operation blocked at once during the run
 	Skipped     int // operations skipped as already-satisfied (intent: compression at target); excludes resume-cursor skips
 	Error       string
+	SizeBeforeKB int64 // used size of every structure this run measured on both sides, before
+	SizeAfterKB  int64 // ... and after; 0 when nothing was fully measured
 }
 
 // History persists run records to a SQLite database.
@@ -72,6 +74,8 @@ var schemaStatements = []string{
 var columnMigrations = []struct{ column, ddl string }{
 	{"peak_blocked", `ALTER TABLE runs ADD COLUMN peak_blocked INTEGER;`},
 	{"skipped", `ALTER TABLE runs ADD COLUMN skipped INTEGER;`},
+	{"size_before_kb", `ALTER TABLE runs ADD COLUMN size_before_kb INTEGER;`},
+	{"size_after_kb", `ALTER TABLE runs ADD COLUMN size_after_kb INTEGER;`},
 }
 
 // OpenHistory opens (creating if needed) the SQLite history database at path.
@@ -115,10 +119,10 @@ func runsColumnExists(db *sql.DB, column string) (bool, error) {
 
 // Record inserts one run record.
 func (h *History) Record(ctx context.Context, r RunRecord) error {
-	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, peak_blocked, skipped, error)
-	           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);`
+	const q = `INSERT INTO runs (manifest, outcome, started_at, finished_at, operations, duration_ms, peak_blocked, skipped, error, size_before_kb, size_after_kb)
+	           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);`
 	if _, err := h.db.ExecContext(ctx, q,
-		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.PeakBlocked, r.Skipped, r.Error); err != nil {
+		r.Manifest, r.Outcome, r.StartedAt, r.FinishedAt, r.Operations, r.DurationMS, r.PeakBlocked, r.Skipped, r.Error, r.SizeBeforeKB, r.SizeAfterKB); err != nil {
 		return fmt.Errorf("record run: %w", err)
 	}
 	return nil
