@@ -137,3 +137,26 @@ func TestReportRendersContendedPointer(t *testing.T) {
 		t.Errorf("missing contended pointer line:\n%s", out)
 	}
 }
+
+// TestHumanizeKB pins the boundaries, including the TB step: a 1.4 TB object exists in the
+// field (TODO.md), and rendering it as "1433.6 GB" while the console header says TB for the
+// same database reads as a bug.
+func TestHumanizeKB(t *testing.T) {
+	tests := []struct {
+		kb   int64
+		want string
+	}{
+		{0, "0 KB"},
+		{812, "812 KB"},
+		{1024, "1.0 MB"},
+		{12_700, "12.4 MB"},
+		{1024 * 1024, "1.0 GB"},
+		{2_684_354, "2.6 GB"},
+		{1024 * 1024 * 1024, "1.00 TB"},
+	}
+	for _, tt := range tests {
+		if got := report.HumanizeKB(tt.kb); got != tt.want {
+			t.Errorf("HumanizeKB(%d) = %q, want %q", tt.kb, got, tt.want)
+		}
+	}
+}

@@ -112,6 +112,23 @@ type RunReport struct {
 	CancelOnlySummary string `json:"cancel_only_summary,omitempty"`
 }
 
+// HumanizeKB renders a size in kilobytes, escalating the unit so large values stay
+// readable. It mirrors tui.HumanizeMB's steps (and its two decimals at TB) without
+// importing it: internal/report has no internal dependency, and one formatter is not
+// worth making the report package depend on the console's.
+func HumanizeKB(kb int64) string {
+	switch {
+	case kb < 1024:
+		return fmt.Sprintf("%d KB", kb)
+	case kb < 1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(kb)/1024)
+	case kb < 1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(kb)/(1024*1024))
+	default:
+		return fmt.Sprintf("%.2f TB", float64(kb)/(1024*1024*1024))
+	}
+}
+
 // Write renders the report as a human summary followed by a JSON block.
 func Write(w io.Writer, r RunReport) error {
 	fmt.Fprintln(w, "SqlGoPace run report")
