@@ -4,89 +4,61 @@ package mssql_test
 
 import (
 	"testing"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
-// TestIndexSizeMBIntegration exercises the three cases the preflight free-space check
-// depends on: a real index reports a size, a heap is addressable with an empty index name,
-// and an object that does not exist reports 0 rather than an error. The check treats 0 as
-// "size unknown" and must never fail a run on it, so the missing-object case is the one
-// that matters most.
-func TestIndexSizeMBIntegration(t *testing.T) {
+// TestTableStructureSizesIntegration covers what the preflight and the engine need: the
+// heap and each index in one read, a disabled index listed with no pages (it is rebuilt
+// from the table, so it must not vanish from the count), one partition, and a missing
+// object reading as "no rows" rather than an error.
+func TestTableStructureSizesIntegration(t *testing.T) {
 	conn, ctx := openTestConn(t)
+	table := "sqlgopace_sizes_probe"
+	exec(t, conn, ctx, "DROP TABLE IF EXISTS dbo."+table)
+	exec(t, conn, ctx, "CREATE TABLE dbo."+table+" (id INT NOT NULL, v CHAR(200) NOT NULL)")
+	exec(t, conn, ctx, "INSERT INTO dbo."+table+" (id, v) SELECT TOP (5000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 'x' FROM sys.all_objects a CROSS JOIN sys.all_objects b")
+	exec(t, conn, ctx, "CREATE INDEX IX_"+table+"_live ON dbo."+table+" (id)")
+	exec(t, conn, ctx, "CREATE INDEX IX_"+table+"_off ON dbo."+table+" (v)")
+	exec(t, conn, ctx, "ALTER INDEX IX_"+table+"_off ON dbo."+table+" DISABLE")
+	t.Cleanup(func() { exec(t, conn, ctx, "DROP TABLE IF EXISTS dbo."+table) })
 
-	const table = "sqlgopace_idxsize"
-	exec := func(stmt string) {
-		t.Helper()
-		if err := conn.ExecDDL(ctx, stmt); err != nil {
-			t.Fatalf("exec %q: %v", stmt, err)
-		}
+	got, err := conn.TableStructureSizes(ctx, "dbo", table, nil)
+	if err != nil {
+		t.Fatalf("TableStructureSizes: %v", err)
+	}
+	byName := map[string]mssql.StructureSize{}
+	for _, s := range got {
+		byName[s.Name] = s
+	}
+	if len(got) != 3 {
+		t.Fatalf("got %d structures, want 3 (heap + 2 indexes): %+v", len(got), got)
+	}
+	if heap := byName[""]; heap.IndexID != 0 || heap.UsedKB <= 0 {
+		t.Errorf("heap row = %+v, want index_id 0 with pages", heap)
+	}
+	if live := byName["IX_"+table+"_live"]; live.Disabled || live.UsedKB <= 0 {
+		t.Errorf("live index row = %+v, want enabled with pages", live)
+	}
+	off := byName["IX_"+table+"_off"]
+	if !off.Disabled || off.UsedKB != 0 {
+		t.Errorf("disabled index row = %+v, want Disabled with 0 KB", off)
 	}
 
-	exec(`IF OBJECT_ID('dbo.` + table + `') IS NOT NULL DROP TABLE dbo.` + table)
-	exec(`CREATE TABLE dbo.` + table + ` (id INT NOT NULL, pad CHAR(200) NOT NULL)`)
-	t.Cleanup(func() { _ = conn.ExecDDL(ctx, `DROP TABLE IF EXISTS dbo.`+table) })
+	one := 1
+	part, err := conn.TableStructureSizes(ctx, "dbo", table, &one)
+	if err != nil {
+		t.Fatalf("TableStructureSizes(partition 1): %v", err)
+	}
+	if len(part) != 3 {
+		t.Errorf("partition read returned %d rows, want 3 (an unpartitioned table has partition 1)", len(part))
+	}
 
-	// Enough rows to allocate more than one page, so a heap reports a non-zero size.
-	exec(`INSERT INTO dbo.` + table + ` (id, pad)
-	      SELECT TOP (2000) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 'x'
-	      FROM sys.all_objects a CROSS JOIN sys.all_objects b`)
-
-	t.Run("heap has a size", func(t *testing.T) {
-		got, err := conn.IndexSizeMB(ctx, "dbo", table, "", nil)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(heap): %v", err)
-		}
-		if got <= 0 {
-			t.Errorf("IndexSizeMB(heap) = %d, want > 0", got)
-		}
-	})
-
-	t.Run("named index has a size", func(t *testing.T) {
-		exec(`CREATE CLUSTERED INDEX IX_` + table + ` ON dbo.` + table + ` (id)`)
-
-		got, err := conn.IndexSizeMB(ctx, "dbo", table, "IX_"+table, nil)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(index): %v", err)
-		}
-		if got <= 0 {
-			t.Errorf("IndexSizeMB(index) = %d, want > 0", got)
-		}
-	})
-
-	// The partition filter is the part that cannot be unit tested, and getting it wrong
-	// sizes a REBUILD PARTITION = n as the whole index. A non-partitioned index lives
-	// entirely in partition 1, so asking for that partition must match the unpartitioned
-	// answer, and asking for one that does not exist must report nothing.
-	t.Run("partition filter selects the partition", func(t *testing.T) {
-		whole, err := conn.IndexSizeMB(ctx, "dbo", table, "IX_"+table, nil)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(whole): %v", err)
-		}
-		one := 1
-		first, err := conn.IndexSizeMB(ctx, "dbo", table, "IX_"+table, &one)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(partition 1): %v", err)
-		}
-		if first != whole {
-			t.Errorf("IndexSizeMB(partition 1) = %d, want %d (the whole unpartitioned index)", first, whole)
-		}
-		absent := 99
-		none, err := conn.IndexSizeMB(ctx, "dbo", table, "IX_"+table, &absent)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(partition 99): %v", err)
-		}
-		if none != 0 {
-			t.Errorf("IndexSizeMB(partition 99) = %d, want 0 (no such partition)", none)
-		}
-	})
-
-	t.Run("missing object reports zero, not an error", func(t *testing.T) {
-		got, err := conn.IndexSizeMB(ctx, "dbo", "sqlgopace_no_such_table", "IX_nope", nil)
-		if err != nil {
-			t.Fatalf("IndexSizeMB(missing) error = %v, want nil (0 means unknown)", err)
-		}
-		if got != 0 {
-			t.Errorf("IndexSizeMB(missing) = %d, want 0", got)
-		}
-	})
+	none, err := conn.TableStructureSizes(ctx, "dbo", "sqlgopace_no_such_table", nil)
+	if err != nil {
+		t.Fatalf("TableStructureSizes(missing) error = %v, want nil", err)
+	}
+	if len(none) != 0 {
+		t.Errorf("missing object returned %d rows, want 0", len(none))
+	}
 }

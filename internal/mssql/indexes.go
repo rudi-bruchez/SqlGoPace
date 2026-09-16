@@ -92,34 +92,61 @@ func (c *Conn) IndexCompression(ctx context.Context, schema, table, index string
 	return out, rows.Err()
 }
 
-// indexSizeMBSQL sums the used pages of one index (or the heap, when @index is empty)
-// across all its partitions. used_page_count is in 8-KB pages, so /128 = MB. A missing
-// object yields no rows, which the caller reads as "size unknown".
-const indexSizeMBSQL = `
-SELECT CAST(CEILING(SUM(ps.used_page_count) / 128.0) AS INT) AS used_mb
-FROM sys.dm_db_partition_stats ps
-JOIN sys.indexes i
-  ON i.object_id = ps.object_id AND i.index_id = ps.index_id
-WHERE ps.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
-  AND ((@index = N'' AND i.index_id = 0) OR i.name = @index)
-  AND (@partition = 0 OR ps.partition_number = @partition);`
+// StructureSize is one heap or index of a table, its used pages summed over partitions.
+// A disabled nonclustered index has no pages at all ("Disabling ... a nonclustered index
+// physically deletes the index data"), so it is listed with UsedKB 0 rather than dropped:
+// ALTER TABLE ... REBUILD on a heap rebuilds it from the table, so it is part of the
+// rewrite even though nothing can size it in advance.
+type StructureSize struct {
+	IndexID  int    // 0 = heap
+	Name     string // empty for the heap
+	TypeDesc string // sys.indexes.type_desc
+	Disabled bool   // sys.indexes.is_disabled
+	UsedKB   int64
+}
 
-// IndexSizeMB returns the used size in MB of [schema].[table]'s index, or of the heap
-// when index is empty, summed across partitions. It returns 0 when the object cannot be
-// measured (no such object, or no allocated pages); callers treat 0 as "size unknown"
-// and must not fail a run on it.
-func (c *Conn) IndexSizeMB(ctx context.Context, schema, table, index string, partition *int) (int, error) {
+// tableStructureSizesSQL lists every structure of one table with its used size.
+// LEFT JOIN, with the partition filter inside the join, so a structure with no
+// allocated pages still gets a row. used_page_count is in 8-KB pages.
+const tableStructureSizesSQL = `
+SELECT i.index_id, i.name, i.type_desc, i.is_disabled,
+       COALESCE(SUM(ps.used_page_count), 0) * 8 AS used_kb
+FROM sys.indexes i
+LEFT JOIN sys.dm_db_partition_stats ps
+  ON ps.object_id = i.object_id AND ps.index_id = i.index_id
+ AND (@partition = 0 OR ps.partition_number = @partition)
+WHERE i.object_id = OBJECT_ID(QUOTENAME(@schema) + '.' + QUOTENAME(@table))
+  AND i.is_hypothetical = 0
+GROUP BY i.index_id, i.name, i.type_desc, i.is_disabled
+ORDER BY i.index_id;`
+
+// TableStructureSizes returns every heap/index of [schema].[table] with its used size in
+// KB, summed across partitions (or for one partition when partition is set). A missing
+// object yields no rows, which callers read as "size unknown" and must never fail a run on.
+func (c *Conn) TableStructureSizes(ctx context.Context, schema, table string, partition *int) ([]StructureSize, error) {
 	// 0 means "every partition": partition numbers start at 1, so it cannot collide.
 	part := 0
 	if partition != nil {
 		part = *partition
 	}
-	var mb sql.NullInt64
-	err := c.pool.QueryRowContext(ctx, indexSizeMBSQL,
-		sql.Named("schema", schema), sql.Named("table", table), sql.Named("index", index),
-		sql.Named("partition", part)).Scan(&mb)
+	rows, err := c.pool.QueryContext(ctx, tableStructureSizesSQL,
+		sql.Named("schema", schema), sql.Named("table", table), sql.Named("partition", part))
 	if err != nil {
-		return 0, fmt.Errorf("index size %s.%s.%s: %w", schema, table, index, err)
+		return nil, fmt.Errorf("structure sizes %s.%s: %w", schema, table, err)
 	}
-	return int(mb.Int64), nil
+	defer func() { _ = rows.Close() }()
+
+	var out []StructureSize
+	for rows.Next() {
+		var (
+			s    StructureSize
+			name sql.NullString
+		)
+		if err := rows.Scan(&s.IndexID, &name, &s.TypeDesc, &s.Disabled, &s.UsedKB); err != nil {
+			return nil, fmt.Errorf("scan structure size row: %w", err)
+		}
+		s.Name = name.String
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }
