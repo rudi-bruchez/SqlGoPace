@@ -79,9 +79,9 @@ func DisabledNames(sizes []mssql.StructureSize) []string {
 
 // CheckReenabledIndexes guards the one irreversible side effect of a heap rebuild. The
 // rebuild recreates every nonclustered index of the table, so a disabled one comes back
-// live and uncompressed (verified on a server: docs/specs/OBJECT-SIZES.md "Verified
-// behavior"). That undoes a deliberate operator decision, so it fails unless the operation
-// opted in. A read error warns rather than fails: sys.dm_db_partition_stats wants VIEW
+// live and uncompressed (measured on a server: docs/specs/OBJECT-SIZES-ANALYSIS.md).
+// That undoes a deliberate operator decision, so it fails unless the operation opted
+// in. A read error warns rather than fails: sys.dm_db_partition_stats wants VIEW
 // DEFINITION, which the documented VIEW SERVER STATE does not imply, and a login missing it
 // must not be blocked by a guard that cannot run.
 func CheckReenabledIndexes(target string, disabled []string, allowed bool, readErr error) Check {
