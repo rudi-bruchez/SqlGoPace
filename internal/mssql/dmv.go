@@ -341,3 +341,22 @@ func (c *Conn) HeldObjectLocks(ctx context.Context, spid int) ([]LockedObject, e
 	}
 	return out, rows.Err()
 }
+
+// ActiveRequestCount counts the requests actually running in an ActiveSessions snapshot.
+// That snapshot also carries sessions that are idle with a transaction open — they matter
+// as blockers, but they are not load, so they do not count here.
+//
+// SqlGoPace's own sessions do count: the monitoring read is itself a running request at the
+// instant it reads, and the operation is another while it runs, so a quiet server reports
+// one or two rather than none. Excluding them would mean filtering activeSessionsSQL, which
+// the reaction path, the shrink driver and preflight also read — too much surface to move
+// for a header line, and the DDL half is real load anyway.
+func ActiveRequestCount(sessions []Session) int {
+	n := 0
+	for _, s := range sessions {
+		if !strings.EqualFold(s.Status, "sleeping") {
+			n++
+		}
+	}
+	return n
+}

@@ -583,3 +583,102 @@ func TestHeapScopesDistinguishesOfflineFromUnreadable(t *testing.T) {
 		t.Errorf("zero-row read while connected = %q, want it to say the sizes could not be read", got)
 	}
 }
+
+func TestServerLoadMsgFlagsRunnablePressure(t *testing.T) {
+	// One runnable task per scheduler is the pressure threshold: the header styles the
+	// segment as an alert from here up.
+	msg := serverLoadMsg(mssql.Load{
+		CPUKnown: true, BusyPercent: 45, SQLPercent: 32, RunnableTasks: 24, Schedulers: 16,
+	})
+	if !msg.CPUKnown || msg.BusyPercent != 45 || msg.SQLPercent != 32 {
+		t.Errorf("serverLoadMsg CPU fields = %+v, want the load passed through", msg)
+	}
+	if msg.RunnableTasks != 24 || msg.Schedulers != 16 {
+		t.Errorf("serverLoadMsg scheduler fields = %+v, want 24/16", msg)
+	}
+	if !msg.RunnableAlert {
+		t.Error("serverLoadMsg RunnableAlert = false at 1.5 runnable per scheduler, want true")
+	}
+}
+
+func TestServerLoadMsgQuietBelowThreshold(t *testing.T) {
+	msg := serverLoadMsg(mssql.Load{CPUKnown: true, BusyPercent: 12, RunnableTasks: 4, Schedulers: 16})
+	if msg.RunnableAlert {
+		t.Error("serverLoadMsg RunnableAlert = true at 0.25 runnable per scheduler, want false")
+	}
+}
+
+func TestServerLoadMsgNeverAlertsOnAnUnknownSchedulerCount(t *testing.T) {
+	// A failed scheduler read must not divide by zero nor alarm on a count nobody measured.
+	msg := serverLoadMsg(mssql.Load{RunnableTasks: 30})
+	if msg.RunnableAlert {
+		t.Error("serverLoadMsg RunnableAlert = true with no schedulers, want false")
+	}
+}
+
+func TestCPUCadenceReadsOnFirstPollThenOncePerRecord(t *testing.T) {
+	// The scheduler-monitor ring buffer emits one record a minute, so reading it on
+	// every progress poll (30s by default) asks the monitored server for a value it
+	// cannot have changed. The first poll reads; the next one inside the period does not.
+	var c cpuCadence
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	if !c.due(now) {
+		t.Fatal("the first poll must read the CPU half")
+	}
+	c.merge(mssql.Load{CPURead: true, CPUKnown: true, BusyPercent: 45, SQLPercent: 32}, now)
+	if c.due(now.Add(30 * time.Second)) {
+		t.Error("read again 30s later: the record cannot have changed yet")
+	}
+	if !c.due(now.Add(mssql.SchedulerMonitorPeriod)) {
+		t.Error("did not read again after a full record period")
+	}
+}
+
+func TestCPUCadenceCarriesTheLastCPUReadingOverTheQuietPolls(t *testing.T) {
+	var c cpuCadence
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	c.merge(mssql.Load{CPURead: true, CPUKnown: true, BusyPercent: 45, SQLPercent: 32, RunnableTasks: 2, Schedulers: 16}, now)
+
+	// A poll that skipped the ring buffer still brings live runnable figures; the CPU
+	// half comes from the last read, which is still the current record.
+	got := c.merge(mssql.Load{RunnableTasks: 24, Schedulers: 16}, now.Add(30*time.Second))
+	if !got.CPUKnown || got.BusyPercent != 45 || got.SQLPercent != 32 {
+		t.Errorf("CPU half = %+v, want the previous reading carried over", got)
+	}
+	if got.RunnableTasks != 24 {
+		t.Errorf("RunnableTasks = %d, want the fresh 24", got.RunnableTasks)
+	}
+}
+
+func TestCPUCadenceLatchesOnAnAnsweredReadEvenWithNoRecord(t *testing.T) {
+	// A ring buffer that answered with no record (a server that started a minute ago)
+	// has been paid for: the scan happened. Asking again on the next poll would pay it
+	// twice for the same answer.
+	var c cpuCadence
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	got := c.merge(mssql.Load{CPURead: true, RunnableTasks: 2, Schedulers: 8}, now)
+	if got.CPUKnown {
+		t.Error("CPUKnown = true although the read brought no record")
+	}
+	if c.due(now.Add(30 * time.Second)) {
+		t.Error("asked again 30s after an answered read")
+	}
+}
+
+func TestCPUCadenceRetriesAReadThatFailed(t *testing.T) {
+	// A ring-buffer read that failed — a connection blip, or a server that refuses the
+	// DMV outright — costs nothing: the statement never scans. Caching that failure for a
+	// minute would blank the cpu segment on a server that was readable the whole time, so
+	// a reading that did not reach the ring buffer must not become the reference.
+	var c cpuCadence
+	now := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
+	c.merge(mssql.Load{CPURead: true, CPUKnown: true, BusyPercent: 45, SQLPercent: 32}, now)
+
+	failed := c.merge(mssql.Load{RunnableTasks: 3, Schedulers: 8}, now.Add(mssql.SchedulerMonitorPeriod))
+	if !failed.CPUKnown || failed.BusyPercent != 45 {
+		t.Errorf("CPU half = %+v, want the last good reading kept while the read fails", failed)
+	}
+	if !c.due(now.Add(mssql.SchedulerMonitorPeriod + time.Second)) {
+		t.Error("the next poll did not retry: a failed read must not hold the clock for a minute")
+	}
+}

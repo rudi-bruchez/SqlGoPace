@@ -266,6 +266,24 @@ type (
 		ReuseWait      string
 		LogAlert       bool
 	}
+	// ServerLoadMsg carries how busy the whole server is, for the header's fourth banner
+	// line. It is ambiance, not a monitored dimension: nothing reacts to it. CPUKnown is
+	// false when the scheduler-monitor ring buffer had no usable record, in which case the
+	// percentages are not rendered rather than rendered as zero. RunnableAlert is computed
+	// by the sender, like SpaceMsg.LogAlert: the console renders the flag and knows no
+	// threshold of its own.
+	ServerLoadMsg struct {
+		CPUKnown      bool
+		BusyPercent   int
+		SQLPercent    int
+		RunnableTasks int
+		Schedulers    int
+		RunnableAlert bool
+	}
+	// ActiveRequestsMsg carries how many requests are running on the server right now. It
+	// is separate from ServerLoadMsg because it rides the blocking poll (which already has
+	// the session snapshot in hand) rather than the coarser progress poll.
+	ActiveRequestsMsg struct{ Count int }
 )
 
 // tickMsg drives the once-a-second re-render that keeps the elapsed timer live.
@@ -366,6 +384,9 @@ type Model struct {
 	server    ServerInfoMsg  // header banner; zero value renders no server line
 	space     SpaceMsg       // header banner's third line: data/log file space
 	hasSpace  bool           // whether a SpaceMsg has arrived yet (before then, no third line)
+	load      ServerLoadMsg  // header banner's fourth line: server-wide CPU and runnable tasks
+	requests  int            // active requests on the server, from ActiveRequestsMsg
+	hasReqs   bool           // whether an ActiveRequestsMsg has arrived yet
 	ops       []OperationRow // the running manifest's operations, with live status
 	width     int            // terminal width, from WindowSizeMsg (0 until first resize)
 	height    int            // terminal height, budgets the operations panel so lower panels stay visible
@@ -564,6 +585,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case SpaceMsg:
 		m.space = msg
 		m.hasSpace = true
+	case ServerLoadMsg:
+		m.load = msg
+	case ActiveRequestsMsg:
+		m.requests = msg.Count
+		m.hasReqs = true
 	case OperationsMsg:
 		// Both are manifest-scoped and replaced together: the engine sends this once as each
 		// manifest starts, so a stale name can never outlive the list it belongs to.
@@ -909,3 +935,7 @@ func truncate(s string, n int) string {
 	}
 	return string(r[:n-1]) + "…"
 }
+
+// OtherPercent is the share of the machine used by everything that is not this SQL Server
+// process — another instance, a backup agent, an antivirus sweep.
+func (m ServerLoadMsg) OtherPercent() int { return m.BusyPercent - m.SQLPercent }

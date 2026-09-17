@@ -137,3 +137,21 @@ func TestScanLockedObjectNullNameFallsBackToID(t *testing.T) {
 		t.Errorf("scanLockedObject = %+v, want %+v", got, want)
 	}
 }
+
+func TestActiveRequestCount(t *testing.T) {
+	// ActiveSessions also returns sessions that are idle with a transaction open (they
+	// matter as blockers); they are not requests running right now, so the load figure
+	// must not count them.
+	snapshot := []Session{
+		{SPID: 51, Status: "running"},
+		{SPID: 52, Status: "runnable"},
+		{SPID: 53, Status: "suspended"},
+		{SPID: 54, Status: "sleeping", OpenTransactions: 1},
+	}
+	if got := ActiveRequestCount(snapshot); got != 3 {
+		t.Errorf("ActiveRequestCount = %d, want 3 (the sleeping session must not count)", got)
+	}
+	if got := ActiveRequestCount(nil); got != 0 {
+		t.Errorf("ActiveRequestCount(nil) = %d, want 0", got)
+	}
+}

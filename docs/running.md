@@ -169,6 +169,40 @@ worth knowing about the 90% mark:
   autogrowth can still extend — 90% full is not 90% of the eventual ceiling if the file
   keeps growing.
 
+A fourth line says how busy the server is, once the first poll has landed:
+
+```
+cpu 45% (sql 32, other 13)   runnable 24/16   18 active requests
+```
+
+`cpu` is the whole machine, not this instance: `sql` is the SQL Server process's share of it and
+`other` is everything else on the box — another instance, a backup agent, an antivirus sweep.
+`runnable 24/16` is tasks waiting for a CPU over online schedulers, and the request count is the
+requests running right now (sessions idle with a transaction open are blockers, not load, and do
+not count). SqlGoPace is in that count: the console's own read is a running request while it
+runs, and so is the operation, so an otherwise quiet server reads `1 active request` or
+`2 active requests` rather than none.
+
+Read it as ambiance. Nothing in the reaction hierarchy looks at it, and no operation is paced by
+it; it is there so an operator can tell a slow rebuild on a saturated server from a slow rebuild
+on a quiet one. Two things about the numbers:
+
+- the CPU percentages come from the scheduler-monitor ring buffer, which emits **one record a
+  minute**, and the console asks for that record at most once a minute — it is the expensive
+  part of the line, and a faster poll would only re-fetch the same record. It can only ask on a
+  poll, so a `progress_poll_seconds` that does not divide 60 stretches the gap: at 45 s the
+  record is re-read every 90 s. Read the percentages as *a minute or so old*, not as now.
+  `runnable` and the request count are live, on `progress_poll_seconds` and
+  `blocking_poll_seconds` respectively;
+- at one runnable task per scheduler the segment switches to the alert style and the console
+  narrates `CPU pressure: 24 tasks runnable across 16 schedulers` once, re-arming only below 0.5
+  per scheduler. Sustained runnable tasks mean the server is short of CPU: the operation will be
+  slower, and so will everything else running on it.
+
+Where the ring buffer cannot be read — Azure SQL Database on Basic/S0/S1 or in an elastic pool —
+the `cpu` segment is left out and the rest of the line still renders. On Azure the figure would
+in any case describe the machine hosting the database, not the database's own limit.
+
 | Key | Action |
 |---|---|
 | `i` | Ignore the selected session: writes an `ignore_blocked_sessions` rule into the running manifest, hot-reloaded. |

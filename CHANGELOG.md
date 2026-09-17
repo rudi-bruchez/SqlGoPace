@@ -13,6 +13,36 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.39.0] - 2026-09-17
+
+### Added
+
+- The `--tui` header carries a fourth line: how busy the whole machine is, how many tasks are
+  waiting for a CPU, and how many requests are running —
+  `cpu 45% (sql 32, other 13)   runnable 24/16   18 active requests`. It is ambiance only: no
+  reaction reads it, and no threshold in it changes what the engine does.
+- The console narrates `CPU pressure: N tasks runnable across M schedulers` once per episode,
+  when runnable tasks reach one per online scheduler, and styles the `runnable` segment as an
+  alert while it stays there. It re-arms below 0.5 per scheduler, the same hysteresis shape as
+  the transaction-log alarm. Both thresholds are constants, not config keys: they change nothing
+  the engine does, they only say why everything on the server is slow.
+
+### Notes
+
+- The CPU figures come from the scheduler-monitor ring buffer, which emits one record a minute,
+  and the console asks for that record at most once a minute: `sys.dm_os_ring_buffers` has no
+  index, so the server materializes every ring buffer it holds to answer. Read them as a minute
+  or so old — the console can only ask on a poll, so a `progress_poll_seconds` that does not
+  divide 60 stretches the gap (45 s polls re-read it every 90 s). The runnable and request counts
+  are live and cost a scan of `sys.dm_os_schedulers` (tens of rows) per poll.
+- The request count includes SqlGoPace's own sessions — the monitoring read always, the operation
+  while it runs — so a quiet server reads 1 or 2, not 0.
+- No new grant: `sys.dm_os_ring_buffers` and `sys.dm_os_schedulers` are covered by the
+  `VIEW SERVER STATE` every run already needs (on SQL Server 2022 and later that permission
+  implies `VIEW SERVER PERFORMANCE STATE`). Where the ring buffer is unreadable — Azure SQL
+  Database Basic/S0/S1 and elastic pools — the line drops the `cpu` segment and keeps the rest
+  rather than reporting a percentage nobody measured.
+
 ## [0.38.0] - 2026-09-16
 
 ### Changed

@@ -1016,6 +1016,8 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 	}
 	susp := newSuspensionTracker()
 	logAlarm := run.NewLogFullAlarm()
+	cpuAlarm := run.NewCPUPressureAlarm()
+	var cpu cpuCadence
 
 	readSessions := func() {
 		// A repaired execution connection is a new session. The header has to follow
@@ -1036,6 +1038,7 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 			})
 		}
 		program.Send(tui.BlockersMsg{Blockers: blockers})
+		program.Send(tui.ActiveRequestsMsg{Count: mssql.ActiveRequestCount(sessions)})
 
 		// Mirror: report whether OUR operation is itself blocked (the victim), from
 		// the same snapshot. Sent every poll so the indicator clears when unblocked.
@@ -1064,6 +1067,17 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 			program.Send(spaceMsg(dataFiles, ls, reuseWait, alert))
 			if fire {
 				program.Send(logAlertMsg(ls.UsedPercent, reuseWait))
+			}
+		}
+		// Server-wide load for the header's fourth line, read last: it is ambiance, and
+		// nothing waits on it, so it never delays the log-full alarm above. Best-effort
+		// like probeSpace — a failed read skips this tick rather than stopping the feed.
+		now := time.Now()
+		if load, err := conn.ServerLoad(ctx, cpu.due(now)); err == nil {
+			load = cpu.merge(load, now)
+			program.Send(serverLoadMsg(load))
+			if cpuAlarm.Observe(load.RunnableTasks, load.Schedulers) {
+				program.Send(tui.LogMsg{Line: run.CPUPressureMessage(load.RunnableTasks, load.Schedulers)})
 			}
 		}
 	}
@@ -1133,6 +1147,47 @@ func spaceMsg(dataFiles []mssql.FileSpace, logSpace mssql.LogSpace, reuseWait st
 		LogBytes: logSpace.TotalBytes, LogUsedPercent: logSpace.UsedPercent,
 		ReuseWait: reuseWait, LogAlert: logAlert,
 	}
+}
+
+// serverLoadMsg maps a server load reading to the console's header line. It computes the
+// runnable-pressure flag here, from the same threshold the narration alarm uses, because
+// the console knows no thresholds of its own (as with SpaceMsg.LogAlert).
+func serverLoadMsg(l mssql.Load) tui.ServerLoadMsg {
+	alert := run.RunnablePerScheduler(l.RunnableTasks, l.Schedulers) >= run.RunnablePerSchedulerThreshold
+	return tui.ServerLoadMsg{
+		CPUKnown: l.CPUKnown, BusyPercent: l.BusyPercent, SQLPercent: l.SQLPercent,
+		RunnableTasks: l.RunnableTasks, Schedulers: l.Schedulers, RunnableAlert: alert,
+	}
+}
+
+// cpuCadence paces the expensive half of the server-load read. The scheduler-monitor ring
+// buffer emits one record a minute, so asking for it on every progress poll (30s by
+// default) makes the monitored server materialize every ring buffer it holds for a value
+// that cannot have changed. Between reads the console keeps showing the last CPU figures,
+// which are still the current record.
+type cpuCadence struct {
+	last   mssql.Load // the last reading that asked for the ring buffer
+	lastAt time.Time
+}
+
+// due reports whether the ring buffer can have produced a new record since the last ask.
+func (c *cpuCadence) due(now time.Time) bool {
+	return now.Sub(c.lastAt) >= mssql.SchedulerMonitorPeriod
+}
+
+// merge returns the reading to show. A reading that reached the ring buffer becomes the
+// reference, even when it held no record: the scan has been paid for, and that is the cost
+// this type exists to spend once a minute. Anything else — a poll that did not ask, or one
+// whose ring-buffer read failed — keeps its live runnable figures and takes the CPU half
+// from the reference, without advancing the clock: a failed statement never scanned, so
+// retrying it on the next poll costs nothing and recovers the segment sooner.
+func (c *cpuCadence) merge(load mssql.Load, now time.Time) mssql.Load {
+	if load.CPURead {
+		c.last, c.lastAt = load, now
+		return load
+	}
+	load.CPUKnown, load.BusyPercent, load.SQLPercent = c.last.CPUKnown, c.last.BusyPercent, c.last.SQLPercent
+	return load
 }
 
 // logAlertMsg builds the single-slot console alert for a transaction log crossing

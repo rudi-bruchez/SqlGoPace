@@ -22,6 +22,15 @@ Without it the sampling loop fails, and it fails on a quiet rebuild that blocks
 nobody, because the loop runs regardless. There is no mode of SqlGoPace that does
 not need it.
 
+Since 0.39.0 the `--tui` header's load line reads two more server-scoped DMVs on the
+same grant: `sys.dm_os_ring_buffers` (machine CPU) and `sys.dm_os_schedulers`
+(runnable tasks). Nothing new is required — on SQL Server 2022 and later
+`VIEW SERVER STATE` implies `VIEW SERVER PERFORMANCE STATE`, which is what those two
+now document. The exception is Azure SQL Database on **Basic**, **S0**, **S1** or in
+an **elastic pool**, where reading the ring buffer needs the server admin, the
+Microsoft Entra admin, or `##MS_ServerPerformanceStateReader##`; without it the line
+drops its `cpu` segment and the run is otherwise unaffected.
+
 ### One optional grant, for `require_data_free_space`
 
 `VIEW DEFINITION` on the database, or membership that implies it.

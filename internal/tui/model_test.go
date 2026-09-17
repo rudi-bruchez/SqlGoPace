@@ -957,3 +957,68 @@ func TestOperationsPanelTitleWithoutAManifestName(t *testing.T) {
 		t.Errorf("a nameless manifest should leave the title bare:\n%s", v)
 	}
 }
+
+func TestModelServerBannerNoLoadLineBeforeFirstMsg(t *testing.T) {
+	// Before any load message arrives the header shows no load line at all, rather than
+	// an idle-looking "cpu 0%" on a server nobody has read yet.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.ServerInfoMsg{Name: "SQLPROD01", Product: "SQL Server 2022", Database: "PRODDB"})
+	v := m.View()
+	if strings.Contains(v, "cpu ") || strings.Contains(v, "active request") || strings.Contains(v, "runnable ") {
+		t.Errorf("load line should not render before a load message arrives:\n%s", v)
+	}
+}
+
+func TestModelServerBannerLoadLine(t *testing.T) {
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.ServerLoadMsg{
+		CPUKnown: true, BusyPercent: 45, SQLPercent: 32,
+		RunnableTasks: 24, Schedulers: 16, RunnableAlert: true,
+	})
+	m, _ = send(m, tui.ActiveRequestsMsg{Count: 18})
+	v := m.View()
+	for _, want := range []string{"cpu 45% (sql 32, other 13)", "runnable 24/16", "18 active requests"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("load line missing %q:\n%s", want, v)
+		}
+	}
+}
+
+func TestModelServerBannerLoadLineWithoutCPU(t *testing.T) {
+	// The scheduler-monitor ring buffer can be unreadable (Azure SQL Database service
+	// objectives, a permission the login lacks). The rest of the line must still render,
+	// and no fabricated percentage may appear.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.ServerLoadMsg{RunnableTasks: 2, Schedulers: 8})
+	m, _ = send(m, tui.ActiveRequestsMsg{Count: 1})
+	v := m.View()
+	if strings.Contains(v, "cpu ") {
+		t.Errorf("CPU shown although the sender reported it unknown:\n%s", v)
+	}
+	for _, want := range []string{"runnable 2/8", "1 active request"} {
+		if !strings.Contains(v, want) {
+			t.Errorf("load line missing %q:\n%s", want, v)
+		}
+	}
+	if strings.Contains(v, "1 active requests") {
+		t.Errorf("singular request count rendered as a plural:\n%s", v)
+	}
+}
+
+func TestModelServerBannerActiveRequestsAlone(t *testing.T) {
+	// The two halves arrive on different cadences (requests on the blocking poll, CPU on
+	// the coarser progress poll), so the first one to arrive must render on its own.
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 160, Height: 40})
+	m, _ = send(m, tui.ActiveRequestsMsg{Count: 7})
+	v := m.View()
+	if !strings.Contains(v, "7 active requests") {
+		t.Errorf("active requests alone did not render:\n%s", v)
+	}
+	if strings.Contains(v, "runnable ") {
+		t.Errorf("runnable rendered although no ServerLoadMsg arrived:\n%s", v)
+	}
+}

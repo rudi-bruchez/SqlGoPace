@@ -168,6 +168,9 @@ func (m Model) serverBanner(width int) string {
 	if m.hasSpace {
 		body += "\n" + m.spaceLine()
 	}
+	if line := m.loadLine(); line != "" {
+		body += "\n" + line
+	}
 	if width <= 0 {
 		return body
 	}
@@ -192,6 +195,36 @@ func (m Model) spaceLine() string {
 		logSeg = alertStyle.Render(logSeg)
 	}
 	return fmt.Sprintf("data %s, %.1f%% free   %s", HumanizeMB(sp.DataMB), dataFreePct, logSeg)
+}
+
+// loadLine renders the header's fourth line: how busy the whole machine is, how many tasks
+// are waiting for a CPU, and how many requests are running. Each segment renders only once
+// its own message has arrived — the CPU percentages come from a ring buffer a server can
+// refuse (Azure SQL Database, a missing permission), and reporting an unread server as 0%
+// idle would be worse than reporting nothing. The runnable segment is styled as an alert
+// when the sender says so (ServerLoadMsg.RunnableAlert); the console applies no threshold
+// of its own.
+func (m Model) loadLine() string {
+	var segs []string
+	if m.load.CPUKnown {
+		segs = append(segs, fmt.Sprintf("cpu %d%% (sql %d, other %d)",
+			m.load.BusyPercent, m.load.SQLPercent, m.load.OtherPercent()))
+	}
+	if m.load.Schedulers > 0 {
+		runnable := fmt.Sprintf("runnable %d/%d", m.load.RunnableTasks, m.load.Schedulers)
+		if m.load.RunnableAlert {
+			runnable = alertStyle.Render(runnable)
+		}
+		segs = append(segs, runnable)
+	}
+	if m.hasReqs {
+		word := "requests"
+		if m.requests == 1 {
+			word = "request"
+		}
+		segs = append(segs, fmt.Sprintf("%d active %s", m.requests, word))
+	}
+	return strings.Join(segs, "   ")
 }
 
 // minOpsRows is the fewest operation rows the panel ever shows, even on a tiny terminal, so
