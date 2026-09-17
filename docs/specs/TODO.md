@@ -418,6 +418,83 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
 
 ## Follow-ups deferred from shipped work
 
+- [ ] **The eight findings of the 2026-09-17 harm review** (`docs/specs/REVIEW-2026-09-17-harm.md`),
+  none fixed at the time of writing, in the order that review argues for. The two SEVERE ones came
+  from an independent reader and were verified against the code here:
+  **(1)** give the shipped `maintenance_profile.yaml` a `shrink.max_block_minutes` — with no
+  `shrink:` block it emits none, so every shrink manifest the planner generates runs its log-shrink
+  and `TRUNCATEONLY` phases with no yield at all, while `docs/blocking-and-kills.md:107` reads as
+  if they were covered;
+  **(2)** surface a failed monitoring sample instead of dropping it (`executor.go:320`, no else
+  branch), and split the two pollers so one stuck DMV read cannot silence the other — they share a
+  goroutine and the project gives the connection no query timeout by design;
+  **(3)** remove `trustServerCertificate=true` from the shipped `config.yaml` and its scaffold twin
+  (found independently by two reviewers);
+  **(8)** delete the stale exception clause in `docs/manifests.md:118`;
+  **(4)** write planned manifests with a dot-prefixed temp name and `os.Rename`;
+  **(5)** tighten artifact permissions and say in `docs/running.md` that the sidecars carry other
+  sessions' SQL text;
+  **(6)** extend `SizedOperation` to `create_index` and decide deliberately about `alter_column`.
+
+- [ ] **Verify codex's F02, F08 and F03/F04 before the release after 0.39.0.** Seventeen findings
+  from that reader are recorded unverified in `docs/specs/REVIEW-2026-09-17-harm-codex.md`; these
+  three are the ones whose harm, if they hold, outranks everything already confirmed: a fallback
+  KILL that identifies its target only by a reusable session id, crash recovery that can replay a
+  committed non-idempotent effect, and a tempdb shrink that watches the wrong database's log and
+  can kill the live workload despite a documented prohibition. Each is a reading of code that
+  nobody has checked; the two findings from the same reader that *were* checked both held, which
+  raises the prior and settles nothing.
+
+- [ ] **A second question for the inert-key audit: is a key read on every path its documentation
+  claims it for?** From the same review (finding 5). `TestNoInertConfigKey` asks whether a key is
+  read *anywhere*, which `progress_poll_seconds` satisfies through its single caller —
+  `runWithTUI`. The key is required, is documented without qualification as pacing progress, waits
+  and space, and does nothing at all for an unattended run. That is the
+  `checkpoint_between_operations` class one level down, and it is mechanically detectable: a key
+  whose only consumer sits behind a flag, documented as if it always applied. Worth writing when
+  the next monitoring key is added rather than on its own, and worth remembering that the fix for
+  the instance (one sentence in `docs/configuration.md` and in `config.yaml`) is not the fix for
+  the class.
+
+- [ ] **The console's active-request count counts SqlGoPace itself.** From 0.39.0, raised by the
+  code review. `ActiveRequestCount` reads the `ActiveSessions` snapshot, whose only session filter
+  is `is_user_process = 1`, so the monitoring read (a running request at the instant it reads) and
+  the operation's own session are both in it: a quiet server reports 1 or 2 rather than 0. The
+  clean fix is `AND r.session_id <> @@SPID` in `activeSessionsSQL`, but that query is also read by
+  the reaction path (`internal/run/executor.go`), the shrink driver, preflight and capture — too
+  much safety-critical surface to move for a header line. Documented instead, in `docs/running.md`
+  and beside the function. Worth doing if a second consumer ever needs a count that excludes the
+  observer.
+
+- [ ] **`CPUPressureAlarm` and `LogFullAlarm` are the same latch, written twice.** From 0.39.0,
+  raised by three of the four cleanup reviewers. Same `armed bool`, same constructor, same
+  three-branch `Observe`, same "fires once per episode, re-arms strictly below" contract; only
+  the threshold pair and the observed value differ. The shared form is one unexported
+  `latch{fire, rearm float64; armed bool}` in `internal/run` with both alarms as thin wrappers.
+  Left out of the 0.39.0 cleanup because the fix edits `logalarm.go` and its tests, which are
+  outside that diff, and two copies is where extraction only barely pays. What was done instead:
+  `TestCPUPressureAlarmRearmExactBoundary` now mirrors `TestLogFullAlarmRearmExactBoundary`, so
+  the second copy is no longer the untested one. **Extract when a third alarm lands** — that is
+  the point where the copies stop being reviewable by eye.
+
+- [ ] **A banner alarm's threshold is evaluated twice: once for the edge, once for the styling.**
+  From 0.39.0. `Observe` knows the threshold and computes the comparison, then discards the level
+  and returns only the edge — so each caller re-derives "is it over right now" from the exported
+  constant (`fire := logAlarm.Observe(...)` beside `alert := ... >= LogFullThresholdPercent`, and
+  the same shape in `serverLoadMsg`). Having `Observe` return both would delete that re-derivation
+  and the risk of a sender that styles nothing. Deferred with the latch extraction above: it is
+  the same committed mechanism, and changing one without the other trades a duplication for an
+  asymmetry.
+
+- [ ] **The CPU-pressure narration reaches the console only, not the manifest's `.log`.** From
+  0.39.0. `feedConsole` lives outside the engine, so its line goes to the TUI narration and
+  vanishes with the session; a run without `--tui`, or read afterwards from `03.done/`, has no
+  record that the server was short of CPU while the operation crawled. The transaction-log alarm
+  has both halves (console alert *and* a `warn` in the `.log`, wired through `WithLogWatch`),
+  which is the shape to copy. Left out because it means giving the engine a load reader and a
+  per-manifest alarm for a figure nothing reacts to — worth doing when the first post-mortem asks
+  why an operation took four hours, not before.
+
 - [ ] **A reflection audit for `internal/maint`, in the spirit of `internal/config/audit_test.go`.**
   From the 2026-09-16 harm review. `HeapMeasurement.DisabledIndexes` shipped parsed, documented by
   its own comment as deciding the outcome, and populated by nobody: the guard in `DecideHeap` that
