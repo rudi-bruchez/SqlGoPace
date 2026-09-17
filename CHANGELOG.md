@@ -13,6 +13,39 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.41.0] - 2026-09-17
+
+The last two open findings of the 2026-09-17 harm review, both of which were waiting on a
+decision rather than on work. Each changes when an operation stops.
+
+### Fixed
+
+- A shrink that sets no `max_block_minutes` now yields after two minutes instead of never.
+  The key is the only reaction the log shrink and the `TRUNCATEONLY` pass have — there is no
+  chunk boundary for `blocking_timeout_minutes` to pause at — and it was absent on every
+  manifest `sqlgopace plan` generates, because the shipped `maintenance_profile.yaml` has no
+  `shrink` block. An explicit `max_block_minutes: 0` still means no cap, and `--explain`
+  names which of the two you have. Index DDL and batch DML are unchanged.
+- An operation whose monitoring stops answering is now stopped rather than left running
+  unobserved. The blocking and log polls each get their own goroutine (they shared one, so a
+  hung poll stopped the other channel too), and a channel that produces no reading for two
+  minutes — or for twice its own poll interval, whichever is longer — cancels the statement
+  with `monitoring stopped answering` in the run report. A resumable keeps its work, a shrink
+  keeps the space it released, and the run does not retry. Reported by an external reader as
+  F02, and half of the review's own finding 2.
+
+**Migration.** Two things to check.
+
+If you run a shrink that is expected to block for more than two minutes and you want it to,
+say so with `options.max_block_minutes` — leaving the key out no longer means "no cap". A
+planned manifest inherits the new default, so the first sign is a shrink reporting
+`max_block_minutes (2) reached` where earlier versions ran on.
+
+An operation can now end with `monitoring stopped answering; operation stopped rather than
+run unwatched`. That is not a SqlGoPace failure to retry past: the instance stopped answering
+`sys.dm_exec_requests`, most often because its worker threads were exhausted, and the
+operation that was running is a candidate for having caused it. Look at the server first.
+
 ## [0.40.0] - 2026-09-17
 
 Five fixes from the 2026-09-17 harm review (`docs/specs/REVIEW-2026-09-17-harm.md`), two of

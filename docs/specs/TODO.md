@@ -427,16 +427,16 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   as MINOR after the draft overstated it), and both pages that describe `max_block_minutes` now
   agree and say what its coverage is worth (finding 8, and the documentation half of finding 1).
 
-- [ ] **What the harm review left open, and why.** Three of them wait on a decision rather than on
-  work:
-  **(1)** the shipped `maintenance_profile.yaml` has no `shrink:` block, so no manifest the
-  planner generates carries `max_block_minutes`, and those two unchunked statements have no yield
-  at all. Giving the profile a value needs a number somebody is willing to defend for a client's
-  shrink; making an unset key mean something other than "never" is a behaviour change.
-  **(2, second half)** both monitoring channels are still served by one goroutine on a connection
-  with no query timeout, so a blocking poll that hangs stops the log poll with it. Splitting them
-  is small; deciding whether a blind monitor should *stop* the operation rather than only narrate
-  is not.
+- [x] **The last two decision-bound harm-review findings landed in 0.41.0.** Finding 1: an
+  absent `max_block_minutes` on a shrink now resolves to two minutes
+  (`ddl.DefaultShrinkMaxBlockMinutes`), so the shipped profile no longer needs a `shrink`
+  block for planned manifests to carry a cap, and an explicit `0` stays the way to opt out.
+  Finding 2, second half: the two monitoring polls run on their own goroutines, and a channel
+  that stops producing readings stops the operation (`Sample.Blind`, `ErrMonitorBlind`,
+  `internal/run/executor.go`) rather than only narrating. The decision on both was the user's,
+  taken 2026-09-17.
+
+- [ ] **What the harm review still leaves open.**
   **(6)** `SizedOperation` covers `rebuild_index`/`rebuild_heap` only, so `create_index` and a
   table-rewriting `alter_column` get no data-free-space check. The `create_index` half is
   mechanical; `alter_column` needs a judgement about which changes rewrite.
