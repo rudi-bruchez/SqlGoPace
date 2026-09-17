@@ -29,7 +29,7 @@ type fakeBatchServer struct {
 
 func (s *fakeBatchServer) SPID() int                             { return 7 }
 func (s *fakeBatchServer) ExecDDL(context.Context, string) error { return nil }
-func (s *fakeBatchServer) Kill(context.Context, int) error       { s.killed = true; return nil }
+func (s *fakeBatchServer) KillSelf(context.Context) error        { s.killed = true; return nil }
 
 func (s *fakeBatchServer) ExecRows(_ context.Context, sql string) (int64, error) {
 	if s.onExec != nil {
@@ -87,7 +87,7 @@ type fakeKeyServer struct {
 
 func (s *fakeKeyServer) SPID() int                             { return 8 }
 func (s *fakeKeyServer) ExecDDL(context.Context, string) error { return nil }
-func (s *fakeKeyServer) Kill(context.Context, int) error       { s.killed = true; return nil }
+func (s *fakeKeyServer) KillSelf(context.Context) error        { s.killed = true; return nil }
 func (s *fakeKeyServer) TableRowEstimate(context.Context, string, string) (int64, error) {
 	return s.maxKey, nil
 }

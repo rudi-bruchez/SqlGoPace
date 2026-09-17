@@ -462,15 +462,17 @@ type killSpy struct {
 
 func (k *killSpy) SPID() int                             { return k.spid }
 func (k *killSpy) ExecDDL(context.Context, string) error { return nil }
-func (k *killSpy) Kill(_ context.Context, spid int) error {
-	k.killed = append(k.killed, spid)
+func (k *killSpy) KillSelf(context.Context) error {
+	k.killed = append(k.killed, k.spid)
 	return nil
 }
 
-// The console's k key ends our own DDL session. SQL Server reuses session ids, so
-// killing an id captured when the run started can name somebody else's session once
-// the execution connection has been re-pinned. Read it at the moment of the kill.
-func TestKillDDLUsesTheCurrentSessionID(t *testing.T) {
+// The console's k key ends our own DDL session, and must go through the identity-checked
+// path rather than name a session id. 0.33.0 made it read the id at the moment of the kill,
+// which was necessary and not sufficient: a re-pin frees the old id and SQL Server hands it
+// to the next login, so a fresh read can name a stranger exactly as a captured one can.
+// KillSelf compares login_time and declines unless the session is still ours.
+func TestKillDDLGoesThroughTheIdentityCheckedPath(t *testing.T) {
 	spy := &killSpy{spid: 57}
 	spy.spid = 88 // the execution connection was re-pinned onto session 88
 
@@ -479,7 +481,7 @@ func TestKillDDLUsesTheCurrentSessionID(t *testing.T) {
 	}
 
 	if want := []int{88}; !cmp.Equal(spy.killed, want) {
-		t.Errorf("killed %v, want %v — the kill must name the live session", spy.killed, want)
+		t.Errorf("killed %v, want %v — killDDL must call KillSelf, not kill a session id of its own choosing", spy.killed, want)
 	}
 }
 

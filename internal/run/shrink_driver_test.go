@@ -109,7 +109,7 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	return nil
 }
 
-func (s *fakeServer) Kill(_ context.Context, _ int) error { s.killed = true; return nil }
+func (s *fakeServer) KillSelf(context.Context) error { s.killed = true; return nil }
 
 func (s *fakeServer) FileSpace(_ context.Context, fileType string) ([]mssql.FileSpace, error) {
 	if fileType != s.fileType {
@@ -915,7 +915,7 @@ func (s *tempdbFakeServer) ExecDDL(_ context.Context, sql string) error {
 	return nil
 }
 
-func (s *tempdbFakeServer) Kill(_ context.Context, _ int) error { return nil }
+func (s *tempdbFakeServer) KillSelf(context.Context) error { return nil }
 
 func (s *tempdbFakeServer) FileSpace(_ context.Context, fileType string) ([]mssql.FileSpace, error) {
 	if fileType != mssql.FileTypeRows {

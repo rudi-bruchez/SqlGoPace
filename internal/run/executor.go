@@ -20,7 +20,14 @@ import (
 type Executor interface {
 	SessionID
 	ExecDDL(ctx context.Context, sql string) error
-	Kill(ctx context.Context, spid int) error
+	// KillSelf ends our own execution session, and only our own: the implementation
+	// re-reads the session's signature and refuses unless it still matches the one
+	// recorded when the session was pinned. It replaced a Kill(spid) the runners called
+	// with whatever SPID() returned, which is not identity — a session id freed by a
+	// re-pin is handed to the next login, so the fallback could end a stranger's
+	// transaction. A refusal wraps mssql.ErrKillDeclined and is not a failure: the
+	// caller keeps waiting for the statement and says why the fallback did not fire.
+	KillSelf(ctx context.Context) error
 }
 
 // SessionID reports the session id of the execution connection. It is an interface
@@ -229,6 +236,19 @@ func stopRequested(stop func() bool) bool { return stop != nil && stop() }
 // the statement finishes on its own (err is nil on success) or the context is
 // canceled, and (Pause|Cancel, pressure, nil) when sustained pressure warrants
 // stopping the statement. samples streams snapshots; done delivers the statement
+// killFallbackEvent narrates a fallback KILL that did not happen. A declined kill is not a
+// failed one and must not read like it: nothing was issued, because the session could no
+// longer be proved to be ours. Either way the statement is still out there and the run
+// keeps waiting for it, which is the half an operator cannot infer from silence.
+func killFallbackEvent(err error, what string) ReactionEvent {
+	if errors.Is(err, mssql.ErrKillDeclined) {
+		return ReactionEvent{Kind: "warn", Detail: fmt.Sprintf(
+			"nothing was killed: %v; the %s is still running, and this run keeps waiting for it", err, what)}
+	}
+	return ReactionEvent{Kind: "warn", Detail: fmt.Sprintf(
+		"fallback KILL failed: %v; waiting for the %s to stop on its own", err, what)}
+}
+
 // result. Blocking pressure is debounced over blockingTimeout.
 func supervise(
 	ctx context.Context,

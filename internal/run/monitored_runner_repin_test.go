@@ -30,7 +30,7 @@ func (e *repinExec) ExecDDL(context.Context, string) error {
 	return nil
 }
 
-func (e *repinExec) Kill(context.Context, int) error { return nil }
+func (e *repinExec) KillSelf(context.Context) error { return nil }
 
 // quietSampler reports a server under no pressure at all.
 type quietSampler struct{}

@@ -1383,13 +1383,14 @@ func (a *spidAnnouncer) observe(spid int) (tui.SPIDMsg, bool) {
 	return tui.SPIDMsg{SPID: spid}, true
 }
 
-// killDDL ends our own execution session, reading its id at the moment of the kill
-// rather than from a value captured when the run started. A pinned connection an
-// aborted statement poisoned is re-pinned onto a new session, and SQL Server reuses
-// session ids: a captured id can name somebody else's session by the time the key is
-// pressed.
+// killDDL ends our own execution session. Reading the id at the moment of the kill was
+// never enough: a pinned connection an aborted statement poisoned is re-pinned onto a new
+// session, and SQL Server hands the freed id to the next login, so a fresh read can name
+// a stranger just as a captured one can. KillSelf compares the session's login_time with
+// the one recorded when it was pinned and refuses unless they match; a refusal wraps
+// mssql.ErrKillDeclined and reaches the operator as a line saying nothing was killed.
 func killDDL(ctx context.Context, sess run.Executor) error {
-	return sess.Kill(ctx, sess.SPID())
+	return sess.KillSelf(ctx)
 }
 
 // dispatchActions routes operator intents to the server (kill) or to the running

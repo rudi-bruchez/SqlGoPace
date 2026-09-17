@@ -250,6 +250,12 @@ whether Accelerated Database Recovery is on, which makes the rollback itself che
 confirms; any other key cancels. Prefer `d` (drain) whenever you can wait — it finishes the
 current operation instead of undoing it.
 
+It kills our session and only our session. Since 0.42.0 the key re-reads the session's
+`login_time` and compares it with the value recorded when the connection was pinned, because
+a session id is not an identity: a re-pinned connection frees its old id and SQL Server hands
+it to the next login. If the session cannot be confirmed, nothing is killed and the console
+says so rather than reporting a kill that landed somewhere else.
+
 **Read the direction before pressing `x`.** The selectable list is the sessions *waiting on*
 the DDL — the ones it is holding up. Killing one of them frees nothing the operation is
 waiting for; it only discards that session's work, and rolls back whatever it had open. The

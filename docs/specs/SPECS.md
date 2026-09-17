@@ -611,7 +611,17 @@ server, the DDL keeps running on the SQL Server side. Therefore:
 
 1. Cancellation via the Go context.
 2. If the DDL is still running on the server after `kill_grace_seconds`, the monitoring thread issues
-   an explicit `KILL <DDL_SPID>` **on its own connection**.
+   an explicit `KILL <DDL_SPID>` **on its own connection** — but only after proving the session is
+   still ours. Since 0.42.0 that is `Conn.KillSelf`, which re-reads the session signature and
+   compares `login_time` with the value recorded when the session was pinned. A session id is not
+   an identity: a canceled statement can poison the pinned connection, which is re-pinned onto a
+   new session, and SQL Server hands the freed id to the next login. Killing on the number alone
+   could therefore end a stranger's transaction, on a server already stressed enough to have
+   needed a fallback. **Anything but a positive match declines** — including a probe that could
+   not answer, because "cannot tell" is not permission — and a decline is not a failure: nothing
+   is killed, the run keeps waiting for the statement, and the report says both. The same check
+   backs the console's `k` key (`killDDL`). The `KILL` used against a *blocker* is a different
+   action against a different session and is unchanged.
 3. **Rollback tracking**: `KILL <DDL_SPID> WITH STATUSONLY` to estimate the **rollback %** and
    log/display it — otherwise the operator thinks it crashed. A 2nd `KILL` does nothing: we
    **monitor** the progress, we do not re-issue it.

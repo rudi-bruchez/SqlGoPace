@@ -29,7 +29,7 @@ func (e *alwaysCancelExec) ExecDDL(ctx context.Context, sql string) error {
 	return ctx.Err()
 }
 
-func (e *alwaysCancelExec) Kill(context.Context, int) error { return nil }
+func (e *alwaysCancelExec) KillSelf(context.Context) error { return nil }
 
 func (e *alwaysCancelExec) callCount() int {
 	e.mu.Lock()

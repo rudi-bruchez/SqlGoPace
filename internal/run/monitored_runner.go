@@ -223,8 +223,8 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 		// canceled, so a KILL issued on it would fail instantly. A failed KILL is
 		// narrated rather than swallowed — the wait below is unbounded, and an operator
 		// watching a run that never returns deserves to know the fallback did not land.
-		if kerr := r.exec.Kill(context.Background(), r.exec.SPID()); kerr != nil {
-			sink(ReactionEvent{Kind: "warn", Detail: "fallback KILL failed: " + kerr.Error() + "; waiting for the statement to stop on its own"})
+		if kerr := r.exec.KillSelf(context.Background()); kerr != nil {
+			sink(killFallbackEvent(kerr, "statement"))
 		}
 		<-done
 	}
