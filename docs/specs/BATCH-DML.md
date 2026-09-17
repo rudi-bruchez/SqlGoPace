@@ -204,6 +204,24 @@ once, so crossing it proves the predicate is not self-consuming. The operation *
 has to decide about them. The `key_range` walk needs no ceiling: its watermark is strictly
 ascending, so it terminates by construction.
 
+**The watermark is bound to the statement it walked** (`contentFingerprint`, 0.42.0). The
+sidecar stores the value and a hash of the generated SQL beside it, and `Load` reports no
+watermark when the hash does not match. Two gaps made that necessary and both land here:
+`planFingerprint` hashes command and target only, so editing `set`, `where` or the batch
+options leaves the resume cursor believed; and it is compared only when the cursor is past
+zero, which a run interrupted during its *first* operation never is. Either way a walk could
+resume behind a position recorded against different SQL, silently skipping every row below
+it. A mismatch is not an error — editing a manifest between an interruption and a re-run is
+ordinary — so the walk restarts, which `key_range`'s idempotent-literal-`SET` restriction
+makes a cost in work rather than in correctness. A watermark written before 0.42.0 carries
+no hash: unverifiable is not the same as matching, so it is discarded too.
+
+Scoping the content hash to the watermark rather than widening `planFingerprint` was a
+deliberate choice: widening it would invalidate every existing sidecar and restart every
+interrupted manifest from its first operation. The case it leaves uncovered is an operation
+the cursor has already passed being edited before the resume — recorded in
+`docs/specs/TODO.md`.
+
 A preflight `WARN` naming a non-idempotent `set_raw` is still worth having — it would catch
 case 2 before any row is written rather than after the ceiling's worth — but it is a heuristic
 over raw SQL text, whereas the ceiling is a proof. Order them that way if both are built.

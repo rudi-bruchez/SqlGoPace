@@ -651,7 +651,7 @@ func (s *ServerSampler) Log(ctx context.Context) (LogSample, error) {
 	// empty ReuseWait reads as "unknown" downstream, which is what it is.
 	reuseWait, err := s.probe.LogReuseWait(ctx)
 	if err != nil {
-		return LogSample{OverCap: true}, nil
+		return LogSample{OverCap: true}, nil //nolint:nilerr // the breach was measured: see above
 	}
 	return LogSample{OverCap: true, ReuseWait: reuseWait}, nil
 }

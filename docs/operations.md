@@ -282,6 +282,12 @@ Three rules the parser enforces, each closing a way to lose data or hang:
   would loop forever. It is rejected; give it a self-limiting `where_raw`.
 - The `key_range` walk persists a watermark and re-applies the boundary batch on a resume,
   so it is restricted to an idempotent literal `UPDATE`.
+- **Editing the operation discards its watermark.** The walk records which statement it was
+  walking, and a resume that finds a different one starts the walk over instead of picking up
+  behind a position recorded against other SQL — which would silently skip every row below it.
+  So changing `set`, `where`, the key column or the batch size between an interruption and a
+  re-run costs the rows already walked, and never skips any. Since 0.42.0; before it, the
+  edited walk resumed behind the old watermark.
 - The `key_range` key must be the table's clustered key, a single integer column, and
   **unique**. A batch covers the key range `(watermark, next]`, where `next` is the
   batch-size-th smallest matching key, and the `UPDATE` carries no row limit of its own —

@@ -1032,7 +1032,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 				// The watermark sidecar lets a key_range walk resume after a crash; it is
 				// removed once the walk completes (a crash — or a graceful stop, which
 				// returns ErrStopped — skips that, preserving resume).
-				store := e.watermarkStore(r.name, i)
+				store := e.watermarkStore(r.name, i, step.SQL)
 				var br BatchDMLResult
 				br, runErr = e.batchDML.Run(ctx, op, step.Options, r.ignore, store, sink)
 				batchResult = &br
