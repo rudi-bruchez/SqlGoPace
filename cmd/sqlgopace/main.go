@@ -608,13 +608,16 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// consider() scope detection to the sampler's own SPID (internal/run/executor.go),
 	// so the tempdb runner needs its own sampler bound to the tempdb connection's SPID
 	// -- reusing the primary sampler would watch the (idle) primary session and never
-	// see the tempdb DBCC SHRINKFILE blocking anyone. DMV reads are instance-wide, so
-	// probing stays on conn (avoids adding query load to the connection running the DBCC).
+	// see the tempdb DBCC SHRINKFILE blocking anyone. The probe is split rather than
+	// pointed at one connection: see tempdbProbe for why the log half has to be the
+	// tempdb connection and the session half must not be.
 	tempdbConn, err := mssql.OpenDatabase(ctx, cfg.Database.ConnectionString, "tempdb", version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
-	tempdbSampler := run.NewServerSampler(conn, tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	tempdbSampler := run.NewServerSampler(
+		tempdbProbe{db: tempdbConn, sessions: conn},
+		tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
 	// No killers on this sampler, deliberately. docs/shrink.md states, under a heading
 	// that says so in as many words, that a tempdb shrink waits its blockers out and
 	// never kills them: they are legitimate application queries, and tempdb is shared by

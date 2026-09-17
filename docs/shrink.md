@@ -124,7 +124,11 @@ from model at every restart so a membership granted there does not survive one.
   operation does its best and stops cleanly when it cannot go further, reporting so plainly.
   Bringing a 400 GB tempdb down to 20 GB live is often impossible without a restart, and
   that is expected.
-- **Data files only.** The tempdb log is out of scope.
+- **Data files only.** The tempdb log is not a shrink target. It *is* what the run watches
+  while the shrink runs: the log thresholds in `config.yaml` are applied to tempdb's log,
+  because that is the log the operation fills. Before 0.42.0 they were applied to the user
+  database's log instead, so a tempdb shrink reacted to pressure that had nothing to do with
+  it and was blind to the pressure it was causing.
 
 ### It never kills a blocker
 
