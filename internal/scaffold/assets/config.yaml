@@ -19,6 +19,10 @@ directories:
   failed:     "./04.failed"
 
 monitoring:
+  # Also the effective delay of every kill rule: after_seconds is counted over the polls a
+  # rule matched, and each blocking episode's first poll banks nothing. Lowering this tightens
+  # every kill_blocking_sessions rule; raising it can keep an intermittent blocker below its
+  # delay forever. See docs/blocking-and-kills.md.
   blocking_poll_seconds: 10
   log_poll_seconds: 60
   progress_poll_seconds: 30
