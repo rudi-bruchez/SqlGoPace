@@ -437,6 +437,14 @@ SELECT log_reuse_wait_desc FROM sys.databases WHERE database_id = DB_ID();
 If the log does not drain after `log_drain_timeout_minutes`, we abort the operation and log the
 observed `log_reuse_wait_desc`.
 
+**The breach and its reason are two reads, and only the second is optional.** Until 0.42.0,
+`ServerSampler.Log` returned an empty sample and the error when the reuse-wait read failed,
+discarding a threshold crossing it had already measured — so a log known to be over cap was
+reported as healthy because the engine could not say why. It now keeps `OverCap` and leaves
+`ReuseWait` empty, which reads as "unknown" in the reaction detail. The trade is deliberate:
+a repeated attribution failure is now silent, where before it was narrated at the cost of
+suppressing the reaction it was supposed to explain.
+
 ### 8.2 Blocking
 
 ```sql

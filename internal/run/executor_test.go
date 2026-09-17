@@ -909,3 +909,33 @@ func TestServerSamplerFollowsTheExecutionSessionID(t *testing.T) {
 type staticSession int
 
 func (s staticSession) SPID() int { return int(s) }
+
+// reuseFailProbe answers LogSpace and fails only the reuse-wait attribution.
+type reuseFailProbe struct{ ls mssql.LogSpace }
+
+func (p reuseFailProbe) LogSpace(context.Context) (mssql.LogSpace, error) { return p.ls, nil }
+func (p reuseFailProbe) LogReuseWait(context.Context) (string, error) {
+	return "", errors.New("read log_reuse_wait_desc: connection reset by peer")
+}
+func (p reuseFailProbe) ActiveSessions(context.Context) ([]mssql.Session, error) { return nil, nil }
+
+// The threshold breach and the reason for it are two different reads, and only the second
+// one is optional. ServerSampler.Log used to discard both when the second failed —
+// returning LogSample{} and an error — so a log already known to be over cap was reported
+// as healthy because the engine could not say *why* it was over cap. Keep what was
+// measured; lose only what could not be attributed.
+func TestServerSamplerKeepsOverCapWhenTheReuseWaitReadFails(t *testing.T) {
+	probe := reuseFailProbe{ls: mssql.LogSpace{TotalBytes: 10_000, UsedPercent: 95}}
+
+	got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
+
+	if err != nil {
+		t.Fatalf("Log() error = %v, want nil: the cap breach was measured, only its attribution was not", err)
+	}
+	if !got.OverCap {
+		t.Error("Log().OverCap = false; the log is at 95% against an 80% cap and that was read successfully")
+	}
+	if got.ReuseWait != "" {
+		t.Errorf("Log().ReuseWait = %q, want empty — nothing was read, so nothing may be asserted", got.ReuseWait)
+	}
+}

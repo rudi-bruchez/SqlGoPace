@@ -643,9 +643,15 @@ func (s *ServerSampler) Log(ctx context.Context) (LogSample, error) {
 	if !overCap {
 		return LogSample{}, nil
 	}
+	// The breach and the reason for it are two reads, and only the second is optional.
+	// Returning LogSample{} with the error here threw away a threshold crossing that had
+	// just been measured, because the attribution could not be fetched — so a log known to
+	// be over cap was reported as healthy, and the reaction that exists for exactly this
+	// did not fire. Keep what was measured; lose only what could not be attributed. The
+	// empty ReuseWait reads as "unknown" downstream, which is what it is.
 	reuseWait, err := s.probe.LogReuseWait(ctx)
 	if err != nil {
-		return LogSample{}, err
+		return LogSample{OverCap: true}, nil
 	}
 	return LogSample{OverCap: true, ReuseWait: reuseWait}, nil
 }
