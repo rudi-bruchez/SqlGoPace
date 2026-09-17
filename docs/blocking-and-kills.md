@@ -105,7 +105,12 @@ As a backstop against a rule that turns out to be too broad, set
 yields anyway, whatever the ignore rules say.
 
 Every operation is covered from 0.30.0, including the two shrink statements that run
-outside the chunk loop. The cap used to be enforced only by the supervisor wrapping each
+outside the chunk loop — covered *by this key*, which is optional and unset by default. On
+those two statements it is the only reaction there is: without `max_block_minutes` they run
+to completion however long they block, and `blocking_timeout_minutes` does not reach them
+(there is no chunk boundary to pause at, so the supervisor has nothing to yield with).
+Manifests that `sqlgopace plan` generates carry the key only when the maintenance profile
+sets `shrink.max_block_minutes`. The cap used to be enforced only by the supervisor wrapping each
 chunk, so a log shrink and the `TRUNCATEONLY` pass of a data shrink — both single unchunked
 `DBCC SHRINKFILE` statements — read `max_block_minutes` from the manifest and had nothing to
 apply it to. They now yield on the same rule. What follows differs by statement, because
