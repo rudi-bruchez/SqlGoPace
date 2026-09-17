@@ -259,6 +259,18 @@ the same code path (`runWatchedStatement`): it can be blocked (§8.2) and can bl
 it must not run dark, but it has no chunk boundary to pause at. A graceful stop cancels either
 one and the run stays re-entrant.
 
+**A shrink that sets no `max_block_minutes` resolves to two minutes, not to no cap**
+(`ddl.DefaultShrinkMaxBlockMinutes`, v0.41.0). The earlier rule — unset means no cap — was
+written when the cap was one option among several; the table above is why it stopped being
+defensible, because for these two statements it is the whole reaction hierarchy. The absent
+key was also the common case rather than the exception: `shrink_plan.go` emits it only when
+the maintenance profile sets `shrink.max_block_minutes`, and the shipped profile has no
+`shrink` block at all, so every planned shrink ran uncapped. The distinction that replaces it
+is between an absent key and a present zero: `OptionOverrides.MaxBlockMinutes` is a `*int`, so
+`max_block_minutes: 0` remains an operator saying "no cap" and is honored, with `--explain`
+naming which of the two you have. The default is scoped to the shrink deliberately; index DDL
+and batch DML keep unset = no cap, because `blocking_timeout_minutes` reaches them.
+
 **The cap was resolved and unused until v0.30.0** (`resolveShrink` has read
 `max_block_minutes` since v0.18.0, but `runWatchedStatement` built no `Capabilities`), so
 these two statements held their locks for as long as the server took. They now apply it on

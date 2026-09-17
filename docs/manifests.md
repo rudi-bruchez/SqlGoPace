@@ -117,8 +117,9 @@ options:
 The last two are reaction-policy overrides rather than T-SQL. `ignore_blocking` holds the
 lock through any blocking instead of yielding; `max_block_minutes` is the backstop that
 yields anyway after N minutes, including on a log shrink and a `TRUNCATEONLY` pass since
-0.30.0 — but only when the key is set: an operation without it has no yield at all on those
-two statements. Both are covered in
+0.30.0. On any operation but a shrink, leaving it out means no cap. **A shrink that leaves
+it out gets two minutes** (since 0.41.0), because those two statements have no other
+reaction; `max_block_minutes: 0` is how you opt out of that on purpose. Both are covered in
 [`blocking-and-kills.md`](blocking-and-kills.md).
 
 Note that some combinations are refused by the server, not by us, and the resolver drops

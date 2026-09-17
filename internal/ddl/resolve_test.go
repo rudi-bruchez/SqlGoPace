@@ -1,6 +1,7 @@
 package ddl_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -257,8 +258,12 @@ func TestResolveShrinkWALPAuto2022(t *testing.T) {
 
 	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
 
-	// WALP only; never ONLINE/RESUMABLE/MAX_DURATION for a shrink.
-	want := ddl.ResolvedOptions{WaitAtLowPriority: true, AbortAfterWait: "SELF"}
+	// WALP only; never ONLINE/RESUMABLE/MAX_DURATION for a shrink. The cap is the one
+	// thing a shrink carries without being asked (see DefaultShrinkMaxBlockMinutes).
+	want := ddl.ResolvedOptions{
+		WaitAtLowPriority: true, AbortAfterWait: "SELF",
+		MaxBlockMinutes: ddl.DefaultShrinkMaxBlockMinutes,
+	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("Resolve(shrink) mismatch (-want +got):\n%s", diff)
 	}
@@ -375,8 +380,13 @@ func TestResolveShrinkLogHasNoWALP(t *testing.T) {
 	if got.WaitAtLowPriority {
 		t.Errorf("Resolve(shrink_log) WaitAtLowPriority = true, want false (WALP not valid for log)")
 	}
-	if len(decisions) != 0 {
-		t.Errorf("Resolve(shrink_log) decisions = %v, want none", decisions)
+	if _, ok := decisionValue(decisions, "wait_at_low_priority"); ok {
+		t.Errorf("Resolve(shrink_log) explains a WALP decision it cannot make: %v", decisions)
+	}
+	// The log shrink is the statement with the least to fall back on — no WALP, no chunk
+	// boundary — so it is the one that must carry the cap, and --explain must show it.
+	if v, ok := decisionValue(decisions, "max_block_minutes"); !ok || v != "2" {
+		t.Errorf("decision[max_block_minutes] = %q (ok=%t), want the default 2", v, ok)
 	}
 }
 
@@ -469,4 +479,76 @@ func TestResolveKeepsSortInTempdbWhenResumableIsOff(t *testing.T) {
 	if !got.SortInTempDB {
 		t.Errorf("SortInTempDB = false, want true (no conflict once RESUMABLE is off)")
 	}
+}
+
+// A shrink with no max_block_minutes must still yield. Until 0.41.0 an absent key meant
+// "no cap", and the shipped maintenance_profile.yaml has no shrink block at all — so every
+// manifest `sqlgopace plan` generates carried no cap, and the two unchunked statements
+// (the log shrink and the TRUNCATEONLY pass) had no yield whatsoever: they held their lock
+// for as long as the server took. Two minutes is the longest an operation is allowed to sit
+// on a blocked session without anybody having asked for that.
+func TestResolveShrinkCapsBlockingWhenTheKeyIsAbsent(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%"}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.MaxBlockMinutes != ddl.DefaultShrinkMaxBlockMinutes {
+		t.Errorf("Resolve(shrink).MaxBlockMinutes = %d with no override, want the default %d",
+			got.MaxBlockMinutes, ddl.DefaultShrinkMaxBlockMinutes)
+	}
+	// --explain must say the cap is a default rather than the operator's choice, or the
+	// operator cannot tell a value they set from one the tool picked for them.
+	d, ok := decision(decisions, "max_block_minutes")
+	if !ok {
+		t.Fatalf("no max_block_minutes decision for --explain: %+v", decisions)
+	}
+	if !strings.Contains(d.Reason, "default") {
+		t.Errorf("decision reason = %q, want it to say the value is a default", d.Reason)
+	}
+}
+
+// An operator who writes max_block_minutes: 0 is opting out knowingly, and that must stay
+// expressible — the key is a *int precisely so an absent key and an explicit zero are two
+// different statements. --explain says so, because a shrink with no cap is worth seeing.
+func TestResolveShrinkExplicitZeroOptsOutOfTheCap(t *testing.T) {
+	m := resolveMatrix()
+	op := ddl.Shrink{
+		Type: "data", Files: "MyDb_Data", TargetFreeSpace: "10%",
+		Options: ddl.OptionOverrides{MaxBlockMinutes: intPtr(0)},
+	}
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard}
+
+	got, decisions := ddl.Resolve(op, target, m, ddl.Policy{})
+
+	if got.MaxBlockMinutes != 0 {
+		t.Errorf("Resolve(shrink).MaxBlockMinutes = %d with an explicit 0, want 0 (no cap)", got.MaxBlockMinutes)
+	}
+	if v, ok := decisionValue(decisions, "max_block_minutes"); !ok || v != "0" {
+		t.Errorf("decision[max_block_minutes] = %q (ok=%t), want an explicit 0 so --explain shows the opt-out", v, ok)
+	}
+}
+
+// The default is the shrink's alone. Index DDL and batch DML keep 0 = no cap: they have
+// other reactions (WAIT_AT_LOW_PRIORITY, the unignored-blocking yield), where the shrink's
+// two unchunked statements have none.
+func TestResolveDDLKeepsNoDefaultCap(t *testing.T) {
+	m := resolveMatrix()
+	target := ddl.Target{MajorVersion: 16, Tier: ddl.TierStandard}
+
+	got, _ := ddl.Resolve(ddl.RebuildIndex{Schema: "dbo", Table: "MEASUREMENT", Index: "PK_MEASUREMENT"}, target, m, ddl.Policy{})
+
+	if got.MaxBlockMinutes != 0 {
+		t.Errorf("Resolve(rebuild_index).MaxBlockMinutes = %d, want 0 — the default is the shrink's alone", got.MaxBlockMinutes)
+	}
+}
+
+func decision(decisions []ddl.Decision, option string) (ddl.Decision, bool) {
+	for _, d := range decisions {
+		if d.Option == option {
+			return d, true
+		}
+	}
+	return ddl.Decision{}, false
 }

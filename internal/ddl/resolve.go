@@ -1,6 +1,7 @@
 package ddl
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
@@ -221,6 +222,17 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	return res, decisions
 }
 
+// DefaultShrinkMaxBlockMinutes is the safety cap a shrink gets when the manifest sets no
+// max_block_minutes. It is the shrink's alone: index DDL and batch DML have other reactions
+// (WAIT_AT_LOW_PRIORITY, the unignored-blocking yield), where a shrink's two unchunked
+// statements — the log shrink and the TRUNCATEONLY pass — react to this cap and to nothing
+// else. Before 0.41.0 an absent key meant "no cap", and since the shipped
+// maintenance_profile.yaml has no shrink block, every planned manifest inherited it: those
+// two statements held their lock for as long as the server took. Two minutes is how long an
+// operation may sit on a session nobody asked it to block. An explicit max_block_minutes: 0
+// still opts out.
+const DefaultShrinkMaxBlockMinutes = 2
+
 // resolveShrink resolves options for a DBCC SHRINKFILE operation, including
 // shrink_tempdb. Only WAIT_AT_LOW_PRIORITY is injectable (2022+, data files
 // only — gated by the matrix). There is no ONLINE clause for DBCC, so no "WALP
@@ -247,9 +259,21 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 	// The per-operation safety cap is a reaction policy, not a T-SQL option, so it is
 	// resolved regardless of the matrix: ShrinkRunner.runChunk reads it as
 	// blockCap(res.MaxBlockMinutes) to yield after this long even through an
-	// allow-listed blocker. Dropping it here silently means "no cap".
-	if ov.MaxBlockMinutes != nil && *ov.MaxBlockMinutes > 0 {
+	// allow-listed blocker. Unlike every other operation, a shrink that sets nothing gets
+	// DefaultShrinkMaxBlockMinutes rather than "no cap" — an absent key is not a decision
+	// to block forever. A pointer to zero is one, and stays honored.
+	res.MaxBlockMinutes = DefaultShrinkMaxBlockMinutes
+	capReason := fmt.Sprintf("default (%d): yield after this long even if the blocker is ignored; set max_block_minutes: 0 to opt out",
+		DefaultShrinkMaxBlockMinutes)
+	if ov.MaxBlockMinutes != nil {
 		res.MaxBlockMinutes = *ov.MaxBlockMinutes
+		capReason = "set by override: yield after this long even if the blocker is ignored (safety cap)"
+		if res.MaxBlockMinutes <= 0 {
+			// Negative is nonsense a manifest can still carry; treat it as the opt-out it
+			// most resembles rather than as a cap of minus something.
+			res.MaxBlockMinutes = 0
+			capReason = "set by override: no cap — this shrink may block another session without bound"
+		}
 	}
 
 	var decisions []Decision
@@ -258,12 +282,10 @@ func resolveShrink(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions
 			Option: "wait_at_low_priority", Value: onOff(walp), Reason: reason,
 		})
 	}
-	if res.MaxBlockMinutes > 0 {
-		decisions = append(decisions, Decision{
-			Option: "max_block_minutes", Value: strconv.Itoa(res.MaxBlockMinutes),
-			Reason: "set by override: yield after this long even if the blocker is ignored (safety cap)",
-		})
-	}
+	// Emitted even at zero: a shrink with no cap is exactly what --explain must show.
+	decisions = append(decisions, Decision{
+		Option: "max_block_minutes", Value: strconv.Itoa(res.MaxBlockMinutes), Reason: capReason,
+	})
 	return res, decisions
 }
 

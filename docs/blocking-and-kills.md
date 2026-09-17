@@ -105,12 +105,20 @@ As a backstop against a rule that turns out to be too broad, set
 yields anyway, whatever the ignore rules say.
 
 Every operation is covered from 0.30.0, including the two shrink statements that run
-outside the chunk loop — covered *by this key*, which is optional and unset by default. On
-those two statements it is the only reaction there is: without `max_block_minutes` they run
-to completion however long they block, and `blocking_timeout_minutes` does not reach them
-(there is no chunk boundary to pause at, so the supervisor has nothing to yield with).
-Manifests that `sqlgopace plan` generates carry the key only when the maintenance profile
-sets `shrink.max_block_minutes`. The cap used to be enforced only by the supervisor wrapping each
+outside the chunk loop — covered *by this key*, and on those two statements it is the only
+reaction there is: `blocking_timeout_minutes` does not reach them (there is no chunk
+boundary to pause at, so the supervisor has nothing to yield with).
+
+Which is why, **since 0.41.0, a shrink that sets no `max_block_minutes` gets two minutes**
+rather than no cap. An absent key was never a decision to block forever, and it was the
+common case: manifests that `sqlgopace plan` generates carry the key only when the
+maintenance profile sets `shrink.max_block_minutes`, and the shipped profile does not.
+Writing `max_block_minutes: 0` explicitly still means no cap — the key distinguishes an
+operator who chose that from a manifest that never mentioned it, and `--explain` prints
+which one you have. The default is the shrink's alone: index DDL and batch DML keep 0 = no
+cap, because they have other reactions where these two statements have none.
+
+The cap used to be enforced only by the supervisor wrapping each
 chunk, so a log shrink and the `TRUNCATEONLY` pass of a data shrink — both single unchunked
 `DBCC SHRINKFILE` statements — read `max_block_minutes` from the manifest and had nothing to
 apply it to. They now yield on the same rule. What follows differs by statement, because

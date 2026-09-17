@@ -563,7 +563,9 @@ run remembers them.
 rule: the monitor tracks the duration we are blocking *any* session (ignored or not), and once it
 exceeds `max_block_minutes` the operation yields regardless of `ignore_blocking` or
 `ignore_blocked_sessions` (the reaction is marked "max block time exceeded"). The log branch is
-unaffected. Unset/zero means no cap. In `--tui`, selecting a blocked session and pressing `i` (then a criterion)
+unaffected. Unset or zero means no cap — except on a shrink, where since v0.41.0 an *unset* key
+resolves to `ddl.DefaultShrinkMaxBlockMinutes` (two minutes) and only an explicit zero means no
+cap; see `SHRINK.md` §9 for why that one operation differs. In `--tui`, selecting a blocked session and pressing `i` (then a criterion)
 writes the rule into the running manifest via a structured atomic rewrite, which the live reload
 then picks up.
 

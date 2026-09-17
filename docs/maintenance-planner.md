@@ -111,7 +111,10 @@ shrink:
   targetfreespace: 10%   # percent or absolute MB
   pre_reorganize: true   # false emits the shrink operation alone
   reorganize_below_density_percent: 65   # reorganize rowstore indexes below this SAMPLED page density
-  max_block_minutes: 10  # optional; carried into the shrink operation's options
+  max_block_minutes: 10  # optional; carried into the shrink operation's options.
+                         # Omitted here, the generated manifest omits it too and the
+                         # shrink falls back to the built-in two-minute cap. Write
+                         # max_block_minutes: 0 in the manifest to run with no cap.
   identify_tail_object: true             # optional; 2019+
 ```
 
