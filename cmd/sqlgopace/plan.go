@@ -377,6 +377,15 @@ func renderManifests(w io.Writer, manifests []namedManifest) error {
 	return nil
 }
 
+// stagedName is the name a manifest is written under before it is renamed into place.
+// The queue claims any *.yaml it discovers, so a manifest written directly into 01.to_run/
+// can be claimed mid-write — and a truncation that lands on an operation boundary is still
+// valid YAML, so the run would execute a prefix of the plan and report success. This name
+// is invisible to Discover twice over: it starts with a dot, and it is not a .yaml
+// (internal/run/queue.go, isManifest). The rename that follows is atomic within one
+// directory, so the manifest appears whole or not at all.
+func stagedName(filename string) string { return "." + filename + ".staged" }
+
 // writeManifests writes each manifest into dir, creating it if needed.
 func writeManifests(w io.Writer, dir string, manifests []namedManifest) error {
 	if len(manifests) == 0 {
@@ -393,8 +402,12 @@ func writeManifests(w io.Writer, dir string, manifests []namedManifest) error {
 			return err
 		}
 		path := filepath.Join(dir, nm.filename)
-		if err := os.WriteFile(path, data, 0o644); err != nil {
-			return fmt.Errorf("write %s: %w", path, err)
+		staged := filepath.Join(dir, stagedName(nm.filename))
+		if err := os.WriteFile(staged, data, 0o644); err != nil {
+			return fmt.Errorf("write %s: %w", staged, err)
+		}
+		if err := os.Rename(staged, path); err != nil {
+			return fmt.Errorf("publish %s: %w", path, err)
 		}
 		written = append(written, nm.filename)
 	}

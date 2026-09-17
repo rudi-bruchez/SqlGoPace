@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -154,5 +156,37 @@ func TestPrefixWidth(t *testing.T) {
 		if got := prefixWidth(tt.databases); got != tt.want {
 			t.Errorf("prefixWidth(%d) = %d, want %d", tt.databases, got, tt.want)
 		}
+	}
+}
+
+func TestWriteManifestsAppearsCompleteOrNotAtAll(t *testing.T) {
+	// A run polling 01.to_run/ claims any *.yaml it sees, so a manifest must never be
+	// visible under its final name while it is still being written: a truncation that
+	// lands on an operation boundary is still valid YAML, and the run would execute a
+	// prefix of the plan and report success. The write goes to a name the queue skips
+	// (leading dot, and not a .yaml extension — internal/run/queue.go isManifest) and is
+	// renamed into place, which is atomic within one directory.
+	dir := t.TempDir()
+	manifests := manifestsFromPlan(scenarioPlan(t), "MYDB")
+	if err := writeManifests(io.Discard, dir, manifests); err != nil {
+		t.Fatalf("writeManifests() error = %v", err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			t.Errorf("temp file %q left behind in the queue directory", e.Name())
+		}
+	}
+	if len(entries) != len(manifests) {
+		t.Errorf("directory holds %d files, want %d", len(entries), len(manifests))
+	}
+
+	// The staging name itself: dot-prefixed so Discover skips it even mid-write.
+	if got := stagedName("020_maint_MYDB_index.yaml"); !strings.HasPrefix(got, ".") || strings.HasSuffix(got, ".yaml") {
+		t.Errorf("stagedName = %q, want a dot-prefixed name that is not a .yaml", got)
 	}
 }
