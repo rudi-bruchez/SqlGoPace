@@ -418,23 +418,31 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
 
 ## Follow-ups deferred from shipped work
 
-- [ ] **The eight findings of the 2026-09-17 harm review** (`docs/specs/REVIEW-2026-09-17-harm.md`),
-  none fixed at the time of writing, in the order that review argues for. The two SEVERE ones came
-  from an independent reader and were verified against the code here:
-  **(1)** give the shipped `maintenance_profile.yaml` a `shrink.max_block_minutes` — with no
-  `shrink:` block it emits none, so every shrink manifest the planner generates runs its log-shrink
-  and `TRUNCATEONLY` phases with no yield at all, while `docs/blocking-and-kills.md:107` reads as
-  if they were covered;
-  **(2)** surface a failed monitoring sample instead of dropping it (`executor.go:320`, no else
-  branch), and split the two pollers so one stuck DMV read cannot silence the other — they share a
-  goroutine and the project gives the connection no query timeout by design;
-  **(3)** remove `trustServerCertificate=true` from the shipped `config.yaml` and its scaffold twin
-  (found independently by two reviewers);
-  **(8)** delete the stale exception clause in `docs/manifests.md:118`;
-  **(4)** write planned manifests with a dot-prefixed temp name and `os.Rename`;
-  **(5)** tighten artifact permissions and say in `docs/running.md` that the sidecars carry other
-  sessions' SQL text;
-  **(6)** extend `SizedOperation` to `create_index` and decide deliberately about `alter_column`.
+- [x] **Five of the eight findings of the 2026-09-17 harm review are fixed in 0.40.0**
+  (`docs/specs/REVIEW-2026-09-17-harm.md`): the shipped connection string no longer trusts any
+  certificate (finding 3, `config.yaml` + the scaffold twin), planned manifests are published by
+  rename (finding 4, `cmd/sqlgopace/plan.go` `stagedName`), a failed monitoring poll is narrated
+  once per outage (half of finding 2, `internal/run/executor.go` `pollHealth`), the `.log` is
+  written `0600` and `docs/running.md` says what each artifact carries (finding 5, restated there
+  as MINOR after the draft overstated it), and both pages that describe `max_block_minutes` now
+  agree and say what its coverage is worth (finding 8, and the documentation half of finding 1).
+
+- [ ] **What the harm review left open, and why.** Three of them wait on a decision rather than on
+  work:
+  **(1)** the shipped `maintenance_profile.yaml` has no `shrink:` block, so no manifest the
+  planner generates carries `max_block_minutes`, and those two unchunked statements have no yield
+  at all. Giving the profile a value needs a number somebody is willing to defend for a client's
+  shrink; making an unset key mean something other than "never" is a behaviour change.
+  **(2, second half)** both monitoring channels are still served by one goroutine on a connection
+  with no query timeout, so a blocking poll that hangs stops the log poll with it. Splitting them
+  is small; deciding whether a blind monitor should *stop* the operation rather than only narrate
+  is not.
+  **(6)** `SizedOperation` covers `rebuild_index`/`rebuild_heap` only, so `create_index` and a
+  table-rewriting `alter_column` get no data-free-space check. The `create_index` half is
+  mechanical; `alter_column` needs a judgement about which changes rewrite.
+  **(7)** `progress_poll_seconds` is required, documented without qualification, and read only by
+  `runWithTUI` — the second question `TestNoInertConfigKey` does not ask. Write that test when the
+  next monitoring key is added.
 
 - [ ] **Verify codex's F02, F08 and F03/F04 before the release after 0.39.0.** Seventeen findings
   from that reader are recorded unverified in `docs/specs/REVIEW-2026-09-17-harm-codex.md`; these
