@@ -114,7 +114,7 @@ func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, ignore, sink)
 
 	return waitForRelief(ctx, r.clk, r.logDrainTimeout, samples, sink)
 }
@@ -185,7 +185,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.Ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.Ignore, sink)
 
 	action, pressure, err := supervise(ctx, r.clk, caps, r.blockingTimeout, samples, done)
 	if action == Continue {

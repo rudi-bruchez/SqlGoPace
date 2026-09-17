@@ -707,7 +707,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
 	// Re-emit progress with the chunk's live server-side percent_complete while it runs.
 	go r.pumpServerProgress(sampleCtx, base)
 
@@ -819,7 +819,7 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 	defer stopWatching()
 	go r.pumpServerProgress(watchCtx, base)
 	samples := make(chan Sample)
-	go pumpSamples(watchCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+	go pumpSamples(watchCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
 
 	maxBlock := blockCap(res.MaxBlockMinutes)
 	var blockedSince time.Time // start of the current continuous blocking streak
@@ -888,7 +888,7 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 

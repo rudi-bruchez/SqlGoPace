@@ -281,12 +281,53 @@ func supervise(
 	}
 }
 
+// pollHealth reports one monitoring channel going blind, and coming back. A failed poll
+// used to be dropped by an `if err == nil` with no else: no log line, no counter, nothing
+// in the run report. That silence is the defect, because pumpSamples keeps the last
+// values it read — so a channel that stops answering while nothing was blocking leaves a
+// reaction hierarchy that never fires again, under a statement that keeps running.
+//
+// It speaks once per outage rather than once per poll: a warning repeated every
+// blocking_poll_seconds is one an operator learns to scroll past, and the thing worth
+// knowing is that the channel went blind and when it came back.
+type pollHealth struct {
+	channel string
+	sink    ReactionSink
+	failing bool
+	misses  int
+}
+
+// observe records the outcome of one poll and reports the transitions.
+func (h *pollHealth) observe(err error) {
+	switch {
+	case err != nil:
+		h.misses++
+		if h.failing {
+			return
+		}
+		h.failing = true
+		if h.sink != nil {
+			h.sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf(
+				"%s failed: %v — monitoring is running on the last state it read, so no reaction can fire on this channel until it recovers",
+				h.channel, err)})
+		}
+	case h.failing:
+		if h.sink != nil {
+			h.sink(ReactionEvent{Kind: "info", Detail: fmt.Sprintf(
+				"%s recovered after %d failed poll(s)", h.channel, h.misses)})
+		}
+		h.failing, h.misses = false, 0
+	}
+}
+
 // pumpSamples polls blocking and transaction-log state on independent cadences and
 // forwards a combined snapshot (the latest known value of each) whenever either poll
 // fires. Both MonitoredRunner and ShrinkRunner drive their monitoring through it. The
 // ignore matcher is re-read from the source on every blocking poll, so a rule added to
 // the manifest mid-run is honored before the operation would abort.
-func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoreSource) {
+func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoreSource, sink ReactionSink) {
+	blocking := pollHealth{channel: "blocking poll", sink: sink}
+	logging := pollHealth{channel: "log poll", sink: sink}
 	blockTicker := time.NewTicker(blockEvery)
 	defer blockTicker.Stop()
 	logTicker := time.NewTicker(logEvery)
@@ -311,19 +352,25 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, bl
 		cur.LogOverCap = l.OverCap
 		cur.LogReuseWait = l.ReuseWait
 		send()
+	} else {
+		logging.observe(err)
 	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-blockTicker.C:
-			if st, err := sampler.Blocking(ctx, currentRules(ignore)); err == nil {
+			st, err := sampler.Blocking(ctx, currentRules(ignore))
+			blocking.observe(err)
+			if err == nil {
 				cur.Blocking = st.Any
 				cur.BlockingOthers = st.Unignored
 				send()
 			}
 		case <-logTicker.C:
-			if l, err := sampler.Log(ctx); err == nil {
+			l, err := sampler.Log(ctx)
+			logging.observe(err)
+			if err == nil {
 				cur.LogOverCap = l.OverCap
 				cur.LogReuseWait = l.ReuseWait
 				send()

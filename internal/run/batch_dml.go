@@ -404,7 +404,7 @@ func (r *BatchDMLRunner) runBatch(ctx context.Context, stmt string, caps Capabil
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, caps.Ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, caps.Ignore, sink)
 
 	action, pressure, serr := supervise(ctx, r.clk, caps, r.blockTO, samples, done)
 	if action == Continue {
@@ -439,7 +439,7 @@ func (r *BatchDMLRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, s
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore)
+	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 
