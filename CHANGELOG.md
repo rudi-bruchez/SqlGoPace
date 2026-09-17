@@ -13,6 +13,46 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.40.0] - 2026-09-17
+
+Five fixes from the 2026-09-17 harm review (`docs/specs/REVIEW-2026-09-17-harm.md`), two of
+them found by an external reader and verified against the code. Nothing here changes what the
+engine does to a database; three change what it ships, writes, or says.
+
+### Fixed
+
+- The scaffolded `config.yaml` no longer carries `trustServerCertificate=true`. Encryption
+  without certificate validation means the client encrypts to whatever answers, so anyone on the
+  path can read the SQL login and its password out of the login packet. Found independently by
+  two reviewers.
+- A planned manifest is written as `.<name>.staged` and renamed into place. Written directly, it
+  could be claimed by a concurrent run mid-write, and a truncation landing on an operation
+  boundary is still valid YAML — the run would execute a prefix of the plan and report success.
+- A monitoring poll that fails now says so, once per outage, through the same sink as every other
+  reaction (`warn` on the first failure, `info` on recovery with the count of lost polls). It was
+  dropped by an `if err == nil` with no else, leaving the reaction hierarchy running on the last
+  state it had read, under a statement that kept going.
+- The run report `.log` is written `0600`, like the capture sidecars beside it. `docs/running.md`
+  now lists what each run artifact holds — the capture sidecars carry verbatim SQL from other
+  people's sessions, the `.log` carries names and counts.
+- `docs/manifests.md` claimed `max_block_minutes` cannot cover a log shrink or a `TRUNCATEONLY`
+  pass, which stopped being true in 0.30.0 and contradicted the page it cited. Both pages now
+  also say what that coverage is worth: those two statements react to that key and to nothing
+  else, so an operation that does not set it has no yield at all.
+
+**Migration.** Three things to check.
+
+An instance whose certificate is not in the client's trust store will now refuse to connect
+instead of connecting blind: add `trustServerCertificate=true` back to your own `config.yaml`
+knowingly, or put the certificate in the store. A `config.yaml` scaffolded before 0.40.0 is
+unchanged on disk and still trusts anything.
+
+If anything reads a run's `.log` as a different local user, it will stop being able to on Unix.
+
+If you rely on `max_block_minutes` to bound a shrink, set it on the operation: the shipped
+`maintenance_profile.yaml` has no `shrink:` block, so the manifests `sqlgopace plan` generates
+carry no cap and their log-shrink and `TRUNCATEONLY` phases have no yield.
+
 ## [0.39.0] - 2026-09-17
 
 ### Added
