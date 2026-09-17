@@ -436,6 +436,41 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   `internal/run/executor.go`) rather than only narrating. The decision on both was the user's,
   taken 2026-09-17.
 
+- [x] **Six findings of the second codex review are fixed in 0.42.0**
+  (`docs/specs/REVIEW-2026-09-17-codex-branch.md`, verdicts recorded there): the tempdb sampler
+  no longer arms the killers a documentation page promised it never used (F-03), the fallback
+  KILL proves the session is still ours before issuing (F-01), the tempdb shrink watches
+  tempdb's log rather than the user database's (F-03 second half), a measured over-cap survives
+  a failed reuse-wait read (F-02 remnant), releasing the queue lock no longer unlinks the file
+  (F-07), and a `key_range` watermark is bound to the statement it walked (F-04).
+
+- [ ] **What the second codex review leaves open.**
+  **(F-04, the part the chosen fix does not reach)** `planFingerprint` still hashes command and
+  target only, and is still compared only when the resume cursor is past zero. Binding the
+  watermark to its statement closes the case that skips rows; it does not close "an operation
+  the cursor has already passed is edited before the resume", which runs the new SQL for
+  operations after the cursor and never runs it for those before. Widening the plan fingerprint
+  to the full resolved plan is the fix and was declined on 2026-09-17 because it invalidates
+  every existing sidecar and restarts every interrupted manifest from operation zero. Revisit
+  when a format version is being introduced for another reason.
+  **(F-05)** `key_range` is at-least-once across a crash: the range commits before its watermark
+  is saved, so triggers, audit rows and downstream effects can fire twice on the boundary batch.
+  The idempotent-literal-`SET` restriction makes the *column value* idempotent and says nothing
+  about side effects. Not verified this pass; if it holds, the fix is to name the guarantee in
+  `docs/operations.md` rather than imply it.
+  **(F-10)** `updateSidecar` returns silently when the sidecar cannot be read, so a precise
+  resume can degrade to a restart with no signal. Worth a look when the resume path is next
+  touched — it is the one maintainability finding of that review with a harm argument.
+  **(F-08)** `type` and `data_compression` reach generated SQL without an allowlist. This is
+  inside the trust boundary `SECURITY.md` declares, so it is hardening rather than a defect, but
+  a field that looks like an enum should be one.
+
+- [ ] **The tempdb no-kill invariant is held by a comment, not a test.** `cmd/sqlgopace/main.go`
+  deliberately attaches no killer to the tempdb sampler, and `docs/shrink.md` promises it. The
+  wiring needs a live tempdb connection, so there is nothing to assert without a server — which
+  is exactly how it was armed for twenty-nine releases without anyone noticing. Either extract
+  the wiring far enough to test it, or add it to the integration suite.
+
 - [ ] **What the harm review still leaves open.**
   **(6)** `SizedOperation` covers `rebuild_index`/`rebuild_heap` only, so `create_index` and a
   table-rewriting `alter_column` get no data-free-space check. The `create_index` half is

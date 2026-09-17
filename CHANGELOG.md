@@ -13,6 +13,56 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.42.0] - 2026-09-17
+
+Six findings from a second external code review of this branch
+(`docs/specs/REVIEW-2026-09-17-codex-branch.md`), each verified against the code before being
+acted on. Four change what the tool does to a server it is pointed at.
+
+### Fixed
+
+- A tempdb shrink no longer kills blockers. Both killers were attached to its sampler, so with
+  `kill_blocking_sessions` armed a `shrink_tempdb` terminated application sessions that
+  `docs/shrink.md` promises, under a heading saying so, are always waited out. The wiring
+  arrived in 0.13.0 and the promise was written in 0.16.0 without checking it.
+- The fallback `KILL` proves the session is still ours before issuing. It aimed at a session
+  number, and a number is the one thing that does not survive: a canceled statement can poison
+  the pinned connection, which is re-pinned onto a new session, and SQL Server hands the freed
+  number to the next login. `Conn.KillSelf` re-reads the session and compares `login_time`,
+  as `stopOrphan` already did. Anything but a match declines, nothing is killed, and the run
+  keeps waiting for the statement and says so. The console's `k` key takes the same path.
+- A `shrink_tempdb` watches tempdb's transaction log instead of the user database's.
+  `sys.dm_db_log_space_usage` and the reuse-wait read both report the connected database, so
+  probing them through the primary connection meant reacting to pressure from elsewhere and
+  missing the pressure the operation was causing.
+- A transaction log measured over cap stays over cap when `log_reuse_wait_desc` cannot be read.
+  The sampler discarded both the breach and its attribution, so a log known to be over cap was
+  reported healthy because the engine could not say why.
+- Releasing the queue lock no longer deletes the lock file. On Unix the unlink reopens the
+  flock race the lock exists to close: two runs can end up holding independent locks on the
+  same path, and the recovery sweep in one requeues the other's in-flight manifest. The file
+  now stays in `02.processing/` — do not delete it.
+- A `key_range` watermark is bound to the statement that produced it. Editing `set`, `where`,
+  the key column or the batch options between an interruption and a re-run left the watermark
+  believed, so the walk resumed behind a position recorded against different SQL and skipped
+  every row below it.
+
+**Migration.** Four things to check.
+
+`.sqlgopace.lock` now stays in the processing directory after a run. It is not stale and must
+not be deleted: exclusion is an OS lock on the open file, not the file's existence.
+
+The log thresholds in `config.yaml` now apply to tempdb's log while a `shrink_tempdb` runs. If
+`log_max_size_bytes` was tuned against a user database, check it is still the number you want.
+
+A `key_range` walk interrupted before this version resumes from the beginning: its watermark
+carries no statement hash and unverifiable is not the same as matching. `key_range` requires an
+idempotent literal `SET`, so that costs the rows already walked and skips none.
+
+If you relied on `kill_blocking_sessions` clearing blockers out of a tempdb shrink, it no longer
+does. That operation waits them out, with `WAIT_AT_LOW_PRIORITY` on 2022+ and a clean give-up
+otherwise.
+
 ## [0.41.0] - 2026-09-17
 
 The last two open findings of the 2026-09-17 harm review, both of which were waiting on a
