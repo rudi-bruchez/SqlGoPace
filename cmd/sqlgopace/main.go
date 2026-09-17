@@ -506,7 +506,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
 	// sampler's per-poll session snapshot; the engine feeds it each manifest's kill rules.
 	var killOpt run.EngineOption
-	var blockerKiller *run.BlockerKiller // shared with the tempdb sampler below
+	var blockerKiller *run.BlockerKiller // the primary sampler only; never the tempdb one
 	if cfg.KillBlockers.Enabled {
 		// Waited is the rule's accumulated debt across every session that matched it, not
 		// this SPID's own blocking time, so both lines attribute it to the rule. For a
@@ -530,7 +530,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// behind it. The killer is shared with the sampler, exactly like the blocker
 	// killer above.
 	var victimOpt run.EngineOption = func(*run.Engine) {}
-	var victimKiller *run.VictimKiller // shared with the tempdb sampler below
+	var victimKiller *run.VictimKiller // the primary sampler only; never the tempdb one
 	if cfg.KillAmplifyingMaintenance.Enabled {
 		policy := run.AmplifierPolicy{
 			MinBlockedBehind: cfg.KillAmplifyingMaintenance.MinBehind(),
@@ -615,13 +615,16 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
 	tempdbSampler := run.NewServerSampler(conn, tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
-	// The killers are per-run, not per-sampler: a tempdb shrink must be able to kill a
-	// blocker exactly like any other operation, and it is the sampler poll that consults
-	// them. The instances are shared with the primary sampler — safe, because the engine
-	// runs one operation at a time, so the two samplers never poll concurrently. Both
-	// setters accept a nil killer (the feature stays off when not armed in config).
-	tempdbSampler.SetKiller(blockerKiller)
-	tempdbSampler.SetVictimKiller(victimKiller)
+	// No killers on this sampler, deliberately. docs/shrink.md states, under a heading
+	// that says so in as many words, that a tempdb shrink waits its blockers out and
+	// never kills them: they are legitimate application queries, and tempdb is shared by
+	// every workload on the instance rather than owned by this run. They were attached
+	// here in 0.13.0 (d81f143), as a fix for a tempdb shrink that "could never kill a
+	// blocker however the feature was armed in config"; that page was written in 0.16.0
+	// and promised the opposite without checking this wiring. 0.42.0 keeps the promise
+	// and drops the wiring. The reaction available here is WAIT_AT_LOW_PRIORITY on 2022+
+	// and a clean give-up otherwise. Do not re-attach them without changing that page
+	// first.
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:          shrinkTuning(cfg.Shrink),
 		PollInterval:    cfg.Monitoring.BlockingPoll(),

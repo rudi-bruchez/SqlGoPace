@@ -134,6 +134,19 @@ driver adds `WAIT_AT_LOW_PRIORITY (ABORT_AFTER_WAIT = SELF)`, which makes *our* 
 and retry and never aborts the blocker. On 2019 the matrix disables that option for
 `shrink_tempdb`, so the reaction degrades to a plain bounded wait and a clean give-up.
 
+That holds even when `kill_blocking_sessions` or `kill_amplifying_maintenance` is armed in
+`config.yaml`: neither killer is attached to the tempdb shrink's monitoring, so a global
+policy that kills blockers everywhere else does not kill them here.
+
+Until 0.42.0 that was not true and this page said it anyway. Both killers were attached to
+the tempdb sampler in 0.13.0, as a fix for a shrink_tempdb that "could never kill a blocker
+however the feature was armed in config"; this paragraph was then written in 0.16.0,
+describing the `WAIT_AT_LOW_PRIORITY` reaction and generalising it into a promise the
+wiring had already broken three weeks earlier. An operator who armed
+`kill_blocking_sessions` got tempdb kills this page told them they would not get. The
+promise is the one worth keeping — tempdb is shared by every workload on the instance
+rather than owned by this run — so 0.42.0 removed the wiring rather than the paragraph.
+
 ### The `flushcaches` trade-off
 
 When a file's shrink shows no progress repeatedly, a no-gain chunk, `Msg 5240` "work table
