@@ -453,11 +453,6 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   to the full resolved plan is the fix and was declined on 2026-09-17 because it invalidates
   every existing sidecar and restarts every interrupted manifest from operation zero. Revisit
   when a format version is being introduced for another reason.
-  **(F-05)** `key_range` is at-least-once across a crash: the range commits before its watermark
-  is saved, so triggers, audit rows and downstream effects can fire twice on the boundary batch.
-  The idempotent-literal-`SET` restriction makes the *column value* idempotent and says nothing
-  about side effects. Not verified this pass; if it holds, the fix is to name the guarantee in
-  `docs/operations.md` rather than imply it.
   **(F-10)** `updateSidecar` returns silently when the sidecar cannot be read, so a precise
   resume can degrade to a restart with no signal. Worth a look when the resume path is next
   touched — it is the one maintainability finding of that review with a harm argument.
@@ -479,14 +474,28 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   `runWithTUI` — the second question `TestNoInertConfigKey` does not ask. Write that test when the
   next monitoring key is added.
 
-- [ ] **Verify codex's F02, F08 and F03/F04 before the release after 0.39.0.** Seventeen findings
-  from that reader are recorded unverified in `docs/specs/REVIEW-2026-09-17-harm-codex.md`; these
-  three are the ones whose harm, if they hold, outranks everything already confirmed: a fallback
-  KILL that identifies its target only by a reusable session id, crash recovery that can replay a
-  committed non-idempotent effect, and a tempdb shrink that watches the wrong database's log and
-  can kill the live workload despite a documented prohibition. Each is a reading of code that
-  nobody has checked; the two findings from the same reader that *were* checked both held, which
-  raises the prior and settles nothing.
+- [x] **Three of codex's four highest-harm findings were verified and fixed in 0.42.0; the
+  fourth is still open.** The second codex run (`REVIEW-2026-09-17-codex-branch.md`) re-found
+  three of them independently, which is the strongest signal either report carries: F02 (a
+  fallback KILL identified only by a reusable session id) is `b677ca5`, F03 (a tempdb shrink
+  killing the live workload despite a documented prohibition) is `1b5b5d6`, and F04 (a tempdb
+  shrink watching the wrong database's log) is `50c6024`. **F08 is not fixed** and is carried
+  below: the watermark half of it — resuming behind a position recorded against different SQL —
+  is closed by `8660c8a`, but the replay of committed side effects on the boundary batch is not.
+  Of the four findings from that reader that have now been checked, four held.
+
+- [ ] **`key_range` is at-least-once across a crash, and the docs imply better.** Codex F08
+  (first run) and F-05 (second run), both rated SEVERE, neither verified by running. The range
+  `UPDATE` commits before its watermark is saved, so a crash replays the boundary range. The
+  `literal SET` restriction makes the *column value* idempotent and says nothing about an
+  `AFTER UPDATE` trigger, an audit or billing row, a temporal write, or a downstream consumer —
+  and a key-range `UPDATE` carries no self-limiting predicate, so it re-touches rows that are
+  already satisfied. A second shape: with `on_failure: continue`, a failed earlier operation
+  freezes the resume cursor, so later successful operations run again after an interruption.
+  Verify first, on the throwaway instance, with a trigger that counts its firings. If it holds,
+  the cheap fix is to name the guarantee in `docs/operations.md` instead of implying idempotence
+  from the literal-`SET` rule; the real fix is to exclude already-satisfied rows, or to require
+  reconciliation before replaying side-effectful work.
 
 - [ ] **A second question for the inert-key audit: is a key read on every path its documentation
   claims it for?** From the same review (finding 5). `TestNoInertConfigKey` asks whether a key is
