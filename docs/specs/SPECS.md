@@ -543,6 +543,29 @@ not only on the first `log_poll_seconds` tick, so a retry issued right after a l
 re-canceled within seconds instead of running blind against an already-over-cap log for up to
 `log_poll_seconds`.
 
+**Monitoring that stops answering — `Sample.Blind` and `ErrMonitorBlind` (0.41.0).** Every
+reaction above is driven by `pumpSamples`, so a pump that stops producing readings disarms the
+whole hierarchy while the statement keeps running. Two things changed. The two polls now run on
+their own goroutines, because they shared one and a hung `Blocking` also stopped `Log`. And a
+channel that has produced no successful read for `BlindAfter` (two minutes, or twice its own
+cadence when that is longer) is named in `Sample.Blind`; `DecideReaction` returns `Cancel` for it
+ahead of every other case, and the operation ends with `ErrMonitorBlind`.
+
+`Cancel` rather than `Pause` even for a resumable, because `waitForRelief` reads relief from the
+channel that has just gone quiet; `waitForRelief` and the paced `reorganize_index` re-issue path
+both bail out on `Blind` for the same reason. `ErrMonitorBlind` is deliberately not `ErrCancelled`,
+so `MonitoredRunner.Run` does not retry it — a retry is another unwatched attempt against a server
+that has just failed to answer a DMV read. `ignore_blocking` does not suppress it: that option
+waives a reaction to something seen, not the ability to see.
+
+The design is a staleness watchdog rather than a per-poll deadline because the failure to catch is
+a **hang**, not an error — a DMV read waits on `THREADPOOL` when the worker pool is exhausted, and
+one thing that exhausts it is a long blocking chain, which is what this pump exists to detect.
+Microsoft's own description of `THREADPOOL` covers logins, and the sampler polls on the shared pool
+rather than the pinned execution connection, so it may need one. No query timeout was added; the
+project has none by design, and a timeout would also have missed the error shape that 0.40.0
+already reports.
+
 **Per-operation escape hatch — `options.ignore_blocking: true`.** The whole hierarchy above reacts
 to *blocking* and *log* pressure. Setting `ignore_blocking` on one operation removes **blocking**
 from its pressure inputs: that operation never pauses/cancels *because it blocks others* — it holds

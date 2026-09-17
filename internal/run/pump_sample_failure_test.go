@@ -54,7 +54,7 @@ func TestPumpSamplesReportsAFailedPollOncePerOutage(t *testing.T) {
 		for range samples { // drain, so the pump is never blocked on its send
 		}
 	}()
-	go pumpSamples(ctx, samples, sampler, time.Millisecond, time.Hour, nil, collect(&mu, &events))
+	go pumpSamples(ctx, samples, pumpSpec{sampler: sampler, blockEvery: time.Millisecond, logEvery: time.Hour, sink: collect(&mu, &events)})
 
 	deadline := time.After(2 * time.Second)
 	for {
@@ -122,7 +122,7 @@ func TestPumpSamplesIsSilentWhilePollsSucceed(t *testing.T) {
 		for range samples {
 		}
 	}()
-	go pumpSamples(ctx, samples, sampler, time.Millisecond, time.Hour, nil, collect(&mu, &events))
+	go pumpSamples(ctx, samples, pumpSpec{sampler: sampler, blockEvery: time.Millisecond, logEvery: time.Hour, sink: collect(&mu, &events)})
 	time.Sleep(50 * time.Millisecond)
 	cancel()
 

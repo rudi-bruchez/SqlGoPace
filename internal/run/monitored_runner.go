@@ -17,10 +17,14 @@ import (
 // non-resumable operation is canceled and retried up to MaxRetries. An explicit
 // KILL is only a fallback when the abort does not stop the statement in time.
 type MonitoredRunner struct {
-	exec            Executor
-	sampler         Sampler
-	clk             Clock
-	pollInterval    time.Duration // blocking poll cadence
+	exec         Executor
+	sampler      Sampler
+	clk          Clock
+	pollInterval time.Duration // blocking poll cadence
+	// blindAfter is how long a monitoring channel may stay silent before this runner
+	// stops the operation. Always BlindAfter in production; a test shortens it rather
+	// than wait two minutes for a hang it staged in milliseconds.
+	blindAfter      time.Duration
 	logPollInterval time.Duration // transaction-log poll cadence (coarser)
 	blockingTimeout time.Duration
 	logDrainTimeout time.Duration
@@ -50,6 +54,7 @@ func NewMonitoredRunner(exec Executor, sampler Sampler, clk Clock, cfg RunnerCon
 		sampler:         sampler,
 		clk:             clk,
 		pollInterval:    cfg.PollInterval,
+		blindAfter:      BlindAfter,
 		logPollInterval: logPoll,
 		blockingTimeout: cfg.BlockingTimeout,
 		logDrainTimeout: cfg.LogDrainTimeout,
@@ -114,7 +119,7 @@ func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollInterval, logEvery: r.logPollInterval, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 
 	return waitForRelief(ctx, r.clk, r.logDrainTimeout, samples, sink)
 }
@@ -132,6 +137,12 @@ func runLoop(sql string, runStatement func(string) (Action, error), waitForRelie
 		action, err := runStatement(stmt)
 		switch action {
 		case Cancel:
+			// Blind: neither branch below is safe. Waiting for relief reads the channel
+			// that stopped answering, and re-issuing puts the statement back on a server
+			// nobody is watching. Stop, and let Run decline to retry.
+			if errors.Is(err, ErrMonitorBlind) {
+				return err
+			}
 			if reissue == nil {
 				return ErrCancelled
 			}
@@ -185,12 +196,17 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollInterval, r.logPollInterval, caps.Ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollInterval, logEvery: r.logPollInterval, ignore: caps.Ignore, sink: sink, blindAfter: r.blindAfter})
 
 	action, pressure, err := supervise(ctx, r.clk, caps, r.blockingTimeout, samples, done)
 	if action == Continue {
 		noteRepin(sink, spidBefore, r.exec.SPID())
 		return Continue, err
+	}
+	// Carried out with the action so runLoop can tell this cancel from a pressure one,
+	// and Run can decline to retry it.
+	if pressure.Blind != "" {
+		err = fmt.Errorf("%w (%s)", ErrMonitorBlind, pressure.Blind)
 	}
 
 	sink(reactionEvent(action, pressure, caps))
@@ -212,7 +228,7 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 		}
 		<-done
 	}
-	return action, nil
+	return action, err
 }
 
 // waitForRelief consumes monitoring snapshots until the pressure that triggered a
@@ -228,6 +244,12 @@ func waitForRelief(ctx context.Context, clk Clock, logDrainTimeout time.Duration
 		case <-ctx.Done():
 			return ctx.Err()
 		case s := <-samples:
+			// Relief is read from the same pump that has just gone quiet, so waiting on
+			// it is waiting for a report that cannot arrive.
+			if s.Blind != "" {
+				sink(ReactionEvent{Kind: "abort", Detail: s.Blind + " stopped answering while waiting for pressure to clear"})
+				return fmt.Errorf("%w (%s)", ErrMonitorBlind, s.Blind)
+			}
 			if s.LogOverCap {
 				if logOverCapSince.IsZero() {
 					logOverCapSince = clk.Now()

@@ -12,10 +12,14 @@ type Pressure struct {
 	LogOverCap     bool
 	LogReuseWait   string // log_reuse_wait_desc when over cap, for the reaction detail
 	Capped         bool   // the reaction was forced by the max_block safety cap
+	// Blind names the monitoring channel that stopped answering. It is not pressure the
+	// server is under; it is the loss of the ability to see any, which is why it reacts
+	// differently from every other field here.
+	Blind string
 }
 
 // Any reports whether any pressure is present.
-func (p Pressure) Any() bool { return p.BlockingOthers || p.LogOverCap }
+func (p Pressure) Any() bool { return p.BlockingOthers || p.LogOverCap || p.Blind != "" }
 
 // Detail describes the pressure for a reaction log entry.
 func (p Pressure) Detail() string {
@@ -27,6 +31,11 @@ func (p Pressure) Detail() string {
 }
 
 func (p Pressure) reason() string {
+	// Reported ahead of the rest: the other fields are the last values the monitor read
+	// before it went quiet, so describing them as the current state would be a guess.
+	if p.Blind != "" {
+		return fmt.Sprintf("%s stopped answering — the operation is no longer monitored", p.Blind)
+	}
 	switch {
 	case p.BlockingOthers && p.LogOverCap:
 		return fmt.Sprintf("blocking other sessions and transaction log over cap%s", reuseWaitSuffix(p.LogReuseWait))
@@ -163,6 +172,12 @@ func DecideReaction(p Pressure, c Capabilities) Action {
 	switch {
 	case !p.Any():
 		return Continue
+	// Blindness is not pressure to wait out, so it is decided before everything else: a
+	// Pause would wait for relief on the very channel that stopped answering, and
+	// ignore_blocking waives a reaction to something seen, never the ability to see. A
+	// cancel of a resumable is still an attention that preserves its work.
+	case p.Blind != "":
+		return Cancel
 	case c.Resumable:
 		return Pause
 	default:

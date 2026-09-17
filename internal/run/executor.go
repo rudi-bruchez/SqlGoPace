@@ -42,6 +42,11 @@ type Sample struct {
 	Blocking       bool   // our DDL is blocking any session, ignored or not (max_block cap)
 	LogOverCap     bool   // the transaction log is over its configured cap
 	LogReuseWait   string // why the log cannot truncate (only set when over cap)
+	// Blind names the monitoring channel that has stopped answering ("" while both are
+	// healthy). The other fields are the last values that channel reported, which is
+	// exactly why this one exists: they keep looking reassuring after the channel that
+	// produced them went silent.
+	Blind string
 }
 
 // LogSample is the transaction-log half of a monitoring snapshot.
@@ -209,6 +214,11 @@ var ErrCancelled = errors.New("operation canceled under pressure")
 // stop) and the run should stop without resuming; the next run continues it via RESUME.
 var ErrStopped = errors.New("operation paused on graceful stop")
 
+// ErrMonitorBlind ends an operation whose monitoring stopped answering. It is
+// deliberately not ErrCancelled: a retry would be one more unwatched attempt against a
+// server that has just demonstrated it cannot answer a DMV read.
+var ErrMonitorBlind = errors.New("monitoring stopped answering; operation stopped rather than run unwatched")
+
 // stopRequested reports whether a graceful stop is currently requested. stop is the
 // DrainFlag's Draining method (cancellable), read at each operation, chunk, and poll
 // boundary. A nil predicate (no drain wired) is never draining.
@@ -267,6 +277,9 @@ func supervise(
 				BlockingOthers: !caps.IgnoreBlocking && !blockingStart.IsZero() && clk.Since(blockingStart) >= blockingTimeout,
 				LogOverCap:     s.LogOverCap,
 				LogReuseWait:   s.LogReuseWait,
+				// Not gated on IgnoreBlocking: that option waives a reaction to something
+				// seen, never the ability to see.
+				Blind: s.Blind,
 			}
 			// The safety cap overrides every ignore policy: after MaxBlock of continuous
 			// blocking, yield even if the blocker is ignored.
@@ -295,10 +308,41 @@ type pollHealth struct {
 	sink    ReactionSink
 	failing bool
 	misses  int
+	// lastOK is when this channel last produced a reading. A poll that hangs never
+	// updates it and never reaches observe, which is the whole point: staleness is the
+	// only evidence a hang leaves.
+	lastOK     time.Time
+	blindAfter time.Duration
+	dark       bool // already reported blind, so the warning is not repeated
+}
+
+// checkBlind reports whether this channel has gone silent for longer than it is allowed
+// to, narrating each transition exactly once.
+func (h *pollHealth) checkBlind(at time.Time) bool {
+	silent := at.Sub(h.lastOK)
+	blind := h.blindAfter > 0 && silent >= h.blindAfter
+	switch {
+	case blind && !h.dark:
+		h.dark = true
+		if h.sink != nil {
+			h.sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf(
+				"%s has not answered for %s — the operation is running unwatched and will be stopped",
+				h.channel, silent.Round(time.Second))})
+		}
+	case !blind && h.dark:
+		h.dark = false
+		if h.sink != nil {
+			h.sink(ReactionEvent{Kind: "info", Detail: h.channel + " is answering again"})
+		}
+	}
+	return blind
 }
 
 // observe records the outcome of one poll and reports the transitions.
 func (h *pollHealth) observe(err error) {
+	if err == nil {
+		h.lastOK = time.Now()
+	}
 	switch {
 	case err != nil:
 		h.misses++
@@ -320,18 +364,125 @@ func (h *pollHealth) observe(err error) {
 	}
 }
 
+// BlindAfter is how long a monitoring channel may go without a successful read before
+// the operation running under it is stopped. Two minutes, the same number as a shrink's
+// default max_block_minutes and for the same reason: it is how long an operation may act
+// on a production server without anybody watching.
+//
+// A channel polled less often than this is judged on its own cadence instead
+// (blindThreshold), so a deliberately slow log poll is not mistaken for a dead one.
+const BlindAfter = 2 * time.Minute
+
+// pumpSpec is everything one run of the monitoring pump needs. It is a struct rather than
+// a parameter list because seven call sites pass it, two of the fields are adjacent
+// durations that would swap silently, and tests need to shorten blindAfter.
+type pumpSpec struct {
+	sampler    Sampler
+	blockEvery time.Duration
+	logEvery   time.Duration
+	ignore     IgnoreSource
+	sink       ReactionSink
+	blindAfter time.Duration // 0 means BlindAfter
+}
+
+// blockOutcome and logOutcome carry one poll's result from its own goroutine to the pump.
+type blockOutcome struct {
+	st  BlockState
+	err error
+}
+
+type logOutcome struct {
+	ls  LogSample
+	err error
+}
+
+// blindThreshold is how long a channel may stay silent before it counts as blind: the
+// global bound, unless this channel's own cadence is slower than that. A log poll set to
+// five minutes is not blind at two; it has simply not been asked yet.
+func blindThreshold(after, every time.Duration) time.Duration {
+	if floor := 2 * every; floor > after {
+		return floor
+	}
+	return after
+}
+
 // pumpSamples polls blocking and transaction-log state on independent cadences and
 // forwards a combined snapshot (the latest known value of each) whenever either poll
 // fires. Both MonitoredRunner and ShrinkRunner drive their monitoring through it. The
 // ignore matcher is re-read from the source on every blocking poll, so a rule added to
 // the manifest mid-run is honored before the operation would abort.
-func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, blockEvery, logEvery time.Duration, ignore IgnoreSource, sink ReactionSink) {
-	blocking := pollHealth{channel: "blocking poll", sink: sink}
-	logging := pollHealth{channel: "log poll", sink: sink}
-	blockTicker := time.NewTicker(blockEvery)
-	defer blockTicker.Stop()
-	logTicker := time.NewTicker(logEvery)
-	defer logTicker.Stop()
+//
+// Each channel gets its own goroutine. Until 0.41.0 one goroutine served both, so a poll
+// that hung stopped the other channel too — and hanging is the likely failure, not
+// erroring: a DMV read waits on THREADPOOL when the worker pool is exhausted, which is
+// what a long blocking chain does, which is what this pump exists to detect. There is no
+// query timeout anywhere by design, so nothing returns and nothing errors. What the pump
+// watches instead is staleness: a channel that has produced no successful read for its
+// blindThreshold is reported in Sample.Blind, and the supervisor stops the operation
+// rather than let it keep acting unobserved.
+func pumpSamples(ctx context.Context, samples chan<- Sample, spec pumpSpec) {
+	blindAfter := spec.blindAfter
+	if blindAfter <= 0 {
+		blindAfter = BlindAfter
+	}
+	now := time.Now()
+	blocking := &pollHealth{channel: "blocking poll", sink: spec.sink, lastOK: now,
+		blindAfter: blindThreshold(blindAfter, spec.blockEvery)}
+	logging := &pollHealth{channel: "log poll", sink: spec.sink, lastOK: now,
+		blindAfter: blindThreshold(blindAfter, spec.logEvery)}
+
+	blockCh := make(chan blockOutcome)
+	logCh := make(chan logOutcome)
+
+	go func() {
+		t := time.NewTicker(spec.blockEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			st, err := spec.sampler.Blocking(ctx, currentRules(spec.ignore))
+			select {
+			case blockCh <- blockOutcome{st: st, err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	go func() {
+		// Take one log sample immediately, before the ticker loop, so a statement never
+		// runs blind to log pressure for up to log_poll_seconds (H1,
+		// docs/specs/REVIEW-2026-09-15-harm.md): without this, a retry issued right after
+		// a log-pressure cancel starts with LogOverCap assumed false and only learns
+		// otherwise on the first tick, writing into an already-over-cap log for the whole
+		// interval. Only the log sample jumps the queue — the blocking path's reaction is
+		// already debounced by blocking_timeout, so an extra immediate blocking poll buys
+		// nothing and would also drive the blocker/victim killers a poll early.
+		ls, err := spec.sampler.Log(ctx)
+		select {
+		case logCh <- logOutcome{ls: ls, err: err}:
+		case <-ctx.Done():
+			return
+		}
+		t := time.NewTicker(spec.logEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+			ls, err := spec.sampler.Log(ctx)
+			select {
+			case logCh <- logOutcome{ls: ls, err: err}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	var cur Sample
 	send := func() {
@@ -340,39 +491,56 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, sampler Sampler, bl
 		case <-ctx.Done():
 		}
 	}
-	// Take one log sample immediately, before the ticker loop, so a statement never
-	// runs blind to log pressure for up to log_poll_seconds (H1,
-	// docs/specs/REVIEW-2026-09-15-harm.md): without this, a retry issued right after a
-	// log-pressure cancel starts with cur.LogOverCap assumed false and only learns
-	// otherwise on the first tick, writing into an already-over-cap log for the whole
-	// interval. Only the log sample jumps the queue — the blocking path's reaction is
-	// already debounced by blocking_timeout, so an extra immediate blocking poll buys
-	// nothing and would also drive the blocker/victim killers a poll early.
-	if l, err := sampler.Log(ctx); err == nil {
-		cur.LogOverCap = l.OverCap
-		cur.LogReuseWait = l.ReuseWait
-		send()
-	} else {
-		logging.observe(err)
+	// blindChannel names the first channel that has gone silent, narrating each
+	// transition once. Both are checked on every call so a channel that recovers stops
+	// being reported even while the other one is still dark.
+	blindChannel := func() string {
+		at := time.Now()
+		name := ""
+		for _, h := range []*pollHealth{blocking, logging} {
+			if h.checkBlind(at) && name == "" {
+				name = h.channel
+			}
+		}
+		return name
 	}
+
+	// The watchdog is what turns a hang into an event: a hung poll sends nothing, so
+	// without it the pump would simply go quiet. It runs on the faster of the two
+	// cadences, which is always at most the blindness threshold.
+	watchEvery := spec.blockEvery
+	if spec.logEvery < watchEvery {
+		watchEvery = spec.logEvery
+	}
+	if blindAfter < watchEvery {
+		watchEvery = blindAfter
+	}
+	watchdog := time.NewTicker(watchEvery)
+	defer watchdog.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-blockTicker.C:
-			st, err := sampler.Blocking(ctx, currentRules(ignore))
-			blocking.observe(err)
-			if err == nil {
-				cur.Blocking = st.Any
-				cur.BlockingOthers = st.Unignored
+		case o := <-blockCh:
+			blocking.observe(o.err)
+			if o.err == nil {
+				cur.Blocking = o.st.Any
+				cur.BlockingOthers = o.st.Unignored
+				cur.Blind = blindChannel()
 				send()
 			}
-		case <-logTicker.C:
-			l, err := sampler.Log(ctx)
-			logging.observe(err)
-			if err == nil {
-				cur.LogOverCap = l.OverCap
-				cur.LogReuseWait = l.ReuseWait
+		case o := <-logCh:
+			logging.observe(o.err)
+			if o.err == nil {
+				cur.LogOverCap = o.ls.OverCap
+				cur.LogReuseWait = o.ls.ReuseWait
+				cur.Blind = blindChannel()
+				send()
+			}
+		case <-watchdog.C:
+			if blind := blindChannel(); blind != cur.Blind {
+				cur.Blind = blind
 				send()
 			}
 		}

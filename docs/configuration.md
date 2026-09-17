@@ -127,6 +127,32 @@ it starts, not only on the next `log_poll_seconds` tick, so a retry issued right
 log-pressure cancel is re-canceled within seconds instead of running blind against an
 already-over-cap log for up to `log_poll_seconds`.
 
+### When the monitor stops answering
+
+The two polls are what every reaction is built on, so from 0.41.0 the engine stops an
+operation whose monitoring has gone silent rather than let it keep working unobserved.
+
+Each poll runs on its own goroutine, and each is judged on whether it has produced a
+reading recently: silent for two minutes (or for two of its own poll intervals, whichever
+is longer) and the running statement is canceled, with `monitoring stopped answering` in
+the run report and a warning naming the channel. A resumable operation is paused by the
+same mechanism it always was, so its work survives; a shrink keeps the space it has
+already released. The run does not retry — a retry would be one more unwatched attempt.
+
+Two failure shapes lead here, and the second is the reason this exists. A poll can
+**fail**, which is a connection reset, a failover, a revoked `VIEW SERVER STATE`, or Azure
+throttling; that has been reported since 0.40.0. Or a poll can **hang**, which is what
+happens when the instance runs out of worker threads: a new task — including a login —
+then waits on `THREADPOOL`, and the pool the monitor polls on is not the pinned execution
+connection, so it needs one. The blocking chain that exhausts the worker pool is very
+often the operation's own. There is no query timeout anywhere by design, so a hung poll
+returns nothing and errors never — which is why the engine watches for silence rather than
+for errors.
+
+If you see this, look at the server before re-running: something made it unable to answer
+`sys.dm_exec_requests`, and the operation you were running is a candidate for having
+caused it.
+
 `blocking_poll_seconds` is not only a sampling rate. A kill rule's `after_seconds` is measured
 over the polls on which the rule matched, and each blocking episode's first poll banks nothing,
 so the effective delay is `after_seconds` plus up to one poll interval per episode. Lowering

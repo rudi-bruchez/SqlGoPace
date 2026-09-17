@@ -149,11 +149,15 @@ type ShrinkRunner struct {
 	clk      Clock
 	tuning   ShrinkTuning
 	pollIntv time.Duration
-	logPoll  time.Duration
-	blockTO  time.Duration
-	logDrain time.Duration
-	killGr   time.Duration
-	major    int // SQL Server major version; gates the tail-object walk (2019+ only)
+	// blindAfter is how long a monitoring channel may stay silent before this runner
+	// stops the operation. Always BlindAfter in production; a test shortens it rather
+	// than wait two minutes for a hang it staged in milliseconds.
+	blindAfter time.Duration
+	logPoll    time.Duration
+	blockTO    time.Duration
+	logDrain   time.Duration
+	killGr     time.Duration
+	major      int // SQL Server major version; gates the tail-object walk (2019+ only)
 
 	progress func(ShrinkProgress)
 	wait     func(ctx context.Context, d time.Duration) error
@@ -194,18 +198,19 @@ func NewShrinkRunner(exec Executor, reader ShrinkReader, sampler Sampler, clk Cl
 		logPoll = pollIntv
 	}
 	r := &ShrinkRunner{
-		exec:     exec,
-		reader:   reader,
-		sampler:  sampler,
-		clk:      clk,
-		tuning:   cfg.Tuning,
-		pollIntv: pollIntv,
-		logPoll:  logPoll,
-		blockTO:  cfg.BlockingTimeout,
-		logDrain: cfg.LogDrainTimeout,
-		killGr:   cfg.KillGrace,
-		major:    cfg.SQLMajorVersion,
-		wait:     sleep,
+		exec:       exec,
+		reader:     reader,
+		sampler:    sampler,
+		clk:        clk,
+		tuning:     cfg.Tuning,
+		pollIntv:   pollIntv,
+		blindAfter: BlindAfter,
+		logPoll:    logPoll,
+		blockTO:    cfg.BlockingTimeout,
+		logDrain:   cfg.LogDrainTimeout,
+		killGr:     cfg.KillGrace,
+		major:      cfg.SQLMajorVersion,
+		wait:       sleep,
 	}
 	for _, o := range opts {
 		o(r)
@@ -245,8 +250,7 @@ func (r *ShrinkRunner) Run(ctx context.Context, op ddl.Shrink, res ddl.ResolvedO
 			result, ferr = r.shrinkData(ctx, op, res, ignore, f, sink, tp)
 		}
 		if ferr != nil {
-			// On a graceful stop the partial file result is still worth recording.
-			if errors.Is(ferr, ErrStopped) {
+			if keepsPartialResult(ferr) {
 				results = append(results, result)
 			}
 			return results, ferr
@@ -321,6 +325,9 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 		if outcome == watchedStopped {
 			return nil, ErrStopped
 		}
+		if outcome == watchedBlind {
+			return nil, ErrMonitorBlind
+		}
 	}
 
 	// Phase 1 — per-file chunk loop.
@@ -344,7 +351,7 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 		}
 		res2, cerr := r.chunkLoop(ctx, f, size, final, res, ignore, sink, prof, nil)
 		if cerr != nil {
-			if errors.Is(cerr, ErrStopped) {
+			if keepsPartialResult(cerr) {
 				results = append(results, res2)
 			}
 			return results, cerr
@@ -413,6 +420,10 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	if outcome == watchedStopped {
 		result.Reason = "stopped: graceful stop during TRUNCATEONLY (freed space preserved)"
 		return result, ErrStopped
+	}
+	if outcome == watchedBlind {
+		result.Reason = "stopped: monitoring stopped answering during TRUNCATEONLY (freed space preserved)"
+		return result, ErrMonitorBlind
 	}
 	// A capped TRUNCATEONLY yielded the lock; it did not end the operation. Phase B moves
 	// pages in chunks and applies the same cap per chunk, so it is the right thing to hand
@@ -651,6 +662,9 @@ func (r *ShrinkRunner) shrinkLog(ctx context.Context, op ddl.Shrink, res ddl.Res
 	case watchedStopped:
 		result.Reason = "stopped: graceful stop during the log shrink (freed space preserved)"
 		return result, ErrStopped
+	case watchedBlind:
+		result.Reason = "stopped: monitoring stopped answering during the log shrink (freed space preserved)"
+		return result, ErrMonitorBlind
 	case watchedCapped:
 		// A clean abort, like the log-reuse timeout above: the log shrink has no second
 		// phase to hand over to, and what it truncated is already released, so a re-run
@@ -707,7 +721,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 	// Re-emit progress with the chunk's live server-side percent_complete while it runs.
 	go r.pumpServerProgress(sampleCtx, base)
 
@@ -762,6 +776,14 @@ func (r *ShrinkRunner) cancelAndAwait(cancelExec context.CancelFunc, done <-chan
 	}
 }
 
+// keepsPartialResult reports whether a file's partial result is still worth recording
+// when the operation ends on err. Both cases here stopped a shrink cleanly rather than
+// failing it: the space already released is real, and the reason on the result is how an
+// operator learns why the file is not at its target.
+func keepsPartialResult(err error) bool {
+	return errors.Is(err, ErrStopped) || errors.Is(err, ErrMonitorBlind)
+}
+
 // watchedOutcome is how a runWatchedStatement call ended.
 type watchedOutcome int
 
@@ -775,6 +797,11 @@ const (
 	// session. The statement yielded, the operation did not fail: what it already released
 	// is preserved, so the caller moves on to its next phase or reports a clean abort.
 	watchedCapped
+	// watchedBlind: monitoring stopped answering, so the statement was canceled rather
+	// than left running unobserved. The caller ends the operation with ErrMonitorBlind:
+	// unlike a cap or a graceful stop, this one is not a clean yield but a refusal to
+	// keep going in the dark.
+	watchedBlind
 )
 
 // runTruncateOnly runs the free TRUNCATEONLY pass under monitoring. It is the Phase A
@@ -819,7 +846,7 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 	defer stopWatching()
 	go r.pumpServerProgress(watchCtx, base)
 	samples := make(chan Sample)
-	go pumpSamples(watchCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
+	go pumpSamples(watchCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 
 	maxBlock := blockCap(res.MaxBlockMinutes)
 	var blockedSince time.Time // start of the current continuous blocking streak
@@ -838,6 +865,20 @@ func (r *ShrinkRunner) runWatchedStatement(ctx context.Context, stmt, label stri
 		case err := <-done:
 			return watchedCompleted, err
 		case s := <-samples:
+			// Decided before the cap: the cap is a reaction to blocking we can see, and
+			// s.Blocking is now a stale reading from a channel that has stopped answering.
+			if s.Blind != "" {
+				select {
+				case err := <-done:
+					return watchedCompleted, err
+				default:
+				}
+				sink(ReactionEvent{Kind: "cancel", Detail: fmt.Sprintf(
+					"shrink %q %s stopped: %s stopped answering, so nothing could react; freed space preserved",
+					base.File, label, s.Blind)})
+				r.cancelAndAwait(cancelExec, done, sink, label+" did not stop within the grace period")
+				return watchedBlind, nil
+			}
 			// The poll runs for its side effects (the killers) whatever the cap says.
 			if maxBlock <= 0 {
 				continue
@@ -888,7 +929,7 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 

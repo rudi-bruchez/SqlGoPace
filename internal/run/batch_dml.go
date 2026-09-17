@@ -116,10 +116,14 @@ type BatchDMLRunner struct {
 	tuning   BatchTuning
 	rcsi     bool
 	pollIntv time.Duration
-	logPoll  time.Duration
-	blockTO  time.Duration
-	logDrain time.Duration
-	killGr   time.Duration
+	// blindAfter is how long a monitoring channel may stay silent before this runner
+	// stops the operation. Always BlindAfter in production; a test shortens it rather
+	// than wait two minutes for a hang it staged in milliseconds.
+	blindAfter time.Duration
+	logPoll    time.Duration
+	blockTO    time.Duration
+	logDrain   time.Duration
+	killGr     time.Duration
 
 	progress func(BatchDMLProgress)
 	stop     func() bool // graceful stop (cancellable): finish the current batch, then stop
@@ -150,17 +154,18 @@ func NewBatchDMLRunner(exec BatchExecutor, reader BatchDMLReader, sampler Sample
 		logPoll = cfg.PollInterval
 	}
 	r := &BatchDMLRunner{
-		exec:     exec,
-		reader:   reader,
-		sampler:  sampler,
-		clk:      clk,
-		tuning:   cfg.Tuning,
-		rcsi:     cfg.RCSI,
-		pollIntv: cfg.PollInterval,
-		logPoll:  logPoll,
-		blockTO:  cfg.BlockingTimeout,
-		logDrain: cfg.LogDrainTimeout,
-		killGr:   cfg.KillGrace,
+		exec:       exec,
+		reader:     reader,
+		sampler:    sampler,
+		clk:        clk,
+		tuning:     cfg.Tuning,
+		rcsi:       cfg.RCSI,
+		pollIntv:   cfg.PollInterval,
+		blindAfter: BlindAfter,
+		logPoll:    logPoll,
+		blockTO:    cfg.BlockingTimeout,
+		logDrain:   cfg.LogDrainTimeout,
+		killGr:     cfg.KillGrace,
 	}
 	for _, o := range opts {
 		o(r)
@@ -404,7 +409,7 @@ func (r *BatchDMLRunner) runBatch(ctx context.Context, stmt string, caps Capabil
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, caps.Ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: caps.Ignore, sink: sink, blindAfter: r.blindAfter})
 
 	action, pressure, serr := supervise(ctx, r.clk, caps, r.blockTO, samples, done)
 	if action == Continue {
@@ -439,7 +444,7 @@ func (r *BatchDMLRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, s
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
-	go pumpSamples(sampleCtx, samples, r.sampler, r.pollIntv, r.logPoll, ignore, sink)
+	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
 }
 
