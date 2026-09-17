@@ -14,7 +14,7 @@ and a missing `.env` is a silent no-op rather than an error.
 
 ```yaml
 database:
-  connection_string: "server=${DB_SERVER};database=${DB_NAME};user id=${DB_USER};password=${DB_PASSWORD};encrypt=true;trustServerCertificate=true;app name=SqlGoPace"
+  connection_string: "server=${DB_SERVER};database=${DB_NAME};user id=${DB_USER};password=${DB_PASSWORD};encrypt=true;app name=SqlGoPace"
 ```
 
 `.env` is gitignored, and `.env.example` is the committed template. The running version is

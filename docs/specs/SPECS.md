@@ -795,7 +795,9 @@ For CI / SQL Agent integration:
 
 - **No plaintext credentials.** The connection string and the password come from a **`.env`** file
   (not versioned), not from the YAML. Supports **Windows / Azure AD authentication** and
-  **`encrypt=true`** in the string. Never log the full string / the password.
+  **`encrypt=true`** in the string, and certificate validation left on: the shipped example
+  carried `trustServerCertificate=true` until 0.40.0, which encrypted the session without
+  authenticating the server. Never log the full string / the password.
 - **Minimum permissions** of the service account, to document:
   - `VIEW SERVER STATE` (and `VIEW DATABASE STATE`) for the monitoring DMVs;
   - `ALTER ANY CONNECTION` (or `processadmin` / `sysadmin`) for the `KILL`;
@@ -808,7 +810,7 @@ For CI / SQL Agent integration:
 ```yaml
 database:
   # secrets via .env: ${DB_PASSWORD}, etc. — never in plaintext here
-  connection_string: "server=localhost;database=MYDB;encrypt=true;trustServerCertificate=true;app name=SqlGoPace"
+  connection_string: "server=localhost;database=MYDB;encrypt=true;app name=SqlGoPace"
   login_timeout_seconds: 15      # connection only — NOT a query timeout
   # Driver query timeout = 0 (infinite): no global timeout on a DDL statement.
   # Duration control is delegated to monitoring (blocking / log), never a fixed timer.
