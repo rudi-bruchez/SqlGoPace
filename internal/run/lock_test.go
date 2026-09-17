@@ -118,3 +118,40 @@ func TestQueueLockCreatesTheDirectory(t *testing.T) {
 		t.Fatalf("processing directory not created: stat err = %v", err)
 	}
 }
+
+// Release used to unlock, close, then os.Remove the file, calling the removal cosmetic
+// because the OS lock is what excludes. On Unix the removal is what reopens the race it
+// was meant to have closed: a second process can open and lock the old inode between the
+// unlock and the unlink, the first then unlinks the inode that process still holds, and a
+// third creates a fresh file of the same name and takes an independent lock on it. Two
+// runs then believe they own the queue, and the recovery sweep in one requeues the
+// other's in-flight manifest.
+//
+// The file staying behind costs nothing: a crashed run already leaves it, which is the
+// documented and harmless case, and the holder line inside is only ever read by a process
+// that has just failed to take the lock.
+func TestQueueLockLeavesTheFileInPlace(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, run.QueueLockName)
+
+	first, err := run.LockQueue(dir)
+	if err != nil {
+		t.Fatalf("LockQueue() error = %v", err)
+	}
+	if err := first.Release(); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("lock file gone after Release: %v — removing it reopens the flock/unlink race", err)
+	}
+
+	// And the next run must still be able to take it, on that same inode.
+	second, err := run.LockQueue(dir)
+	if err != nil {
+		t.Fatalf("second LockQueue() error = %v, want the released lock to be takeable", err)
+	}
+	if err := second.Release(); err != nil {
+		t.Errorf("second Release() error = %v", err)
+	}
+}

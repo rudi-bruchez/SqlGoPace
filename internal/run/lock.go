@@ -77,19 +77,29 @@ func LockQueue(dir string) (*QueueLock, error) {
 	return &QueueLock{f: f}, nil
 }
 
-// Release drops the lock and removes the file. Removing it is cosmetic — the OS lock
-// is what excludes — so a failure to remove is not reported.
+// Release drops the lock and leaves the file where it is.
+//
+// It used to remove it too, on the argument that the OS lock is what excludes and the
+// file is cosmetic. Both halves of that are true and the conclusion was still wrong: on
+// Unix the unlink is what reopens the race the lock exists to close. A second process can
+// open and flock the old inode in the window between the unlock and the unlink; this
+// process then unlinks the inode that one is holding; a third creates a fresh file of the
+// same name and takes an independent lock on it. Two runs now believe they own the queue,
+// and the recovery sweep in one requeues the other's in-flight manifest — which is the
+// exact outcome LockQueue was written to prevent.
+//
+// Leaving it costs nothing. A crashed run already leaves it behind, which is the
+// documented harmless case, and the holder line inside is only ever read by a process
+// that has just failed to take the lock.
 func (l *QueueLock) Release() error {
 	if l == nil || l.f == nil {
 		return nil
 	}
-	name := l.f.Name()
 	err := unlockFile(l.f)
 	if cerr := l.f.Close(); err == nil {
 		err = cerr
 	}
 	l.f = nil
-	_ = os.Remove(name)
 	return err
 }
 

@@ -213,12 +213,21 @@ Beside each manifest, in `03.done/` or `04.failed/`:
 | `<manifest>.blocked.yaml` | the sessions this run blocked — **their SQL text**, login, host and program, ready to paste back as `ignore_blocked_sessions` rules | `0600` |
 | `<manifest>.contended.yaml`, `<manifest>.amplifiers.yaml` | the same shape for contention and for maintenance statements terminated | `0600` |
 | `sqlgopace_history.db` | one row per run, with the object names, kept across runs | created by SQLite, `0644` on Unix |
+| `02.processing/.sqlgopace.lock` | the queue lock: one line naming the process that last held it | `0600` |
 
 The capture sidecars are the ones to be careful with: `active_query` and `parent_query` are
 verbatim statements from someone else's application, literals included. They are written
 owner-only, and they stay sensitive when you copy them into a ticket, an email or a
 repository. The queue directories themselves are `0755`, so their *file names* — which
 usually carry a database name — are readable by any local account.
+
+**Leave `.sqlgopace.lock` alone.** It stays in `02.processing/` after a run ends, and an
+empty-looking one is not stale: exclusion is an OS lock on the open file, not the file's
+existence, so a run that crashed leaves nothing to clean up and a run that exited cleanly
+leaves the same file behind. Deleting it while another run holds it lets a third run take a
+second, independent lock on a new file of the same name — two runs then both believe they
+own the queue, and the recovery sweep in one can requeue the other's in-flight manifest.
+Until 0.42.0 SqlGoPace deleted it itself on a clean exit, which opened that same window.
 
 | Key | Action |
 |---|---|
