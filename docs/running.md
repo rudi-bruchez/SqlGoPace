@@ -203,6 +203,23 @@ Where the ring buffer cannot be read — Azure SQL Database on Basic/S0/S1 or in
 the `cpu` segment is left out and the rest of the line still renders. On Azure the figure would
 in any case describe the machine hosting the database, not the database's own limit.
 
+### What a run leaves on disk
+
+Beside each manifest, in `03.done/` or `04.failed/`:
+
+| File | What it carries | Mode |
+|---|---|---|
+| `<manifest>.log` | the run report: operations, reactions, timings, and the names of the databases, tables and indexes touched | `0600` |
+| `<manifest>.blocked.yaml` | the sessions this run blocked — **their SQL text**, login, host and program, ready to paste back as `ignore_blocked_sessions` rules | `0600` |
+| `<manifest>.contended.yaml`, `<manifest>.amplifiers.yaml` | the same shape for contention and for maintenance statements terminated | `0600` |
+| `sqlgopace_history.db` | one row per run, with the object names, kept across runs | created by SQLite, `0644` on Unix |
+
+The capture sidecars are the ones to be careful with: `active_query` and `parent_query` are
+verbatim statements from someone else's application, literals included. They are written
+owner-only, and they stay sensitive when you copy them into a ticket, an email or a
+repository. The queue directories themselves are `0755`, so their *file names* — which
+usually carry a database name — are readable by any local account.
+
 | Key | Action |
 |---|---|
 | `i` | Ignore the selected session: writes an `ignore_blocked_sessions` rule into the running manifest, hot-reloaded. |

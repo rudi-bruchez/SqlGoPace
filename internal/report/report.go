@@ -323,7 +323,10 @@ func WriteFile(path string, r RunReport) error {
 	if err := Write(&buf, r); err != nil {
 		return err
 	}
-	if err := os.WriteFile(path, buf.Bytes(), 0o644); err != nil {
+	// 0600, like the .blocked.yaml / .amplifiers.yaml sidecars it sits beside: a run
+	// report names the client's databases, tables and indexes, and three files of one
+	// run with two different modes is an accident waiting to be copied.
+	if err := os.WriteFile(path, buf.Bytes(), 0o600); err != nil {
 		return fmt.Errorf("write report: %w", err)
 	}
 	return nil

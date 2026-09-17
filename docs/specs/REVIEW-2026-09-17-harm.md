@@ -171,31 +171,28 @@ precisely so a manifest can be parked — and a rename within one directory is a
 appears complete or not at all. `Engine.writeRecovery` (`engine.go:1457`) has the same shape but
 writes into `04.failed/`, which nothing scans, so it needs no fix.
 
-### 5. MODERATE — the run artifacts carry other sessions' SQL text, and are written world-readable
+### 5. MINOR — one run artifact was world-readable while its siblings were owner-only
 
-`internal/run/capture.go:216-217` writes `active_query` and `parent_query` of every blocking
-session into `<manifest>.blocked.yaml`, along with its login, host and program name. That is the
-text of the client's *application* statements, literals included — order ids, account numbers,
-whatever the application passes inline. The `.contended.yaml` and `.amplifiers.yaml` sidecars and
-the `.log` report are the same class, and the SQLite history (`history.enabled: true` by default,
-written to `./sqlgopace_history.db`) accumulates the object names of every run.
+**Corrected after the first draft of this review, which overstated it as MODERATE.** The claim
+was that the run artifacts carry other sessions' SQL text and are written `0644`. The first half
+is true of the capture sidecars and the second half is not: `capture.go:160` and
+`amplifier_capture.go:161` already write `0600`, as does the scaffolded `.env.example`
+(`scaffold.go:38`, with a comment explaining why). The `.log` run report was `0644`, and it
+carries no statement text at all — `report.go` records counts ("peak blocked: N session(s)") and
+object names, not queries. The draft read the modes of the files it could grep and attributed to
+them the contents of the files it had opened.
 
-They are written `0644` in directories created `0755` (`engine.go:1457`, `report/report.go:326`,
-`plan.go:396`, `queue.go:35`, `lock.go:51`, `scaffold.go:66,96`). On the shared Linux or macOS
-jump host where a tool of this kind usually lives, every local account can read them. On Windows
-the mode is largely inert and inherited ACLs govern, which is why this is easy to miss from a
-Windows checkout — it is the author's platform.
+What is left, and it is small: a run wrote one file at `0644` beside three at `0600`, all naming
+the same client's databases, tables and indexes. Three files of one run under two different modes
+is an accident waiting to be copied. The queue directories are `0755`, so the *file names* — which
+usually carry a database name — are readable by any local account, and the SQLite history is
+created by the driver at whatever mode it chooses.
 
-Nothing in `docs/` says the sidecars contain third-party statement text, so an operator has no
-reason to treat the queue directory as sensitive. This is also the mechanism by which a client's
-object names end up somewhere they should not: this repository's own working tree holds
-`.blocked.yaml` captures naming a real database and a real stored procedure, gitignored only
-because someone thought to ignore the whole directory.
-
-Smallest fix: `0600` for the artifacts and `0700` for the lifecycle directories (code, one
-constant per call site), plus one sentence in `docs/running.md` saying what the sidecars contain
-and that they should be treated as production data. The permission half is Unix-only in effect;
-the documentation half is what protects a Windows operator who pastes a sidecar into a ticket.
+Fixed here by moving the `.log` to `0600` and documenting, in `docs/running.md`, what each
+artifact carries — including that the capture sidecars hold verbatim statements from someone
+else's application, which is the fact an operator needs before pasting one into a ticket. The
+directory modes are left alone: a `0600` file inside a `0755` directory is still unreadable, and
+tightening the directories would break an operator who reads their own queue as another account.
 
 ### 6. MODERATE — the data-free-space guard covers rebuilds only, and two operations in the same space class are not checked
 
