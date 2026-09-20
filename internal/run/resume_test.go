@@ -117,10 +117,14 @@ func TestResumeCursorAdvancesProgressively(t *testing.T) {
 
 // sqlCapturingRunner records the statement it is handed for each operation, so a test
 // can assert the engine issued ALTER INDEX … RESUME rather than a fresh REBUILD.
-type sqlCapturingRunner struct{ sqls []string }
+type sqlCapturingRunner struct {
+	sqls []string
+	caps []run.Capabilities
+}
 
-func (r *sqlCapturingRunner) Run(_ context.Context, _ ddl.Operation, sql string, _ run.Capabilities, _ run.ReactionSink) error {
+func (r *sqlCapturingRunner) Run(_ context.Context, _ ddl.Operation, sql string, caps run.Capabilities, _ run.ReactionSink) error {
 	r.sqls = append(r.sqls, sql)
+	r.caps = append(r.caps, caps)
 	return nil
 }
 
@@ -172,6 +176,35 @@ func TestResumeAdoptsOwnPausedResumable(t *testing.T) {
 	}
 	if !strings.Contains(runner.sqls[0], "RESUME") {
 		t.Errorf("the recorded own paused resumable should RESUME, got: %q", runner.sqls[0])
+	}
+	// A bare RESUME is documented as WAIT_AT_LOW_PRIORITY (MAX_DURATION = 0,
+	// ABORT_AFTER_WAIT = NONE) — normal-priority waiting. The manifest asked to yield,
+	// so the resume must say so again; SQL Server does not remember it across the pause.
+	if !strings.Contains(runner.sqls[0], "WAIT_AT_LOW_PRIORITY") {
+		t.Errorf("the RESUME dropped WAIT_AT_LOW_PRIORITY and will wait at normal priority: %q", runner.sqls[0])
+	}
+}
+
+// TestRunnerGetsLowPriorityOptions pins the other resume path. The pressure loop builds its
+// own RESUME from the Capabilities it was handed and nothing else, so an engine that does
+// not pass the resolved options makes every pressure-driven resume wait at normal priority
+// — and that is the resume that happens most, once per log-pressure pause.
+func TestRunnerGetsLowPriorityOptions(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, _ := setupEngine(t, fakePreflighter{}, runner, run.WithSession(fakeSession{spid: 70}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if len(runner.caps) != 1 {
+		t.Fatalf("runner ran %d operations, want 1", len(runner.caps))
+	}
+	got := runner.caps[0].Options
+	if !got.WaitAtLowPriority {
+		t.Fatalf("Capabilities.Options = %+v; the pressure-driven RESUME has no other source for the clause", got)
+	}
+	if got.AbortAfterWait == "" || got.MaxDurationMinutes <= 0 {
+		t.Errorf("Options = %+v, want a usable ABORT_AFTER_WAIT and MAX_DURATION (SELF is invalid at MAX_DURATION = 0)", got)
 	}
 }
 

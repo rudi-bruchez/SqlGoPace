@@ -390,7 +390,9 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		if useTUI {
 			current = &currentManifest{}
 			fwd = &tuiForwarder{}
-			extra = append(extra, run.WithManifestObserver(current.set), run.WithAlertSink(fwd.alert), run.WithNoticeSink(fwd.notice))
+			extra = append(extra, run.WithManifestObserver(current.set),
+				run.WithAlertSink(fwd.alert), run.WithNoticeSink(fwd.notice),
+				run.WithReactionSink(fwd.reaction))
 		}
 		engine, tempdbConn, berr := buildEngine(runCtx, cfg, matrix, dbConn, dbInfo, dirs, engineOut, history, fwd, drain.Draining, extra...)
 		if berr != nil {
@@ -1300,6 +1302,31 @@ func (f *tuiForwarder) shrink(p run.ShrinkProgress) { f.send(shrinkMsg(p)) }
 // operator sees the reason (e.g. a shrink refused for lack of db_owner) on screen.
 func (f *tuiForwarder) alert(mf run.ManifestFailure) {
 	f.send(tui.AlertMsg{Title: "manifest failed: " + mf.Manifest + " — " + mf.Error, Lines: mf.Details})
+}
+
+// reaction forwards an engine reaction to the console. In TUI mode the engine's own
+// narration goes to io.Discard (main.go:206), so without this the operator never learns
+// that the operation paused, nor why — the same trap the amplifier-kill forwarder above
+// works around.
+func (f *tuiForwarder) reaction(ev run.ReactionEvent) {
+	for _, msg := range reactionMsgs(ev) {
+		f.send(msg)
+	}
+}
+
+// reactionMsgs maps an engine reaction to the console messages that announce it. Every
+// reaction is narrated; pause and resume additionally move the displayed state, because a
+// paused operation is stopped and the status line would otherwise read RUNNING with a
+// frozen ETA — indistinguishable from a hung rebuild.
+func reactionMsgs(ev run.ReactionEvent) []any {
+	msgs := []any{tui.LogMsg{Line: ev.Kind + ": " + ev.Detail}}
+	switch ev.Kind {
+	case "pause":
+		msgs = append(msgs, tui.PausedMsg{Paused: true, Reason: ev.Detail})
+	case "resume":
+		msgs = append(msgs, tui.PausedMsg{Paused: false})
+	}
+	return msgs
 }
 
 // notice forwards the manifest-start rollback-on-cancel notice (CANCEL-ONLY.md §2) to

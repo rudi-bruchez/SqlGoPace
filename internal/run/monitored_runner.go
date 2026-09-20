@@ -107,7 +107,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 		func() error { return r.awaitRelief(ctx, caps.Ignore, sink) },
 		func() (string, error) {
 			sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared"})
-			return ddl.ResumableControlSQL(op, "RESUME")
+			return ddl.ResumeSQL(op, caps.Options)
 		},
 		reissueFor(op, sql, sink),
 	)

@@ -18,7 +18,9 @@ type Status int
 const (
 	// StatusRunning means the DDL is executing.
 	StatusRunning Status = iota
-	// StatusPaused means a resumable operation is paused.
+	// StatusPaused means a resumable operation is paused. Like StatusSuspended it is a
+	// display-only state, derived from PausedMsg rather than set as the lifecycle status,
+	// so a pause cannot erase a drain the operator requested.
 	StatusPaused
 	// StatusCancelling means a cancel/kill is in progress.
 	StatusCancelling
@@ -134,6 +136,14 @@ type (
 	WaitsMsg struct {
 		Categories []WaitCategory
 		TotalMS    int64
+	}
+	// PausedMsg reports that the reaction loop paused the resumable operation, and why.
+	// The engine narrates this on its reaction sink; in console mode that sink's text
+	// output is io.Discard, so without this message the pause reaches only the .log and
+	// the console reads RUNNING with a frozen ETA for the whole pause.
+	PausedMsg struct {
+		Paused bool
+		Reason string
 	}
 	// StatusMsg updates the lifecycle status (and optionally the operation label). A
 	// non-zero StepTotal sets the manifest-level "op i/N" counter; a non-zero
@@ -355,6 +365,8 @@ type Model struct {
 	percent         float64
 	etaSeconds      int64
 	rollbackPercent float64
+	paused          bool   // the reaction loop paused the resumable operation
+	pauseReason     string // why, as the reaction event narrated it
 	batch           BatchMsg
 	hasBatch        bool
 	shrink          ShrinkMsg
@@ -415,10 +427,16 @@ func (m Model) Init() tea.Cmd { return tick() }
 // request); the lifecycle states (paused, draining, canceling, done) take precedence
 // over the transient block, so the substitution applies only while RUNNING.
 func (m Model) displayStatus() Status {
-	if m.status == StatusRunning && m.blockedBy.Blocked {
+	if m.status != StatusRunning {
+		return m.status // draining, canceling and done outrank both derived states
+	}
+	switch {
+	case m.paused:
+		return StatusPaused // stopped, so not merely blocked
+	case m.blockedBy.Blocked:
 		return StatusSuspended
 	}
-	return m.status
+	return StatusRunning
 }
 
 // setOpStatus sets the status of the operation with the given 1-based index in the
@@ -560,6 +578,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case WaitsMsg:
 		m.waits = msg.Categories
 		m.waitTotalMS = msg.TotalMS
+	case PausedMsg:
+		m.paused = msg.Paused
+		m.pauseReason = msg.Reason
+		if !msg.Paused {
+			// Whatever was on screen was measured before the pause; the next progress
+			// poll replaces it. Leaving a stale ETA would count down from a standstill.
+			m.etaSeconds = 0
+		}
 	case StatusMsg:
 		m.status = msg.Status
 		if msg.Operation != "" {

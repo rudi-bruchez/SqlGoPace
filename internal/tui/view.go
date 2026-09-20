@@ -344,10 +344,19 @@ func (m Model) opStatusBody() string {
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
 	default:
 		fmt.Fprintf(&b, "progress: %.0f%%", m.percent)
+		// While paused the percentage is the last one measured and nothing advances, so
+		// an ETA would count down from a standstill. Name the pause and its cause instead:
+		// a frozen number is only misleading when it is unlabelled.
+		switch {
+		case m.paused:
+			b.WriteString("   PAUSED")
+			if m.pauseReason != "" {
+				fmt.Fprintf(&b, " — %s", m.pauseReason)
+			}
 		// Humanized like every other duration in the console ("6m35s", "1h04m"):
 		// a raw second count is unreadable past a few minutes. Omitted entirely
 		// when zero — nothing has been measured, and "ETA: 0s" reads as "done".
-		if m.etaSeconds > 0 {
+		case m.etaSeconds > 0:
 			fmt.Fprintf(&b, "   ETA %s", humanizeMS(m.etaSeconds*1000))
 		}
 		if m.rollbackPercent > 0 {

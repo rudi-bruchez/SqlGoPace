@@ -136,6 +136,12 @@ work; see [blocking-and-kills.md](blocking-and-kills.md#rollback-on-cancel-opera
 `--tui` replaces the silent run with a live console: the running operation and its
 progress, the sessions it is blocking, the sessions blocking it, and the reaction feed.
 
+The status line reads `PAUSED` with its cause — usually transaction-log pressure — whenever
+the reaction loop has stopped the operation, and the percentage stays at the last value
+measured with no ETA beside it, because nothing is advancing. A pause is normal and clears
+itself; it commonly lasts ten to twenty minutes while a log backup runs. `DRAINING` and
+`CANCELING` outrank it, so a stop you requested is never hidden by a pause.
+
 The operations panel is titled with the manifest being run. The `op i/N` counter restarts at 1
 for each manifest, so the counter says where the run is inside one and the title says which.
 
@@ -386,6 +392,11 @@ During a run this is handled automatically. If the paused operation is this mani
 interrupted work, the run resumes it with `ALTER INDEX … RESUME`, reusing the server-side
 progress rather than restarting. Ownership is matched by identity, the operation index plus
 the target object, never by cursor position.
+
+The RESUME restates `WAIT_AT_LOW_PRIORITY` from the operation's options. SQL Server does
+not remember it across a pause: omitting it on RESUME is documented as `MAX_DURATION = 0,
+ABORT_AFTER_WAIT = NONE`, which waits at normal priority. The same applies to the pause
+and resume the monitoring loop performs by itself under transaction-log pressure.
 
 A stale or foreign paused resumable that would block a fresh rebuild fails the operation
 with a message pointing at the subcommand below, unless the manifest opts in:

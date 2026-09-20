@@ -3,6 +3,8 @@ package run
 import (
 	"fmt"
 	"time"
+
+	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 )
 
 // Pressure describes why the engine may need to react: the DDL is blocking other
@@ -105,7 +107,13 @@ func noteRepin(sink ReactionSink, before, after int) {
 // determines the least-destructive reaction available.
 type Capabilities struct {
 	Resumable bool // the running operation can PAUSE/RESUME
-	ADR       bool // Accelerated Database Recovery makes a KILL rollback cheap
+	// Options are the resolved options the statement was generated from. The pause/
+	// resume loop needs them because SQL Server does not remember WAIT_AT_LOW_PRIORITY
+	// across a pause: a bare RESUME is documented as MAX_DURATION = 0,
+	// ABORT_AFTER_WAIT = NONE, which waits at normal priority. Zero value renders the
+	// bare form, which is right for an operation that never asked to yield.
+	Options ddl.ResolvedOptions
+	ADR     bool // Accelerated Database Recovery makes a KILL rollback cheap
 	// CancelSafe marks an operation whose cancellation is a clean stop with no
 	// expensive rollback: REORGANIZE commits incrementally, DBCC CHECKDB is a
 	// read-only snapshot, UPDATE STATISTICS rolls back cheaply. It does not change

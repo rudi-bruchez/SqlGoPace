@@ -25,7 +25,7 @@
 > manifest (a sidecar existed at claim time → `resumed` flag returned by `writeSidecar`), if the
 > **op at the cursor boundary** (`i == resumeFrom`) carries a **PAUSED** resumable on the server
 > (`PausedResumable`), the engine emits `ALTER INDEX … RESUME` (`resumeStatement` →
-> `ddl.ResumableControlSQL(op,"RESUME")`) instead of the REBUILD — which SQL Server would reject
+> `ddl.ResumeSQL(op, options)`, which since 0.45.0 restates WAIT_AT_LOW_PRIORITY) instead of the REBUILD — which SQL Server would reject
 > as long as a resumable is paused — reusing the whole `MonitoredRunner` (which already knows the
 > pause/resume loop). Guardrail against a "foreign resumable": never RESUME on a **fresh** manifest
 > nor on an op that **never started** (options may differ). Recovery **preserves the sidecar** on
@@ -88,7 +88,7 @@ is alive** and **in reaction to pressure** (log / locks), not on user interrupti
   (`internal/run/monitored_runner.go:132-159`).
 - `runLoop` waits for relief, then re-issues the resume statement
   (`internal/run/monitored_runner.go:105-130`), which is a true `ALTER INDEX … RESUME`
-  (`internal/run/monitored_runner.go:89`, `ddl.ResumableControlSQL(op, "RESUME")`).
+  (`internal/run/monitored_runner.go`, `ddl.ResumeSQL(op, caps.Options)` since 0.45.0).
 
 This is the "WAIT_AT_LOW_PRIORITY → RESUMABLE pause/resume → KILL" mechanism from the product
 docs. **It does not cover external interruption** (Ctrl+C / kill / crash).

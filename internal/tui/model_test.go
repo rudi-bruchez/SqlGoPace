@@ -1046,3 +1046,48 @@ func TestProgressETAOmittedWhenUnknown(t *testing.T) {
 		t.Errorf("View() announces an ETA it has not measured\n%s", view)
 	}
 }
+
+// A resumable operation held by transaction-log pressure is stopped, not running. The
+// console said RUNNING for the whole pause and kept the last ETA on screen, which is
+// indistinguishable from a hung rebuild — the reaction that explains it only ever reached
+// the .log sidecar, because in console mode the engine's narration goes to io.Discard.
+func TestPausedShowsReasonAndHidesStaleETA(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.ProgressMsg{Percent: 97, ETASeconds: 120})
+	m, _ = send(m, tui.PausedMsg{Paused: true, Reason: "transaction log over cap (reuse_wait=LOG_BACKUP)"})
+	v := m.View()
+	if !strings.Contains(v, "[PAUSED]") {
+		t.Errorf("a paused operation must not read RUNNING\n%s", v)
+	}
+	if !strings.Contains(v, "LOG_BACKUP") {
+		t.Errorf("the operator must see WHY it is paused\n%s", v)
+	}
+	if strings.Contains(v, "ETA") {
+		t.Errorf("the ETA is frozen while paused and must not be shown\n%s", v)
+	}
+	if !strings.Contains(v, "97%") {
+		t.Errorf("the percentage reached is still worth showing\n%s", v)
+	}
+}
+
+// Resuming returns to RUNNING and drops the reason.
+func TestResumeClearsThePausedState(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.PausedMsg{Paused: true, Reason: "transaction log over cap"})
+	m, _ = send(m, tui.PausedMsg{Paused: false})
+	if v := m.View(); !strings.Contains(v, "[RUNNING]") || strings.Contains(v, "transaction log over cap") {
+		t.Errorf("resume should clear the pause and its reason\n%s", v)
+	}
+}
+
+// A pause during a requested drain must not erase the drain: the drain is a decision the
+// operator made and it is still pending, while the pause is the reaction loop narrating the
+// current operation. Same precedence the block substitution already obeys.
+func TestDrainOutranksPaused(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.StatusMsg{Status: tui.StatusDraining})
+	m, _ = send(m, tui.PausedMsg{Paused: true, Reason: "transaction log over cap"})
+	if v := m.View(); !strings.Contains(v, "[DRAINING]") {
+		t.Errorf("draining should outrank the pause\n%s", v)
+	}
+}

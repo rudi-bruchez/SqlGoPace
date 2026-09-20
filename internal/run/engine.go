@@ -215,6 +215,7 @@ type Engine struct {
 	opListSink       func(string, []OpInfo)      // manifest name + its full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
 	noticeSink       func(string)                // notified with the manifest-start rollback-on-cancel notice (TUI)
+	reactionSink     func(ReactionEvent)         // notified of every reaction as it happens (TUI)
 	compression      CompressionReader           // reads current index compression for the intent: compression skip
 	drain            func() bool                 // reports a requested graceful stop (cancellable DrainFlag)
 	serverClock      ServerClock                 // reads SQL Server local time for manifest windows
@@ -343,6 +344,13 @@ func WithAlertSink(f func(ManifestFailure)) EngineOption { return func(e *Engine
 // sent in the order they happen, so the later notice replaces the earlier. Without it the
 // notices are unaffected: they still go to e.out and the report.
 func WithNoticeSink(f func(string)) EngineOption { return func(e *Engine) { e.noticeSink = f } }
+
+// WithReactionSink forwards every reaction (pause, resume, cancel, kill, abort, warn,
+// info) as it happens, for a presentation layer that cannot read the engine's own
+// narration — the console, where that narration goes to io.Discard.
+func WithReactionSink(f func(ReactionEvent)) EngineOption {
+	return func(e *Engine) { e.reactionSink = f }
+}
 
 // WithCompressionReader lets the engine honor a rebuild's intent: compression by
 // reading an index's current compression and skipping a rebuild already at its target.
@@ -864,7 +872,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		return endRun(e.finalizeDrained(ctx, r.name, r.rep, r.start, r.cursor, len(r.planned), r.failedOps))
 	}
 	opStart := e.clk.Now()
-	caps := Capabilities{Resumable: step.Options.Resumable, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: r.ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
+	caps := Capabilities{Resumable: step.Options.Resumable, Options: step.Options, ADR: e.adr, CancelSafe: cancelSafe(step.Operation), IgnoreBlocking: step.Options.IgnoreBlocking, Ignore: r.ignore, MaxBlock: blockCap(step.Options.MaxBlockMinutes), Stop: e.drain}
 
 	// Manifest-level progress: the started event is emitted now; a finished event
 	// derived from it is emitted at each terminal outcome below.
@@ -936,6 +944,13 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 			peakBlocked = blocked
 		}
 		reactionMu.Unlock()
+		// Presentation, after the report has the event: the console cannot read the
+		// engine's narration (io.Discard in TUI mode), so a pause would otherwise show
+		// as RUNNING for its whole duration. Carries the enriched detail, which includes
+		// the percentage reached and the sessions being blocked.
+		if e.reactionSink != nil {
+			e.reactionSink(ReactionEvent{Kind: ev.Kind, Detail: detail})
+		}
 		if capture {
 			e.notify(ctx, ev.Kind, r.name, fmt.Sprintf("%s on %s (%s)", ev.Kind, opTarget(step.Operation), detail))
 		}
@@ -1000,7 +1015,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		// Our own paused resumable from a previous run, recorded in the sidecar. Continue it
 		// whatever the current resolve says about resumability. If nothing is actually paused
 		// now, resumeStatement declines and the planned REBUILD runs (a clean restart).
-		if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
+		if resume, ok := e.resumeStatement(ctx, step.Operation, step.Options); ok {
 			stmt = resume
 			sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
 		}
@@ -1646,7 +1661,7 @@ func (e *Engine) resumableInterruption(ctx context.Context, op ddl.Operation) bo
 // which SQL Server rejects while a resumable is paused. ok is false when no probe is
 // wired, when nothing is paused (or the probe errors), or when op does not support
 // resumable control; the caller then runs the planned REBUILD.
-func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation) (string, bool) {
+func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation, res ddl.ResolvedOptions) (string, bool) {
 	if e.resumeCheck == nil {
 		return "", false
 	}
@@ -1655,7 +1670,7 @@ func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation) (string,
 	if err != nil || !paused {
 		return "", false
 	}
-	stmt, err := ddl.ResumableControlSQL(op, "RESUME")
+	stmt, err := ddl.ResumeSQL(op, res)
 	if err != nil {
 		return "", false
 	}

@@ -936,15 +936,6 @@ Raised by two external code reviews and an external harm review of the 0.44.0 re
 Each was verified as real and deliberately left undone; the reasoning is what decides
 whether it is still the right call.
 
-- **`ALTER INDEX … RESUME` drops the manifest's lock policy.** `ddl.ResumableControlSQL(op,
-  "RESUME")` emits a bare RESUME. Microsoft documents that omitting `WAIT_AT_LOW_PRIORITY`
-  on RESUME means `MAX_DURATION = 0` with `ABORT_AFTER_WAIT = NONE` — the resumed rebuild
-  waits at *normal* priority, against the traffic the manifest told it to yield to. 0.44.0
-  closed this for the statement-recognized path (it re-executes the original REBUILD, which
-  carries the options), but the **sidecar-recognized path still emits the bare RESUME**.
-  RESUME accepts `WITH (MAXDOP, MAX_DURATION, WAIT_AT_LOW_PRIORITY(...))`, so the fix is to
-  render the resolved options there. Deferred only because it sits in `ddl/control.go` and
-  wanted its own tests; on a 24/7 database it is the more likely path to bite.
 - **Automatic resumption has no gate.** A paused rebuild whose stored statement matches is
   now resumed without confirmation. The harm review's first finding: a DBA may have paused
   that rebuild *deliberately* to relieve pressure, and the tool would silently undo it. The
@@ -980,6 +971,87 @@ table and index names to stdout, the `.log` sidecar and the SQLite history for e
 operation it runs, and `CLAUDE.md`'s rule is about what reaches *the repository*, not what
 a run prints about the database it is pointed at. Scoping the scan to the run's database
 would still be reasonable on noise grounds.
+### Found while shipping 0.45.0 (2026-09-20)
+
+The first two were seen in a live production campaign; the rest come from the harm review and
+the external codex review of the same day and were verified here in code. None is scheduled.
+
+- **A graceful stop is invisible while waiting for relief.** The drain is checked in the
+  statement supervisor (`internal/run/executor.go:273`), which only runs while a statement is
+  executing — and a paused operation is running none. `waitForRelief` has its own loop and
+  consults monitor blindness, the log cap and the drain timeout, never `caps.Stop`. Measured:
+  `d` pressed while the operation was paused on `LOG_BACKUP`; the stop was honoured at
+  14:32:25Z, one second after the 14:32:24Z resume, fifteen minutes later. So the drain waits
+  out the pressure, spends a full resume cycle and its log, and pauses again immediately. The
+  operation is *already* paused when the request arrives: there is nothing to finish. Fix:
+  check `stopRequested(caps.Stop)` in `waitForRelief` and return a stop, so `runLoop` ends
+  without resuming. Deferred only because it surfaced mid-campaign.
+- **The operation index disagrees with itself in the failure message.** The report lists
+  `[10] rebuild_index …` and the error underneath reads `operation 9 (rebuild_index)
+  interrupted by a graceful stop` — the display is 1-based, the internal cursor 0-based.
+  Cosmetic, but an operator grepping a log for the operation they just watched finds nothing.
+- **The ETA is still wrong, and the 0.43.0 change was cosmetic.** Measured against a live
+  rebuild: at 44.66% with 128 s of request elapsed, `Progress.ETASeconds()` returns 158.6 s and
+  `sys.dm_exec_requests.estimated_completion_time` returns 158 s. They are the same number —
+  the server computes that column the same way, so replacing it changed the provenance and not
+  the value. Real remaining, from the observed rate of 4.39 pct/min, was ~12.6 minutes. Cause:
+  `percent_complete` is cumulative over the resumable operation's whole life while
+  `total_elapsed_time` restarts at each RESUME, so after a pause the two are on different
+  clocks and the error is the ratio between them (720 s / 128 s = 5.6 here). Fix: use
+  `sys.index_resumable_operations.total_execution_time`, already read into
+  `ResumableOp.ExecutionMinutes` since 0.44.0, as the elapsed term — or derive the rate from
+  two successive samples, which is immune to any clock mismatch. Neither is implemented or
+  tested. Until one is, the console shows a number that is wrong by about 5x while it matters
+  most, which is worse than showing none.
+- **`plan` estimates compression on every eligible object before the size ceiling applies.**
+  `internal/plan/plan.go:158` and `:181` call `estimateFor` gated only by `estimable(row)` and
+  the include/exclude rules; `rebuild_max_size_mb` is applied later, in the decision layer. A
+  1.4 TB index the ceiling will reject is therefore sampled twice, ROW then PAGE, and
+  per-partition mode multiplies the calls. Microsoft documents that
+  `sp_estimate_data_compression_savings` scans the source under read committed, acquires an IS
+  lock and loads a sampled equivalent into tempdb, while `docs/specs/MAINTENANCE.md:72`
+  promises "no locks ... beyond cheap reads" and `docs/maintenance-planner.md:40` says dry-run
+  takes "no locks". The documentation half is the dangerous one: that claim is what makes an
+  operator willing to run it against production. Found by codex, verified here in code.
+- **The resume cursor's fingerprint ignores operation content.** `planFingerprint`
+  (`internal/run/engine.go`) hashes only `CommandType()` and `opTarget()`, so editing a
+  completed operation's compression, partition, column type, default or batch predicate leaves
+  the fingerprint unchanged and the cursor skips it. For compression the damage is bounded —
+  `skipSatisfied` re-reads the server and rebuilds when the target differs, observed working on
+  a live manifest — but nothing re-checks a batch-DML predicate or a column type. Found by
+  codex, verified here in code.
+
+- **A log-pressure pause never says which threshold fired, or at what value.** `LogSample`
+  (`internal/run/executor.go:60`) carries only `OverCap bool` and `ReuseWait string`.
+  `ServerSampler.Log` computes `used >= logMaxBytes || used% >= logMaxPercent` and then
+  discards both measurements, so `Pressure.reason()` can only say "transaction log over cap".
+  The operator cannot tell whether the absolute byte cap or the percentage tripped, nor how
+  far over it was. Found the hard way: an operator watching a campaign pause repeatedly asked
+  why, with 79% of a 260 GB log file free — answering it took reading the source and querying
+  the server, because the report could not. The byte cap had been left at the shipped 50 GB
+  while the file was 260 GB, so it fired at 20% full. Fix: carry `UsedBytes`, `UsedPercent`
+  and the rule that fired in `LogSample`, and render them — `used 53.7 GB >= 50 GB cap; file
+  20% used; reuse_wait=LOG_BACKUP`. Cheap, and it converts a support question into a line of
+  the report.
+- **Nothing says which configuration file the run loaded.** The banner names the server,
+  edition, version and recovery model, and the `.log` names the manifest and the binary
+  version, but neither names the resolved `--config` path or the thresholds it carried. A
+  checkout can easily hold two divergent configs — this one had `config-local.yaml` and
+  `local/config.yaml` disagreeing on `blocking_timeout_minutes`, `max_retry_attempts`, the
+  notification events and the whole `shrink` block — and editing the wrong one is silent. It
+  was caught here only because the unused file's `matrix_file` resolved to a path that does
+  not exist. Fix: print the absolute config path at startup and record it in the `.log`
+  sidecar, next to the version already recorded there.
+
+Five more came from the same codex review, concluded by reading and **not** verified here, so
+re-derive each before acting: the data-space preflight warns and proceeds on a file with
+unlimited growth without ever reading volume free space; `max_chunk_seconds` does not cancel a
+chunk already running, and a failed self-KILL is followed by an unbounded join; `finalize`
+deletes the sidecar before the queue move has succeeded and can report SUCCESS with the
+manifest stranded in `02.processing`; the README's categorical "takes no lock" for dry-run is
+false in connected mode; and the queue lock is keyed by directory rather than by database, so
+two queues against one database can KILL each other once kill rules are armed.
+
 ## Iterations still to design / implement
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another
@@ -1010,6 +1082,13 @@ would still be reasonable on noise grounds.
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
 
+- [x] **`RESUME` keeps the manifest's lock policy** (0.45.0) — `ddl.ResumeSQL` in
+  `internal/ddl/control.go`, wired through `Capabilities.Options` so all three resume paths
+  use it: `internal/run/monitored_runner.go` (the pressure loop), `resumeStatement` in
+  `internal/run/engine.go`, and recovery. Tests: `TestResumeSQLCarriesWaitAtLowPriority`,
+  `TestRunnerGetsLowPriorityOptions`, and the strengthened `TestResumeAdoptsOwnPausedResumable`.
+  The entry deferred from 0.44.0 named only the sidecar path; the **pressure loop had the same
+  bare RESUME**, and it is the path that fires most — once per transaction-log pause.
 - [x] **Batched DML** ([BATCH-DML.md](BATCH-DML.md)) — `internal/run/batch_dml.go`,
   `batch_calc.go`; `batch_update` / `batch_delete` documented in `docs/operations.md`. See the
   follow-ups above for what its controller still owes.

@@ -16,6 +16,8 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/config"
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/run"
+	"github.com/rudi-bruchez/SqlGoPace/internal/tui"
 )
 
 func TestSuspensionTracker(t *testing.T) {
@@ -706,5 +708,49 @@ func TestProgressMsgETAUnknownIsZero(t *testing.T) {
 	msg := progressMsg(mssql.Progress{PercentComplete: 0, ElapsedMS: 100_000, EstimatedCompletionMS: 5_000})
 	if msg.ETASeconds != 0 {
 		t.Errorf("ETASeconds = %d at 0%%, want 0 (unknown)", msg.ETASeconds)
+	}
+}
+
+// The engine narrates every reaction on its sink, but in console mode the engine writes to
+// io.Discard (main.go), so a pause reached only the .log sidecar: the status line read
+// RUNNING with a frozen ETA for the whole pause, which is what a hung rebuild looks like.
+// Four pauses in one hour were observed on a single production rebuild.
+func TestReactionMsgsAnnouncePauseAndItsReason(t *testing.T) {
+	msgs := reactionMsgs(run.ReactionEvent{Kind: "pause", Detail: "transaction log over cap (reuse_wait=LOG_BACKUP) (at 97%)"})
+
+	var logged string
+	var paused *tui.PausedMsg
+	for _, m := range msgs {
+		switch v := m.(type) {
+		case tui.LogMsg:
+			logged = v.Line
+		case tui.PausedMsg:
+			paused = &v
+		}
+	}
+	if !strings.Contains(logged, "LOG_BACKUP") {
+		t.Errorf("the reason must reach the log pane, got %q", logged)
+	}
+	if paused == nil || !paused.Paused {
+		t.Fatalf("a pause must set the paused state, got %+v", msgs)
+	}
+	if !strings.Contains(paused.Reason, "LOG_BACKUP") {
+		t.Errorf("the status line must carry the reason too, got %q", paused.Reason)
+	}
+}
+
+// Resume clears it; every other reaction only narrates.
+func TestReactionMsgsClearOnResumeAndOnlyNarrateOtherwise(t *testing.T) {
+	for _, m := range reactionMsgs(run.ReactionEvent{Kind: "resume", Detail: "pressure cleared"}) {
+		if p, ok := m.(tui.PausedMsg); ok && p.Paused {
+			t.Errorf("resume must clear the paused state, got %+v", p)
+		}
+	}
+	for _, kind := range []string{"kill", "cancel", "warn", "info", "abort"} {
+		for _, m := range reactionMsgs(run.ReactionEvent{Kind: kind, Detail: "d"}) {
+			if _, ok := m.(tui.PausedMsg); ok {
+				t.Errorf("%s must not touch the paused state", kind)
+			}
+		}
 	}
 }

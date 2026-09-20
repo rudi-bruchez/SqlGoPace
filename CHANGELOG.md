@@ -13,6 +13,25 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.45.0] - 2026-09-20
+
+### Fixed
+
+- Every `ALTER INDEX … RESUME` now carries the operation's `WAIT_AT_LOW_PRIORITY` options.
+  A bare RESUME is documented as `MAX_DURATION = 0, ABORT_AFTER_WAIT = NONE`, which waits at
+  *normal* priority, so from its first pause onward a rebuild stopped yielding to the traffic
+  its manifest told it to yield to — and the pressure loop pauses once per transaction-log
+  episode (four times in one hour on one production rebuild). It affected all three resume
+  paths: the pressure loop, sidecar-recognized ownership, and recovery. Operators who lowered
+  `max_block_minutes` to work around it can revisit that value. New `ddl.ResumeSQL` renders
+  the clause; `ddl.ResumableControlSQL` remains for PAUSE and ABORT.
+- The console says `PAUSED` and why, instead of `RUNNING` with a frozen ETA. A paused
+  operation has no row in `sys.dm_exec_requests`, so the progress poll sent nothing and the
+  last reading stayed on screen; the reaction that explains the pause reached only the `.log`,
+  because in `--tui` mode the engine's narration goes to `io.Discard`. Pauses of 12 to 17
+  minutes were indistinguishable from a hung rebuild. Reactions are now forwarded to the
+  console (new `run.WithReactionSink`), and the status line shows the pause and its cause.
+
 ## [0.44.0] - 2026-09-20
 
 A run no longer refuses to continue its own interrupted work, and says what resumable
