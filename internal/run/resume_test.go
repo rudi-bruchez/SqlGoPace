@@ -1,6 +1,7 @@
 package run_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -176,27 +177,58 @@ func TestResumeAdoptsOwnPausedResumable(t *testing.T) {
 
 // indexAwareResumeCheck reports a paused resumable only for a specific index, so a test can
 // model a server where one index (not another) holds a paused rebuild.
-type indexAwareResumeCheck struct{ pausedIndex string }
+type indexAwareResumeCheck struct{ pausedIndex, pausedTable string }
+
+// table is the table holding the pause; empty means dbo.T.
+func (c indexAwareResumeCheck) table() string {
+	if c.pausedTable == "" {
+		return "T"
+	}
+	return c.pausedTable
+}
 
 func (c indexAwareResumeCheck) PausedResumable(_ context.Context, _, _, index string) (bool, error) {
 	return strings.EqualFold(index, c.pausedIndex), nil
 }
 
+// ResumableOps reports that index on dbo.T as paused, with no statement text — the same
+// state PausedResumable describes, so the fake is coherent with a real server.
+func (c indexAwareResumeCheck) ResumableOps(context.Context) ([]mssql.ResumableOp, error) {
+	return []mssql.ResumableOp{{Schema: "dbo", Table: c.table(), Name: c.pausedIndex, StateDesc: "PAUSED"}}, nil
+}
+
+const twoTableManifest = `
+description: two ops on different tables
+operations:
+  - operation: rebuild_index
+    schema: dbo
+    table: T
+    index: IX
+  - operation: rebuild_index
+    schema: dbo
+    table: T2
+    index: IX2
+`
+
 func TestOwnPausedResumedWhenNotAtCursorBoundary(t *testing.T) {
-	// The headline #1 case: a continue-on-failure gap left the cursor behind the operation
-	// that actually paused its own resumable (op 1, index IX2), while op 0 (IX) is not paused.
-	// The paused op must be RESUMEd by recorded identity even though it is not at the cursor,
-	// and op 0 must run normally rather than being treated as a foreign blocker.
+	// A continue-on-failure gap left the cursor behind the operation that actually paused
+	// its own resumable (op 1, index IX2), while op 0 (IX) is not paused. The paused op must
+	// be RESUMEd by recorded identity even though it is not at the cursor.
+	//
+	// op 0 and op 1 are on DIFFERENT tables here, and that is the point: while IX2's rebuild
+	// is paused, SQL Server refuses a rebuild of any index on ITS table (Msg 10637), so a
+	// same-table op 0 could not run whatever this engine decided. Putting them on one table
+	// would assert a happy path the server does not offer.
 	runner := &sqlCapturingRunner{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(indexAwareResumeCheck{pausedIndex: "IX2"}))
-	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoOpManifest), 0o644); err != nil {
+		run.WithResumeCheck(indexAwareResumeCheck{pausedIndex: "IX2", pausedTable: "T2"}))
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(twoTableManifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	writeSidecarState(t, dirs, "010_a.yaml", run.State{
 		Manifest: "010_a.yaml",
-		Paused:   &run.PausedResumable{Op: 1, Schema: "dbo", Table: "T", Index: "IX2"},
+		Paused:   &run.PausedResumable{Op: 1, Schema: "dbo", Table: "T2", Index: "IX2"},
 	})
 
 	sum, err := eng.ProcessAll(context.Background())
@@ -361,7 +393,11 @@ func TestBlockingResumableWithoutOptInFails(t *testing.T) {
 	runner := &sqlCapturingRunner{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(&fakeResumeCheck{paused: true}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true, resumables: []mssql.ResumableOp{
+			// Paused on the target index, but the server reported no sql_text, so this
+			// cannot be recognized as this manifest's own work.
+			{Schema: "dbo", Table: "T", Name: "IX", StateDesc: "PAUSED"},
+		}}),
 		run.WithResumableAborter(&fakeAborter{}))
 	// Fresh manifest (no sidecar): a paused resumable on the index is foreign. Without the
 	// abort_blocking_resumable opt-in the run must NOT adopt it (never RESUME) — it fails
@@ -386,7 +422,9 @@ func TestBlockingResumableOptInAborts(t *testing.T) {
 	aborter := &fakeAborter{}
 	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
 		run.WithSession(fakeSession{spid: 70}),
-		run.WithResumeCheck(&fakeResumeCheck{paused: true}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true, resumables: []mssql.ResumableOp{
+			{Schema: "dbo", Table: "T", Name: "IX", StateDesc: "PAUSED"},
+		}}),
 		run.WithResumableAborter(aborter))
 	// Fresh manifest that opts in: the blocking paused resumable is ABORTed, then the
 	// rebuild runs with this manifest's own options.
@@ -532,4 +570,183 @@ func TestWriteSidecarPreservesCursor(t *testing.T) {
 	if runner.calls != 1 {
 		t.Errorf("runner ran %d ops, want 1 (cursor honored despite fresh sidecar write)", runner.calls)
 	}
+}
+
+// fixtureRebuildSQL is what the engine test manifest (dbo.T.IX) generates. Captured from
+// the engine itself; if generation changes, these tests fail loudly, which is the point.
+const fixtureRebuildSQL = "ALTER INDEX [IX] ON [dbo].[T] REBUILD WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)), RESUMABLE = ON);"
+
+// TestPausedResumableWithSameStatementIsResumed is the re-armed-manifest case: a manifest
+// queued afresh (no sidecar) whose index carries a paused resumable rebuild built from the
+// very statement it is about to issue. That is its own work, not a foreign obstacle — SQL
+// Server resumes such a rebuild when the statement is re-executed. Refusing it stranded a
+// rebuild 99.84% complete and offered only the irreversible ABORT.
+func TestPausedResumableWithSameStatementIsResumed(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	aborter := &fakeAborter{}
+	eng, _ := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true, resumables: []mssql.ResumableOp{
+			{Schema: "dbo", Table: "T", Name: "IX", StateDesc: "PAUSED", SQLText: fixtureRebuildSQL},
+		}}),
+		run.WithResumableAborter(aborter))
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Done != 1 {
+		t.Errorf("Summary = %+v, want Done:1 (the paused rebuild is continued, not refused)", sum)
+	}
+	if len(aborter.sqls) != 0 {
+		t.Errorf("its own work must never be aborted; aborted: %v", aborter.sqls)
+	}
+	// Re-executing the matched REBUILD is what resumes it, and it carries the manifest's
+	// lock policy. A bare `ALTER INDEX … RESUME` would not: Microsoft documents that
+	// omitting WAIT_AT_LOW_PRIORITY on RESUME means MAX_DURATION = 0 with
+	// ABORT_AFTER_WAIT = NONE, i.e. wait at normal priority — which on a 24/7 database is
+	// the resumed rebuild blocking the very traffic the manifest asked it to yield to.
+	if len(runner.sqls) != 1 {
+		t.Fatalf("runner ran %d statements, want 1: %v", len(runner.sqls), runner.sqls)
+	}
+	if !strings.Contains(runner.sqls[0], "WAIT_AT_LOW_PRIORITY") {
+		t.Errorf("the resumed statement must keep the manifest's lock policy, got: %q", runner.sqls[0])
+	}
+	if runner.sqls[0] != fixtureRebuildSQL {
+		t.Errorf("want the matched REBUILD re-executed verbatim, got: %q", runner.sqls[0])
+	}
+}
+
+// TestProbeErrorRefusesRatherThanGuessing: an unreadable sys.index_resumable_operations
+// must not be read as "nothing is paused". The rest of this codebase is conservative with
+// an unreadable server signal (the window check defers rather than run at an unknown
+// time); issuing DDL on a guess is the one thing a tool pointed at production must not do.
+func TestProbeErrorRefusesRatherThanGuessing(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{err: errors.New("DMV unreadable")}))
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	// Inconclusive, not failed: the manifest stays in processing so the next run
+	// reconsiders it, which is this engine's existing stance for a server signal it
+	// could not read (see TestProcessAllResumableServerUnreachableIsInterrupted).
+	if sum.Interrupted != 1 {
+		t.Errorf("Summary = %+v, want Interrupted:1", sum)
+	}
+	if len(runner.sqls) != 0 {
+		t.Errorf("nothing may run while the paused-rebuild state is unknown; ran: %v", runner.sqls)
+	}
+	mustExist(t, filepath.Join(dirs.Processing, "010_a.yaml"))
+}
+
+// TestPausedResumableWithDifferentStatementStillRefused: same index, different work (the
+// manifest now asks for PAGE where the paused rebuild was ROW). Resuming would silently
+// apply the old compression, so this must stay a refusal.
+func TestPausedResumableWithDifferentStatementStillRefused(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true, resumables: []mssql.ResumableOp{
+			{Schema: "dbo", Table: "T", Name: "IX", StateDesc: "PAUSED",
+				SQLText: "ALTER INDEX [IX] ON [dbo].[T] REBUILD WITH (ONLINE = ON, RESUMABLE = ON, DATA_COMPRESSION = PAGE);"},
+		}}),
+		run.WithResumableAborter(&fakeAborter{}))
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Failed != 1 {
+		t.Errorf("Summary = %+v, want Failed:1", sum)
+	}
+	if len(runner.sqls) != 0 {
+		t.Errorf("must not run against a paused rebuild of different work; ran: %v", runner.sqls)
+	}
+	if log := readFailLog(t, dirs, "010_a.yaml"); !strings.Contains(log, "abort-resumable") {
+		t.Errorf("failure should stay actionable, got:\n%s", log)
+	}
+}
+
+// TestPausedResumableOnSiblingIndexNamesThatIndex: SQL Server's Msg 10637 is table-scoped —
+// a paused rebuild on ANY index of a table blocks a fresh rebuild of every other index on
+// it. The old index-scoped probe missed this entirely, so the operation was launched and
+// failed against a raw server error naming an index the operator never asked about.
+func TestPausedResumableOnSiblingIndexNamesThatIndex(t *testing.T) {
+	runner := &sqlCapturingRunner{}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner,
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithResumeCheck(&fakeResumeCheck{resumables: []mssql.ResumableOp{
+			{Schema: "dbo", Table: "T", Name: "PK_T", StateDesc: "PAUSED",
+				SQLText: "ALTER INDEX [PK_T] ON [dbo].[T] REBUILD WITH (RESUMABLE = ON);"},
+		}}),
+		run.WithResumableAborter(&fakeAborter{}))
+
+	sum, err := eng.ProcessAll(context.Background())
+	if err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if sum.Failed != 1 {
+		t.Errorf("Summary = %+v, want Failed:1", sum)
+	}
+	if len(runner.sqls) != 0 {
+		t.Errorf("a sibling index holds the table; nothing must run, ran: %v", runner.sqls)
+	}
+	log := readFailLog(t, dirs, "010_a.yaml")
+	if !strings.Contains(log, "PK_T") {
+		t.Errorf("failure must name the index actually holding the pause, got:\n%s", log)
+	}
+}
+
+// TestProcessAllWarnsAboutStrandedResumables: a paused rebuild nothing in the queue will
+// touch is reported before the run starts, to stdout and to the console, saying plainly
+// that no queued operation covers it. It stays invisible otherwise until an unrelated
+// operation trips over Msg 10637 — or, as happened, until someone reads the DMV by hand.
+func TestProcessAllWarnsAboutStrandedResumables(t *testing.T) {
+	var out bytes.Buffer
+	var notices []string
+	eng, _ := setupEngine(t, fakePreflighter{}, &sqlCapturingRunner{},
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithOutput(&out),
+		run.WithNoticeSink(func(s string) { notices = append(notices, s) }),
+		run.WithResumeCheck(&fakeResumeCheck{resumables: []mssql.ResumableOp{
+			// The queue targets dbo.T.IX; this pause is on another table entirely.
+			{Schema: "dbo", Table: "Other", Name: "PK_Other", StateDesc: "PAUSED", PercentComplete: 99.84},
+		}}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "PK_Other") || !strings.Contains(out.String(), "no queued operation") {
+		t.Errorf("stdout must warn about the stranded rebuild, got:\n%s", out.String())
+	}
+	if !strings.Contains(strings.Join(notices, "\n"), "PK_Other") {
+		t.Errorf("the console must receive the warning too, got: %v", notices)
+	}
+}
+
+// TestProcessAllSaysAStrandedResumableIsCovered: the same scan, when the queue does target
+// the paused index, must say so rather than alarm the operator about work already planned.
+func TestProcessAllSaysAStrandedResumableIsCovered(t *testing.T) {
+	var out bytes.Buffer
+	eng, _ := setupEngine(t, fakePreflighter{}, &sqlCapturingRunner{},
+		run.WithSession(fakeSession{spid: 70}),
+		run.WithOutput(&out),
+		run.WithResumeCheck(&fakeResumeCheck{paused: true, resumables: []mssql.ResumableOp{
+			{Schema: "dbo", Table: "T", Name: "IX", StateDesc: "PAUSED", PercentComplete: 40},
+		}}))
+
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if !strings.Contains(out.String(), "named by a queued operation") {
+		t.Errorf("stdout must say the queue names it, got:\n%s", out.String())
+	}
+	// Deliberately "named by", not "will continue": coverage is decided from the queued
+	// target alone. This very fixture shows why — the paused rebuild carries no statement,
+	// so the classifier still treats it as foreign and refuses the operation. Promising
+	// continuation from the target alone would be a promise the run does not keep.
 }

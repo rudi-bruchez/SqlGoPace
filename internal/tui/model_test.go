@@ -1022,3 +1022,27 @@ func TestModelServerBannerActiveRequestsAlone(t *testing.T) {
 		t.Errorf("runnable rendered although no ServerLoadMsg arrived:\n%s", v)
 	}
 }
+
+// TestProgressETARendersInMinutes: a raw second count past a few minutes is unreadable
+// ("ETA: 395s"). The console already humanizes every other duration; the generic
+// progress line must too.
+func TestProgressETARendersInMinutes(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.ProgressMsg{Percent: 42, ETASeconds: 395})
+	view := m.View()
+	if !strings.Contains(view, "6m35s") {
+		t.Errorf("View() should render a 395s ETA as 6m35s\n%s", view)
+	}
+	if strings.Contains(view, "395s") {
+		t.Errorf("View() still shows the raw second count\n%s", view)
+	}
+}
+
+// TestProgressETAOmittedWhenUnknown: no measurement yet means no ETA, not "ETA: 0s".
+func TestProgressETAOmittedWhenUnknown(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.ProgressMsg{Percent: 0, ETASeconds: 0})
+	if view := m.View(); strings.Contains(view, "ETA") {
+		t.Errorf("View() announces an ETA it has not measured\n%s", view)
+	}
+}

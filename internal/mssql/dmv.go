@@ -67,6 +67,23 @@ func (p Progress) IsRollback() bool {
 	return strings.Contains(strings.ToUpper(p.Command), "ROLLBACK")
 }
 
+// ETASeconds estimates the seconds remaining from what has actually been measured:
+// the request took ElapsedMS to reach PercentComplete, so the remainder is expected
+// to take the same time per percent. ok is false when there is nothing to measure —
+// no percentage reported yet, no elapsed time, or a rollback, whose percent_complete
+// tracks the undo and not the work.
+//
+// It deliberately does not use EstimatedCompletionMS. sys.dm_exec_requests documents
+// estimated_completion_time as "Internal only", and forwarding it is what made the
+// console announce "ETA: 5s" for a rebuild 72% done after 27 minutes.
+func (p Progress) ETASeconds() (int64, bool) {
+	if p.IsRollback() || p.PercentComplete <= 0 || p.ElapsedMS <= 0 {
+		return 0, false
+	}
+	remainingMS := float64(p.ElapsedMS) * (100 - p.PercentComplete) / p.PercentComplete
+	return int64(remainingMS / 1000), true
+}
+
 const progressSQL = `
 SELECT percent_complete, estimated_completion_time, total_elapsed_time, command
 FROM sys.dm_exec_requests
@@ -101,12 +118,20 @@ type ResumableOp struct {
 	StateDesc       string // "RUNNING" | "PAUSED"
 	PercentComplete float64
 	LastPauseTime   string // ISO 8601, empty when never paused
+	// SQLText is the statement the operation was started from. SQL Server resumes a
+	// paused rebuild when that statement is re-executed, so it is how a run tells its
+	// own interrupted work from a foreign one. Empty when the server does not report it.
+	SQLText string
+	// ExecutionMinutes is how long the operation has actually run (total_execution_time),
+	// which with PercentComplete is enough to estimate what is left.
+	ExecutionMinutes int
 }
 
 const resumableOpsSQL = `
 SELECT OBJECT_SCHEMA_NAME(object_id), OBJECT_NAME(object_id),
        object_id, index_id, name, state_desc, percent_complete,
-       CONVERT(varchar(30), last_pause_time, 126)
+       CONVERT(varchar(30), last_pause_time, 126),
+       sql_text, total_execution_time
 FROM sys.index_resumable_operations;`
 
 // ResumableOps lists resumable index operations in the connected database, with
@@ -121,13 +146,16 @@ func (c *Conn) ResumableOps(ctx context.Context) ([]ResumableOp, error) {
 	var ops []ResumableOp
 	for rows.Next() {
 		var (
-			op                           ResumableOp
-			schema, table, lastPauseTime sql.NullString
+			op                                    ResumableOp
+			schema, table, lastPauseTime, sqlText sql.NullString
+			execMinutes                           sql.NullInt64
 		)
-		if err := rows.Scan(&schema, &table, &op.ObjectID, &op.IndexID, &op.Name, &op.StateDesc, &op.PercentComplete, &lastPauseTime); err != nil {
+		if err := rows.Scan(&schema, &table, &op.ObjectID, &op.IndexID, &op.Name, &op.StateDesc,
+			&op.PercentComplete, &lastPauseTime, &sqlText, &execMinutes); err != nil {
 			return nil, fmt.Errorf("scan resumable operation: %w", err)
 		}
 		op.Schema, op.Table, op.LastPauseTime = schema.String, table.String, lastPauseTime.String
+		op.SQLText, op.ExecutionMinutes = sqlText.String, int(execMinutes.Int64)
 		ops = append(ops, op)
 	}
 	return ops, rows.Err()

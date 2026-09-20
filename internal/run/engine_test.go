@@ -68,10 +68,23 @@ type fakeResumeCheck struct {
 	err    error // non-nil simulates an unreachable server (e.g. restarting)
 	// becomesPaused models a rebuild that is NOT paused when the operation starts (so it
 	// does not block a fresh rebuild) but IS paused after the session is killed (so the
-	// interruption is recoverable): the first PausedResumable call returns false, later
-	// calls return true.
+	// interruption is recoverable): the run's first probe sees nothing paused, later ones
+	// do. calls counts every probe, whichever method asks, so the fake does not depend on
+	// the order the engine happens to consult them in.
 	becomesPaused bool
 	calls         int
+	// resumables is what sys.index_resumable_operations reports for the whole database.
+	// Left nil, the server reports none, which is what most tests mean: PausedResumable
+	// answers the index-scoped question and nothing holds the table.
+	resumables []mssql.ResumableOp
+}
+
+func (f *fakeResumeCheck) ResumableOps(context.Context) ([]mssql.ResumableOp, error) {
+	f.calls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.resumables, nil
 }
 
 func (f *fakeResumeCheck) PausedResumable(context.Context, string, string, string) (bool, error) {

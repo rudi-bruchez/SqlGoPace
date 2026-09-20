@@ -13,6 +13,82 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.44.0] - 2026-09-20
+
+A run no longer refuses to continue its own interrupted work, and says what resumable
+rebuilds a database is already holding before it starts.
+
+### Fixed
+
+- A manifest re-armed from scratch resumes the rebuild it left paused, instead of calling
+  it foreign. Ownership was known only from the `.state.json` sidecar, so a manifest
+  re-queued by hand — the sidecar gone — met its own paused rebuild as an obstacle and was
+  told to `abort-resumable`, which discards the work for good. It now also recognizes the
+  work by the statement the server kept: SQL Server resumes a paused rebuild when the
+  original statement is re-executed (ALTER INDEX, *Online index operations*), so a paused
+  rebuild of the same index built from the same statement is the same work. A different
+  statement on that index — a manifest since changed from ROW to PAGE — is still refused,
+  because resuming it would silently apply the old compression.
+- The paused-resumable check is table-scoped, as SQL Server is. It asked
+  `sys.index_resumable_operations` about one index, but Msg 10637 is "Cannot perform this
+  operation on '<object>' … as **one or more indexes** are currently in resumable index
+  rebuild state": a pause on any index of a table blocks a rebuild of every other index on
+  it. A sibling's pause was therefore invisible, and the operation started only to be
+  refused by the server with an error naming an index the operator had not asked about. The
+  refusal now names the index actually holding the table and gives its `RESUME`. A pause
+  held by a sibling is never auto-aborted: `abort_blocking_resumable` licenses discarding a
+  stale rebuild of the index the operation names, not another index's work.
+
+### Added
+
+- A run reports, before the first manifest, every paused resumable rebuild the database
+  holds and whether the queue will continue it — to stdout and to the `--tui` console. A
+  paused rebuild keeps both the old and the new structure allocated, is maintained by every
+  DML, and blocks its table; nothing surfaced it until something tripped over it. An
+  operation targeting that index is reported as covered; anything else is named with the
+  `ALTER INDEX … RESUME` that would finish it.
+
+- An unreadable `sys.index_resumable_operations` no longer reads as "nothing is paused". The
+  probe's error was discarded, so a transient DMV failure let a fresh `REBUILD` go out on a
+  guess and be refused by the server mid-run. The operation now stops before it runs and the
+  manifest stays in `02.processing/` for the next run — the same treatment the window check
+  gives a clock it cannot read.
+- A rebuild recognized by its statement is continued by re-executing that statement, not by
+  a bare `ALTER INDEX … RESUME`. Microsoft documents that omitting `WAIT_AT_LOW_PRIORITY` on
+  `RESUME` means `MAX_DURATION = 0` with `ABORT_AFTER_WAIT = NONE`: the resumed rebuild would
+  have waited at normal priority, against the traffic the manifest told it to yield to.
+  Re-executing keeps every option the manifest chose. (The sidecar-recognized path still
+  emits a bare `RESUME` — see `docs/specs/TODO.md`.)
+- The statement comparison no longer case-folds. Identifiers compare under the database's
+  collation, which may be case-sensitive, and string literals are data: folding either could
+  make a rebuild of `[T]` and one of `[t]` compare equal. It now ignores layout only —
+  whitespace runs and one trailing semicolon. A hand-typed statement spaced differently no
+  longer matches, which is the safe direction to fail.
+
+**Migration.** Nothing to change. Three behaviour differences to expect: a re-queued manifest
+that previously failed with "a paused resumable operation blocks this rebuild" now continues
+that rebuild; an operation whose table is held by another index's paused rebuild now fails
+before it runs rather than at the server; and an operation whose paused-rebuild state cannot
+be read is left for the next run instead of proceeding. All three are reported in the run log.
+
+Reviewed by two external code reviews and an external harm review before release; what was
+found and deliberately left undone is in `docs/specs/TODO.md`.
+
+## [0.43.0] - 2026-09-20
+
+### Fixed
+
+- The console's ETA is measured instead of forwarded. It printed
+  `sys.dm_exec_requests.estimated_completion_time`, a column whose own documentation reads
+  "Internal only", which is why a rebuild 72% done after 27 minutes announced `ETA: 5s`.
+  The estimate now comes from the request's own elapsed time and percentage — the time
+  taken to reach *n*% is what the remaining `100-n`% is expected to cost — and is omitted
+  entirely when nothing has been measured yet, rather than shown as `ETA: 0s`. It is also
+  suppressed during a rollback, where `percent_complete` tracks the undo and not the work.
+- The ETA on that line is humanized like every other duration in the console (`6m35s`,
+  `1h04m`) instead of a raw second count. The shrink panel already did this; the generic
+  progress line did not.
+
 ## [0.42.0] - 2026-09-17
 
 Six findings from a second external code review of this branch

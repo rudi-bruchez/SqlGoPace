@@ -72,6 +72,12 @@ type SessionInfo interface {
 // rebuild behind (so it is recoverable rather than failed). *mssql.Conn satisfies it.
 type ResumableProbe interface {
 	PausedResumable(ctx context.Context, schema, table, index string) (bool, error)
+	// ResumableOps lists every resumable index operation in the database. The engine
+	// needs the whole list, not one index's flag, because SQL Server's Msg 10637 is
+	// table-scoped: a paused rebuild on any index of a table blocks a fresh rebuild of
+	// every other index on it. The statement each carries also tells the run's own
+	// interrupted work from a foreign one.
+	ResumableOps(ctx context.Context) ([]mssql.ResumableOp, error)
 }
 
 var _ ResumableProbe = (*mssql.Conn)(nil)
@@ -474,6 +480,7 @@ func (e *Engine) ProcessAll(ctx context.Context) (Summary, error) {
 	if err != nil {
 		return Summary{}, err
 	}
+	e.warnStrandedResumables(ctx, names)
 
 	var sum Summary
 	for _, name := range names {
@@ -966,20 +973,45 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	// position, so a continue-on-failure gap that freezes the cursor before the paused op
 	// no longer misclassifies the manifest's own paused resumable as foreign — and a
 	// foreign paused resumable is never adopted, whatever the cursor.
+	// Two ways to recognize our own paused resumable. The sidecar records it when this
+	// run left it (fast, and survives a plan the server cannot speak for); the server's
+	// own statement text recognizes it when the sidecar is gone — a manifest re-armed
+	// from scratch, which is how a rebuild 99.84% complete was once declared foreign and
+	// offered only ABORT.
+	owns := ownsPausedResumable(r.st.Paused, i, step.Operation)
+	standing, blocker := resumableClear, ""
+	var standingErr error
+	if !owns {
+		standing, blocker, standingErr = e.resumableStandingFor(ctx, step.Operation, step.SQL)
+	}
 	stmt := step.SQL
 	var prepErr error
 	switch {
-	case ownsPausedResumable(r.st.Paused, i, step.Operation):
-		// Our own paused resumable from a previous run: continue it whatever the current
-		// resolve says about resumability (a fresh REBUILD would be rejected while it is
-		// paused). If nothing is actually paused now, resumeStatement declines and the
-		// planned REBUILD runs (a clean restart).
+	case standingErr != nil:
+		// An unreadable sys.index_resumable_operations is not "nothing is paused". Issuing
+		// DDL on that guess is what the rest of this engine refuses to do with an unreadable
+		// signal (see windowOpen), and here the guess ends in a server refusal mid-run.
+		// Wrapped in ErrStopped so this lands on the recoverable path: the manifest stays
+		// in processing and the next run reconsiders it, rather than being quarantined for
+		// a transient read. That is this engine's existing stance for an inconclusive
+		// server signal, not a new one.
+		prepErr = fmt.Errorf("could not read paused resumable operations, so it is unknown whether one blocks this rebuild: %w: %w", standingErr, ErrStopped)
+	case owns:
+		// Our own paused resumable from a previous run, recorded in the sidecar. Continue it
+		// whatever the current resolve says about resumability. If nothing is actually paused
+		// now, resumeStatement declines and the planned REBUILD runs (a clean restart).
 		if resume, ok := e.resumeStatement(ctx, step.Operation); ok {
 			stmt = resume
 			sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild (server-side progress kept)"})
 		}
-	case e.blockingResumable(ctx, step.Operation):
-		prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, r.manifest.AbortBlockingResumable)
+	case standing == resumableOwn:
+		// Recognized by statement rather than by sidecar. Re-executing that statement is
+		// exactly how SQL Server resumes it, and it keeps the manifest's own options —
+		// notably WAIT_AT_LOW_PRIORITY, which a bare RESUME would drop, leaving the resumed
+		// rebuild waiting at normal priority against the traffic it was told to yield to.
+		sink(ReactionEvent{Kind: "resume", Detail: "continuing paused resumable rebuild recognized by its statement (server-side progress kept)"})
+	case standing == resumableForeign:
+		prepErr = e.clearOrRejectBlockingResumable(ctx, step.Operation, r.manifest.AbortBlockingResumable, blocker)
 	}
 
 	// Size before: for a RESUME too. A paused resumable's partial target lives under
@@ -1630,19 +1662,61 @@ func (e *Engine) resumeStatement(ctx context.Context, op ddl.Operation) (string,
 	return stmt, true
 }
 
-// blockingResumable reports whether op's index currently holds a paused resumable that
-// would block a fresh REBUILD (SQL Server Msg 10637). It is false for a non-index
-// operation, when no probe is wired, or when nothing is paused.
-func (e *Engine) blockingResumable(ctx context.Context, op ddl.Operation) bool {
+// resumableStanding says what a paused resumable rebuild on the operation's table means
+// for the operation about to run.
+type resumableStanding int
+
+const (
+	resumableClear   resumableStanding = iota // nothing paused on the table
+	resumableOwn                              // this operation's own work: RESUME it
+	resumableForeign                          // different work, or another index's: do not touch
+)
+
+// resumableStandingFor classifies the paused resumable rebuilds on op's table, and names
+// the index holding one. The scope is the table because SQL Server's Msg 10637 is: a
+// paused rebuild on any index of a table blocks a fresh rebuild of every other index on
+// it — an index-scoped check misses a sibling and lets the operation start only to be
+// refused by the server.
+//
+// A paused rebuild of the same index built from the same statement is this operation's
+// own work: re-executing the original statement is how SQL Server resumes it (ALTER
+// INDEX, Online index operations), so it must be resumed, never aborted. Anything else —
+// a different statement on the same index, or any pause on a sibling — is foreign.
+//
+// It reports resumableClear for a non-index operation, with no probe wired, or when the
+// probe cannot answer: an unreadable DMV must not invent a blocker.
+//
+// An error from the probe is returned, never folded into "nothing is paused": the caller
+// must be able to tell an unreadable server from a verified clear one before issuing DDL.
+func (e *Engine) resumableStandingFor(ctx context.Context, op ddl.Operation, stmt string) (resumableStanding, string, error) {
 	if e.resumeCheck == nil {
-		return false
+		return resumableClear, "", nil
 	}
-	if _, err := ddl.ResumableControlSQL(op, "ABORT"); err != nil {
-		return false // not an index operation
+	if !isIndexOperation(op) {
+		return resumableClear, "", nil
+	}
+	ops, err := e.resumeCheck.ResumableOps(ctx)
+	if err != nil {
+		return resumableClear, "", err
 	}
 	ref := op.Target()
-	paused, err := e.resumeCheck.PausedResumable(ctx, ref.Schema, ref.Table, ref.Name)
-	return err == nil && paused
+	foreign := ""
+	for _, p := range ops {
+		if !strings.EqualFold(p.StateDesc, "PAUSED") ||
+			!strings.EqualFold(p.Schema, ref.Schema) || !strings.EqualFold(p.Table, ref.Table) {
+			continue
+		}
+		if strings.EqualFold(p.Name, ref.Name) && sameRebuildStatement(p.SQLText, stmt) {
+			return resumableOwn, p.Name, nil // our own work wins over any sibling pause
+		}
+		if foreign == "" {
+			foreign = p.Name
+		}
+	}
+	if foreign != "" {
+		return resumableForeign, foreign, nil
+	}
+	return resumableClear, "", nil
 }
 
 // clearOrRejectBlockingResumable handles a paused resumable that blocks op's fresh
@@ -1651,11 +1725,26 @@ func (e *Engine) blockingResumable(ctx context.Context, op ddl.Operation) bool {
 // returns nil. Without the opt-in (or with no aborter wired) it returns an actionable
 // error so the operator resolves the conflict deliberately, since aborting is destructive
 // on a shared/production database.
-func (e *Engine) clearOrRejectBlockingResumable(ctx context.Context, op ddl.Operation, optIn bool) error {
+func (e *Engine) clearOrRejectBlockingResumable(ctx context.Context, op ddl.Operation, optIn bool, blocker string) error {
+	ref := op.Target()
+	// A pause held by a SIBLING index of the same table. abort_blocking_resumable is a
+	// license to discard a stale rebuild of the index this operation names; it does not
+	// extend to destroying another index's work, so this is always a refusal — and it
+	// names the real holder, which is not the index the operator asked about.
+	if !strings.EqualFold(blocker, ref.Name) {
+		return fmt.Errorf(
+			"a paused resumable rebuild of index %s on %s.%s blocks this rebuild of %s: SQL Server refuses "+
+				"a rebuild of any index on a table that holds one (Msg 10637). Continue it with "+
+				"`ALTER INDEX [%s] ON [%s].[%s] RESUME;`, or discard it with "+
+				"`sqlgopace abort-resumable --config <config> --table %s.%s --index %s --yes` "+
+				"(an aborted operation cannot be resumed). abort_blocking_resumable does not cover another index's work",
+			blocker, ref.Schema, ref.Table, ref.Name,
+			blocker, ref.Schema, ref.Table,
+			ref.Schema, ref.Table, blocker)
+	}
 	if !optIn {
 		// Name the target: abort-resumable refuses a bare invocation, and an operator
 		// arriving from this message should not have to work out the flags under pressure.
-		ref := op.Target()
 		return fmt.Errorf(
 			"a paused resumable operation blocks this rebuild; resolve it with `sqlgopace abort-resumable --config <config> --table %s.%s --index %s --yes` "+
 				"(preview it with --dry-run first; an aborted operation cannot be resumed), or set abort_blocking_resumable: true in the manifest",

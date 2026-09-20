@@ -343,7 +343,13 @@ func (m Model) opStatusBody() string {
 			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
 	default:
-		fmt.Fprintf(&b, "progress: %.0f%%   ETA: %ds", m.percent, m.etaSeconds)
+		fmt.Fprintf(&b, "progress: %.0f%%", m.percent)
+		// Humanized like every other duration in the console ("6m35s", "1h04m"):
+		// a raw second count is unreadable past a few minutes. Omitted entirely
+		// when zero — nothing has been measured, and "ETA: 0s" reads as "done".
+		if m.etaSeconds > 0 {
+			fmt.Fprintf(&b, "   ETA %s", humanizeMS(m.etaSeconds*1000))
+		}
 		if m.rollbackPercent > 0 {
 			fmt.Fprintf(&b, "   rollback: %.0f%%", m.rollbackPercent)
 		}

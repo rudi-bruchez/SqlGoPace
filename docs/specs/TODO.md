@@ -929,6 +929,57 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   it the next time the console feed is opened — the same seam would let the suspension tracker's
   accrual be tested, which is also currently uncovered.
 
+
+### Resumable-rebuild follow-ups deferred from 0.44.0 (2026-09-20)
+
+Raised by two external code reviews and an external harm review of the 0.44.0 resume work.
+Each was verified as real and deliberately left undone; the reasoning is what decides
+whether it is still the right call.
+
+- **`ALTER INDEX … RESUME` drops the manifest's lock policy.** `ddl.ResumableControlSQL(op,
+  "RESUME")` emits a bare RESUME. Microsoft documents that omitting `WAIT_AT_LOW_PRIORITY`
+  on RESUME means `MAX_DURATION = 0` with `ABORT_AFTER_WAIT = NONE` — the resumed rebuild
+  waits at *normal* priority, against the traffic the manifest told it to yield to. 0.44.0
+  closed this for the statement-recognized path (it re-executes the original REBUILD, which
+  carries the options), but the **sidecar-recognized path still emits the bare RESUME**.
+  RESUME accepts `WITH (MAXDOP, MAX_DURATION, WAIT_AT_LOW_PRIORITY(...))`, so the fix is to
+  render the resolved options there. Deferred only because it sits in `ddl/control.go` and
+  wanted its own tests; on a 24/7 database it is the more likely path to bite.
+- **Automatic resumption has no gate.** A paused rebuild whose stored statement matches is
+  now resumed without confirmation. The harm review's first finding: a DBA may have paused
+  that rebuild *deliberately* to relieve pressure, and the tool would silently undo it. The
+  statement match is strong evidence of ownership (it includes the manifest's exact option
+  string) and the resumed statement now yields at low priority, which bounds the damage —
+  but on a shared server "same statement" is not "my work". Decide whether adoption should
+  require the sidecar, or a manifest opt-in, or stay automatic.
+- **`PausedResumable` and `ResumableOps` overlap on `ResumableProbe`.** One reviewer
+  wants the index-scoped method deleted and its two callers (`resumeStatement`,
+  `resumableInterruption`) filtering the table-wide list instead; the other argues both
+  are justified because the Engine genuinely needs a targeted check and a table-wide
+  enumeration. Not resolved. Deleting it is the KISS answer if the filtering reads as well.
+- **Several paused rebuilds on one table are handled first-come.** `resumableStandingFor`
+  records only the first foreign blocker and the DMV read has no `ORDER BY`. With
+  `abort_blocking_resumable` and two foreign pauses, aborting the first still leaves the
+  operation blocked by the second. Either inspect every blocker before any ABORT and refuse
+  while an unabortable sibling remains, or establish that SQL Server cannot produce that
+  state and write the invariant down instead.
+- **Same-table ordering.** A manifest holding two indexes of one table, one of them paused,
+  now fails the earlier operation cleanly (Msg 10637 is table-scoped) instead of failing at
+  the server. Resuming the paused sibling *first* would let the manifest complete, but that
+  is a scheduling change, not a check. The startup scan added in 0.44.0 at least names the
+  pause before the run starts.
+- **The startup scan's coverage claim is shallow.** It matches a queued `ObjectRef` only:
+  no operation kind (a `reorganize_index` on that index reads as covering a paused
+  rebuild), no database scope (a manifest for another database counts, though `ownsManifest`
+  will skip it), and no `index: ALL` expansion. The wording was softened to "named by a
+  queued operation" rather than deepening the check.
+
+**Rejected, with the reason, so it is not re-raised:** the harm review called the startup
+scan a client-identifier leak. It is not a new class — the tool already writes schema,
+table and index names to stdout, the `.log` sidecar and the SQLite history for every
+operation it runs, and `CLAUDE.md`'s rule is about what reaches *the repository*, not what
+a run prints about the database it is pointed at. Scoping the scan to the run's database
+would still be reasonable on noise grounds.
 ## Iterations still to design / implement
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another

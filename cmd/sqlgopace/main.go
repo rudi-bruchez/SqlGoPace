@@ -1109,7 +1109,13 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 // the request's percent_complete is rollback progress, shown separately from
 // forward progress.
 func progressMsg(p mssql.Progress) tui.ProgressMsg {
-	msg := tui.ProgressMsg{ETASeconds: p.EstimatedCompletionMS / 1000}
+	var msg tui.ProgressMsg
+	// Measured from the request's own elapsed time and percentage. Never
+	// estimated_completion_time, which sys.dm_exec_requests documents as
+	// "Internal only". Zero means "not measurable yet" and the view omits it.
+	if eta, ok := p.ETASeconds(); ok {
+		msg.ETASeconds = eta
+	}
 	if p.IsRollback() {
 		msg.RollbackPercent = p.PercentComplete
 	} else {

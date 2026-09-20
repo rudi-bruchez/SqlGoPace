@@ -155,3 +155,44 @@ func TestActiveRequestCount(t *testing.T) {
 		t.Errorf("ActiveRequestCount(nil) = %d, want 0", got)
 	}
 }
+
+// TestProgressETAIsMeasuredFromElapsed pins the ETA to a figure the tool measures
+// itself. sys.dm_exec_requests.estimated_completion_time is documented "Internal
+// only", and the console showed "ETA: 5s" on a rebuild that was 72% done after 27
+// minutes because it forwarded that column verbatim.
+func TestProgressETAIsMeasuredFromElapsed(t *testing.T) {
+	// 30% done after 60s: the remaining 70% needs 140s at the same rate.
+	p := Progress{PercentComplete: 30, ElapsedMS: 60_000, EstimatedCompletionMS: 5_000}
+	got, ok := p.ETASeconds()
+	if !ok || got != 140 {
+		t.Errorf("ETASeconds() = %d, %v; want 140, true (measured, not estimated_completion_time)", got, ok)
+	}
+}
+
+// TestProgressETAUnknownBeforeFirstPercent: with no percentage there is no rate, so
+// the ETA is unknown and must be reported as such rather than as a number.
+func TestProgressETAUnknownBeforeFirstPercent(t *testing.T) {
+	p := Progress{PercentComplete: 0, ElapsedMS: 60_000, EstimatedCompletionMS: 5_000}
+	if got, ok := p.ETASeconds(); ok {
+		t.Errorf("ETASeconds() = %d, true at 0%%; want unknown", got)
+	}
+}
+
+// TestProgressETAUnknownDuringRollback: percent_complete is rollback progress then,
+// so treating it as forward progress would announce a finish time for the wrong work.
+func TestProgressETAUnknownDuringRollback(t *testing.T) {
+	p := Progress{PercentComplete: 60, ElapsedMS: 60_000, Command: "KILLED/ROLLBACK"}
+	if got, ok := p.ETASeconds(); ok {
+		t.Errorf("ETASeconds() = %d, true during rollback; want unknown", got)
+	}
+}
+
+// TestProgressETAUnknownWithoutElapsed: without elapsed time there is no rate. Both
+// external reviewers noted that every other ETA test supplies positive elapsed time, so
+// deleting the ElapsedMS guard would have gone unnoticed.
+func TestProgressETAUnknownWithoutElapsed(t *testing.T) {
+	p := Progress{PercentComplete: 50, ElapsedMS: 0, EstimatedCompletionMS: 5_000}
+	if got, ok := p.ETASeconds(); ok {
+		t.Errorf("ETASeconds() = %d, true with no elapsed time; want unknown", got)
+	}
+}
