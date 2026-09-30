@@ -99,13 +99,36 @@ func CheckServer(info mssql.ServerInfo) Check {
 func CheckLog(ls mssql.LogSpace, reuseWait string, maxBytes int64, maxPercent int) Check {
 	switch used := ls.UsedBytes(); {
 	case used >= maxBytes:
-		return Check{"transaction log", Fail, fmt.Sprintf("log already uses %d bytes (cap %d)", used, maxBytes)}
+		return Check{"transaction log", Fail, fmt.Sprintf("log already uses %s, over the %s cap (monitoring.log_max_size_bytes)",
+			humanizeBytes(used), humanizeBytes(maxBytes))}
 	case int(ls.UsedPercent) >= maxPercent:
-		return Check{"transaction log", Fail, fmt.Sprintf("log already at %.0f%% (cap %d%%)", ls.UsedPercent, maxPercent)}
+		return Check{"transaction log", Fail, fmt.Sprintf("log already at %.0f%%, over the %d%% cap (monitoring.log_max_percent)", ls.UsedPercent, maxPercent)}
 	case reuseWait != "" && reuseWait != "NOTHING":
 		return Check{"transaction log", Warn, fmt.Sprintf("log_reuse_wait = %s", reuseWait)}
 	default:
 		return Check{"transaction log", Pass, fmt.Sprintf("%.0f%% used, reuse_wait=%s", ls.UsedPercent, reuseWait)}
+	}
+}
+
+// humanizeBytes renders a byte count at a unit a human compares by eye. The log caps are
+// configured in bytes and were reported in bytes, which made the failure unreadable: two
+// 12-digit numbers whose ratio is the only thing the operator needs.
+//
+// It repeats report.HumanizeKB's steps rather than calling it, for that function's own
+// stated reason: internal/report has no internal dependency, and preflight should not gain
+// one on an output package to format a number.
+func humanizeBytes(b int64) string {
+	switch {
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	case b < 1024*1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	case b < 1024*1024*1024*1024:
+		return fmt.Sprintf("%.1f GB", float64(b)/(1024*1024*1024))
+	default:
+		return fmt.Sprintf("%.2f TB", float64(b)/(1024*1024*1024*1024))
 	}
 }
 

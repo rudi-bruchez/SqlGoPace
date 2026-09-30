@@ -1052,7 +1052,196 @@ manifest stranded in `02.processing`; the README's categorical "takes no lock" f
 false in connected mode; and the queue lock is keyed by directory rather than by database, so
 two queues against one database can KILL each other once kill rules are armed.
 
+### Found in a live shrink, blocked on a tail object (2026-09-20)
+
+A 500 GB `DBCC SHRINKFILE` against `PRODDB` on a synchronous AG stopped after 15 minutes
+having reclaimed 33.6 GB of it. Outcome `INCOMPLETE`, work preserved, which is the designed
+behaviour. What is wrong is how little it tried and what it did with what it already knew.
+
+- **The tail object is identified before the give-up but never feeds the decision.** The
+  backward page walk ran at `+12s`, long before the first failure, and named the object owning
+  the file's last allocated page: `dbo.MEASUREMENT` `index_id = 8`, `0 pages from end`, a
+  covering nonclustered index of 57.7 GB. That fact reached the operator only in the report,
+  after the run ended. It should steer the loop instead: re-probe the tail on each no-progress
+  event and branch on whether it moved. **A tail object that is the same object across
+  successive retries while `halveStep` is shrinking the ask is a structural blocker** and
+  waiting is pointless, so stop at once with the object named in the reason rather than burning
+  the whole budget. A tail object that keeps changing is workload churn re-using the freed
+  space, which is exactly the case Microsoft documents for Azure SQL ("a workload might start
+  using the storage space freed by shrink before shrink truncates the file"), and there waiting
+  is the right answer and the budget should be generous. Today both cases get the same 90
+  seconds. The measured run: three attempts asking for 8 GB, then 4, then 2, each returning
+  `Could not adjust the space allocation for file`, with nothing in the server error log for
+  the window (no 665, no 1450, no 5202/5203) — the signature of a structural blocker, and the
+  driver could have said so at the second retry.
+  **CORRECTION, measured 2026-09-20 22:10-23:34, and it invalidates the heuristic above as
+  stated.** The rule proposed here was "same tail object across successive retries while
+  `halveStep` shrinks the ask = structural blocker, stop at once". A later run of the same
+  campaign falsifies it. The shrink stalled **five separate times**, each episode backing off
+  30 s then 1 m then 2 m, with `dbo.MEASUREMENT` index_id 5 named as the tail object
+  throughout — the same object, across retries, exactly the signature this entry calls
+  structural. It was not. With the budget raised to `max_no_progress: 10` and
+  `self_wait_timeout_minutes: 30`, every one of those five episodes recovered on its own and
+  the run finished at 100 % of target: 746 347 MB -> 381 298 MB, 365 049 MB reclaimed in 39
+  chunks, 1 h 22 m. Total blocked time 1 042 s, i.e. 17 minutes of pure waiting that turned
+  into 356 GB.
+
+  Two consequences. **The defaults would have thrown that away**: at `max_no_progress: 3` the
+  first episode stops the run on its third backoff, and the 5-minute cumulative cap kills it
+  regardless, so the shrink would have ended around 680 GB instead of 372 GB. That is the
+  second point of this entry proven in production, and it is now the higher-value half.
+  **And identity of the tail object is not the discriminator.** The same object can mean
+  "actively being written into the space you just freed", which is churn and wants patience,
+  or "cannot be moved", which is structural and wants a relocation. Distinguishing them needs
+  something else — whether the file size moved at all between episodes, whether the object is
+  taking writes, whether the *page* at the tail changed even though the object did not. Do not
+  build the identity heuristic; it would have stopped a run that was working.
+- **The no-progress budget is sized for a chunk, not for an overnight shrink.** Defaults are
+  `max_no_progress: 3` with `no_progress_backoff_seconds: 30` doubling to a 300 s ceiling, so
+  a shrink planned to run for a night gives up after **90 seconds of waiting across three
+  tries**. Worse, `self_wait_timeout_minutes: 5` caps the *cumulative* wait, so raising
+  `max_no_progress` alone changes almost nothing: the two interact and neither comment says so.
+  Fix is small and in two parts. State the interaction in `config.yaml` next to both keys, and
+  make the give-up reason name which bound tripped (count or cumulative wait) rather than the
+  present single `no further progress` for both. Then consider scaling the budget to the size
+  of the reclaim: a shrink whose remaining work is measured in hundreds of gigabytes should
+  wait minutes, not seconds, before concluding that a transient blocker is permanent.
+
+### Found relocating a tail object, and in the run that did nothing (2026-09-20)
+
+Same campaign as the entry above, the next two hours of it. All three were measured, not
+reasoned about.
+
+- **Asking for the tail-object walk makes the give-up record *less* fresh, not more.**
+  `chunkLoop` runs the proactive walk once at loop entry when `identify_tail_object: true`
+  and stashes it in `tp.finding` (`internal/run/shrink.go`). `captureGiveUpTail` then
+  returns early precisely *because* a finding is already stashed, "so the give-up path stays
+  a single read". So the record written at give-up is a re-emit of a measurement taken
+  before the first chunk executed. Measured: the walk ran at `+12s`, five chunks moved
+  33.6 GB over the next fourteen minutes, and at `+14m50s` the run emitted the `+12s`
+  finding and wrote `confirmed_by: tail_position` into the `.contended.yaml` sidecar. In
+  that run the answer happened to still be right, because 33.6 GB off a 57.7 GB tail object
+  cannot have moved its ownership of the last page. It is right by arithmetic that the
+  driver did not do. A run *without* `identify_tail_object` walks fresh at give-up and gets
+  a genuinely current answer, which inverts the meaning of the flag. Worse, the sidecar
+  feeds `plan --confirmed`: a stale reading is promoted to a confirmed structural blocker
+  and generates a relocation manifest for whatever owned the tail some minutes earlier.
+  Fix: walk again at give-up even when a proactive finding exists, and keep both — the entry
+  walk and the give-up walk answer different questions, and *comparing* them is the signal
+  the entry above asks for (same object = structural, moved = churn). The saved read is a
+  micro-optimization on a path that has already decided to stop.
+
+- **A manifest whose every operation was skipped reports `SUCCESS`, indistinguishable from
+  one that did the work.** Measured: a `rebuild_index` manifest carrying `intent:
+  compression` against an index already at the target compression produced
+  `outcome: SUCCESS`, `duration: 4307ms`, one operation line reading
+  `skipped: already ROW (563ms)`. The skip is correct (`skipSatisfied`,
+  `internal/run/skip.go`) and the per-operation line is honest; the manifest-level verdict
+  is not, and the verdict is what an operator reads first, what the queue acts on (the file
+  moves to `03.done/`) and what the history records. The codebase already names this exact
+  defect class one screen away: `reconcileResumePlan` restarts clean rather than "silently
+  skip operations (which would report SUCCESS having executed nothing)" (`engine.go`). The
+  guard exists for the resume cursor and not for its sibling. `rep.Skipped` is already
+  counted in `summarize`, so the fix is small: when every operation in the plan was skipped,
+  say so in the outcome rather than only in a count nobody reads. `docs/manifests.md` states
+  the danger in its own words under `intent` — "a wrongly skipped rebuild is silent,
+  reported as a success that did nothing" — which is a specification of the symptom, written
+  before it was observed.
+
+- **`intent` has no word for relocation, which is a third thing the two it has cannot say.**
+  `compression` means "skip if already at target"; `fragmentation` means "always run". A
+  rebuild whose purpose is to *move* an object off the end of a file is neither: its
+  `data_compression:` is there to preserve the current setting, not to change it, and it must
+  run whatever the catalog says. Today it is expressed as `intent: fragmentation`, which
+  works by side effect. This is a small gap while an operator writes the manifest by hand and
+  a real one the moment the first entry above lands: once the driver names a structural tail
+  blocker, the obvious next step is `plan` generating the relocation manifest, and a generator
+  cannot emit a word that means something else and hope the reader understands. Consider
+  `intent: relocation` (always runs, like `fragmentation`, but says why) before building the
+  generator, not after. Counter-argument worth keeping: on the measured run the tail index was
+  at **53.5 % logical fragmentation** against **0.62 %** for the clustered index of the same
+  table, so `fragmentation` was literally true and the vocabulary gap cost nothing that day.
+
+- **Shrink fragments what it relocates, and here is the number.** `docs/specs/SHRINK.md` and
+  `docs/shrink.md` both warn about post-shrink fragmentation in general terms. Measured on the
+  campaign above, after five chunks moved 33.6 GB: the nonclustered index the shrink was
+  relocating stood at **53.46 %** logical fragmentation (7 363 368 pages), the clustered index
+  of the same table, which the shrink never touched, at **0.62 %** (7 077 868 pages). Same
+  table, same rebuild pass a few hours earlier, one order of magnitude apart. Put the figure in
+  the docs — a warning with a measurement behind it is acted on and a warning without one is
+  not. Do NOT propose the post-shrink defrag chaining as new work here: it is designed in
+  `SHRINK.md` §12.1 (Phase 2, layering settled, deliberately not a field of the `shrink`
+  operation), and §12 already lists the before/after `sys.dm_db_index_physical_stats` report.
+  What that design lacked was a measured number justifying an extra read on a path that has
+  just finished a long operation. This is that number.
+
 ## Iterations still to design / implement
+
+- [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested
+  after a live campaign spent an evening doing this by hand, three rounds of the same loop. A
+  shrink that stops `INCOMPLETE` on a tail object already knows the name of what blocks it: the
+  `.contended.yaml` sidecar records it with `confirmed_by: tail_position`. Today the operator
+  reads the report, writes a relocation manifest by hand, runs it, and re-arms the shrink. The
+  measured case, on one `PRODDB` data file:
+
+  | Round | Tail object | Before | After | Gain |
+  |---|---|---:|---:|---:|
+  | 1 | an unused NC index, 57.7 GB | 898 184 MB | 864 568 MB | 33.6 GB |
+  | 2 | *(after rebuilding that index)* | 864 568 MB | 746 347 MB | **115.4 GB** |
+  | 3 | a 2.3 GB log heap | 746 347 MB | 715 831 MB | 29.8 GB on TRUNCATEONLY alone |
+
+  Relocation works and the effect is not marginal: 33.6 GB reclaimed before it, 115.4 GB after.
+  The heap rebuild was verified to land at **22.2 % of the file, 580 GB before the end**
+  (`sys.dm_db_database_page_allocations`), so the allocator did cooperate. Proposed shape,
+  declared **in the manifest and never on by default**, because this is unrequested DDL on
+  production:
+
+  ```yaml
+  - operation: shrink
+    identify_tail_object: true
+    unblock_tail:
+      enabled: true
+      max_rounds: 3
+      max_object_mb: 5000        # above this, stop and ask
+      require_online: true
+      require_low_priority: true
+      preserve_compression: true
+  ```
+
+  **The guard rails are the feature, not decoration.** ONLINE mandatory, and stop with the object
+  named if the matrix resolves it off. `WAIT_AT_LOW_PRIORITY` mandatory where it exists, or an
+  unattended unblock can block production while nobody watches. A size ceiling: relocating 2.3 GB
+  unattended is reasonable, relocating 57.7 GB is an hour of DDL and ~58 GB of log on a
+  synchronous AG. Compression preserved, because changing it mid-operation is an architecture
+  decision taken at night by a machine. RESUMABLE where the operation has it, and a much lower
+  ceiling where it does not: `rebuild_heap` (`ALTER TABLE ... REBUILD`) has **no RESUMABLE form**,
+  so it is one transaction and a cancel under pressure rolls back everything — the planner already
+  says so (`reaction = cancel only`). And a bounded round count, or it is a treadmill: each object
+  moved uncovers the next.
+
+  **Hard dependency, stated so nobody builds this first.** It cannot be built before the entry
+  above about the tail object not steering the decision: an automatic unblock acting on a stale
+  reading relocates the wrong object. It also wants `intent: relocation`, because a generator
+  cannot emit `fragmentation` and mean "move this".
+
+- [ ] **A DBCC error in the TRUNCATEONLY phase is fatal; the identical error in the chunk loop is
+  by design not.** Measured on a production run that was lost to it:
+  `shrink "PRODDB": truncateonly: execute ddl: mssql: Could not adjust the space allocation for
+  file 'PRODDB'.`, outcome `FAILED`. The chunk loop states the opposite policy in its own comment
+  — "A DBCC SHRINKFILE chunk error almost never means the operation is broken ... We decide
+  success by progress, not by matching a specific message number" — while `shrinkData` returns
+  the phase A error straight out. **The same Msg 3140 is benign in phase B and fatal in phase A.**
+  Two costs, and the second is worse than the lost run. The manifest lands in `04.failed` having
+  attempted nothing: no TRUNCATEONLY, not one chunk. And **the tail-object walk never runs**,
+  because it sits at `chunkLoop`'s entry, behind phase A — so the operator gets a failure with no
+  diagnosis at all, on the one operation whose entire subject is "what is in the way". In the
+  measured case the cause was transient: a `rebuild_heap` had finished two minutes earlier and the
+  old copy's extents were not yet released (verified by hand: no allocated page in the last
+  200 000 pages, no backup running). A plain re-run then released 29.8 GB in the TRUNCATEONLY it
+  had just called fatal. Fix: decide phase A by result rather than by message — re-read the file
+  size, and treat "released nothing" as information, continuing into the chunk loop, which exists
+  precisely to move what TRUNCATEONLY cannot release. At minimum, run the tail walk before giving
+  up so the failure names something.
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another
   process. Proposes `--serve :port` (SSE broadcast hub) plus `--connect host:port` (reuses the

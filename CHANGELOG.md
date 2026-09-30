@@ -13,6 +13,17 @@ mean inventing boundaries the repository never had, since no release was tagged.
 The version a run used is written into its `.log` sidecar and into the SQLite
 history, so a report can always name the build that produced it.
 
+## [0.46.0] - 2026-09-20
+
+### Changed
+
+- The failing transaction-log preflight now reports sizes at a readable unit and names the
+  key that set the cap: `log already uses 217.6 GB, over the 150.0 GB cap
+  (monitoring.log_max_size_bytes)` instead of `log already uses 233606274710 bytes (cap
+  161061273600)`. The percent branch names `monitoring.log_max_percent` the same way. Two
+  12-digit numbers are not compared by eye, and the message named no knob to turn. The
+  existing test asserted only the severity, which is how the text drifted.
+
 ## [0.45.0] - 2026-09-20
 
 ### Fixed

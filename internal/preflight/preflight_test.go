@@ -44,6 +44,39 @@ func TestCheckLog(t *testing.T) {
 	}
 }
 
+// A failing log check is read by an operator deciding what to change, and the numbers it
+// prints are the whole content of that decision. Raw byte counts defeat it: the shipped
+// message read "log already uses 233606274710 bytes (cap 161061273600)", two 12-digit
+// numbers whose ratio is the only thing that matters and which nobody compares by eye.
+// TestCheckLog above asserts only Severity, which is how the Detail drifted unnoticed.
+// Naming the config key matters as much as the unit: the cap is invisible from the message
+// otherwise, and an operator who cannot find the knob cannot act on the failure.
+func TestCheckLogDetailIsReadable(t *testing.T) {
+	// 217.6 GB used against a 150 GB cap: the real numbers from the run that prompted this.
+	over := mssql.LogSpace{TotalBytes: 279613145088, UsedPercent: 83.55}
+
+	byteCap := preflight.CheckLog(over, "NOTHING", 161061273600, 92).Detail
+	for _, want := range []string{"217.6 GB", "150.0 GB", "monitoring.log_max_size_bytes"} {
+		if !strings.Contains(byteCap, want) {
+			t.Errorf("byte-cap detail = %q, want it to contain %q", byteCap, want)
+		}
+	}
+	// No raw byte count. Checking for the word "bytes" would be a false positive: the
+	// config key named in the message legitimately ends in it.
+	for _, raw := range []string{"161061273600", "233616782721"} {
+		if strings.Contains(byteCap, raw) {
+			t.Errorf("byte-cap detail = %q, want no raw byte count %s", byteCap, raw)
+		}
+	}
+
+	pctCap := preflight.CheckLog(over, "NOTHING", 1<<62, 80).Detail
+	for _, want := range []string{"84%", "80%", "monitoring.log_max_percent"} {
+		if !strings.Contains(pctCap, want) {
+			t.Errorf("percent-cap detail = %q, want it to contain %q", pctCap, want)
+		}
+	}
+}
+
 // An offline rebuild materializes the new index before dropping the old one, so it needs
 // roughly the object's own size free in the data files. Running out mid-rebuild wastes the
 // whole operation, which is what preflight exists to prevent.
