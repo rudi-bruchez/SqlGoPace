@@ -51,7 +51,7 @@ operations:
 | `window` | no | Restrict the manifest to a recurring time window. See below. |
 | `ignore_blocked_sessions` | no | Sessions allowed to stay blocked by these operations. See [`blocking-and-kills.md`](blocking-and-kills.md). |
 | `kill_blocking_sessions` | no | Sessions that may be killed when they block these operations. Inert unless armed in `config.yaml`. |
-| `abort_blocking_resumable` | no | Clear a foreign paused resumable before a fresh rebuild. Off by default. See [`running.md`](running.md). |
+| `abort_blocking_resumable` | no | ABORT a foreign paused rebuild of the index the operation names before a fresh rebuild. Never touches another index's pause. Off by default. See [`running.md`](running.md). |
 
 ## `intent` (rebuild_index only)
 

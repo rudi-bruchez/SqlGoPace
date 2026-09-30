@@ -691,7 +691,9 @@ a transient outage or a server restart.
 ### 11.2 Aborting orphaned resumable operations
 
 A paused resumable operation is not free: it **holds data space** for the partial index and **blocks a
-concurrent rebuild of the same index** (error 10637) until it is resumed or aborted. When the work is
+rebuild of any index on its table** (error 10637), not only its own, until it is resumed or aborted.
+(Before 0.44.0 this section said "of the same index", and the engine checked only that index, so a
+sibling's pause surfaced as a server refusal mid-run.) When the work is
 no longer wanted, the **`abort-resumable`** subcommand inventories the connected database's resumable
 operations (`sys.index_resumable_operations`, with their schema/table resolved) and cancels each with
 `ALTER INDEX … ABORT`. It targets `PAUSED` operations by default (`--include-running` to also stop

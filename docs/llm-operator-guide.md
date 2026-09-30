@@ -254,8 +254,9 @@ existing index is `ALTER INDEX … REBUILD WITH (DATA_COMPRESSION = …)`. So:
    `i` on a blocked session to ignore it — writes an `ignore_blocked_sessions` rule into the
    running manifest, hot-reloaded so the operation holds its lock through that session).
 3. **Recovery / interruptions**: a crash leaves the manifest in `02.processing/`; the next
-   run reconciles it. A paused RESUMABLE that blocks a retry can be cleared with the
-   `abort-resumable` subcommand.
+   run reconciles it. A manifest re-queued by hand continues its own paused RESUMABLE (same
+   index, same statement). Only a *foreign* paused RESUMABLE blocks a retry; the run names it
+   and its `RESUME`, and `abort-resumable` discards it for good, so prefer the RESUME.
 4. **Automatic maintenance** (a different path): the `plan` subcommand inspects a live
    database and *generates* reviewable manifests into `01.to_run/` from
    `maintenance_profile.yaml`. Use it for "reorganize/rebuild/compress/update stats/checkdb

@@ -385,13 +385,28 @@ reviewable. It is superseded by the final report when the manifest eventually fi
 
 ## Paused resumable operations
 
-A paused resumable index operation keeps consuming data space and blocks a concurrent
-rebuild of the same index (error 10637) until it is finished or aborted.
+A paused resumable index operation keeps both the old and the new structure allocated, is
+maintained by every DML, and blocks a rebuild of any index on its table (error 10637), not
+only its own, until it is finished or aborted.
+
+Before the first manifest, a run lists every paused resumable rebuild the database holds, to
+stdout and to the `--tui` console. One that a queued operation targets is reported as
+covered; any other is named with the `ALTER INDEX … RESUME` that would finish it.
 
 During a run this is handled automatically. If the paused operation is this manifest's own
-interrupted work, the run resumes it with `ALTER INDEX … RESUME`, reusing the server-side
-progress rather than restarting. Ownership is matched by identity, the operation index plus
-the target object, never by cursor position.
+interrupted work, the run continues it, reusing the server-side progress rather than
+restarting. Ownership is recognized two ways:
+
+- the `.state.json` sidecar records the operation index plus the target object, never the
+  cursor position, and the run issues `ALTER INDEX … RESUME`;
+- without a sidecar (a manifest re-queued by hand), a paused rebuild of the same index whose
+  statement matches the one the manifest generates is the same work, and the run
+  re-executes that statement, which is how SQL Server resumes it. The comparison ignores
+  whitespace and one trailing semicolon, nothing else: a manifest changed since, from ROW to
+  PAGE for instance, is treated as foreign.
+
+If `sys.index_resumable_operations` cannot be read, the operation does not run and the
+manifest stays in `02.processing/` for the next run.
 
 The RESUME restates `WAIT_AT_LOW_PRIORITY` from the operation's options. SQL Server does
 not remember it across a pause: omitting it on RESUME is documented as `MAX_DURATION = 0,
@@ -411,7 +426,9 @@ operations:
 ```
 
 That flag is off by default because aborting discards the paused operation's server-side
-progress, which is a deliberate choice to make on a shared database.
+progress, which is a deliberate choice to make on a shared database. It only covers a paused
+rebuild of the index the operation names. A pause held by another index of the same table is
+always refused, with a message naming that index and its `RESUME`.
 
 ### `abort-resumable`
 
