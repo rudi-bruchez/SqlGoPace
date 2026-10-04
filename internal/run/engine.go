@@ -1187,9 +1187,9 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 			e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 			r.rep.Operations = append(r.rep.Operations, opRep)
 			if stopped {
-				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i, step.Operation.CommandType())
+				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i+1, step.Operation.CommandType())
 			} else {
-				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i, step.Operation.CommandType(), runErr)
+				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i+1, step.Operation.CommandType(), runErr)
 			}
 			return endRun(e.finalizeInterrupted(ctx, r.name, r.rep, r.start))
 		}
@@ -1198,12 +1198,12 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		e.emitStep(stepEv.finished("failed", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		if !r.manifest.Continue() {
-			r.rep.Error = fmt.Sprintf("operation %d (%s): %v", i, step.Operation.CommandType(), runErr)
+			r.rep.Error = fmt.Sprintf("operation %d (%s): %v", i+1, step.Operation.CommandType(), runErr)
 			return endRun(e.finalize(ctx, r.name, r.rep, r.start, false))
 		}
 		// continue-on-failure: quarantine the failed op and keep going.
 		r.failedOps = append(r.failedOps, step.Operation)
-		fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i, step.Operation.CommandType(), runErr)
+		fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i+1, step.Operation.CommandType(), runErr)
 		e.checkpointBetween(ctx, i, len(r.planned))
 		return nil // carry on to the next operation
 	}
@@ -1216,7 +1216,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
-			i, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
+			i+1, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	// A batch-DML operation stops the same way: log pressure, blocking, or the self-wait
@@ -1229,7 +1229,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped before the predicate was exhausted, work preserved — %s",
-			i, step.Operation.CommandType(), batchResult.Reason)
+			i+1, step.Operation.CommandType(), batchResult.Reason)
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	opRep.Outcome = "success"

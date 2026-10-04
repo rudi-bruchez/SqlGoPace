@@ -361,6 +361,15 @@ func TestProcessAllOperationError(t *testing.T) {
 		t.Errorf("Summary = %+v, want Failed:1", sum)
 	}
 	mustExist(t, filepath.Join(dirs.Failed, "010_a.yaml"))
+	// The report lists operations from 1; the error under it must name the same number,
+	// or an operator grepping for the operation they watched finds nothing.
+	data, err := os.ReadFile(filepath.Join(dirs.Failed, "010_a.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if !strings.Contains(string(data), "[1] rebuild_index") || !strings.Contains(string(data), "operation 1 (rebuild_index)") {
+		t.Errorf("log does not name operation 1 in both places\n--- log ---\n%s", data)
+	}
 }
 
 func TestProcessAllRecordsReactions(t *testing.T) {
