@@ -14,6 +14,7 @@ package mssql_test
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,5 +69,27 @@ func TestIntegrationLogSpaceAndSPID(t *testing.T) {
 	}
 	if ls.TotalBytes <= 0 {
 		t.Errorf("LogSpace().TotalBytes = %d, want > 0", ls.TotalBytes)
+	}
+}
+
+// The driver renders a server error as "mssql: <text>" with no number. Against a real
+// server, a failed statement's message must carry it, so a report can tell 1105 from 1205.
+func TestIntegrationExecDDLErrorCarriesTheNumber(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	err := conn.ExecDDL(ctx, "SELECT 1/0;")
+	if err == nil || !strings.Contains(err.Error(), "Msg 8134") {
+		t.Fatalf("ExecDDL() error = %v, want it to name Msg 8134", err)
+	}
+}
+
+// The reuse wait is read in the same statement as the log space now.
+func TestIntegrationLogSpaceCarriesTheReuseWait(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	ls, err := conn.LogSpace(ctx)
+	if err != nil {
+		t.Fatalf("LogSpace() error = %v", err)
+	}
+	if ls.ReuseWait == "" {
+		t.Errorf("LogSpace().ReuseWait is empty, want log_reuse_wait_desc (NOTHING at least)")
 	}
 }

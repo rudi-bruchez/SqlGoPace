@@ -270,15 +270,20 @@ func TestE2EDryRunExpandsAllInTheManifestDatabase(t *testing.T) {
 			t.Fatalf("seed index in %q: %v", s.db, err)
 		}
 		db := s.db
+		// Its own connection: cleanups run after the deferred Close of conn above, so
+		// reusing conn here executed on a closed connection and panicked.
 		t.Cleanup(func() {
-			cc := conn
+			var cc *mssql.Conn
+			var cerr error
 			if db != "" {
-				var cerr error
-				if cc, cerr = mssql.OpenDatabase(context.Background(), dsn, db, "test"); cerr != nil {
-					return
-				}
-				defer func() { _ = cc.Close() }()
+				cc, cerr = mssql.OpenDatabase(context.Background(), dsn, db, "test")
+			} else {
+				cc, cerr = mssql.Open(context.Background(), dsn, "test")
 			}
+			if cerr != nil {
+				return
+			}
+			defer func() { _ = cc.Close() }()
 			_ = cc.ExecDDL(context.Background(), "IF OBJECT_ID('dbo.sqlgopace_xdb') IS NOT NULL DROP TABLE dbo.sqlgopace_xdb;")
 		})
 	}
