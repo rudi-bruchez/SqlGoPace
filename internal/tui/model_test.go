@@ -1047,6 +1047,23 @@ func TestProgressETAOmittedWhenUnknown(t *testing.T) {
 	}
 }
 
+// Some statements never feed sys.dm_exec_requests.percent_complete (an ALTER COLUMN, an
+// offline CREATE INDEX on older versions). The console read "progress: 0%" for their whole
+// run, which says "stuck at the start", not "not reported". Until the server reports a
+// figure, say so.
+func TestProgressUnreportedReadsNA(t *testing.T) {
+	m := tui.New("alter_column dbo.T.C", nil)
+	m, _ = send(m, tui.ProgressMsg{Percent: 0})
+	v := m.View()
+	if strings.Contains(v, "progress: 0%") || !strings.Contains(v, "progress: n/a") {
+		t.Errorf("an unreported percentage must read n/a, not 0%%\n%s", v)
+	}
+	m, _ = send(m, tui.ProgressMsg{Percent: 12})
+	if v := m.View(); !strings.Contains(v, "progress: 12%") {
+		t.Errorf("a reported percentage must be shown\n%s", v)
+	}
+}
+
 // A resumable operation held by transaction-log pressure is stopped, not running. The
 // console said RUNNING for the whole pause and kept the last ETA on screen, which is
 // indistinguishable from a hung rebuild — the reaction that explains it only ever reached
@@ -1089,5 +1106,20 @@ func TestDrainOutranksPaused(t *testing.T) {
 	m, _ = send(m, tui.PausedMsg{Paused: true, Reason: "transaction log over cap"})
 	if v := m.View(); !strings.Contains(v, "[DRAINING]") {
 		t.Errorf("draining should outrank the pause\n%s", v)
+	}
+}
+
+// Text outside the bordered panels (the alerts above the dashboard, the notice line below
+// it) sat flush against the terminal's left edge while every panel's text is inset by its
+// border and padding. It now carries a one-column margin.
+func TestUnboxedTextIsIndented(t *testing.T) {
+	m := tui.New("rebuild_index dbo.T.IX", nil)
+	m, _ = send(m, tui.AlertMsg{Title: "manifest failed: 010_rebuild.yaml", Lines: []string{"permission denied"}})
+	v := m.View()
+	for _, line := range strings.Split(v, "\n") {
+		plain := line
+		if strings.Contains(plain, "manifest failed") && !strings.HasPrefix(plain, " ") {
+			t.Errorf("alert line not indented: %q", plain)
+		}
 	}
 }

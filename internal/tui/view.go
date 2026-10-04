@@ -28,7 +28,7 @@ func (m Model) View() string {
 	full := max(w-boxChrome, 20) // inner width of a full-width bordered panel
 
 	// Every block other than the operations panel, so its body can take the remaining height.
-	alerts := m.alertsBlock()
+	alerts := indent(m.alertsBlock())
 
 	nameBox := panel("", titleStyle.Render("SqlGoPace")+"  "+m.server.App, accentColor, 0)
 	rightW := max(w-lipgloss.Width(nameBox)-colGap-boxChrome, 20)
@@ -97,9 +97,18 @@ func (m Model) View() string {
 		b.WriteString(blk)
 	}
 	if m.notice != "" {
-		b.WriteString("\n" + m.notice)
+		b.WriteString("\n" + indent(m.notice))
 	}
 	return b.String()
+}
+
+// indent gives text outside the bordered panels a one-column margin, so it does not sit
+// flush against the terminal edge while every panel's text is inset by its border.
+func indent(s string) string {
+	if s == "" {
+		return ""
+	}
+	return " " + strings.ReplaceAll(s, "\n", "\n ")
 }
 
 // maxHeapScopeLines caps the heap rebuild scope lines rendered in the alerts block; an
@@ -343,7 +352,13 @@ func (m Model) opStatusBody() string {
 			m.batch.Verb, m.batch.Table, m.batch.RowsDone, m.batch.EstRows,
 			m.batch.Percent*100, m.batch.BatchRows, m.batch.RowsPerSec)
 	default:
-		fmt.Fprintf(&b, "progress: %.0f%%", m.percent)
+		// percent_complete stays 0 for statements the server does not report on, so a 0
+		// is "not reported", not "not started": n/a until a figure arrives.
+		if m.percent > 0 {
+			fmt.Fprintf(&b, "progress: %.0f%%", m.percent)
+		} else {
+			b.WriteString("progress: n/a")
+		}
 		// While paused the percentage is the last one measured and nothing advances, so
 		// an ETA would count down from a standstill. Name the pause and its cause instead:
 		// a frozen number is only misleading when it is unlabelled.
