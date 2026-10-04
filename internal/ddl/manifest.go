@@ -701,6 +701,32 @@ func validateIntent(i Intent) error {
 	}
 }
 
+// validateDataCompression accepts an empty value or one of the DATA_COMPRESSION settings,
+// in any case. The value reaches the generated SQL verbatim, and a manifest is a trusted
+// input (SECURITY.md), so this is hardening: a field that reads as an enumeration is one.
+func validateDataCompression(cmd, v string) error {
+	switch strings.ToUpper(v) {
+	case "", "NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE":
+		return nil
+	}
+	return fmt.Errorf("%s: data_compression must be NONE, ROW, PAGE, COLUMNSTORE or COLUMNSTORE_ARCHIVE, got %q: %w", cmd, v, ErrInvalidManifest)
+}
+
+// dataTypeShape is a type name, optionally schema-qualified (a user-defined type), with an
+// optional length, precision or (precision, scale). A shape rather than a list of names,
+// so a user-defined type or a type added in a later version is not refused.
+var dataTypeShape = regexp.MustCompile(`(?i)^[a-z_][a-z0-9_]*(\.[a-z_][a-z0-9_]*)?(\s*\(\s*(\d+|max)\s*(,\s*\d+\s*)?\))?$`)
+
+// validateDataType checks that a column type has the shape of a type and nothing more. It
+// reaches the generated SQL verbatim; anything after the type (a COLLATE, a NULL, a
+// comment) belongs to fields of its own.
+func validateDataType(cmd, v string) error {
+	if dataTypeShape.MatchString(strings.TrimSpace(v)) {
+		return nil
+	}
+	return fmt.Errorf("%s: type %q is not a type name with an optional (length) or (precision, scale): %w", cmd, v, ErrInvalidManifest)
+}
+
 // --- Concrete operations -------------------------------------------------
 
 // RebuildIndex is ALTER INDEX ... REBUILD. Index may be "ALL" to expand to one
@@ -731,6 +757,9 @@ func (o RebuildIndex) Validate() error {
 	}); err != nil {
 		return err
 	}
+	if err := validateDataCompression("rebuild_index", o.DataCompression); err != nil {
+		return err
+	}
 	return validateIntent(o.Intent)
 }
 
@@ -758,7 +787,7 @@ func (o CreateIndex) Validate() error {
 	if len(o.Columns) == 0 {
 		return fmt.Errorf("create_index: at least one column required: %w", ErrInvalidManifest)
 	}
-	return nil
+	return validateDataCompression("create_index", o.DataCompression)
 }
 
 // AlterColumn is ALTER TABLE ALTER COLUMN. v1 supports type + nullability only.
@@ -776,9 +805,12 @@ func (o AlterColumn) Target() ObjectRef {
 	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Column}
 }
 func (o AlterColumn) Validate() error {
-	return requireFields("alter_column", map[string]string{
+	if err := requireFields("alter_column", map[string]string{
 		"schema": o.Schema, "table": o.Table, "column": o.Column, "type": o.DataType,
-	})
+	}); err != nil {
+		return err
+	}
+	return validateDataType("alter_column", o.DataType)
 }
 
 // AddColumn is ALTER TABLE ADD. v1 supports type + nullability + constant default.
@@ -796,9 +828,12 @@ func (o AddColumn) Target() ObjectRef {
 	return ObjectRef{Schema: o.Schema, Table: o.Table, Name: o.Column}
 }
 func (o AddColumn) Validate() error {
-	return requireFields("add_column", map[string]string{
+	if err := requireFields("add_column", map[string]string{
 		"schema": o.Schema, "table": o.Table, "column": o.Column, "type": o.DataType,
-	})
+	}); err != nil {
+		return err
+	}
+	return validateDataType("add_column", o.DataType)
 }
 
 // AddConstraint is ALTER TABLE ADD CONSTRAINT (primary key or unique).
@@ -921,9 +956,12 @@ type RebuildHeap struct {
 func (o RebuildHeap) CommandType() string { return "rebuild_heap" }
 func (o RebuildHeap) Target() ObjectRef   { return ObjectRef{Schema: o.Schema, Table: o.Table} }
 func (o RebuildHeap) Validate() error {
-	return requireFields("rebuild_heap", map[string]string{
+	if err := requireFields("rebuild_heap", map[string]string{
 		"schema": o.Schema, "table": o.Table,
-	})
+	}); err != nil {
+		return err
+	}
+	return validateDataCompression("rebuild_heap", o.DataCompression)
 }
 
 // UpdateStatistics is UPDATE STATISTICS. An empty Statistic targets every

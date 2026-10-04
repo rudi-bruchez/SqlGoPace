@@ -172,7 +172,12 @@ ISO 8601 form and needs no such care.
   nullable: true            # optional
 ```
 
-Type and nullability only. `ONLINE` applies from SQL Server 2016, and
+Type and nullability only. `type` must be a type name, optionally schema-qualified for a
+user-defined type, with an optional `(length)`, `(max)` or `(precision, scale)`: anything after
+it, a `COLLATE` included, is refused at load (since 0.48.0; it used to be passed through
+verbatim). The same rule applies to `add_column`, and `data_compression` on the index and heap
+operations must be one of `NONE`, `ROW`, `PAGE`, `COLUMNSTORE`, `COLUMNSTORE_ARCHIVE`.
+`ONLINE` applies from SQL Server 2016, and
 `WAIT_AT_LOW_PRIORITY` is not supported with an online `ALTER COLUMN` on any version, so
 the matrix never pairs them.
 
