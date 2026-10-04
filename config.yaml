@@ -83,6 +83,10 @@ shrink:
   min_step_mb:             50    # chunk floor
   max_step_mb:           8192    # absolute chunk ceiling
   max_chunk_seconds:      300    # ceiling on chunk duration: stops the step growing, never shrinks it
+  # The two give-up bounds interact: whichever trips first stops the shrink, and the
+  # second one caps the CUMULATIVE wait, so raising max_no_progress alone changes little.
+  # At these defaults a stalled shrink gives up after about 90 s of waiting. For a long
+  # (overnight) shrink, raise both; the give-up reason names the one that tripped.
   max_no_progress:          3    # consecutive no-gain chunks before a clean stop
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
   no_progress_backoff_max_seconds: 300   # backoff ceiling

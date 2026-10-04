@@ -1294,3 +1294,36 @@ func hasEventContaining(events []ReactionEvent, sub string) bool {
 	}
 	return false
 }
+
+// The two give-up bounds interact: self_wait_timeout_minutes caps the cumulative wait,
+// so raising max_no_progress alone changes almost nothing, and the reason read "no
+// further progress" whichever one tripped. A production shrink was given up at the
+// defaults and finished at 100% once both were raised; the operator could not tell from
+// the report which key to turn.
+func TestShrinkGiveUpNamesTheBoundThatTripped(t *testing.T) {
+	tests := []struct {
+		name string
+		tune func(*ShrinkTuning)
+		want string
+	}{
+		{"the attempt count", func(tu *ShrinkTuning) {},
+			"no further progress after 3 attempts without a gain (shrink.max_no_progress); work preserved"},
+		{"the cumulative wait", func(tu *ShrinkTuning) { tu.MaxNoProgress = 100; tu.SelfWaitTimeout = 3 * time.Second },
+			"no further progress after 3s of waiting (shrink.self_wait_timeout_minutes); work preserved"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true}
+			r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+			tt.tune(&r.tuning)
+			op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+			res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+			if err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			if res[0].Reason != tt.want {
+				t.Errorf("Reason = %q\nwant     %q", res[0].Reason, tt.want)
+			}
+		})
+	}
+}

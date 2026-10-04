@@ -547,13 +547,13 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			}
 			step = halveStep(step, r.tuning, maxStep)
 			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
-			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
+			stop, bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
-				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress: %v (work preserved)", err))
+				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s: %v; work preserved", bound, err))
 				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
@@ -594,14 +594,14 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			// cleanly at whichever bound trips first — count or total wait time.
 			blocked += elapsed // the chunk ran but moved nothing (WALP timeout / blocked)
 			s0 := r.clk.Now()
-			stop, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
+			stop, bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			blocked += r.clk.Since(s0)
 			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
 			} else if stop {
 				result.FinalMB = current
-				result.Reason = giveUpReason(tp, "no further progress (work preserved)")
+				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s; work preserved", bound))
 				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
@@ -1043,27 +1043,32 @@ func (r *ShrinkRunner) pumpSelfBlock(ctx context.Context, out chan<- MaintBlock)
 // caller ends the shrink cleanly with the reduction so far preserved; otherwise it backs off
 // (doubling each time) and returns stop=false so the caller retries. The pointers are the
 // loop's running counters.
-func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink, prof *TempdbProfile) (stop bool, err error) {
+func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink, prof *TempdbProfile) (stop bool, bound string, err error) {
 	*noProgress++
 	// Tempdb escalation: once, when the stall is persistent and flushing is enabled.
 	if prof != nil && prof.FlushCaches && prof.flushed != nil && !*prof.flushed && *noProgress >= r.tuning.NoProgressBeforeFlush {
 		if ferr := r.flushTempdbCaches(ctx, sink); ferr != nil {
-			return false, ferr
+			return false, "", ferr
 		}
 		*prof.flushed = true
 		*noProgress = 0 // give the freed pages a fresh budget
-		return false, nil
+		return false, "", nil
 	}
-	if *noProgress >= r.tuning.MaxNoProgress || *stallWaited >= r.tuning.SelfWaitTimeout {
-		return true, nil
+	// Two bounds, and the reason names the one that tripped: the wait cap is cumulative, so
+	// raising max_no_progress alone changes little, and an operator needs to know which to turn.
+	if *noProgress >= r.tuning.MaxNoProgress {
+		return true, fmt.Sprintf("%d attempts without a gain (shrink.max_no_progress)", *noProgress), nil
+	}
+	if *stallWaited >= r.tuning.SelfWaitTimeout {
+		return true, fmt.Sprintf("%s of waiting (shrink.self_wait_timeout_minutes)", *stallWaited), nil
 	}
 	sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q made no progress; backing off %s", file, *backoff)})
 	if werr := r.wait(ctx, *backoff); werr != nil {
-		return false, werr
+		return false, "", werr
 	}
 	*stallWaited += *backoff
 	*backoff = nextBackoff(*backoff, r.tuning.NoProgressBackoffMax)
-	return false, nil
+	return false, "", nil
 }
 
 // flushTempdbCaches releases the temp-object cachestore that pins tempdb pages, preceded

@@ -326,6 +326,16 @@ much (WRITELOG or PAGEIOLATCH_EX past their thresholds, or the supervisor stoppi
 because it was blocking others), grown by a quarter after any chunk that was not, held once a
 chunk reaches `max_chunk_seconds`.
 
+`max_no_progress` and `self_wait_timeout_minutes` are the two give-up bounds of a stalled
+shrink, and whichever trips first stops it cleanly with the work preserved. They interact:
+`self_wait_timeout_minutes` caps the *cumulative* backoff wait, so raising `max_no_progress`
+alone changes almost nothing. At the defaults a stall gives up after three tries and about
+90 seconds of waiting, which suits a chunk and not an overnight shrink: on a production
+campaign, five separate stalls on the same tail object all recovered on their own once both
+were raised (`max_no_progress: 10`, `self_wait_timeout_minutes: 30`), and the run reclaimed
+356 GB that the defaults would have given up on. The give-up reason names the bound that
+tripped, with its key, since 0.47.0.
+
 `max_chunk_seconds` is a **ceiling, not a target**. It stops the step growing; it never shrinks
 one. A chunk longer than it is not a problem to correct — `DBCC SHRINKFILE` restarts its
 end-of-file page walk on every call, so small chunks pay that fixed cost over and over and are
