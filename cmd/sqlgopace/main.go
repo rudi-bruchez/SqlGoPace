@@ -638,7 +638,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// and promised the opposite without checking this wiring. 0.42.0 keeps the promise
 	// and drops the wiring. The reaction available here is WAIT_AT_LOW_PRIORITY on 2022+
 	// and a clean give-up otherwise. Do not re-attach them without changing that page
-	// first.
+	// first; TestTempdbSamplerIsNeverArmedWithKillers fails if you do.
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:          shrinkTuning(cfg.Shrink),
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
