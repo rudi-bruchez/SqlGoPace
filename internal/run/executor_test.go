@@ -922,8 +922,6 @@ func (p *recurringBlockerProbe) LogSpace(context.Context) (mssql.LogSpace, error
 	return mssql.LogSpace{}, nil
 }
 
-func (p *recurringBlockerProbe) LogReuseWait(context.Context) (string, error) { return "NOTHING", nil }
-
 func (p *recurringBlockerProbe) ActiveSessions(context.Context) ([]mssql.Session, error) {
 	spid := p.blockers[min(p.calls, len(p.blockers)-1)]
 	p.calls++

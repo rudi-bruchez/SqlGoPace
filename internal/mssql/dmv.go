@@ -37,21 +37,6 @@ func (c *Conn) LogSpace(ctx context.Context) (LogSpace, error) {
 	return ls, nil
 }
 
-const logReuseWaitSQL = `
-SELECT log_reuse_wait_desc
-FROM sys.databases
-WHERE database_id = DB_ID();`
-
-// LogReuseWait returns what is preventing log truncation (e.g. LOG_BACKUP,
-// ACTIVE_TRANSACTION, AVAILABILITY_REPLICA).
-func (c *Conn) LogReuseWait(ctx context.Context) (string, error) {
-	var desc string
-	if err := c.pool.QueryRowContext(ctx, logReuseWaitSQL).Scan(&desc); err != nil {
-		return "", fmt.Errorf("read log_reuse_wait_desc: %w", err)
-	}
-	return desc, nil
-}
-
 // Progress is a running request's completion estimate. PercentComplete is
 // populated for REBUILD/ALTER and during a rollback; Command distinguishes the
 // two — during a KILL/abort rollback it reads "KILLED/ROLLBACK", so the percent
@@ -80,8 +65,7 @@ func (p Progress) IsRollback() bool {
 // documents it as "Internal only", and forwarding it made the console announce "ETA: 5s"
 // for a rebuild 72% done after 27 minutes.
 type ProgressRate struct {
-	anchor Progress
-	set    bool
+	anchor Progress // zero until a forward reading has been recorded
 }
 
 // ETASeconds records p and returns the estimated seconds left. ok is false when there is
@@ -90,11 +74,11 @@ type ProgressRate struct {
 // tracks the undo and not the work.
 func (r *ProgressRate) ETASeconds(p Progress) (int64, bool) {
 	if p.IsRollback() || p.PercentComplete <= 0 {
-		r.set = false
+		r.anchor = Progress{}
 		return 0, false
 	}
-	if !r.set || p.ElapsedMS < r.anchor.ElapsedMS || p.PercentComplete < r.anchor.PercentComplete {
-		r.anchor, r.set = p, true
+	if r.anchor.PercentComplete <= 0 || p.ElapsedMS < r.anchor.ElapsedMS || p.PercentComplete < r.anchor.PercentComplete {
+		r.anchor = p
 		return 0, false
 	}
 	gained := p.PercentComplete - r.anchor.PercentComplete

@@ -1083,12 +1083,12 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 		}
 		// Data/log space for the header's third line (see probeSpace for the
 		// best-effort read).
-		if dataFiles, ls, reuseWait, ok := probeSpace(ctx, conn); ok {
+		if dataFiles, ls, ok := probeSpace(ctx, conn); ok {
 			fire := logAlarm.Observe(ls.UsedPercent)
 			alert := ls.UsedPercent >= run.LogFullThresholdPercent
-			program.Send(spaceMsg(dataFiles, ls, reuseWait, alert))
+			program.Send(spaceMsg(dataFiles, ls, ls.ReuseWait, alert))
 			if fire {
-				program.Send(logAlertMsg(ls.UsedPercent, reuseWait))
+				program.Send(logAlertMsg(ls.UsedPercent, ls.ReuseWait))
 			}
 		}
 		// Server-wide load for the header's fourth line, read last: it is ambiance, and
@@ -1143,23 +1143,19 @@ func progressMsg(p mssql.Progress, rate *mssql.ProgressRate) tui.ProgressMsg {
 }
 
 // probeSpace best-effort reads the data/log space needed for the header's third line
-// (FileSpace, LogSpace, LogReuseWait). Any failed read — a transient connection hiccup —
+// (FileSpace, LogSpace, which carries the reuse wait). Any failed read — a transient connection hiccup —
 // reports ok=false so feedConsole skips this tick's update instead of stopping the feed;
 // the next tick tries again.
-func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, reuseWait string, ok bool) {
+func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, ok bool) {
 	dataFiles, err := conn.FileSpace(ctx, mssql.FileTypeRows)
 	if err != nil {
-		return nil, mssql.LogSpace{}, "", false
+		return nil, mssql.LogSpace{}, false
 	}
 	ls, err = conn.LogSpace(ctx)
 	if err != nil {
-		return nil, mssql.LogSpace{}, "", false
+		return nil, mssql.LogSpace{}, false
 	}
-	reuseWait, err = conn.LogReuseWait(ctx)
-	if err != nil {
-		return nil, mssql.LogSpace{}, "", false
-	}
-	return dataFiles, ls, reuseWait, true
+	return dataFiles, ls, true
 }
 
 // spaceMsg maps a data-file space reading (summed over every ROWS file — files:all

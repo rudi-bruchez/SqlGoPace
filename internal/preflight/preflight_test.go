@@ -467,8 +467,11 @@ func (f fakeProber) TableStructureSizes(_ context.Context, _, _ string, partitio
 	return f.structures, nil
 }
 
-func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) { return f.logSpace, nil }
-func (f fakeProber) LogReuseWait(context.Context) (string, error)     { return f.reuseWait, nil }
+func (f fakeProber) LogSpace(context.Context) (mssql.LogSpace, error) {
+	ls := f.logSpace
+	ls.ReuseWait = f.reuseWait
+	return ls, nil
+}
 func (f fakeProber) ActiveSessions(context.Context) ([]mssql.Session, error) {
 	return f.sessions, nil
 }

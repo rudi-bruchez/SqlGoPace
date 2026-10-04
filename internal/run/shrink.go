@@ -317,7 +317,7 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 		}
 		r.emitProgress(base)
 		outcome, terr := r.runTruncateOnly(ctx, f.Name, res, base, ignore, sink)
-		if terr != nil && !truncateOnlyFailed(terr, f.Name, sink) {
+		if terr != nil {
 			return nil, fmt.Errorf("shrink_tempdb %q: truncateonly: %w", f.Name, terr)
 		}
 		// watchedCapped falls through to the chunk loop, as in shrinkData: the cap yields
@@ -409,7 +409,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// graceful stop cancels it and the space it already released is preserved (a re-run
 	// resumes from the smaller size), so it stops cleanly rather than failing.
 	outcome, err := r.runTruncateOnly(ctx, f.Name, res, truncProgress, ignore, sink)
-	if err != nil && !truncateOnlyFailed(err, f.Name, sink) {
+	if err != nil {
 		return result, fmt.Errorf("shrink %q: truncateonly: %w", f.Name, err)
 	}
 	size, err := r.reader.FileSizeMB(ctx, f.Name)
@@ -448,23 +448,6 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		r.emitTail(sink, tp.finding, f.Name, true)
 	}
 	return out, err
-}
-
-// truncateOnlyFailed applies the chunk loop's error policy to the TRUNCATEONLY pass: a
-// DBCC error there means it released nothing right now (Msg 3140 "could not adjust the
-// space allocation" is the measured case, after a rebuild whose old extents were not yet
-// deallocated), which is information, not a broken operation. It narrates the error and
-// reports true so the caller carries on into the chunk loop, which exists to move what
-// TRUNCATEONLY cannot release, and whose entry is where the tail walk runs. Only our own
-// cancellation reports false. Until 0.47.0 the pass returned the error as fatal: the same
-// message was benign in a chunk and lost the run here, with no chunk tried and no tail
-// walk, on the one operation whose subject is what stands in the way.
-func truncateOnlyFailed(err error, file string, sink ReactionSink) bool {
-	if ownCancellation(err) {
-		return false
-	}
-	sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("TRUNCATEONLY on %q released nothing: %v; continuing with the chunked shrink", file, err)})
-	return true
 }
 
 // ownCancellation reports whether err is this run's own cancellation, the one statement
@@ -547,11 +530,11 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			}
 			step = halveStep(step, r.tuning, maxStep)
 			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
-			stop, bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
+			bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
-			} else if stop {
+			} else if bound != "" {
 				result.FinalMB = current
 				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s: %v; work preserved", bound, err))
 				r.captureGiveUpTail(ctx, f, sink, tp)
@@ -594,12 +577,12 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			// cleanly at whichever bound trips first — count or total wait time.
 			blocked += elapsed // the chunk ran but moved nothing (WALP timeout / blocked)
 			s0 := r.clk.Now()
-			stop, bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
+			bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			blocked += r.clk.Since(s0)
 			r.applyMaintBlock(sink, f, tp, lastMaint)
 			if werr != nil {
 				return result, werr
-			} else if stop {
+			} else if bound != "" {
 				result.FinalMB = current
 				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s; work preserved", bound))
 				r.captureGiveUpTail(ctx, f, sink, tp)
@@ -834,8 +817,20 @@ const (
 
 // runTruncateOnly runs the free TRUNCATEONLY pass under monitoring. It is the Phase A
 // case of runWatchedStatement.
+//
+// A DBCC error from the pass follows the chunk loop's policy: it means nothing could be
+// released right now (Msg 3140 "could not adjust the space allocation" is the measured case,
+// after a rebuild whose old extents were not yet deallocated), which is information, not a
+// broken operation. It is narrated and swallowed, so the caller carries on into the chunk
+// loop, which exists to move what TRUNCATEONLY cannot release and whose entry runs the tail
+// walk. Only our own cancellation is returned.
 func (r *ShrinkRunner) runTruncateOnly(ctx context.Context, file string, res ddl.ResolvedOptions, base ShrinkProgress, ignore IgnoreSource, sink ReactionSink) (watchedOutcome, error) {
-	return r.runWatchedStatement(ctx, ddl.ShrinkTruncateOnlySQL(file), "TRUNCATEONLY", res, base, ignore, sink)
+	outcome, err := r.runWatchedStatement(ctx, ddl.ShrinkTruncateOnlySQL(file), "TRUNCATEONLY", res, base, ignore, sink)
+	if err != nil && !ownCancellation(err) {
+		sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("TRUNCATEONLY on %q released nothing: %v; continuing with the chunked shrink", file, err)})
+		return outcome, nil
+	}
+	return outcome, err
 }
 
 // runWatchedStatement runs one *unchunked* shrink statement — the TRUNCATEONLY pass and the
@@ -1039,36 +1034,36 @@ func (r *ShrinkRunner) pumpSelfBlock(ctx context.Context, out chan<- MaintBlock)
 // path (prof != nil && prof.FlushCaches), once the stall persists to NoProgressBeforeFlush
 // it flushes the temp-object cache exactly once (the flushed guard) and gives the loop a
 // fresh no-progress budget rather than counting straight through to a give-up. Otherwise it
-// returns stop=true once the no-progress count or the total self-wait budget trips, so the
-// caller ends the shrink cleanly with the reduction so far preserved; otherwise it backs off
-// (doubling each time) and returns stop=false so the caller retries. The pointers are the
+// returns the bound that tripped (the no-progress count or the total self-wait budget, named
+// with its key), so the caller ends the shrink cleanly with the reduction so far preserved;
+// otherwise it backs off (doubling each time) and returns "" so the caller retries. The pointers are the
 // loop's running counters.
-func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink, prof *TempdbProfile) (stop bool, bound string, err error) {
+func (r *ShrinkRunner) stall(ctx context.Context, file string, noProgress *int, backoff, stallWaited *time.Duration, sink ReactionSink, prof *TempdbProfile) (bound string, err error) {
 	*noProgress++
 	// Tempdb escalation: once, when the stall is persistent and flushing is enabled.
 	if prof != nil && prof.FlushCaches && prof.flushed != nil && !*prof.flushed && *noProgress >= r.tuning.NoProgressBeforeFlush {
 		if ferr := r.flushTempdbCaches(ctx, sink); ferr != nil {
-			return false, "", ferr
+			return "", ferr
 		}
 		*prof.flushed = true
 		*noProgress = 0 // give the freed pages a fresh budget
-		return false, "", nil
+		return "", nil
 	}
 	// Two bounds, and the reason names the one that tripped: the wait cap is cumulative, so
 	// raising max_no_progress alone changes little, and an operator needs to know which to turn.
 	if *noProgress >= r.tuning.MaxNoProgress {
-		return true, fmt.Sprintf("%d attempts without a gain (shrink.max_no_progress)", *noProgress), nil
+		return fmt.Sprintf("%d attempts without a gain (shrink.max_no_progress)", *noProgress), nil
 	}
 	if *stallWaited >= r.tuning.SelfWaitTimeout {
-		return true, fmt.Sprintf("%s of waiting (shrink.self_wait_timeout_minutes)", *stallWaited), nil
+		return fmt.Sprintf("%s of waiting (shrink.self_wait_timeout_minutes)", *stallWaited), nil
 	}
 	sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf("shrink %q made no progress; backing off %s", file, *backoff)})
 	if werr := r.wait(ctx, *backoff); werr != nil {
-		return false, "", werr
+		return "", werr
 	}
 	*stallWaited += *backoff
 	*backoff = nextBackoff(*backoff, r.tuning.NoProgressBackoffMax)
-	return false, "", nil
+	return "", nil
 }
 
 // flushTempdbCaches releases the temp-object cachestore that pins tempdb pages, preceded
@@ -1147,10 +1142,8 @@ func (r *ShrinkRunner) emitTail(sink ReactionSink, f *TailFinding, fileName stri
 // progress") — the always-on reactive walk. It always walks fresh, even when the proactive
 // walk stashed a finding at loop entry: the two answer different questions (what owned the
 // tail before any chunk ran, and what owns it now), and the give-up record is the one that
-// feeds `plan --confirmed`. Until 0.47.0 it re-emitted the stashed finding to save a read,
-// so asking for the proactive walk made the record older, not fresher. When both exist the
-// two are compared in the narration, and the stash is cleared so shrinkData does not record
-// the stale one as well. warn=false: a run that never opted in must not be nagged about a
+// feeds `plan --confirmed`, so it must be current. When both exist the two are compared in
+// the narration, and the stash is cleared so shrinkData does not record the stale one too. warn=false: a run that never opted in must not be nagged about a
 // pre-2019 server just for stalling.
 func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) {
 	if tp == nil {

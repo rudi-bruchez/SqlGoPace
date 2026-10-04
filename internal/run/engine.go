@@ -132,7 +132,6 @@ var _ BlockerReader = (*mssql.Conn)(nil)
 // log-full watcher (WithLogWatch). *mssql.Conn satisfies it.
 type LogWatchReader interface {
 	LogSpace(ctx context.Context) (mssql.LogSpace, error)
-	LogReuseWait(ctx context.Context) (string, error)
 }
 
 var _ LogWatchReader = (*mssql.Conn)(nil)
@@ -1171,6 +1170,8 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	if opRep.ContendedCount > 0 {
 		opRep.ContendedFile = r.name + contendedCaptureSuffix
 	}
+	// Numbered as the report numbers it (opRep.Index), so the error under "[10]" says 10.
+	label := fmt.Sprintf("operation %d (%s)", opRep.Index, opRep.CommandType)
 	if runErr != nil {
 		opRep.Error = runErr.Error()
 		// A resumable operation left PAUSED is a clean interruption, not a failure:
@@ -1195,9 +1196,9 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 			e.emitStep(stepEv.finished("interrupted", opDuration(opRep)))
 			r.rep.Operations = append(r.rep.Operations, opRep)
 			if stopped {
-				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted by a graceful stop — resumes on the next run", i+1, step.Operation.CommandType())
+				r.rep.Error = label + " interrupted by a graceful stop — resumes on the next run"
 			} else {
-				r.rep.Error = fmt.Sprintf("operation %d (%s) interrupted; paused and recoverable: %v", i+1, step.Operation.CommandType(), runErr)
+				r.rep.Error = fmt.Sprintf("%s interrupted; paused and recoverable: %v", label, runErr)
 			}
 			return endRun(e.finalizeInterrupted(ctx, r.name, r.rep, r.start))
 		}
@@ -1206,12 +1207,12 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		e.emitStep(stepEv.finished("failed", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
 		if !r.manifest.Continue() {
-			r.rep.Error = fmt.Sprintf("operation %d (%s): %v", i+1, step.Operation.CommandType(), runErr)
+			r.rep.Error = fmt.Sprintf("%s: %v", label, runErr)
 			return endRun(e.finalize(ctx, r.name, r.rep, r.start, false))
 		}
 		// continue-on-failure: quarantine the failed op and keep going.
 		r.failedOps = append(r.failedOps, step.Operation)
-		fmt.Fprintf(e.out, "-- continue-on-failure: operation %d (%s) failed, quarantined: %v\n", i+1, step.Operation.CommandType(), runErr)
+		fmt.Fprintf(e.out, "-- continue-on-failure: %s failed, quarantined: %v\n", label, runErr)
 		e.checkpointBetween(ctx, i, len(r.planned))
 		return nil // carry on to the next operation
 	}
@@ -1223,8 +1224,8 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		opRep.Outcome = "incomplete"
 		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
-		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped short of target, work preserved — %s",
-			i+1, step.Operation.CommandType(), shrinkShortReason(shrinkResults))
+		r.rep.Error = fmt.Sprintf("%s: stopped short of target, work preserved — %s",
+			label, shrinkShortReason(shrinkResults))
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	// A batch-DML operation stops the same way: log pressure, blocking, or the self-wait
@@ -1236,8 +1237,8 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		opRep.Outcome = "incomplete"
 		e.emitStep(stepEv.finished("incomplete", opDuration(opRep)))
 		r.rep.Operations = append(r.rep.Operations, opRep)
-		r.rep.Error = fmt.Sprintf("operation %d (%s): stopped before the predicate was exhausted, work preserved — %s",
-			i+1, step.Operation.CommandType(), batchResult.Reason)
+		r.rep.Error = fmt.Sprintf("%s: stopped before the predicate was exhausted, work preserved — %s",
+			label, batchResult.Reason)
 		return endRun(e.finalizeIncomplete(ctx, r.name, r.rep, r.start))
 	}
 	opRep.Outcome = "success"
@@ -2040,7 +2041,6 @@ func opTarget(op ddl.Operation) string {
 	return op.Target().String()
 }
 
-// shrinkReport maps the driver's per-file results into the run report.
 // peakLogReport converts a recorded peak for the report; nil when nothing was read.
 func peakLogReport(ls mssql.LogSpace) *report.PeakLogReport {
 	if ls.TotalBytes == 0 {
@@ -2049,6 +2049,7 @@ func peakLogReport(ls mssql.LogSpace) *report.PeakLogReport {
 	return &report.PeakLogReport{UsedBytes: ls.UsedBytes(), UsedPercent: ls.UsedPercent, FileBytes: ls.TotalBytes, ReuseWait: ls.ReuseWait}
 }
 
+// shrinkReport maps the driver's per-file results into the run report.
 func shrinkReport(results []ShrinkResult) []report.ShrinkFileReport {
 	if len(results) == 0 {
 		return nil

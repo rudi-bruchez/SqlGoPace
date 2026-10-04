@@ -752,11 +752,7 @@ type fakeLogWatchReader struct {
 }
 
 func (f fakeLogWatchReader) LogSpace(context.Context) (mssql.LogSpace, error) {
-	return mssql.LogSpace{UsedPercent: f.usedPercent}, nil
-}
-
-func (f fakeLogWatchReader) LogReuseWait(context.Context) (string, error) {
-	return f.reuseWait, nil
+	return mssql.LogSpace{UsedPercent: f.usedPercent, ReuseWait: f.reuseWait}, nil
 }
 
 func TestLogWatchWarnsOncePerManifestAcrossOperations(t *testing.T) {

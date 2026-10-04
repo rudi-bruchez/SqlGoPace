@@ -21,8 +21,7 @@ func (e *Engine) watchLog(ctx context.Context, alarm *LogFullAlarm, sink Reactio
 		if !alarm.Observe(ls.UsedPercent) {
 			return
 		}
-		reuseWait, _ := e.logWatch.LogReuseWait(ctx) // best effort: an empty reuse wait still names the percent
-		sink(ReactionEvent{Kind: "warn", Detail: LogFullMessage(ls.UsedPercent, reuseWait)})
+		sink(ReactionEvent{Kind: "warn", Detail: LogFullMessage(ls.UsedPercent, ls.ReuseWait)})
 	})
 }
 

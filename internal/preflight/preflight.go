@@ -353,7 +353,6 @@ func CheckOperation(op ddl.Operation, tableExists, targetExists bool) Check {
 // Prober is the narrow set of server facts preflight needs. *mssql.Conn satisfies it.
 type Prober interface {
 	LogSpace(ctx context.Context) (mssql.LogSpace, error)
-	LogReuseWait(ctx context.Context) (string, error)
 	ActiveSessions(ctx context.Context) ([]mssql.Session, error)
 	TableExists(ctx context.Context, schema, table string) (bool, error)
 	IndexExists(ctx context.Context, schema, table, index string) (bool, error)
@@ -395,11 +394,7 @@ func Run(ctx context.Context, p Prober, info mssql.ServerInfo, m *ddl.Manifest, 
 	if err != nil {
 		return Report{}, fmt.Errorf("preflight log space: %w", err)
 	}
-	reuseWait, err := p.LogReuseWait(ctx)
-	if err != nil {
-		return Report{}, fmt.Errorf("preflight log reuse wait: %w", err)
-	}
-	rep.add(CheckLog(ls, reuseWait, th.LogMaxBytes, th.LogMaxPercent))
+	rep.add(CheckLog(ls, ls.ReuseWait, th.LogMaxBytes, th.LogMaxPercent))
 
 	sessions, err := p.ActiveSessions(ctx)
 	if err != nil {
