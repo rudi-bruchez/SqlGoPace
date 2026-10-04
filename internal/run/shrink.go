@@ -439,7 +439,8 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	out, err := r.chunkLoop(ctx, f, size, final, res, ignore, sink, nil, tp)
 
 	// #1: a proactively-identified tail is a *confirmed* blocker only when the shrink missed
-	// target — a graceful stop or a log-drain stop (a give-up already recorded it in the loop).
+	// target — a graceful stop or a log-drain stop. A give-up has already walked fresh,
+	// recorded that reading and cleared tp.finding, so this does not fire for it.
 	// On full success (FinalMB <= TargetMB) it was relocated fine, so recording it would leave a
 	// false blocker in the sidecar and mislead `plan --confirmed`; drop it.
 	if tp != nil && tp.finding != nil && out.FinalMB > out.TargetMB {
@@ -1138,17 +1139,31 @@ func (r *ShrinkRunner) emitTail(sink ReactionSink, f *TailFinding, fileName stri
 }
 
 // captureGiveUpTail records the tail object when a data shrink gives up ("no further
-// progress") — the always-on reactive walk. It walks fresh and records only when the
-// proactive walk did not already stash a finding (which shrinkData records post-loop for a
-// missed target); this keeps the give-up path to a single read. warn=false: a run that never
-// opted in must not be nagged about a pre-2019 server just for stalling.
+// progress") — the always-on reactive walk. It always walks fresh, even when the proactive
+// walk stashed a finding at loop entry: the two answer different questions (what owned the
+// tail before any chunk ran, and what owns it now), and the give-up record is the one that
+// feeds `plan --confirmed`. Until 0.47.0 it re-emitted the stashed finding to save a read,
+// so asking for the proactive walk made the record older, not fresher. When both exist the
+// two are compared in the narration, and the stash is cleared so shrinkData does not record
+// the stale one as well. warn=false: a run that never opted in must not be nagged about a
+// pre-2019 server just for stalling.
 func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) {
-	if tp == nil || tp.finding != nil {
+	if tp == nil {
 		return
 	}
+	entry := tp.finding
+	tp.finding = nil
 	tf := r.walkTail(ctx, f, sink, tp.warned, false)
 	if tf == nil {
 		return
+	}
+	if entry != nil {
+		if entry.ObjectID == tf.ObjectID && entry.IndexID == tf.IndexID {
+			sink(ReactionEvent{Kind: "info", Detail: "same tail object as when the shrink started"})
+		} else {
+			sink(ReactionEvent{Kind: "info", Detail: fmt.Sprintf("tail object changed since the shrink started (was %s.%s index_id=%d)",
+				entry.Schema, entry.Table, entry.IndexID)})
+		}
 	}
 	r.markTransient(tf, tp)
 	r.emitTail(sink, tf, f.Name, true)

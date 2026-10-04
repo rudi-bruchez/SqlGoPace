@@ -60,6 +60,7 @@ type fakeServer struct {
 	tail      mssql.TailObject // scripted FindTailObject result
 	tailFound bool
 	tailCalls int
+	tailSeq   []mssql.TailObject // if set, successive FindTailObject results (the last repeats); overrides tail
 
 	execLog  []string
 	killed   bool
@@ -176,6 +177,13 @@ func (s *fakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, e
 
 func (s *fakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObject, bool, error) {
 	s.tailCalls++
+	if len(s.tailSeq) > 0 {
+		t := s.tailSeq[0]
+		if len(s.tailSeq) > 1 {
+			s.tailSeq = s.tailSeq[1:]
+		}
+		return t, true, nil
+	}
 	return s.tail, s.tailFound, nil
 }
 

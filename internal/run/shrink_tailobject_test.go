@@ -245,35 +245,58 @@ func TestProactiveWalkNotRecordedOnSuccess(t *testing.T) {
 }
 
 // TestProactiveTailRecordedOnGiveUp is the failure counterpart of the success test: with
-// op.IdentifyTailObject set AND the shrink stalling to a give-up (misses target), the
-// proactively-identified tail IS recorded (a real, missed-target blocker). The walk still runs
-// once (the give-up path skips a second walk because the proactive finding is already stashed).
+// op.IdentifyTailObject set AND the shrink stalling to a give-up (misses target), the tail is
+// recorded, and it is the one read at give-up, not the proactive one. The give-up record used
+// to re-emit the walk taken before the first chunk: measured, a finding from +12s written as
+// confirmed_by: tail_position at +14m50s, after five chunks had moved 33.6 GB, and fed to
+// `plan --confirmed`. A run without the flag walked fresh, so the flag degraded the answer.
 func TestProactiveTailRecordedOnGiveUp(t *testing.T) {
-	s := &fakeServer{
-		fileType: mssql.FileTypeRows, name: "Data",
-		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true, // stalls → give-up
-		tail:      mssql.TailObject{ObjectID: 13, Schema: "dbo", Table: "Stuck", IndexID: 1, PageFromEnd: 4},
-		tailFound: true,
+	tests := []struct {
+		name      string
+		seq       []mssql.TailObject
+		want      int64
+		narration string
+	}{
+		{"the tail moved while the shrink ran", []mssql.TailObject{
+			{ObjectID: 13, Schema: "dbo", Table: "Early", IndexID: 1, PageFromEnd: 4},
+			{ObjectID: 21, Schema: "dbo", Table: "Late", IndexID: 8, PageFromEnd: 0},
+		}, 21, "tail object changed since the shrink started (was dbo.Early index_id=1)"},
+		{"the same object at both ends", []mssql.TailObject{
+			{ObjectID: 13, Schema: "dbo", Table: "Stuck", IndexID: 1, PageFromEnd: 4},
+		}, 13, "same tail object as when the shrink started"},
 	}
-	clk := NewManualClock(time.Unix(0, 0))
-	r := newTestRunner(s, clk)
-	r.major = 15
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := &fakeServer{
+				fileType: mssql.FileTypeRows, name: "Data",
+				sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true, // stalls → give-up
+				tailSeq: tt.seq,
+			}
+			r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+			r.major = 15
 
-	var events []ReactionEvent
-	sink := func(e ReactionEvent) { events = append(events, e) }
+			var events []ReactionEvent
+			sink := func(e ReactionEvent) { events = append(events, e) }
 
-	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%", IdentifyTailObject: true}
-	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink); err != nil {
-		t.Fatalf("Run() error = %v", err)
-	}
-	tail := wantTail(events)
-	if tail == nil {
-		t.Fatal("#1: a missed-target shrink must record the proactively-identified tail")
-	}
-	if tail.ObjectID != 13 {
-		t.Errorf("tail finding = %+v, want object 13", tail)
-	}
-	if s.tailCalls != 1 {
-		t.Errorf("FindTailObject calls = %d, want 1 (proactive stash reused at give-up, no second walk)", s.tailCalls)
+			op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%", IdentifyTailObject: true}
+			if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, sink); err != nil {
+				t.Fatalf("Run() error = %v", err)
+			}
+			var recorded []*TailFinding
+			for _, e := range events {
+				if e.Tail != nil {
+					recorded = append(recorded, e.Tail)
+				}
+			}
+			if len(recorded) != 1 || recorded[0].ObjectID != tt.want {
+				t.Errorf("recorded tails = %+v, want exactly one, object %d (read at give-up)", recorded, tt.want)
+			}
+			if s.tailCalls != 2 {
+				t.Errorf("FindTailObject calls = %d, want 2 (at loop entry, and fresh at give-up)", s.tailCalls)
+			}
+			if !hasEventContaining(events, tt.narration) {
+				t.Errorf("events = %+v, want the two readings compared: %q", events, tt.narration)
+			}
+		})
 	}
 }

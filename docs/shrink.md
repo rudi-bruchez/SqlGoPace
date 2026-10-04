@@ -81,7 +81,11 @@ two complementary means, each tagged with how it was established:
 The tail-object walk runs automatically when a data shrink gives up short of target, and,
 with `identify_tail_object: true`, once at the start of each data shrink. In that second
 case it is logged for visibility but only *recorded* as a blocker if the shrink then fails
-to reach target: a tail object a successful shrink relocated was never a blocker.
+to reach target: a tail object a successful shrink relocated was never a blocker. On a
+give-up the walk always runs again, so the record reflects the tail at the moment the shrink
+stopped, and the log says whether it is the same object as at the start or a different one.
+Before 0.47.0 a give-up re-used the walk from the start, which could be minutes and tens of
+gigabytes old.
 
 It requires SQL Server 2019 or later (`sys.dm_db_page_info`). Below that it is skipped,
 silently for the automatic give-up walk and with a one-line warning when you asked for it
