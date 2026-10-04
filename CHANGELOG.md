@@ -10,8 +10,51 @@ This file starts at 0.16.0. Earlier work is recorded in the git history, which i
 the honest record of it; reconstructing per-release entries after the fact would
 mean inventing boundaries the repository never had, since no release was tagged.
 
-The version a run used is written into its `.log` sidecar and into the SQLite
-history, so a report can always name the build that produced it.
+The version a run used, and the config file it loaded, are written into its `.log`
+sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
+SQLite history does not record either yet.
+
+## [0.47.0] - 2026-10-04
+
+### Fixed
+
+- A failed statement's error names its SQL Server number. A fatal error reached the report
+  as the driver's fixed `SQL Server had internal error`, the real number and text reachable
+  only through `Unwrap`; it now reads `… : Msg 1105, Level 17, State 2: <text>`, and an
+  ordinary error gains `(Msg n, Level l, State s)`. 1105, 1205 and 9002 call for different
+  reactions and could not be told apart.
+- A graceful stop requested while an operation is paused under pressure is honored at the
+  next poll, without resuming. It used to wait out the pressure, resume, and only then stop:
+  measured fifteen minutes late, one resume cycle wasted. Applies to shrink and batch DML too.
+- Manifest-level failure messages number operations from 1, as the report does
+  (`[10] rebuild_index` above `operation 9` before).
+- The console ETA is the rate measured between two progress readings. `elapsed / percent`
+  mixed two clocks on a resumed rebuild (percent cumulative, elapsed restarted at RESUME) and
+  read 158 s for a real 12.6 minutes. The ETA now appears one poll later.
+- A DBCC error in the `TRUNCATEONLY` pass (data and tempdb) no longer fails the shrink: it is
+  narrated and the chunk loop runs, as for a chunk error. A Msg 3140 there lost a production
+  run with no chunk tried and no tail walk.
+- A shrink give-up walks the tail again instead of re-emitting the walk taken at loop entry
+  with `identify_tail_object: true`, and says whether the object changed. The stale reading
+  was written as `confirmed_by: tail_position` and fed `plan --confirmed`.
+- The console reads `progress: n/a` when the server reports no percentage, instead of 0%.
+  A kill (`k` or `x`) re-polls the sessions at once.
+
+### Changed
+
+- A log-pressure reaction names the measurement and the cap it crossed:
+  `transaction log over cap: used 52.0 GB, 20% of a 260.0 GB file, over the 50.0 GB cap
+  (monitoring.log_max_size_bytes) (reuse_wait=LOG_BACKUP)`. The reuse wait is now read in the
+  same query as the log space.
+- Each operation in the `.log` records its peak transaction-log use and the reuse wait at
+  that moment (`peak log:` line, `peak_log` in the JSON). No extra query.
+- The banner prints the absolute `--config` path, and each `.log` records it with the
+  sqlgopace version.
+- A shrink give-up reason names the bound that tripped and its key (`shrink.max_no_progress`
+  or `shrink.self_wait_timeout_minutes`). The defaults are unchanged; `config.yaml` now says
+  that the second caps the cumulative wait, so raising the first alone changes little.
+- A `maxdop` above 1 on `rebuild_index`, `create_index` or `check_db` outside Enterprise and
+  Azure is still emitted, and its decision now says the engine ignores it on this edition.
 
 ## [0.46.0] - 2026-09-20
 

@@ -95,7 +95,7 @@ when a scheduler launches the binary from somewhere else than you do.
 | `blocking_poll_seconds` | required | How often to sample sessions and blocking, for the reaction and for the console's blocked-sessions panel. |
 | `log_poll_seconds` | required | How often to sample transaction-log usage. |
 | `progress_poll_seconds` | required | How often to read the operation's completion estimate, its waits, and data/log space. |
-| `log_max_size_bytes` | required | Log-size ceiling that triggers the log reaction. |
+| `log_max_size_bytes` | required | Log-size ceiling that triggers the log reaction. Size it against the log file: a 50 GB cap on a 260 GB file fires at 20% full. A pause names the cap that fired and its key. |
 | `log_max_percent` | required | Log-usage percentage ceiling, 1 to 100. |
 | `blocking_timeout_minutes` | 1 | How long we may block another session before yielding. |
 | `log_drain_timeout_minutes` | 30 | How long to wait for the log to drain before giving up cleanly. |

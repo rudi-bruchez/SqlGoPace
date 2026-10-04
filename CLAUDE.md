@@ -217,8 +217,9 @@ The codebase splits into a **pure core** (unit-testable, no DB) and **SQL-touchi
                               ↘   04.failed/ (+ .log)
 ```
 
-Directories are configurable in `config.yaml`. The `.log` sidecar and SQLite history record
-which `--version` produced each run.
+Directories are configurable in `config.yaml`. The `.log` sidecar records which `--version`
+produced each run and which config file it loaded (since 0.47.0; this line claimed the version
+before it was true). The SQLite history records neither yet.
 
 ## Where the specs live
 

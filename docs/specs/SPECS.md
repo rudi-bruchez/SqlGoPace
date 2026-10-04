@@ -425,6 +425,7 @@ If we cross the ceiling, we trigger the **reaction hierarchy** (§9). Interpreti
 
 ```sql
 SELECT log_reuse_wait_desc FROM sys.databases WHERE database_id = DB_ID();
+-- read since 0.47.0 in the same statement as the log space, see below
 ```
 
 - `LOG_BACKUP` (FULL/BULK_LOGGED recovery) → a log backup is needed: **we wait** (it usually arrives
@@ -437,13 +438,18 @@ SELECT log_reuse_wait_desc FROM sys.databases WHERE database_id = DB_ID();
 If the log does not drain after `log_drain_timeout_minutes`, we abort the operation and log the
 observed `log_reuse_wait_desc`.
 
-**The breach and its reason are two reads, and only the second is optional.** Until 0.42.0,
-`ServerSampler.Log` returned an empty sample and the error when the reuse-wait read failed,
-discarding a threshold crossing it had already measured — so a log known to be over cap was
-reported as healthy because the engine could not say why. It now keeps `OverCap` and leaves
-`ReuseWait` empty, which reads as "unknown" in the reaction detail. The trade is deliberate:
-a repeated attribution failure is now silent, where before it was narrated at the cost of
-suppressing the reaction it was supposed to explain.
+**One read since 0.47.0.** `log_reuse_wait_desc` is joined into the log-space query
+(`sys.dm_db_log_space_usage` joined to `sys.databases` on `database_id`), so every caller
+(sampler, log-full watcher, preflight, console) gets the use and its cause from the same
+moment and a breach is never reported without its reason. The reaction detail names the cap
+that fired and the measurement that crossed it, with the config key: `used 52.0 GB, 20% of a
+260.0 GB file, over the 50.0 GB cap (monitoring.log_max_size_bytes)`. Each operation's report
+also records its peak use and the reuse wait at that peak.
+
+*Superseded:* from 0.42.0 to 0.46.0 the breach and its reason were two reads, and the sampler
+kept `OverCap` with an empty `ReuseWait` when the second failed, rather than discarding a
+measured crossing as it had before 0.42.0. Joining the reads removes that failure mode instead
+of handling it, which is why the rule "only the second read is optional" no longer appears.
 
 ### 8.2 Blocking
 

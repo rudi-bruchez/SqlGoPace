@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.30.0 (2026-09-02).
+Status last verified against the tree at v0.47.0 (2026-10-04).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -971,38 +971,13 @@ table and index names to stdout, the `.log` sidecar and the SQLite history for e
 operation it runs, and `CLAUDE.md`'s rule is about what reaches *the repository*, not what
 a run prints about the database it is pointed at. Scoping the scan to the run's database
 would still be reasonable on noise grounds.
+
 ### Found while shipping 0.45.0 (2026-09-20)
 
-The first two were seen in a live production campaign; the rest come from the harm review and
-the external codex review of the same day and were verified here in code. None is scheduled.
+These come from the harm review and the external codex review of the same day and were
+verified here in code. Five siblings of this section, two of them seen in the live campaign,
+shipped in 0.47.0 and are under *Shipped*.
 
-- **A graceful stop is invisible while waiting for relief.** The drain is checked in the
-  statement supervisor (`internal/run/executor.go:273`), which only runs while a statement is
-  executing — and a paused operation is running none. `waitForRelief` has its own loop and
-  consults monitor blindness, the log cap and the drain timeout, never `caps.Stop`. Measured:
-  `d` pressed while the operation was paused on `LOG_BACKUP`; the stop was honoured at
-  14:32:25Z, one second after the 14:32:24Z resume, fifteen minutes later. So the drain waits
-  out the pressure, spends a full resume cycle and its log, and pauses again immediately. The
-  operation is *already* paused when the request arrives: there is nothing to finish. Fix:
-  check `stopRequested(caps.Stop)` in `waitForRelief` and return a stop, so `runLoop` ends
-  without resuming. Deferred only because it surfaced mid-campaign.
-- **The operation index disagrees with itself in the failure message.** The report lists
-  `[10] rebuild_index …` and the error underneath reads `operation 9 (rebuild_index)
-  interrupted by a graceful stop` — the display is 1-based, the internal cursor 0-based.
-  Cosmetic, but an operator grepping a log for the operation they just watched finds nothing.
-- **The ETA is still wrong, and the 0.43.0 change was cosmetic.** Measured against a live
-  rebuild: at 44.66% with 128 s of request elapsed, `Progress.ETASeconds()` returns 158.6 s and
-  `sys.dm_exec_requests.estimated_completion_time` returns 158 s. They are the same number —
-  the server computes that column the same way, so replacing it changed the provenance and not
-  the value. Real remaining, from the observed rate of 4.39 pct/min, was ~12.6 minutes. Cause:
-  `percent_complete` is cumulative over the resumable operation's whole life while
-  `total_elapsed_time` restarts at each RESUME, so after a pause the two are on different
-  clocks and the error is the ratio between them (720 s / 128 s = 5.6 here). Fix: use
-  `sys.index_resumable_operations.total_execution_time`, already read into
-  `ResumableOp.ExecutionMinutes` since 0.44.0, as the elapsed term — or derive the rate from
-  two successive samples, which is immune to any clock mismatch. Neither is implemented or
-  tested. Until one is, the console shows a number that is wrong by about 5x while it matters
-  most, which is worse than showing none.
 - **`plan` estimates compression on every eligible object before the size ceiling applies.**
   `internal/plan/plan.go:158` and `:181` call `estimateFor` gated only by `estimable(row)` and
   the include/exclude rules; `rebuild_max_size_mb` is applied later, in the decision layer. A
@@ -1020,28 +995,6 @@ the external codex review of the same day and were verified here in code. None i
   `skipSatisfied` re-reads the server and rebuilds when the target differs, observed working on
   a live manifest — but nothing re-checks a batch-DML predicate or a column type. Found by
   codex, verified here in code.
-
-- **A log-pressure pause never says which threshold fired, or at what value.** `LogSample`
-  (`internal/run/executor.go:60`) carries only `OverCap bool` and `ReuseWait string`.
-  `ServerSampler.Log` computes `used >= logMaxBytes || used% >= logMaxPercent` and then
-  discards both measurements, so `Pressure.reason()` can only say "transaction log over cap".
-  The operator cannot tell whether the absolute byte cap or the percentage tripped, nor how
-  far over it was. Found the hard way: an operator watching a campaign pause repeatedly asked
-  why, with 79% of a 260 GB log file free — answering it took reading the source and querying
-  the server, because the report could not. The byte cap had been left at the shipped 50 GB
-  while the file was 260 GB, so it fired at 20% full. Fix: carry `UsedBytes`, `UsedPercent`
-  and the rule that fired in `LogSample`, and render them — `used 53.7 GB >= 50 GB cap; file
-  20% used; reuse_wait=LOG_BACKUP`. Cheap, and it converts a support question into a line of
-  the report.
-- **Nothing says which configuration file the run loaded.** The banner names the server,
-  edition, version and recovery model, and the `.log` names the manifest and the binary
-  version, but neither names the resolved `--config` path or the thresholds it carried. A
-  checkout can easily hold two divergent configs — this one had `config-local.yaml` and
-  `local/config.yaml` disagreeing on `blocking_timeout_minutes`, `max_retry_attempts`, the
-  notification events and the whole `shrink` block — and editing the wrong one is silent. It
-  was caught here only because the unused file's `matrix_file` resolved to a path that does
-  not exist. Fix: print the absolute config path at startup and record it in the `.log`
-  sidecar, next to the version already recorded there.
 
 Five more came from the same codex review, concluded by reading and **not** verified here, so
 re-derive each before acting: the data-space preflight warns and proceeds on a file with
@@ -1096,7 +1049,11 @@ behaviour. What is wrong is how little it tried and what it did with what it alr
   something else — whether the file size moved at all between episodes, whether the object is
   taking writes, whether the *page* at the tail changed even though the object did not. Do not
   build the identity heuristic; it would have stopped a run that was working.
-- **The no-progress budget is sized for a chunk, not for an overnight shrink.** Defaults are
+- **The no-progress budget is sized for a chunk, not for an overnight shrink.** *Partly shipped
+  in 0.47.0*: the give-up reason names the bound that tripped, and `config.yaml` and
+  `configuration.md` state the interaction. Still open, and a behavior change needing its own
+  decision: the defaults themselves, and scaling the budget to the size of the reclaim. The
+  original entry follows. Defaults are
   `max_no_progress: 3` with `no_progress_backoff_seconds: 30` doubling to a 300 s ceiling, so
   a shrink planned to run for a night gives up after **90 seconds of waiting across three
   tries**. Worse, `self_wait_timeout_minutes: 5` caps the *cumulative* wait, so raising
@@ -1111,25 +1068,6 @@ behaviour. What is wrong is how little it tried and what it did with what it alr
 
 Same campaign as the entry above, the next two hours of it. All three were measured, not
 reasoned about.
-
-- **Asking for the tail-object walk makes the give-up record *less* fresh, not more.**
-  `chunkLoop` runs the proactive walk once at loop entry when `identify_tail_object: true`
-  and stashes it in `tp.finding` (`internal/run/shrink.go`). `captureGiveUpTail` then
-  returns early precisely *because* a finding is already stashed, "so the give-up path stays
-  a single read". So the record written at give-up is a re-emit of a measurement taken
-  before the first chunk executed. Measured: the walk ran at `+12s`, five chunks moved
-  33.6 GB over the next fourteen minutes, and at `+14m50s` the run emitted the `+12s`
-  finding and wrote `confirmed_by: tail_position` into the `.contended.yaml` sidecar. In
-  that run the answer happened to still be right, because 33.6 GB off a 57.7 GB tail object
-  cannot have moved its ownership of the last page. It is right by arithmetic that the
-  driver did not do. A run *without* `identify_tail_object` walks fresh at give-up and gets
-  a genuinely current answer, which inverts the meaning of the flag. Worse, the sidecar
-  feeds `plan --confirmed`: a stale reading is promoted to a confirmed structural blocker
-  and generates a relocation manifest for whatever owned the tail some minutes earlier.
-  Fix: walk again at give-up even when a proactive finding exists, and keep both — the entry
-  walk and the give-up walk answer different questions, and *comparing* them is the signal
-  the entry above asks for (same object = structural, moved = churn). The saved read is a
-  micro-optimization on a path that has already decided to stop.
 
 - **A manifest whose every operation was skipped reports `SUCCESS`, indistinguishable from
   one that did the work.** Measured: a `rebuild_index` manifest carrying `intent:
@@ -1162,18 +1100,36 @@ reasoned about.
   at **53.5 % logical fragmentation** against **0.62 %** for the clustered index of the same
   table, so `fragmentation` was literally true and the vocabulary gap cost nothing that day.
 
-- **Shrink fragments what it relocates, and here is the number.** `docs/specs/SHRINK.md` and
-  `docs/shrink.md` both warn about post-shrink fragmentation in general terms. Measured on the
-  campaign above, after five chunks moved 33.6 GB: the nonclustered index the shrink was
-  relocating stood at **53.46 %** logical fragmentation (7 363 368 pages), the clustered index
-  of the same table, which the shrink never touched, at **0.62 %** (7 077 868 pages). Same
-  table, same rebuild pass a few hours earlier, one order of magnitude apart. Put the figure in
-  the docs — a warning with a measurement behind it is acted on and a warning without one is
-  not. Do NOT propose the post-shrink defrag chaining as new work here: it is designed in
-  `SHRINK.md` §12.1 (Phase 2, layering settled, deliberately not a field of the `shrink`
-  operation), and §12 already lists the before/after `sys.dm_db_index_physical_stats` report.
-  What that design lacked was a measured number justifying an extra read on a path that has
-  just finished a long operation. This is that number.
+### Deferred from 0.47.0 (2026-10-04)
+
+- **The SQLite history records neither the version, the config path nor the log peak.** The
+  `.log` carries all three since 0.47.0. Adding them to `runs` is a schema change with a
+  migration, which nothing else needed in this release.
+- **A graceful stop or a log-drain stop still records the entry walk as the tail blocker.**
+  0.47.0 made the give-up walk fresh; `shrinkData`'s post-loop branch for those two stops still
+  records `tp.finding`, the walk from loop entry. Same staleness, smaller stake: neither stop is
+  evidence of a structural blocker. Left alone because whether those stops should record a
+  blocker at all is the open question, not how fresh it is.
+- **The maxdop note is a decision line, not a preflight `[WARN]`.** The Todoist item preferred a
+  warning. The decision is where the resolved value is known (policy and override together);
+  preflight sees only the manifest. Promote it if operators miss the line in `--explain`.
+- **`sort_in_tempdb` for compression rebuilds, and a measured throughput constant.** Measured
+  on a Standard instance with `sort_in_tempdb` on: 83 and 89 MB/s for ROW, 39 MB/s for PAGE,
+  against the 10 to 20 MB/s the project had been using to size outage windows (four to eight
+  times too pessimistic). Proposed: default or propose `sort_in_tempdb: true` for a rebuild that
+  changes compression, and replace the constant with one learned from `maintenance_analysis`
+  (duration over size). Not started: the default is a behavior change.
+- **A system session queued for Sch-M behind our DDL is invisible.** Field case: a long
+  `REORGANIZE` on an AG with `AUTO_UPDATE_STATISTICS_ASYNC ON`, a background `TASK MANAGER`
+  session waiting `LCK_M_SCH_M` on it, and every compiling query queued behind that one.
+  `activeSessionsSQL` filters `is_user_process = 1`, and `BlockedBy` counts direct victims
+  only, so no victim is seen and nothing yields. Needs a reproduction on a throwaway instance
+  first (is the session `is_user_process = 0`, which lock resource, does `KILL` refuse it), then
+  transitive counting through non-user sessions and a fast yield.
+- **Transaction-log VLF diagnosis and staged rebuild.** Designed outside the repository so far:
+  trigger on average VLF size rather than count, grow by 8 GB steps to 64 GB then by 512 MB
+  steps (below 1/8 of the current size, each growth makes exactly one VLF of that size). A loop
+  of growth statements is what makes the technique practical. Needs its own spec.
 
 ## Iterations still to design / implement
 
@@ -1223,25 +1179,6 @@ reasoned about.
   above about the tail object not steering the decision: an automatic unblock acting on a stale
   reading relocates the wrong object. It also wants `intent: relocation`, because a generator
   cannot emit `fragmentation` and mean "move this".
-
-- [ ] **A DBCC error in the TRUNCATEONLY phase is fatal; the identical error in the chunk loop is
-  by design not.** Measured on a production run that was lost to it:
-  `shrink "PRODDB": truncateonly: execute ddl: mssql: Could not adjust the space allocation for
-  file 'PRODDB'.`, outcome `FAILED`. The chunk loop states the opposite policy in its own comment
-  — "A DBCC SHRINKFILE chunk error almost never means the operation is broken ... We decide
-  success by progress, not by matching a specific message number" — while `shrinkData` returns
-  the phase A error straight out. **The same Msg 3140 is benign in phase B and fatal in phase A.**
-  Two costs, and the second is worse than the lost run. The manifest lands in `04.failed` having
-  attempted nothing: no TRUNCATEONLY, not one chunk. And **the tail-object walk never runs**,
-  because it sits at `chunkLoop`'s entry, behind phase A — so the operator gets a failure with no
-  diagnosis at all, on the one operation whose entire subject is "what is in the way". In the
-  measured case the cause was transient: a `rebuild_heap` had finished two minutes earlier and the
-  old copy's extents were not yet released (verified by hand: no allocated page in the last
-  200 000 pages, no backup running). A plain re-run then released 29.8 GB in the TRUNCATEONLY it
-  had just called fatal. Fix: decide phase A by result rather than by message — re-read the file
-  size, and treat "released nothing" as information, continuing into the chunk loop, which exists
-  precisely to move what TRUNCATEONLY cannot release. At minimum, run the tail walk before giving
-  up so the failure names something.
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another
   process. Proposes `--serve :port` (SSE broadcast hub) plus `--connect host:port` (reuses the
@@ -1298,6 +1235,35 @@ reasoned about.
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
+
+- [x] **0.47.0, a batch of fixes from the September campaigns.** Each was an entry above or a
+  Todoist item without one; the reasoning lives in the commit messages and `CHANGELOG.md`.
+  - A failed statement names its SQL Server error number, including a fatal `ServerError`
+    whose message hid it: `withErrorNumber` in `internal/mssql/conn.go`, tests in
+    `errnum_test.go` and `TestIntegrationExecDDLErrorCarriesTheNumber`.
+  - A log-pressure reaction names the cap and the measurement (`logBreach`,
+    `internal/run/executor.go`), and each operation reports its peak log use with the reuse wait
+    at the peak (`LogPeak`, `peak_log` in the report). The reuse wait is read in the log-space
+    query (`logSpaceSQL`, `internal/mssql/dmv.go`).
+  - A graceful stop is honored while waiting for relief (`waitForRelief`,
+    `internal/run/monitored_runner.go`, `TestWaitForReliefHonorsAStopWhilePaused`).
+  - Failure messages number operations from 1 (`internal/run/engine.go`,
+    `TestProcessAllOperationError`).
+  - The console ETA is a measured rate between two readings (`ProgressRate`,
+    `internal/mssql/dmv.go`, `TestProgressRateETA`). `total_execution_time`, the other
+    candidate, is in whole minutes.
+  - The banner and every `.log` name the config file; the `.log` also records the version,
+    which this file and `CLAUDE.md` claimed it already did (`WithProvenance`).
+  - A `TRUNCATEONLY` error is narrated and the chunk loop runs (`runTruncateOnly`,
+    `internal/run/shrink.go`, `TestShrinkDataContinuesPastAFailedTruncateOnly` and its tempdb
+    twin).
+  - A give-up walks the tail again and compares it with the entry walk (`captureGiveUpTail`,
+    `TestProactiveTailRecordedOnGiveUp`).
+  - The measured post-shrink fragmentation figure is in `docs/shrink.md` and `SHRINK.md` §12.1.
+  - A `maxdop` above 1 on index or CHECKDB operations outside Enterprise says it is ignored
+    (`maxDOPReason`, `internal/ddl/resolve.go`).
+  - Console: `progress: n/a` for an unreported percentage, unboxed text inset, immediate
+    session re-poll after a kill.
 
 - [x] **`RESUME` keeps the manifest's lock policy** (0.45.0) — `ddl.ResumeSQL` in
   `internal/ddl/control.go`, wired through `Capabilities.Options` so all three resume paths

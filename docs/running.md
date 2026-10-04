@@ -221,7 +221,7 @@ Beside each manifest, in `03.done/` or `04.failed/`:
 
 | File | What it carries | Mode |
 |---|---|---|
-| `<manifest>.log` | the run report: operations, reactions, timings, and the names of the databases, tables and indexes touched | `0600` |
+| `<manifest>.log` | the run report: the sqlgopace version and config path, operations, reactions, timings, each operation's peak transaction-log use, and the names of the databases, tables and indexes touched | `0600` |
 | `<manifest>.blocked.yaml` | the sessions this run blocked — **their SQL text**, login, host and program, ready to paste back as `ignore_blocked_sessions` rules | `0600` |
 | `<manifest>.contended.yaml`, `<manifest>.amplifiers.yaml` | the same shape for contention and for maintenance statements terminated | `0600` |
 | `sqlgopace_history.db` | one row per run, with the object names, kept across runs | created by SQLite, `0644` on Unix |
