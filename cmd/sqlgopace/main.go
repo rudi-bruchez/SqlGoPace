@@ -1074,9 +1074,15 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 	}
 
 	var rate mssql.ProgressRate
+	var moved counterRate
 	readProgress := func() {
 		if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
 			program.Send(progressMsg(p, &rate))
+		}
+		if total, err := conn.ShrinkMovedBytes(ctx); err == nil {
+			if bps, ok := moved.observe(total, time.Now()); ok {
+				program.Send(tui.MovementMsg{BytesPerSec: bps})
+			}
 		}
 		if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
 			program.Send(waitsMsg(waits))
@@ -1125,6 +1131,24 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 			readProgress()
 		}
 	}
+}
+
+// counterRate turns a cumulative server counter into a per-second rate between two
+// readings. A counter that goes back (an instance restart) re-anchors instead of reporting
+// a negative rate.
+type counterRate struct {
+	prev int64
+	at   time.Time
+	set  bool
+}
+
+func (r *counterRate) observe(v int64, now time.Time) (float64, bool) {
+	prev, at, set := r.prev, r.at, r.set
+	r.prev, r.at, r.set = v, now, true
+	if !set || v < prev || !now.After(at) {
+		return 0, false
+	}
+	return float64(v-prev) / now.Sub(at).Seconds(), true
 }
 
 // progressMsg maps a server progress reading to a TUI message. During a rollback

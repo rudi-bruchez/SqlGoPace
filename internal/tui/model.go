@@ -171,6 +171,11 @@ type (
 	// BatchMsg it is distinct from ProgressMsg: a shrink's percent is the deterministic
 	// fraction of the planned reduction (design §9), not the server's percent_complete
 	// (which is 0 for the chunked DBCC SHRINKFILE loop).
+	// MovementMsg carries the bytes per second shrink is moving in the connected database,
+	// from the server's own counter, for the shrink block. Zero means nothing is moving.
+	MovementMsg struct {
+		BytesPerSec float64
+	}
 	ShrinkMsg struct {
 		File              string
 		Type              string // "data" | "log"
@@ -377,6 +382,7 @@ type Model struct {
 	hasBatch        bool
 	shrink          ShrinkMsg
 	hasShrink       bool
+	moveRate        float64 // bytes/s shrink is moving, from the server counter (MovementMsg)
 	spid            int
 	alerts          []AlertMsg
 	// logAlert is the transaction-log-full alarm's single slot (latest only, H3): unlike
@@ -649,6 +655,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case ShrinkMsg:
 		m.hasShrink = true
 		m.shrink = msg
+	case MovementMsg:
+		m.moveRate = msg.BytesPerSec
 	case SPIDMsg:
 		m.spid = msg.SPID
 	case AlertMsg:

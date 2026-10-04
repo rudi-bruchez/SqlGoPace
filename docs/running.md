@@ -171,7 +171,13 @@ when. `last log backup` is the age of the last log backup (`sys.dm_db_log_stats`
 what truncates a `FULL` or `BULK_LOGGED` log; it is absent in `SIMPLE` recovery and for a
 database never backed up. `oldest txn` is the age of the oldest open transaction in the
 database, our own operation included, and is absent when none is open. Both need SQL Server
-2016 SP2 or later and are simply left out on an older server. Sizes switch from MB to GB at 1024 MB. At 90% log space used, the log part
+2016 SP2 or later and are simply left out on an older server.
+
+During a shrink, the shrink block also shows `moving N MB/s`: the rate at which the server
+is moving pages in the connected database, from its `Shrink Data Movement Bytes/sec`
+counter, read on every progress poll. A chunk can run for minutes, and this is what tells a
+long chunk that is working from one that is stuck. It covers the connected database only,
+so a `shrink_tempdb` does not show it. Sizes switch from MB to GB at 1024 MB. At 90% log space used, the log part
 switches to the alert style, a sticky console alert names the percent and
 `log_reuse_wait_desc`, and a `warn` is written to the running manifest's `.log`. Neither
 repeats while the log stays high: both re-arm only once it has dropped back under 85%. The

@@ -120,3 +120,11 @@ func TestIntegrationLogHistorySeesAnOpenTransaction(t *testing.T) {
 		t.Errorf("LogHistory() = %+v, want an open transaction at least 1 s old", lh)
 	}
 }
+
+// The counter exists for the connected database on the supported versions.
+func TestIntegrationShrinkMovedBytesReads(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	if v, err := conn.ShrinkMovedBytes(ctx); err != nil || v < 0 {
+		t.Fatalf("ShrinkMovedBytes() = %d, %v", v, err)
+	}
+}

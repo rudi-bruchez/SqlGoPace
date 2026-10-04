@@ -756,3 +756,22 @@ func TestReactionMsgsClearOnResumeAndOnlyNarrateOtherwise(t *testing.T) {
 		}
 	}
 }
+
+// "Shrink Data Movement Bytes/sec" is a running total despite its name; the console needs
+// the difference between two readings over the time between them.
+func TestCounterRate(t *testing.T) {
+	var r counterRate
+	t0 := time.Unix(0, 0)
+	if _, ok := r.observe(1000, t0); ok {
+		t.Error("one reading has no rate")
+	}
+	if got, ok := r.observe(1000+10*1024*1024, t0.Add(2*time.Second)); !ok || got != 5*1024*1024 {
+		t.Errorf("rate = %v, %v; want 5 MB/s", got, ok)
+	}
+	if _, ok := r.observe(10, t0.Add(4*time.Second)); ok {
+		t.Error("a counter that went back (instance restart) must re-anchor, not report a negative rate")
+	}
+	if got, ok := r.observe(10, t0.Add(6*time.Second)); !ok || got != 0 {
+		t.Errorf("idle rate = %v, %v; want 0, true", got, ok)
+	}
+}

@@ -1142,3 +1142,18 @@ func TestUnboxedTextIsIndented(t *testing.T) {
 		}
 	}
 }
+
+// A chunk can run for minutes, and the shrink block only changed between chunks. The
+// server's own movement counter says whether pages are moving right now.
+func TestShrinkBlockShowsTheMovementRate(t *testing.T) {
+	m := tui.New("shrink", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 200, Height: 40})
+	m, _ = send(m, tui.ShrinkMsg{File: "Data", Type: "data", CurrentMB: 2000, FinalMB: 1000, StartMB: 3000})
+	if strings.Contains(m.View(), "moving") {
+		t.Fatal("no rate received yet: nothing to show")
+	}
+	m, _ = send(m, tui.MovementMsg{BytesPerSec: 85 * 1024 * 1024})
+	if v := m.View(); !strings.Contains(v, "moving 85 MB/s") {
+		t.Errorf("shrink block missing the movement rate:\n%s", v)
+	}
+}

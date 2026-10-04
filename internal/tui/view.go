@@ -451,6 +451,10 @@ func (m Model) shrinkLines() string {
 	if sh.BlockedSeconds > 0 {
 		fmt.Fprintf(&b, " · blocked %s", humanizeMS(int64(sh.BlockedSeconds)*1000))
 	}
+	// Measured by the server while the chunk runs, so a long chunk is not a frozen line.
+	if m.moveRate > 0 {
+		fmt.Fprintf(&b, " · moving %s/s", HumanizeMB(int(m.moveRate/(1024*1024))))
+	}
 	// The literal statement in flight, so the operator sees exactly what runs each step: the
 	// TRUNCATEONLY pass first, then each DBCC SHRINKFILE (file, target) chunk with its target.
 	if sh.Statement != "" {

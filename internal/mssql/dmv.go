@@ -73,6 +73,24 @@ func (c *Conn) LogHistory(ctx context.Context) (LogHistory, error) {
 	}, nil
 }
 
+// shrinkMovedSQL reads the connected database's cumulative "Shrink Data Movement Bytes/sec"
+// counter. Despite its name it is a running total (PERF_COUNTER_BULK_COUNT): a rate needs two
+// readings. object_name carries the instance prefix (SQLServer: or MSSQL$NAME:), hence LIKE.
+const shrinkMovedSQL = `
+SELECT cntr_value FROM sys.dm_os_performance_counters
+WHERE object_name LIKE '%:Databases%' AND counter_name = 'Shrink Data Movement Bytes/sec'
+  AND instance_name = DB_NAME();`
+
+// ShrinkMovedBytes reads the total bytes shrink has moved in the connected database since
+// the instance started.
+func (c *Conn) ShrinkMovedBytes(ctx context.Context) (int64, error) {
+	var v int64
+	if err := c.pool.QueryRowContext(ctx, shrinkMovedSQL).Scan(&v); err != nil {
+		return 0, fmt.Errorf("read shrink data movement: %w", err)
+	}
+	return v, nil
+}
+
 // Progress is a running request's completion estimate. PercentComplete is
 // populated for REBUILD/ALTER and during a rollback; Command distinguishes the
 // two — during a KILL/abort rollback it reads "KILLED/ROLLBACK", so the percent
