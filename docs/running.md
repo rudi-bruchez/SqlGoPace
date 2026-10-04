@@ -142,6 +142,12 @@ measured with no ETA beside it, because nothing is advancing. A pause is normal 
 itself; it commonly lasts ten to twenty minutes while a log backup runs. `DRAINING` and
 `CANCELING` outrank it, so a stop you requested is never hidden by a pause.
 
+The ETA is the rate measured between two progress polls of the running statement, so it
+appears from the second poll and again one poll after each resume. It is not
+`elapsed / percent`: on a resumed rebuild the percentage counts the operation's whole life
+while the elapsed time restarts at each RESUME, and that ratio came out about five times too
+short.
+
 The operations panel is titled with the manifest being run. The `op i/N` counter restarts at 1
 for each manifest, so the counter says where the run is inside one and the title says which.
 

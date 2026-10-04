@@ -69,21 +69,40 @@ func (p Progress) IsRollback() bool {
 	return strings.Contains(strings.ToUpper(p.Command), "ROLLBACK")
 }
 
-// ETASeconds estimates the seconds remaining from what has actually been measured:
-// the request took ElapsedMS to reach PercentComplete, so the remainder is expected
-// to take the same time per percent. ok is false when there is nothing to measure —
-// no percentage reported yet, no elapsed time, or a rollback, whose percent_complete
-// tracks the undo and not the work.
+// ProgressRate estimates the time left from the rate measured between two readings of
+// the same request: the first reading anchors, later ones measure percent gained over
+// elapsed time from it. Both terms come from one request, so they share a clock.
 //
-// It deliberately does not use EstimatedCompletionMS. sys.dm_exec_requests documents
-// estimated_completion_time as "Internal only", and forwarding it is what made the
-// console announce "ETA: 5s" for a rebuild 72% done after 27 minutes.
-func (p Progress) ETASeconds() (int64, bool) {
-	if p.IsRollback() || p.PercentComplete <= 0 || p.ElapsedMS <= 0 {
+// The single-reading estimate it replaces, elapsed / percent, mixed two clocks on a
+// resumed rebuild: percent_complete is cumulative over the resumable operation's whole
+// life while total_elapsed_time restarts at each RESUME, and the ETA came out about five
+// times too short. estimated_completion_time is not used either: sys.dm_exec_requests
+// documents it as "Internal only", and forwarding it made the console announce "ETA: 5s"
+// for a rebuild 72% done after 27 minutes.
+type ProgressRate struct {
+	anchor Progress
+	set    bool
+}
+
+// ETASeconds records p and returns the estimated seconds left. ok is false when there is
+// nothing to measure yet: a first reading, a new request (elapsed or percent went back,
+// so it re-anchors), no progress since the anchor, or a rollback, whose percent_complete
+// tracks the undo and not the work.
+func (r *ProgressRate) ETASeconds(p Progress) (int64, bool) {
+	if p.IsRollback() || p.PercentComplete <= 0 {
+		r.set = false
 		return 0, false
 	}
-	remainingMS := float64(p.ElapsedMS) * (100 - p.PercentComplete) / p.PercentComplete
-	return int64(remainingMS / 1000), true
+	if !r.set || p.ElapsedMS < r.anchor.ElapsedMS || p.PercentComplete < r.anchor.PercentComplete {
+		r.anchor, r.set = p, true
+		return 0, false
+	}
+	gained := p.PercentComplete - r.anchor.PercentComplete
+	took := p.ElapsedMS - r.anchor.ElapsedMS
+	if gained <= 0 || took <= 0 {
+		return 0, false
+	}
+	return int64(float64(took) * (100 - p.PercentComplete) / gained / 1000), true
 }
 
 const progressSQL = `

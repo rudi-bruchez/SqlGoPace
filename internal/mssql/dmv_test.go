@@ -156,43 +156,49 @@ func TestActiveRequestCount(t *testing.T) {
 	}
 }
 
-// TestProgressETAIsMeasuredFromElapsed pins the ETA to a figure the tool measures
-// itself. sys.dm_exec_requests.estimated_completion_time is documented "Internal
-// only", and the console showed "ETA: 5s" on a rebuild that was 72% done after 27
-// minutes because it forwarded that column verbatim.
-func TestProgressETAIsMeasuredFromElapsed(t *testing.T) {
-	// 30% done after 60s: the remaining 70% needs 140s at the same rate.
-	p := Progress{PercentComplete: 30, ElapsedMS: 60_000, EstimatedCompletionMS: 5_000}
-	got, ok := p.ETASeconds()
-	if !ok || got != 140 {
-		t.Errorf("ETASeconds() = %d, %v; want 140, true (measured, not estimated_completion_time)", got, ok)
+// ETA pins the console estimate to a rate the tool measures itself, between two readings
+// of the same request. Two estimates were wrong before it. estimated_completion_time is
+// documented "Internal only" and showed "ETA: 5s" on a rebuild 72% done after 27
+// minutes. Its replacement, elapsed / percent, returned the same number on a resumed
+// rebuild, because percent_complete is cumulative over the resumable's whole life while
+// total_elapsed_time restarts at each RESUME: 158 s for a real ~12.6 minutes.
+func TestProgressRateETA(t *testing.T) {
+	tests := []struct {
+		name     string
+		readings []Progress
+		want     int64
+		ok       bool
+	}{
+		{"one reading has no rate yet",
+			[]Progress{{PercentComplete: 30, ElapsedMS: 60_000}}, 0, false},
+		{"two readings of one request: 10% per 20 s leaves 60% for 120 s",
+			[]Progress{{PercentComplete: 30, ElapsedMS: 60_000}, {PercentComplete: 40, ElapsedMS: 80_000, EstimatedCompletionMS: 5_000}}, 120, true},
+		{"the production case: resumed at 44.66% with 128 s elapsed, rate measured after the restart",
+			[]Progress{
+				{PercentComplete: 20, ElapsedMS: 720_000}, // before the pause
+				{PercentComplete: 44.66, ElapsedMS: 128_000},
+				{PercentComplete: 46.12, ElapsedMS: 148_000},
+			}, 738, true},
+		{"elapsed going back means a new request: re-anchor, no estimate from mixed clocks",
+			[]Progress{{PercentComplete: 30, ElapsedMS: 60_000}, {PercentComplete: 44, ElapsedMS: 10_000}}, 0, false},
+		{"no progress between readings has no rate",
+			[]Progress{{PercentComplete: 30, ElapsedMS: 60_000}, {PercentComplete: 30, ElapsedMS: 90_000}}, 0, false},
+		{"0% has no rate",
+			[]Progress{{PercentComplete: 0, ElapsedMS: 60_000}, {PercentComplete: 0, ElapsedMS: 90_000}}, 0, false},
+		{"a rollback's percent is the undo, not the work",
+			[]Progress{{PercentComplete: 30, ElapsedMS: 60_000, Command: "KILLED/ROLLBACK"}, {PercentComplete: 40, ElapsedMS: 80_000, Command: "KILLED/ROLLBACK"}}, 0, false},
 	}
-}
-
-// TestProgressETAUnknownBeforeFirstPercent: with no percentage there is no rate, so
-// the ETA is unknown and must be reported as such rather than as a number.
-func TestProgressETAUnknownBeforeFirstPercent(t *testing.T) {
-	p := Progress{PercentComplete: 0, ElapsedMS: 60_000, EstimatedCompletionMS: 5_000}
-	if got, ok := p.ETASeconds(); ok {
-		t.Errorf("ETASeconds() = %d, true at 0%%; want unknown", got)
-	}
-}
-
-// TestProgressETAUnknownDuringRollback: percent_complete is rollback progress then,
-// so treating it as forward progress would announce a finish time for the wrong work.
-func TestProgressETAUnknownDuringRollback(t *testing.T) {
-	p := Progress{PercentComplete: 60, ElapsedMS: 60_000, Command: "KILLED/ROLLBACK"}
-	if got, ok := p.ETASeconds(); ok {
-		t.Errorf("ETASeconds() = %d, true during rollback; want unknown", got)
-	}
-}
-
-// TestProgressETAUnknownWithoutElapsed: without elapsed time there is no rate. Both
-// external reviewers noted that every other ETA test supplies positive elapsed time, so
-// deleting the ElapsedMS guard would have gone unnoticed.
-func TestProgressETAUnknownWithoutElapsed(t *testing.T) {
-	p := Progress{PercentComplete: 50, ElapsedMS: 0, EstimatedCompletionMS: 5_000}
-	if got, ok := p.ETASeconds(); ok {
-		t.Errorf("ETASeconds() = %d, true with no elapsed time; want unknown", got)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var r ProgressRate
+			var got int64
+			var ok bool
+			for _, p := range tt.readings {
+				got, ok = r.ETASeconds(p)
+			}
+			if got != tt.want || ok != tt.ok {
+				t.Errorf("ETASeconds() = %d, %v; want %d, %v", got, ok, tt.want, tt.ok)
+			}
+		})
 	}
 }

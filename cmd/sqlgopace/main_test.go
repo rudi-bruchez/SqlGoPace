@@ -122,12 +122,12 @@ const (
 func TestProgressMsgForwardVsRollback(t *testing.T) {
 	// No elapsed time, so the ETA is not measurable and is reported as unknown (0)
 	// however large estimated_completion_time is — see TestProgressMsgETAIsMeasuredNotForwarded.
-	fwd := progressMsg(mssql.Progress{PercentComplete: 30, EstimatedCompletionMS: 5000, Command: "ALTER INDEX"})
+	fwd := progressMsg(mssql.Progress{PercentComplete: 30, EstimatedCompletionMS: 5000, Command: "ALTER INDEX"}, &mssql.ProgressRate{})
 	if fwd.Percent != 30 || fwd.RollbackPercent != 0 || fwd.ETASeconds != 0 {
 		t.Errorf("forward progress = %+v, want Percent=30 RollbackPercent=0 ETASeconds=0", fwd)
 	}
 
-	rb := progressMsg(mssql.Progress{PercentComplete: 60, Command: "KILLED/ROLLBACK"})
+	rb := progressMsg(mssql.Progress{PercentComplete: 60, Command: "KILLED/ROLLBACK"}, &mssql.ProgressRate{})
 	if rb.RollbackPercent != 60 || rb.Percent != 0 {
 		t.Errorf("rollback progress = %+v, want RollbackPercent=60 Percent=0", rb)
 	}
@@ -693,19 +693,21 @@ func TestCPUCadenceRetriesAReadThatFailed(t *testing.T) {
 // estimated_completion_time is documented "Internal only" in sys.dm_exec_requests and
 // must never reach the operator, whatever it happens to contain.
 func TestProgressMsgETAIsMeasuredNotForwarded(t *testing.T) {
-	// 25% after 100s: 300s remain. The internal column says 5s and is ignored.
+	// 20% then 25% over 25s: 75% remain at 5% per 25s, 375s. The internal column says 5s.
+	var rate mssql.ProgressRate
+	progressMsg(mssql.Progress{PercentComplete: 20, ElapsedMS: 75_000, Command: "ALTER INDEX"}, &rate)
 	msg := progressMsg(mssql.Progress{
 		PercentComplete: 25, ElapsedMS: 100_000, EstimatedCompletionMS: 5_000, Command: "ALTER INDEX",
-	})
-	if msg.ETASeconds != 300 {
-		t.Errorf("ETASeconds = %d, want 300 (measured from elapsed, not the internal column)", msg.ETASeconds)
+	}, &rate)
+	if msg.ETASeconds != 375 {
+		t.Errorf("ETASeconds = %d, want 375 (measured rate, not the internal column)", msg.ETASeconds)
 	}
 }
 
 // TestProgressMsgETAUnknownIsZero: an unmeasurable ETA is reported as unknown so the
 // view can omit it, rather than shown as a confident "0s".
 func TestProgressMsgETAUnknownIsZero(t *testing.T) {
-	msg := progressMsg(mssql.Progress{PercentComplete: 0, ElapsedMS: 100_000, EstimatedCompletionMS: 5_000})
+	msg := progressMsg(mssql.Progress{PercentComplete: 0, ElapsedMS: 100_000, EstimatedCompletionMS: 5_000}, &mssql.ProgressRate{})
 	if msg.ETASeconds != 0 {
 		t.Errorf("ETASeconds = %d at 0%%, want 0 (unknown)", msg.ETASeconds)
 	}

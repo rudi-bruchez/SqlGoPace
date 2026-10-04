@@ -1070,9 +1070,10 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 		program.Send(susp.snapshot())
 	}
 
+	var rate mssql.ProgressRate
 	readProgress := func() {
 		if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
-			program.Send(progressMsg(p))
+			program.Send(progressMsg(p, &rate))
 		}
 		if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
 			program.Send(waitsMsg(waits))
@@ -1120,12 +1121,11 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 // progressMsg maps a server progress reading to a TUI message. During a rollback
 // the request's percent_complete is rollback progress, shown separately from
 // forward progress.
-func progressMsg(p mssql.Progress) tui.ProgressMsg {
+func progressMsg(p mssql.Progress, rate *mssql.ProgressRate) tui.ProgressMsg {
 	var msg tui.ProgressMsg
-	// Measured from the request's own elapsed time and percentage. Never
-	// estimated_completion_time, which sys.dm_exec_requests documents as
-	// "Internal only". Zero means "not measurable yet" and the view omits it.
-	if eta, ok := p.ETASeconds(); ok {
+	// Measured from the rate between readings of the request (see ProgressRate).
+	// Zero means "not measurable yet" and the view omits it.
+	if eta, ok := rate.ETASeconds(p); ok {
 		msg.ETASeconds = eta
 	}
 	if p.IsRollback() {
