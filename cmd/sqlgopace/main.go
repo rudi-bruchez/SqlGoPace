@@ -1083,10 +1083,13 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 		}
 		// Data/log space for the header's third line (see probeSpace for the
 		// best-effort read).
-		if dataFiles, ls, ok := probeSpace(ctx, conn); ok {
+		if dataFiles, ls, lh, ok := probeSpace(ctx, conn); ok {
 			fire := logAlarm.Observe(ls.UsedPercent)
 			alert := ls.UsedPercent >= run.LogFullThresholdPercent
-			program.Send(spaceMsg(dataFiles, ls, ls.ReuseWait, alert))
+			msg := spaceMsg(dataFiles, ls, ls.ReuseWait, alert)
+			msg.LogBackupAgeSec, msg.HasLogBackup = lh.LogBackupAgeSec, lh.HasLogBackup
+			msg.OldestTxnSec, msg.HasOldestTxn = lh.OldestTxnSec, lh.HasOldestTxn
+			program.Send(msg)
 			if fire {
 				program.Send(logAlertMsg(ls.UsedPercent, ls.ReuseWait))
 			}
@@ -1146,16 +1149,19 @@ func progressMsg(p mssql.Progress, rate *mssql.ProgressRate) tui.ProgressMsg {
 // (FileSpace, LogSpace, which carries the reuse wait). Any failed read — a transient connection hiccup —
 // reports ok=false so feedConsole skips this tick's update instead of stopping the feed;
 // the next tick tries again.
-func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, ok bool) {
+func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, lh mssql.LogHistory, ok bool) {
 	dataFiles, err := conn.FileSpace(ctx, mssql.FileTypeRows)
 	if err != nil {
-		return nil, mssql.LogSpace{}, false
+		return nil, mssql.LogSpace{}, mssql.LogHistory{}, false
 	}
 	ls, err = conn.LogSpace(ctx)
 	if err != nil {
-		return nil, mssql.LogSpace{}, false
+		return nil, mssql.LogSpace{}, mssql.LogHistory{}, false
 	}
-	return dataFiles, ls, true
+	// The history is decoration on the same line: a server too old for sys.dm_db_log_stats,
+	// or a refused read, leaves it out rather than costing the line.
+	lh, _ = conn.LogHistory(ctx)
+	return dataFiles, ls, lh, true
 }
 
 // spaceMsg maps a data-file space reading (summed over every ROWS file — files:all

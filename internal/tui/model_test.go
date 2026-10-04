@@ -330,6 +330,25 @@ func TestModelServerBannerSpaceLine(t *testing.T) {
 	}
 }
 
+// reuse=LOG_BACKUP says why the log cannot truncate, not since when. The age of the last
+// log backup and of the oldest open transaction answer the next question, and each segment
+// renders only when the server reported it.
+func TestModelServerBannerSpaceLineLogHistory(t *testing.T) {
+	m := tui.New("(running)", nil)
+	m, _ = send(m, tea.WindowSizeMsg{Width: 200, Height: 40})
+	m, _ = send(m, tui.SpaceMsg{
+		DataMB: 500, DataFreeMB: 100, LogBytes: 200 * 1024 * 1024, LogUsedPercent: 10, ReuseWait: "LOG_BACKUP",
+		LogBackupAgeSec: 754, HasLogBackup: true, OldestTxnSec: 185, HasOldestTxn: true,
+	})
+	if v := m.View(); !strings.Contains(v, "reuse=LOG_BACKUP, last log backup 12m34s ago, oldest txn 3m05s") {
+		t.Errorf("space line missing the log history:\n%s", v)
+	}
+	m, _ = send(m, tui.SpaceMsg{DataMB: 500, DataFreeMB: 100, LogBytes: 200 * 1024 * 1024, LogUsedPercent: 10, ReuseWait: "NOTHING"})
+	if v := m.View(); strings.Contains(v, "last log backup") || strings.Contains(v, "oldest txn") {
+		t.Errorf("unreported history must not render:\n%s", v)
+	}
+}
+
 func TestModelServerBannerSpaceLineSmallSizesInMB(t *testing.T) {
 	// Below 1024 MB, sizes stay in MB rather than escalating to a fraction of a GB.
 	m := tui.New("(running)", nil)

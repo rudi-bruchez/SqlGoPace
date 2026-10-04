@@ -93,3 +93,30 @@ func TestIntegrationLogSpaceCarriesTheReuseWait(t *testing.T) {
 		t.Errorf("LogSpace().ReuseWait is empty, want log_reuse_wait_desc (NOTHING at least)")
 	}
 }
+
+// An open transaction in the database shows up as the oldest one, and the read works on
+// the supported versions (sys.dm_db_log_stats is 2016 SP2+).
+func TestIntegrationLogHistorySeesAnOpenTransaction(t *testing.T) {
+	conn, ctx := openTestConn(t)
+	other, err := mssql.Open(ctx, dsn(t), "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.Close() })
+	if err := other.ExecDDL(ctx, "IF OBJECT_ID('dbo.sqlgopace_lh') IS NULL CREATE TABLE dbo.sqlgopace_lh (i int);"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.ExecDDL(ctx, "DROP TABLE IF EXISTS dbo.sqlgopace_lh;") })
+	if err := other.ExecDDL(ctx, "BEGIN TRAN; INSERT dbo.sqlgopace_lh VALUES (1); WAITFOR DELAY '00:00:02';"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = other.ExecDDL(ctx, "IF @@TRANCOUNT > 0 ROLLBACK;") })
+
+	lh, err := conn.LogHistory(ctx)
+	if err != nil {
+		t.Fatalf("LogHistory() error = %v", err)
+	}
+	if !lh.HasOldestTxn || lh.OldestTxnSec < 1 {
+		t.Errorf("LogHistory() = %+v, want an open transaction at least 1 s old", lh)
+	}
+}

@@ -200,6 +200,12 @@ func (m Model) spaceLine() string {
 	logMB := int(sp.LogBytes / (1024 * 1024))
 	logFreePct := 100 - sp.LogUsedPercent
 	logSeg := fmt.Sprintf("log %s, %.0f%% free, reuse=%s", HumanizeMB(logMB), logFreePct, sp.ReuseWait)
+	if sp.HasLogBackup {
+		logSeg += fmt.Sprintf(", last log backup %s ago", humanizeMS(sp.LogBackupAgeSec*1000))
+	}
+	if sp.HasOldestTxn {
+		logSeg += ", oldest txn " + humanizeMS(sp.OldestTxnSec*1000)
+	}
 	if sp.LogAlert {
 		logSeg = alertStyle.Render(logSeg)
 	}

@@ -162,11 +162,16 @@ to leave it alone.
 The header's right-hand box carries a third line, once the first poll has landed:
 
 ```
-data 812.4 GB, 9.2% free   log 64.0 GB, 37% free, reuse=LOG_BACKUP
+data 812.4 GB, 9.2% free   log 64.0 GB, 37% free, reuse=LOG_BACKUP, last log backup 12m34s ago, oldest txn 3m05s
 ```
 
 Data is summed across every ROWS file of the connected database; the log size is the total
-of its log files. Sizes switch from MB to GB at 1024 MB. At 90% log space used, the log part
+of its log files. `reuse=` says why the log cannot truncate; the last two segments say since
+when. `last log backup` is the age of the last log backup (`sys.dm_db_log_stats`), which is
+what truncates a `FULL` or `BULK_LOGGED` log; it is absent in `SIMPLE` recovery and for a
+database never backed up. `oldest txn` is the age of the oldest open transaction in the
+database, our own operation included, and is absent when none is open. Both need SQL Server
+2016 SP2 or later and are simply left out on an older server. Sizes switch from MB to GB at 1024 MB. At 90% log space used, the log part
 switches to the alert style, a sticky console alert names the percent and
 `log_reuse_wait_desc`, and a `warn` is written to the running manifest's `.log`. Neither
 repeats while the log stays high: both re-arm only once it has dropped back under 85%. The

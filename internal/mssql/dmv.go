@@ -37,6 +37,42 @@ func (c *Conn) LogSpace(ctx context.Context) (LogSpace, error) {
 	return ls, nil
 }
 
+// LogHistory is what explains a log that does not truncate, for the console header: how
+// long ago the last log backup ran and how long the oldest open transaction in the database
+// has been running. A false Has* means the server reported nothing (never backed up,
+// SIMPLE recovery, no open transaction).
+type LogHistory struct {
+	LogBackupAgeSec int64
+	HasLogBackup    bool
+	OldestTxnSec    int64
+	HasOldestTxn    bool
+}
+
+// Ages are computed by the server (DATEDIFF against SYSDATETIME), so a client clock that
+// drifts from the server's cannot skew them. log_backup_time reads 1900-01-01 for a
+// database never backed up, which is "none", not a 126-year-old backup.
+const logHistorySQL = `
+SELECT
+  CASE WHEN ls.log_backup_time > '19000101' THEN DATEDIFF(second, ls.log_backup_time, SYSDATETIME()) END,
+  (SELECT DATEDIFF(second, MIN(dt.database_transaction_begin_time), SYSDATETIME())
+     FROM sys.dm_tran_database_transactions AS dt
+    WHERE dt.database_id = DB_ID() AND dt.database_transaction_begin_time IS NOT NULL)
+FROM sys.dm_db_log_stats(DB_ID()) AS ls;`
+
+// LogHistory reads the last log backup's age and the oldest open transaction's age for the
+// connected database. sys.dm_db_log_stats needs SQL Server 2016 SP2; on an older server
+// the read fails and the caller omits the segment.
+func (c *Conn) LogHistory(ctx context.Context) (LogHistory, error) {
+	var backup, oldest sql.NullInt64
+	if err := c.pool.QueryRowContext(ctx, logHistorySQL).Scan(&backup, &oldest); err != nil {
+		return LogHistory{}, fmt.Errorf("read log history: %w", err)
+	}
+	return LogHistory{
+		LogBackupAgeSec: backup.Int64, HasLogBackup: backup.Valid,
+		OldestTxnSec: oldest.Int64, HasOldestTxn: oldest.Valid,
+	}, nil
+}
+
 // Progress is a running request's completion estimate. PercentComplete is
 // populated for REBUILD/ALTER and during a rollback; Command distinguishes the
 // two — during a KILL/abort rollback it reads "KILLED/ROLLBACK", so the percent

@@ -275,6 +275,12 @@ type (
 		LogUsedPercent float64
 		ReuseWait      string
 		LogAlert       bool
+		// The log's history, for "since when": the last log backup's age and the oldest
+		// open transaction's, each rendered only when its Has* flag says it was reported.
+		LogBackupAgeSec int64
+		HasLogBackup    bool
+		OldestTxnSec    int64
+		HasOldestTxn    bool
 	}
 	// ServerLoadMsg carries how busy the whole server is, for the header's fourth banner
 	// line. It is ambiance, not a monitored dimension: nothing reacts to it. CPUKnown is
