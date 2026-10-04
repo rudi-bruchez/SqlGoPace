@@ -870,8 +870,11 @@ func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool,
 
 	feedCtx, stopFeed := context.WithCancel(ctx)
 	defer stopFeed()
-	go feedConsole(feedCtx, program, conn, blockingInterval, progressInterval)
-	go dispatchActions(feedCtx, program, conn, current, drain, actions)
+	// A kill re-polls the sessions at once rather than at the next blocking tick, so the
+	// panels show what the kill changed while the operator is still looking at them.
+	refresh := make(chan struct{}, 1)
+	go feedConsole(feedCtx, program, conn, blockingInterval, progressInterval, refresh)
+	go dispatchActions(feedCtx, program, conn, current, drain, actions, refresh)
 
 	// The engine runs under its own cancelable context so that if the console dies first
 	// (program.Run returns an error) we can unwind ProcessAll before the caller closes the
@@ -1027,7 +1030,7 @@ func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
 // the console blind for 60-90s and reset itself after every kill, so each kill bought
 // another minute of blindness on the next link of the chain (BLOCKER-VISIBILITY.md). No
 // kill timer lives here: the reaction path samples separately and is unchanged.
-func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, blockingInterval, progressInterval time.Duration) {
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, blockingInterval, progressInterval time.Duration, refresh <-chan struct{}) {
 	var spid spidAnnouncer
 	if msg, ok := spid.observe(conn.SPID()); ok { // show which server session is ours
 		program.Send(msg)
@@ -1112,6 +1115,9 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 			return
 		case <-blockTicker.C:
 			readSessions()
+		case <-refresh:
+			readSessions()
+			blockTicker.Reset(blockingInterval)
 		case <-progressTicker.C:
 			readProgress()
 		}
@@ -1441,7 +1447,14 @@ func killDDL(ctx context.Context, sess run.Executor) error {
 
 // dispatchActions routes operator intents to the server (kill) or to the running
 // manifest (ignore a blocked session).
-func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, current *currentManifest, drain *run.DrainFlag, actions <-chan tui.Action) {
+func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn, current *currentManifest, drain *run.DrainFlag, actions <-chan tui.Action, refresh chan<- struct{}) {
+	// Non-blocking: a refresh already pending covers this one.
+	requestRefresh := func() {
+		select {
+		case refresh <- struct{}{}:
+		default:
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -1453,10 +1466,14 @@ func dispatchActions(ctx context.Context, program *tui.Program, conn *mssql.Conn
 				// ALTER ANY CONNECTION) must not look like it worked.
 				if err := killDDL(ctx, conn); err != nil {
 					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill DDL (SPID %d) failed: %v", conn.SPID(), err)})
+				} else {
+					requestRefresh()
 				}
 			case tui.ActionKillBlocker:
 				if err := conn.Kill(ctx, a.SPID); err != nil {
 					program.Send(tui.LogMsg{Line: fmt.Sprintf("kill SPID %d failed: %v", a.SPID, err)})
+				} else {
+					requestRefresh()
 				}
 			case tui.ActionDrain:
 				// The drain key toggles: request a graceful stop, or cancel a pending one.
