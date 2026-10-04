@@ -118,6 +118,25 @@ func TestFragmentationIntentRunsEvenWhenSatisfied(t *testing.T) {
 	}
 }
 
+// A rebuild whose purpose is to move an object off the end of a data file carries its
+// current compression only to preserve it, so "already PAGE" says nothing about whether
+// the move is done: relocation must run whatever the catalog says.
+func TestRelocationIntentRunsEvenWhenSatisfied(t *testing.T) {
+	runner := &fakeOpRunner{}
+	comp := &fakeCompression{parts: []mssql.PartitionCompression{{Partition: 1, Desc: "PAGE"}}}
+	eng, dirs := setupEngine(t, fakePreflighter{}, runner, run.WithCompressionReader(comp))
+	manifest := strings.Replace(skipCompressManifest, "intent: compression\n", "intent: relocation\n", 1)
+	if err := os.WriteFile(filepath.Join(dirs.ToRun, "010_a.yaml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	if runner.calls != 1 {
+		t.Errorf("runner ran %d times, want 1 (relocation must run despite matching compression)", runner.calls)
+	}
+}
+
 func TestOperationIntentBeatsManifestDefault(t *testing.T) {
 	// Manifest default is compression, but the operation overrides to fragmentation → runs.
 	runner := &fakeOpRunner{}

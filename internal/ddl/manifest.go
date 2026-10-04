@@ -202,12 +202,17 @@ const (
 // Intent records why a rebuild was scheduled. A rebuild both applies a compression
 // target (a state, idempotent) and defragments (an act, never idempotent); only the
 // manifest knows which motivated it, and the engine cannot skip correctly without
-// being told. Empty means "unknown" and always runs.
+// being told. Empty means "unknown" and always runs. Only compression is ever skipped.
 type Intent string
 
 const (
 	IntentCompression   Intent = "compression"
 	IntentFragmentation Intent = "fragmentation"
+	// IntentRelocation is a rebuild that moves an object off the end of a data file so a
+	// shrink can get past it. Its data_compression preserves the current setting rather
+	// than changing it, so "already at target" says nothing about whether the move is
+	// done: it always runs, like fragmentation, and says why.
+	IntentRelocation Intent = "relocation"
 )
 
 // IgnoredSession matches sessions that are allowed to remain blocked by our DDL
@@ -685,14 +690,14 @@ func requireFields(opType string, fields map[string]string) error {
 		opType, strings.Join(missing, ", "), ErrInvalidManifest)
 }
 
-// validateIntent accepts an empty intent (unset) or one of the two constants.
+// validateIntent accepts an empty intent (unset) or one of the constants.
 func validateIntent(i Intent) error {
 	switch i {
-	case "", IntentCompression, IntentFragmentation:
+	case "", IntentCompression, IntentFragmentation, IntentRelocation:
 		return nil
 	default:
-		return fmt.Errorf("intent must be %q or %q, got %q: %w",
-			IntentCompression, IntentFragmentation, i, ErrInvalidManifest)
+		return fmt.Errorf("intent must be %q, %q or %q, got %q: %w",
+			IntentCompression, IntentFragmentation, IntentRelocation, i, ErrInvalidManifest)
 	}
 }
 

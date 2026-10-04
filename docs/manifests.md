@@ -64,6 +64,7 @@ engine which one motivated the operation, so a re-run knows whether skipping it 
 |---|---|
 | `compression` | Skips the operation when every partition already carries the target compression. A cheap catalog read, reported as `skipped: already PAGE`. |
 | `fragmentation` | Always runs. The defrag still needs doing whatever the compression state. |
+| `relocation` | Always runs. The rebuild moves the index off the end of a data file so a shrink can get past it; its `data_compression` preserves the current setting, so "already at target" says nothing about the move. Since 0.48.0; before it, `fragmentation` was used for this and worked by side effect. |
 | unset | Same as `fragmentation`. |
 
 Unset defaults to always running because a wrongly skipped rebuild is silent, reported as

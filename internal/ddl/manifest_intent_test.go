@@ -17,6 +17,7 @@ func TestParseRebuildIndexIntent(t *testing.T) {
 		{"unset", "", ""},
 		{"compression", "    intent: compression\n", ddl.IntentCompression},
 		{"fragmentation", "    intent: fragmentation\n", ddl.IntentFragmentation},
+		{"relocation", "    intent: relocation\n", ddl.IntentRelocation},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

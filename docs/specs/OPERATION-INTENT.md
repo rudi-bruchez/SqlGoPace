@@ -123,6 +123,14 @@ const (
 Intent Intent `yaml:"intent,omitempty"`
 ```
 
+*Extended (0.48.0):* a third value, `relocation`, names a rebuild that moves an object off the
+end of a data file so a shrink can get past it. It always runs, like `fragmentation`: its
+`data_compression` preserves the current setting, so a satisfied catalog says nothing about
+whether the move is done. The two-value design had to express it as `fragmentation`, which
+worked by side effect and would not do once `plan` generates relocation manifests: a generator
+cannot emit a word that means something else. Only `compression` is ever skipped; that rule is
+unchanged.
+
 `Validate()` rejects any value but the two constants, naming the offending value. It does **not**
 reject `intent: compression` on an operation without `data_compression` — §4.3 explains why.
 
