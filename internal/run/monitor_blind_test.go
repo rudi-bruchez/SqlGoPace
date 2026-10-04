@@ -167,7 +167,7 @@ func TestWaitForReliefGivesUpWhenTheMonitorIsBlind(t *testing.T) {
 	samples := make(chan Sample)
 	out := make(chan error, 1)
 	go func() {
-		out <- waitForRelief(context.Background(), NewManualClock(testStart), time.Hour, samples, func(ReactionEvent) {})
+		out <- waitForRelief(context.Background(), NewManualClock(testStart), time.Hour, samples, func(ReactionEvent) {}, nil)
 	}()
 
 	sendSample(t, samples, Sample{BlockingOthers: true, Blind: "blocking poll"})

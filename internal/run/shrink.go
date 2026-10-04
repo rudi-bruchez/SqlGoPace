@@ -556,6 +556,10 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 					result.Reason = "stopped: log did not drain before timeout (work preserved)"
 					return result, nil
 				}
+				if errors.Is(err, ErrStopped) {
+					result.FinalMB = current
+					result.Reason = "stopped: graceful stop (work preserved)"
+				}
 				return result, err
 			}
 		}
@@ -930,7 +934,7 @@ func (r *ShrinkRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sin
 	defer stopSampling()
 	samples := make(chan Sample)
 	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
-	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
+	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink, r.stop)
 }
 
 func (r *ShrinkRunner) emitProgress(p ShrinkProgress) {

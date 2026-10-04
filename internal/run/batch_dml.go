@@ -216,6 +216,9 @@ func (r *BatchDMLRunner) runPredicate(ctx context.Context, op ddl.BatchDML, res 
 		if stopped {
 			stop, reason, err := r.handleStop(ctx, ignore, sink, &stallWaited)
 			if err != nil {
+				if errors.Is(err, ErrStopped) {
+					result.Reason = "stopped: graceful stop (work committed per batch)"
+				}
 				return result, err
 			}
 			if stop {
@@ -445,7 +448,7 @@ func (r *BatchDMLRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, s
 	defer stopSampling()
 	samples := make(chan Sample)
 	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollIntv, logEvery: r.logPoll, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
-	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink)
+	return waitForRelief(ctx, r.clk, r.logDrain, samples, sink, r.stop)
 }
 
 func (r *BatchDMLRunner) emitProgress(op ddl.BatchDML, rowsDone, estRows int64, batchRows int, rate float64) {

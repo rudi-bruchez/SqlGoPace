@@ -104,7 +104,7 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 	return runLoop(
 		sql,
 		func(stmt string) (Action, error) { return r.runStatement(ctx, stmt, caps, sink) },
-		func() error { return r.awaitRelief(ctx, caps.Ignore, sink) },
+		func() error { return r.awaitRelief(ctx, caps.Ignore, caps.Stop, sink) },
 		func() (string, error) {
 			sink(ReactionEvent{Kind: "resume", Detail: "pressure cleared"})
 			return ddl.ResumeSQL(op, caps.Options)
@@ -115,13 +115,13 @@ func (r *MonitoredRunner) runOnce(ctx context.Context, op ddl.Operation, sql str
 
 // awaitRelief samples the server (via its own pump) until the pressure that
 // triggered a pause clears, enforcing the log-drain timeout.
-func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, sink ReactionSink) error {
+func (r *MonitoredRunner) awaitRelief(ctx context.Context, ignore IgnoreSource, stop func() bool, sink ReactionSink) error {
 	sampleCtx, stopSampling := context.WithCancel(ctx)
 	defer stopSampling()
 	samples := make(chan Sample)
 	go pumpSamples(sampleCtx, samples, pumpSpec{sampler: r.sampler, blockEvery: r.pollInterval, logEvery: r.logPollInterval, ignore: ignore, sink: sink, blindAfter: r.blindAfter})
 
-	return waitForRelief(ctx, r.clk, r.logDrainTimeout, samples, sink)
+	return waitForRelief(ctx, r.clk, r.logDrainTimeout, samples, sink, stop)
 }
 
 // runLoop drives the pause/resume state machine for one operation. It runs the
@@ -234,9 +234,11 @@ func (r *MonitoredRunner) runStatement(ctx context.Context, sql string, caps Cap
 // waitForRelief consumes monitoring snapshots until the pressure that triggered a
 // pause has cleared, so the operation can be resumed. If the transaction log stays
 // over cap for longer than logDrainTimeout, it aborts with ErrLogDrainTimeout
-// (recording the observed log_reuse_wait). It is pure (channel + clock driven) so
-// it can be tested deterministically.
-func waitForRelief(ctx context.Context, clk Clock, logDrainTimeout time.Duration, samples <-chan Sample, sink ReactionSink) error {
+// (recording the observed log_reuse_wait). A graceful stop requested while waiting
+// returns ErrStopped at the next snapshot: the operation is already stopped, so there
+// is nothing to finish, and resuming it only to stop it again spends a cycle and its
+// log. It is pure (channel + clock driven) so it can be tested deterministically.
+func waitForRelief(ctx context.Context, clk Clock, logDrainTimeout time.Duration, samples <-chan Sample, sink ReactionSink, stop func() bool) error {
 	var logOverCapSince time.Time
 
 	for {
@@ -249,6 +251,10 @@ func waitForRelief(ctx context.Context, clk Clock, logDrainTimeout time.Duration
 			if s.Blind != "" {
 				sink(ReactionEvent{Kind: "abort", Detail: s.Blind + " stopped answering while waiting for pressure to clear"})
 				return fmt.Errorf("%w (%s)", ErrMonitorBlind, s.Blind)
+			}
+			if stopRequested(stop) {
+				sink(ReactionEvent{Kind: "stop", Detail: "graceful stop while waiting for pressure to clear; not resuming"})
+				return ErrStopped
 			}
 			if s.LogOverCap {
 				if logOverCapSince.IsZero() {

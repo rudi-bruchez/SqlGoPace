@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -845,9 +846,35 @@ func TestSamplerMutualBlockIssuesExactlyOneKill(t *testing.T) {
 
 // runRelief starts waitForRelief in a goroutine and returns its result channel.
 func runRelief(clk Clock, drain time.Duration, samples chan Sample, sink ReactionSink) <-chan error {
+	return runReliefStop(clk, drain, samples, sink, nil)
+}
+
+func runReliefStop(clk Clock, drain time.Duration, samples chan Sample, sink ReactionSink, stop func() bool) <-chan error {
 	out := make(chan error, 1)
-	go func() { out <- waitForRelief(context.Background(), clk, drain, samples, sink) }()
+	go func() { out <- waitForRelief(context.Background(), clk, drain, samples, sink, stop) }()
 	return out
+}
+
+// Measured in production: a drain requested while the operation was paused on
+// LOG_BACKUP was honored fifteen minutes later, one second after a resume, because only
+// the statement supervisor read the stop and a paused operation runs no statement. It
+// spent a resume cycle and its log to stop something that was already stopped.
+func TestWaitForReliefHonorsAStopWhilePaused(t *testing.T) {
+	samples := make(chan Sample)
+	var stopping atomic.Bool
+	var events []ReactionEvent
+	out := runReliefStop(NewManualClock(testStart), time.Hour, samples,
+		func(ev ReactionEvent) { events = append(events, ev) }, stopping.Load)
+
+	sendSample(t, samples, Sample{LogOverCap: true}) // paused, no stop yet
+	stopping.Store(true)
+	sendSample(t, samples, Sample{LogOverCap: true}) // still over cap: the stop must not wait for it
+	if err := awaitRelief(t, out); !errors.Is(err, ErrStopped) {
+		t.Errorf("waitForRelief() = %v, want ErrStopped", err)
+	}
+	if len(events) != 1 || events[0].Kind != "stop" {
+		t.Errorf("events = %+v, want one stop event naming the graceful stop", events)
+	}
 }
 
 func TestWaitForReliefReturnsWhenClear(t *testing.T) {
