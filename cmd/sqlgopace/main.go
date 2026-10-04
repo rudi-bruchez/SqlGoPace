@@ -625,10 +625,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	if err != nil {
 		return nil, nil, fmt.Errorf("open tempdb connection: %w", err)
 	}
-	tempdbSampler := run.NewServerSampler(
-		tempdbProbe{db: tempdbConn, sessions: conn},
-		tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
-	tempdbSampler.SetLogPeak(logPeak)
+	tempdbSampler := newTempdbSampler(tempdbConn, conn, cfg, logPeak)
 	// No killers on this sampler, deliberately. docs/shrink.md states, under a heading
 	// that says so in as many words, that a tempdb shrink waits its blockers out and
 	// never kills them: they are legitimate application queries, and tempdb is shared by
@@ -638,7 +635,8 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// and promised the opposite without checking this wiring. 0.42.0 keeps the promise
 	// and drops the wiring. The reaction available here is WAIT_AT_LOW_PRIORITY on 2022+
 	// and a clean give-up otherwise. Do not re-attach them without changing that page
-	// first; TestTempdbSamplerIsNeverArmedWithKillers fails if you do.
+	// first: newTempdbSampler returns a type that cannot be armed, and
+	// TestTempdbSamplerIsNeverArmedWithKillers guards its body.
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:          shrinkTuning(cfg.Shrink),
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
@@ -873,7 +871,7 @@ func runWithTUI(ctx context.Context, stdout io.Writer, consoleLive *atomic.Bool,
 	// A kill re-polls the sessions at once rather than at the next blocking tick, so the
 	// panels show what the kill changed while the operator is still looking at them.
 	refresh := make(chan struct{}, 1)
-	go feedConsole(feedCtx, program, conn, blockingInterval, progressInterval, refresh)
+	go feedConsole(feedCtx, program, conn, blockingInterval, progressInterval, refresh, fwd.shrinkingData.Load)
 	go dispatchActions(feedCtx, program, conn, current, drain, actions, refresh)
 
 	// The engine runs under its own cancelable context so that if the console dies first
@@ -1030,7 +1028,7 @@ func (t *suspensionTracker) snapshot() tui.SuspensionMsg {
 // the console blind for 60-90s and reset itself after every kill, so each kill bought
 // another minute of blindness on the next link of the chain (BLOCKER-VISIBILITY.md). No
 // kill timer lives here: the reaction path samples separately and is unchanged.
-func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, blockingInterval, progressInterval time.Duration, refresh <-chan struct{}) {
+func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, blockingInterval, progressInterval time.Duration, refresh <-chan struct{}, shrinkingData func() bool) {
 	var spid spidAnnouncer
 	if msg, ok := spid.observe(conn.SPID()); ok { // show which server session is ours
 		program.Send(msg)
@@ -1079,23 +1077,30 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 		if p, found, err := conn.Progress(ctx, conn.SPID()); err == nil && found {
 			program.Send(progressMsg(p, &rate))
 		}
-		if total, err := conn.ShrinkMovedBytes(ctx); err == nil {
-			if bps, ok := moved.observe(total, time.Now()); ok {
-				program.Send(tui.MovementMsg{BytesPerSec: bps})
+		// Read only while a data shrink runs: nothing else moves pages, and the counter view
+		// is scanned on every read. The rate is cleared once the shrink is over.
+		if shrinkingData() {
+			if total, err := conn.ShrinkMovedBytes(ctx); err == nil {
+				if bps, ok := moved.observe(total, time.Now()); ok {
+					program.Send(tui.MovementMsg{BytesPerSec: bps})
+				}
 			}
+		} else if moved != (counterRate{}) {
+			moved = counterRate{}
+			program.Send(tui.MovementMsg{})
 		}
 		if waits, err := conn.SessionWaits(ctx, conn.SPID()); err == nil {
 			program.Send(waitsMsg(waits))
 		}
 		// Data/log space for the header's third line (see probeSpace for the
 		// best-effort read).
-		if dataFiles, ls, lh, ok := probeSpace(ctx, conn); ok {
+		if dataFiles, ls, ok := probeSpace(ctx, conn); ok {
 			fire := logAlarm.Observe(ls.UsedPercent)
 			alert := ls.UsedPercent >= run.LogFullThresholdPercent
-			msg := spaceMsg(dataFiles, ls, ls.ReuseWait, alert)
-			msg.LogBackupAgeSec, msg.HasLogBackup = lh.LogBackupAgeSec, lh.HasLogBackup
-			msg.OldestTxnSec, msg.HasOldestTxn = lh.OldestTxnSec, lh.HasOldestTxn
-			program.Send(msg)
+			// The history is decoration on the same line: a server too old for
+			// sys.dm_db_log_stats, or a refused read, leaves it out rather than costing the line.
+			lh, _ := conn.LogHistory(ctx)
+			program.Send(spaceMsg(dataFiles, ls, lh, alert))
 			if fire {
 				program.Send(logAlertMsg(ls.UsedPercent, ls.ReuseWait))
 			}
@@ -1133,19 +1138,29 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 	}
 }
 
+// newTempdbSampler builds the tempdb shrink's sampler and returns it as the narrow
+// run.Sampler, which has no SetKiller or SetVictimKiller: docs/shrink.md promises a tempdb
+// shrink never kills a blocker, and arming it from buildEngine now fails to compile.
+// TestTempdbSamplerIsNeverArmedWithKillers guards the body of this function.
+func newTempdbSampler(tempdb, sessions *mssql.Conn, cfg *config.Config, peak *run.LogPeak) run.Sampler {
+	s := run.NewServerSampler(tempdbProbe{db: tempdb, sessions: sessions}, tempdb,
+		cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	s.SetLogPeak(peak)
+	return s
+}
+
 // counterRate turns a cumulative server counter into a per-second rate between two
 // readings. A counter that goes back (an instance restart) re-anchors instead of reporting
 // a negative rate.
 type counterRate struct {
 	prev int64
-	at   time.Time
-	set  bool
+	at   time.Time // zero until the first reading
 }
 
 func (r *counterRate) observe(v int64, now time.Time) (float64, bool) {
-	prev, at, set := r.prev, r.at, r.set
-	r.prev, r.at, r.set = v, now, true
-	if !set || v < prev || !now.After(at) {
+	prev, at := r.prev, r.at
+	r.prev, r.at = v, now
+	if at.IsZero() || v < prev || !now.After(at) {
 		return 0, false
 	}
 	return float64(v-prev) / now.Sub(at).Seconds(), true
@@ -1173,26 +1188,23 @@ func progressMsg(p mssql.Progress, rate *mssql.ProgressRate) tui.ProgressMsg {
 // (FileSpace, LogSpace, which carries the reuse wait). Any failed read — a transient connection hiccup —
 // reports ok=false so feedConsole skips this tick's update instead of stopping the feed;
 // the next tick tries again.
-func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, lh mssql.LogHistory, ok bool) {
+func probeSpace(ctx context.Context, conn *mssql.Conn) (dataFiles []mssql.FileSpace, ls mssql.LogSpace, ok bool) {
 	dataFiles, err := conn.FileSpace(ctx, mssql.FileTypeRows)
 	if err != nil {
-		return nil, mssql.LogSpace{}, mssql.LogHistory{}, false
+		return nil, mssql.LogSpace{}, false
 	}
 	ls, err = conn.LogSpace(ctx)
 	if err != nil {
-		return nil, mssql.LogSpace{}, mssql.LogHistory{}, false
+		return nil, mssql.LogSpace{}, false
 	}
-	// The history is decoration on the same line: a server too old for sys.dm_db_log_stats,
-	// or a refused read, leaves it out rather than costing the line.
-	lh, _ = conn.LogHistory(ctx)
-	return dataFiles, ls, lh, true
+	return dataFiles, ls, true
 }
 
 // spaceMsg maps a data-file space reading (summed over every ROWS file — files:all
 // expands over more than one), a transaction-log space reading, and the log's reuse wait
 // to the TUI's header space line. logAlert is computed by the caller (feedConsole, from a
 // run.LogFullAlarm): the TUI applies no threshold of its own.
-func spaceMsg(dataFiles []mssql.FileSpace, logSpace mssql.LogSpace, reuseWait string, logAlert bool) tui.SpaceMsg {
+func spaceMsg(dataFiles []mssql.FileSpace, logSpace mssql.LogSpace, lh mssql.LogHistory, logAlert bool) tui.SpaceMsg {
 	var totalMB, freeMB int
 	for _, f := range dataFiles {
 		totalMB += f.SizeMB
@@ -1201,7 +1213,9 @@ func spaceMsg(dataFiles []mssql.FileSpace, logSpace mssql.LogSpace, reuseWait st
 	return tui.SpaceMsg{
 		DataMB: totalMB, DataFreeMB: freeMB,
 		LogBytes: logSpace.TotalBytes, LogUsedPercent: logSpace.UsedPercent,
-		ReuseWait: reuseWait, LogAlert: logAlert,
+		ReuseWait: logSpace.ReuseWait, LogAlert: logAlert,
+		LogBackupAgeSec: lh.LogBackupAgeSec, HasLogBackup: lh.HasLogBackup,
+		OldestTxnSec: lh.OldestTxnSec, HasOldestTxn: lh.HasOldestTxn,
 	}
 }
 
@@ -1292,7 +1306,8 @@ func serverBanner(info mssql.ServerInfo, matrix *ddl.Matrix) tui.ServerInfoMsg {
 // console starts. attach happens-before the engine goroutine that drives send (the
 // step/batch callbacks fire only inside ProcessAll), so no lock is needed.
 type tuiForwarder struct {
-	program *tui.Program
+	program       *tui.Program
+	shrinkingData atomic.Bool // a shrink_data operation is running; gates the movement-counter read
 }
 
 func (f *tuiForwarder) attach(p *tui.Program) { f.program = p }
@@ -1306,6 +1321,7 @@ func (f *tuiForwarder) send(msg any) {
 // step forwards an operation's start (as a StatusMsg — label, i/N counter, timer anchor)
 // or its terminal outcome (as a StepDoneMsg, so the operations panel can mark it DONE/FAILED).
 func (f *tuiForwarder) step(ev run.StepEvent) {
+	f.shrinkingData.Store(ev.Phase == run.StepStarted && ev.Command == "shrink_data")
 	if ev.Phase == run.StepFinished {
 		f.send(stepDoneMsg(ev))
 		return

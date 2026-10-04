@@ -360,11 +360,7 @@ func TestBatchKeyRangeSQL(t *testing.T) {
     batch: { strategy: key_range, key: OrderID }
 `).(ddl.BatchDML)
 
-	// Every key_range statement excludes the rows already at the target. The UPDATE
-	// commits before its watermark is saved, so a crash replays the boundary batch; without
-	// the clause the replay re-touched every row in it, firing AFTER UPDATE triggers and
-	// temporal or audit writes a second time (measured on SQL Server 2022: 10 rows shown to
-	// the trigger for a 5-row batch replayed once, 5 with the clause).
+	// Every key_range statement carries the self-limiting clause (why: keyRangeWhere).
 	// First batch: no lower bound; next-key query orders and tops by the key.
 	if got, want := ddl.BatchKeyRangeNextSQL(op, "OrderID", 5000, 0, false),
 		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] WHERE ([Status] IS NULL OR [Status] <> N'Archived') ORDER BY [OrderID]) x;"; got != want {
@@ -782,9 +778,9 @@ func TestBatchUnmatchedRowsCountsTheSelfLimit(t *testing.T) {
 	}
 }
 
-// A key_range walk's statement carries the self-limiting clause since 0.48.0 (it used to
-// re-touch rows already at the target on a resume), so the untouched-rows probe credits it
-// exactly as it credits the predicate strategy, and must not when the clause is absent.
+// A key_range walk's statement carries the self-limiting clause, so the untouched-rows
+// probe credits it exactly as it credits the predicate strategy, while the filter probe
+// stays the filter alone.
 func TestBatchUntouchedRowsKeyRangeCreditsTheSelfLimit(t *testing.T) {
 	op := parseOneOp(t, `operations:
   - operation: batch_update

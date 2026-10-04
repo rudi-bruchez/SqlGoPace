@@ -644,10 +644,7 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// monitoring loop exists, so without this line nothing at all would appear between
 	// the manifest starting and its first operation.
 	pfNotice := fmt.Sprintf("preflight: checking %d operation(s)", len(manifest.Operations))
-	fmt.Fprintln(e.out, pfNotice)
-	if e.noticeSink != nil {
-		e.noticeSink(pfNotice)
-	}
+	e.notice(pfNotice)
 
 	pfReport, err := e.pf.Check(ctx, manifest)
 	rep.Preflight = checkLines(pfReport)
@@ -740,11 +737,8 @@ func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	// docs/specs/REVIEW-2026-09-15-harm.md): an operation already completed in a
 	// previous run is skipped below and is not exposure this run will incur.
 	if notice := rollbackOnCancelNotice(planned[resumeFrom:], e.maxRetries); notice != "" {
-		fmt.Fprintln(e.out, notice)
+		e.notice(notice)
 		rep.CancelOnlyNotice = notice
-		if e.noticeSink != nil {
-			e.noticeSink(notice)
-		}
 	}
 
 	// Sessions the operator allows to stay blocked, applied to every operation in the
@@ -1908,6 +1902,15 @@ func (e *Engine) advanceCursor(name string, cursor *int, i int) {
 	e.updateSidecar(name, func(s *State) { s.ResumeFromOp = next })
 }
 
+// notice writes a line to the run output and to the notice sink, which the console reads
+// because it discards the run output.
+func (e *Engine) notice(msg string) {
+	fmt.Fprintln(e.out, msg)
+	if e.noticeSink != nil {
+		e.noticeSink(msg)
+	}
+}
+
 // updateSidecar applies mutate to the manifest's sidecar state and rewrites it, in place
 // (a no-op when there is no sidecar to update). Used to record resume progress — the cursor,
 // plan fingerprint, and paused-resumable record — after each operation. An unreadable
@@ -1919,16 +1922,12 @@ func (e *Engine) updateSidecar(name string, mutate func(*State)) {
 		return
 	}
 	if err != nil {
-		msg := fmt.Sprintf("warn: sidecar %s unreadable, resume progress is not being recorded (an interruption will restart or replay operations): %v", name, err)
-		fmt.Fprintln(e.out, msg)
-		if e.noticeSink != nil {
-			e.noticeSink(msg)
-		}
+		e.notice(fmt.Sprintf("warn: sidecar %s unreadable, resume progress is not being recorded (an interruption will restart or replay operations): %v", name, err))
 		return
 	}
 	mutate(&st)
 	if err := WriteState(e.sidecarPath(name), st); err != nil {
-		fmt.Fprintf(e.out, "sidecar %s: %v\n", name, err)
+		e.notice(fmt.Sprintf("warn: sidecar %s not written, resume progress is not being recorded: %v", name, err))
 	}
 }
 

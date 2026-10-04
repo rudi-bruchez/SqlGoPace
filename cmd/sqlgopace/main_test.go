@@ -138,8 +138,8 @@ func TestSpaceMsgSumsDataFilesAcrossFilegroups(t *testing.T) {
 		{Name: "PRODDB_Data1", SizeMB: 500_000, UsedMB: 450_000, FreeMB: 50_000},
 		{Name: "PRODDB_Data2", SizeMB: 300_000, UsedMB: 270_000, FreeMB: 30_000},
 	}
-	logSpace := mssql.LogSpace{TotalBytes: 64 * 1024 * 1024 * 1024, UsedPercent: 37}
-	msg := spaceMsg(files, logSpace, "LOG_BACKUP", false)
+	logSpace := mssql.LogSpace{TotalBytes: 64 * 1024 * 1024 * 1024, UsedPercent: 37, ReuseWait: "LOG_BACKUP"}
+	msg := spaceMsg(files, logSpace, mssql.LogHistory{LogBackupAgeSec: 60, HasLogBackup: true}, false)
 
 	if msg.DataMB != 800_000 || msg.DataFreeMB != 80_000 {
 		t.Errorf("spaceMsg data = MB:%d FreeMB:%d, want 800000/80000", msg.DataMB, msg.DataFreeMB)
@@ -150,11 +150,14 @@ func TestSpaceMsgSumsDataFilesAcrossFilegroups(t *testing.T) {
 	if msg.LogAlert {
 		t.Errorf("spaceMsg LogAlert = true, want false (caller passed false)")
 	}
+	if !msg.HasLogBackup || msg.LogBackupAgeSec != 60 || msg.HasOldestTxn {
+		t.Errorf("spaceMsg history = %+v, want the passed-through log history", msg)
+	}
 }
 
 func TestSpaceMsgCarriesTheCallerComputedAlertFlag(t *testing.T) {
 	// The TUI is dumb about thresholds: spaceMsg just carries whatever the caller decided.
-	msg := spaceMsg(nil, mssql.LogSpace{UsedPercent: 95}, "ACTIVE_TRANSACTION", true)
+	msg := spaceMsg(nil, mssql.LogSpace{UsedPercent: 95, ReuseWait: "ACTIVE_TRANSACTION"}, mssql.LogHistory{}, true)
 	if !msg.LogAlert {
 		t.Errorf("spaceMsg LogAlert = false, want true (caller passed true)")
 	}
@@ -773,5 +776,22 @@ func TestCounterRate(t *testing.T) {
 	}
 	if got, ok := r.observe(10, t0.Add(6*time.Second)); !ok || got != 0 {
 		t.Errorf("idle rate = %v, %v; want 0, true", got, ok)
+	}
+}
+
+// The movement counter is read only while a data shrink runs: nothing else moves pages.
+func TestForwarderTracksARunningDataShrink(t *testing.T) {
+	var f tuiForwarder // no program attached: send is a no-op
+	f.step(run.StepEvent{Phase: run.StepStarted, Command: "shrink_data"})
+	if !f.shrinkingData.Load() {
+		t.Error("a started shrink_data must enable the counter read")
+	}
+	f.step(run.StepEvent{Phase: run.StepFinished, Command: "shrink_data"})
+	if f.shrinkingData.Load() {
+		t.Error("a finished shrink must disable it")
+	}
+	f.step(run.StepEvent{Phase: run.StepStarted, Command: "rebuild_index"})
+	if f.shrinkingData.Load() {
+		t.Error("a rebuild must not enable it")
 	}
 }

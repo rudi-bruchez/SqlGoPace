@@ -236,7 +236,6 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 	// rewrite, and the remedy the failure names is confirm_full_table, which turns this
 	// check off. A false positive that teaches operators to disarm the guard is worse than
 	// no guard.
-	//
 	return unmatchedRowsSQL(o, o.userWhere(), limit)
 }
 
@@ -252,7 +251,7 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 //
 // It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause),
 // so preflight only pays for the second probe when the two can differ. Both strategies
-// of a literal UPDATE carry the clause (key_range since 0.48.0).
+// of a literal UPDATE carry the clause.
 func BatchUntouchedRowsSQL(o BatchDML, limit int) string {
 	return unmatchedRowsSQL(o, o.predicateWhere(), limit)
 }

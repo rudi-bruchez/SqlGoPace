@@ -705,12 +705,14 @@ func validateIntent(i Intent) error {
 // in any case. The value reaches the generated SQL verbatim, and a manifest is a trusted
 // input (SECURITY.md), so this is hardening: a field that reads as an enumeration is one.
 func validateDataCompression(cmd, v string) error {
-	switch strings.ToUpper(v) {
-	case "", "NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE":
+	if v == "" || slices.Contains(dataCompressions, strings.ToUpper(v)) {
 		return nil
 	}
-	return fmt.Errorf("%s: data_compression must be NONE, ROW, PAGE, COLUMNSTORE or COLUMNSTORE_ARCHIVE, got %q: %w", cmd, v, ErrInvalidManifest)
+	return fmt.Errorf("%s: data_compression must be one of %s, got %q: %w", cmd, strings.Join(dataCompressions, ", "), v, ErrInvalidManifest)
 }
+
+// dataCompressions are the DATA_COMPRESSION settings a manifest may name.
+var dataCompressions = []string{"NONE", "ROW", "PAGE", "COLUMNSTORE", "COLUMNSTORE_ARCHIVE"}
 
 // dataTypeShape is a type name, optionally schema-qualified (a user-defined type), with an
 // optional length, precision or (precision, scale). A shape rather than a list of names,

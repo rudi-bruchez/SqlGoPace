@@ -47,7 +47,10 @@ func TestTempdbSamplerIsNeverArmedWithKillers(t *testing.T) {
 			case *ast.AssignStmt:
 				for i, rhs := range n.Rhs {
 					call, ok := rhs.(*ast.CallExpr)
-					if !ok || !isSelector(call.Fun, "NewServerSampler") || len(call.Args) == 0 || i >= len(n.Lhs) {
+					if !ok || len(call.Args) == 0 || i >= len(n.Lhs) {
+						continue
+					}
+					if sel, ok := call.Fun.(*ast.SelectorExpr); !ok || sel.Sel.Name != "NewServerSampler" {
 						continue
 					}
 					if lit, ok := call.Args[0].(*ast.CompositeLit); ok {
@@ -81,9 +84,4 @@ func TestTempdbSamplerIsNeverArmedWithKillers(t *testing.T) {
 			t.Errorf("%s: %s is the tempdb sampler and must never be armed with a killer (docs/shrink.md: a tempdb shrink never kills a blocker)", fset.Position(a.pos), a.recv)
 		}
 	}
-}
-
-func isSelector(e ast.Expr, name string) bool {
-	sel, ok := e.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == name
 }

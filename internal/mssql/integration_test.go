@@ -95,7 +95,9 @@ func TestIntegrationLogSpaceCarriesTheReuseWait(t *testing.T) {
 }
 
 // An open transaction in the database shows up as the oldest one, and the read works on
-// the supported versions (sys.dm_db_log_stats is 2016 SP2+).
+// the supported versions (sys.dm_db_log_stats is 2016 SP2+). The transaction is held for
+// the read alone: the DSN database is often tempdb, and TestE2EShrinkData shrinks it from
+// the other package, in parallel; a write held open in it stalls that shrink.
 func TestIntegrationLogHistorySeesAnOpenTransaction(t *testing.T) {
 	conn, ctx := openTestConn(t)
 	other, err := mssql.Open(ctx, dsn(t), "test")
@@ -107,17 +109,16 @@ func TestIntegrationLogHistorySeesAnOpenTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.ExecDDL(ctx, "DROP TABLE IF EXISTS dbo.sqlgopace_lh;") })
-	if err := other.ExecDDL(ctx, "BEGIN TRAN; INSERT dbo.sqlgopace_lh VALUES (1); WAITFOR DELAY '00:00:02';"); err != nil {
+	if err := other.ExecDDL(ctx, "BEGIN TRAN; INSERT dbo.sqlgopace_lh VALUES (1);"); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = other.ExecDDL(ctx, "IF @@TRANCOUNT > 0 ROLLBACK;") })
-
 	lh, err := conn.LogHistory(ctx)
+	_ = other.ExecDDL(ctx, "IF @@TRANCOUNT > 0 ROLLBACK;")
 	if err != nil {
 		t.Fatalf("LogHistory() error = %v", err)
 	}
-	if !lh.HasOldestTxn || lh.OldestTxnSec < 1 {
-		t.Errorf("LogHistory() = %+v, want an open transaction at least 1 s old", lh)
+	if !lh.HasOldestTxn || lh.OldestTxnSec < 0 {
+		t.Errorf("LogHistory() = %+v, want the open transaction reported", lh)
 	}
 }
 
