@@ -3,6 +3,7 @@ package mssql
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -273,7 +274,27 @@ func (c *Conn) execStatement(ctx context.Context, statement string) (sql.Result,
 	c.mu.Lock()
 	c.suspect = err != nil
 	c.mu.Unlock()
+	if err != nil {
+		err = withErrorNumber(err)
+	}
 	return res, err
+}
+
+// withErrorNumber puts the server's error number in the message. The driver's
+// mssql.Error renders as "mssql: <text>" with no number, and a fatal error that aborts
+// the batch arrives as ServerError, whose message is the fixed "SQL Server had internal
+// error" with the real number and text reachable only through Unwrap. A report then
+// cannot tell 1105 (no space) from 1205 (deadlock) from 9002 (log full), which call for
+// three different reactions. The original error stays in the chain.
+func withErrorNumber(err error) error {
+	var me mssqldb.Error
+	if !errors.As(err, &me) || me.Number == 0 {
+		return err
+	}
+	if !strings.Contains(err.Error(), me.Message) {
+		return fmt.Errorf("%w: Msg %d, Level %d, State %d: %s", err, me.Number, me.Class, me.State, me.Message)
+	}
+	return fmt.Errorf("%w (Msg %d, Level %d, State %d)", err, me.Number, me.Class, me.State)
 }
 
 // repairIfBroken re-pins the execution connection when the statement before it left
