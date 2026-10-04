@@ -14,6 +14,38 @@ The version a run used, and the config file it loaded, are written into its `.lo
 sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
 SQLite history does not record either yet.
 
+## [0.48.0] - 2026-10-05
+
+### Fixed
+
+- A `key_range` resume changes no row twice. The range `UPDATE` commits before its watermark
+  is saved, so a crash replays the boundary batch, and the statement carried no
+  self-limiting clause: measured on SQL Server 2022, a 5-row batch replayed once showed an
+  `AFTER UPDATE` trigger 10 rows. Every `key_range` statement now excludes rows already at the
+  target. A statement-level trigger still fires on the replay, with an empty `inserted`. A
+  watermark saved by 0.47.0 stays valid.
+- A `.state.json` that cannot be read or written is reported (output and console) instead of
+  silently stopping resume bookkeeping.
+
+### Changed
+
+- `data_compression` must be `NONE`, `ROW`, `PAGE`, `COLUMNSTORE` or `COLUMNSTORE_ARCHIVE`, and
+  an `add_column`/`alter_column` `type` must be a type name with an optional `(length)`,
+  `(max)` or `(precision, scale)`. Migration: a manifest writing a `COLLATE` (or anything else)
+  after the type no longer loads, naming `type`.
+- New `intent: relocation` for a `rebuild_index` that moves an index off the end of a data
+  file. It always runs, like `fragmentation`, and says why.
+- The console's space line adds the age of the last log backup and of the oldest open
+  transaction; the shrink block adds `moving N MB/s` from the server's movement counter.
+
+### Documentation
+
+- The planner's analysis and the run's dry run no longer claim to take no locks:
+  `sp_estimate_data_compression_savings` takes an IS lock, scans under read committed and
+  loads a sample into tempdb.
+- `operations.md` names the `key_range` guarantee, and states that `on_failure: continue`
+  freezes the resume point at the first failure.
+
 ## [0.47.0] - 2026-10-04
 
 ### Fixed

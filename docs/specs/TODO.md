@@ -11,7 +11,7 @@ Keep this file honest: when work ships, move its entry to *Shipped* with the evi
 deleting it. A backlog that lists finished work as pending is worse than no backlog — it invites
 re-implementing what already exists.
 
-Status last verified against the tree at v0.47.0 (2026-10-04).
+Status last verified against the tree at v0.48.0 (2026-10-05).
 
 ## Before advertising this publicly — the production-safety gate
 
@@ -453,23 +453,20 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   to the full resolved plan is the fix and was declined on 2026-09-17 because it invalidates
   every existing sidecar and restarts every interrupted manifest from operation zero. Revisit
   when a format version is being introduced for another reason.
-  **(F-10)** `updateSidecar` returns silently when the sidecar cannot be read, so a precise
-  resume can degrade to a restart with no signal. Worth a look when the resume path is next
-  touched — it is the one maintainability finding of that review with a harm argument.
-  **(F-08)** `type` and `data_compression` reach generated SQL without an allowlist. This is
-  inside the trust boundary `SECURITY.md` declares, so it is hardening rather than a defect, but
-  a field that looks like an enum should be one.
-
-- [ ] **The tempdb no-kill invariant is held by a comment, not a test.** `cmd/sqlgopace/main.go`
-  deliberately attaches no killer to the tempdb sampler, and `docs/shrink.md` promises it. The
-  wiring needs a live tempdb connection, so there is nothing to assert without a server — which
-  is exactly how it was armed for twenty-nine releases without anyone noticing. Either extract
-  the wiring far enough to test it, or add it to the integration suite.
+  F-10 (silent `updateSidecar`) and F-08 (allowlist for `type` and `data_compression`) shipped
+  in 0.48.0, see *Shipped*. What remains of F-10 is the stronger option the review offered:
+  marking the run as needing a manual resume when progress can no longer be recorded. 0.48.0
+  warns instead, because the operation in progress is unaffected.
 
 - [ ] **What the harm review still leaves open.**
   **(6)** `SizedOperation` covers `rebuild_index`/`rebuild_heap` only, so `create_index` and a
-  table-rewriting `alter_column` get no data-free-space check. The `create_index` half is
-  mechanical; `alter_column` needs a judgement about which changes rewrite.
+  table-rewriting `alter_column` get no data-free-space check. *Correction (2026-10-04):* the
+  `create_index` half is not mechanical, as this entry used to say. A rebuild measures the index
+  it rewrites; a `create_index` builds one that does not exist yet, so there is nothing to read
+  before. The base table's size is an upper bound that would fail a narrow index on a large
+  table, the false positive that teaches operators to disarm the guard. It needs an estimate
+  (key and included column widths times rows), which is a design decision. `alter_column`
+  still needs a judgement about which changes rewrite.
   **(7)** `progress_poll_seconds` is required, documented without qualification, and read only by
   `runWithTUI` — the second question `TestNoInertConfigKey` does not ask. Write that test when the
   next monitoring key is added.
@@ -479,23 +476,11 @@ preceded it. The findings below are ordered by how much they cost, not by how ha
   three of them independently, which is the strongest signal either report carries: F02 (a
   fallback KILL identified only by a reusable session id) is `b677ca5`, F03 (a tempdb shrink
   killing the live workload despite a documented prohibition) is `1b5b5d6`, and F04 (a tempdb
-  shrink watching the wrong database's log) is `50c6024`. **F08 is not fixed** and is carried
-  below: the watermark half of it — resuming behind a position recorded against different SQL —
-  is closed by `8660c8a`, but the replay of committed side effects on the boundary batch is not.
+  shrink watching the wrong database's log) is `50c6024`. F08 was carried
+  open from there: the watermark half of it (resuming behind a position recorded against
+  different SQL) is closed by `8660c8a`, and the replay of committed side effects on the
+  boundary batch was closed in 0.48.0 (see *Shipped*).
   Of the four findings from that reader that have now been checked, four held.
-
-- [ ] **`key_range` is at-least-once across a crash, and the docs imply better.** Codex F08
-  (first run) and F-05 (second run), both rated SEVERE, neither verified by running. The range
-  `UPDATE` commits before its watermark is saved, so a crash replays the boundary range. The
-  `literal SET` restriction makes the *column value* idempotent and says nothing about an
-  `AFTER UPDATE` trigger, an audit or billing row, a temporal write, or a downstream consumer —
-  and a key-range `UPDATE` carries no self-limiting predicate, so it re-touches rows that are
-  already satisfied. A second shape: with `on_failure: continue`, a failed earlier operation
-  freezes the resume cursor, so later successful operations run again after an interruption.
-  Verify first, on the throwaway instance, with a trigger that counts its firings. If it holds,
-  the cheap fix is to name the guarantee in `docs/operations.md` instead of implying idempotence
-  from the literal-`SET` rule; the real fix is to exclude already-satisfied rows, or to require
-  reconciliation before replaying side-effectful work.
 
 - [ ] **A second question for the inert-key audit: is a key read on every path its documentation
   claims it for?** From the same review (finding 5). `TestNoInertConfigKey` asks whether a key is
@@ -979,6 +964,9 @@ verified here in code. Five siblings of this section, two of them seen in the li
 shipped in 0.47.0 and are under *Shipped*.
 
 - **`plan` estimates compression on every eligible object before the size ceiling applies.**
+  *The documentation half shipped in 0.48.0.* The code half is deliberately not done: gating
+  the estimate on the ceiling would settle by default the open question of whether the
+  ceiling should apply to compression at all, whose entry wants those estimates stored.
   `internal/plan/plan.go:158` and `:181` call `estimateFor` gated only by `estimable(row)` and
   the include/exclude rules; `rebuild_max_size_mb` is applied later, in the decision layer. A
   1.4 TB index the ceiling will reject is therefore sampled twice, ROW then PAGE, and
@@ -1099,6 +1087,22 @@ reasoned about.
   generator, not after. Counter-argument worth keeping: on the measured run the tail index was
   at **53.5 % logical fragmentation** against **0.62 %** for the clustered index of the same
   table, so `fragmentation` was literally true and the vocabulary gap cost nothing that day.
+
+### Found while shipping 0.48.0 (2026-10-05)
+
+- **`TestE2EShrinkData` is intermittent, on `main` too, because it shrinks tempdb.** The e2e
+  DSN in the `Makefile` and `docs/testing.md` points at `database=tempdb`, so the test shrinks
+  tempdb's five small data files while every other integration test, in the same run, uses
+  tempdb. Measured against the project's SQL Server 2022 container: two failures in three runs
+  of `go test -tags=integration ./internal/mssql ./cmd/sqlgopace` on `main`, also on the commit
+  before 0.47.0, also with `-p 1` (so not package parallelism), also right after a restart. The
+  failure is the shrink's own clean give-up (`INCOMPLETE`, manifest to `04.failed/`) after
+  chunks of several seconds on 20 to 70 MB files. Run alone, it passes in under a second. Fix:
+  point the e2e tests at a dedicated database they create, and keep tempdb for a test that
+  means to shrink it. Not done in 0.48.0, which did not touch the shrink path; the 0.47.0
+  green runs were luck.
+- **`create_index` free-space check needs an estimate, not a read.** See the correction on the
+  harm review's finding (6) above.
 
 ### Deferred from 0.47.0 (2026-10-04)
 
@@ -1235,6 +1239,26 @@ reasoned about.
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
+
+- [x] **0.48.0, the autonomous half of the remaining backlog.**
+  - `key_range` is at-least-once for statements and once for rows: every statement carries the
+    self-limiting clause (`keyRangeWhere`, `internal/ddl/batch.go`). Verified first on SQL
+    Server 2022 with a counting trigger (10 rows seen for a 5-row batch replayed once, 5 with
+    the clause); pinned by `TestIntegrationKeyRangeReplayTouchesNoRowTwice`. `operations.md`
+    names the guarantee and the `on_failure: continue` replay shape (codex F08 / F-05).
+  - An unreadable sidecar is reported (`updateSidecar`, `internal/run/engine.go`,
+    `TestUpdateSidecarSaysWhenTheSidecarIsUnreadable`; codex F-10).
+  - The tempdb no-kill promise is held by `TestTempdbSamplerIsNeverArmedWithKillers`, which reads
+    the package AST; it fails on the 0.13.0 wiring put back.
+  - `intent: relocation` (`internal/ddl/manifest.go`, `TestRelocationIntentRunsEvenWhenSatisfied`).
+  - `data_compression` allowlist and column-type shape (`validateDataCompression`,
+    `validateDataType`, `internal/ddl/allowlist_test.go`; codex F-08).
+  - The planner and dry-run docs no longer promise no locks (`MAINTENANCE.md`,
+    `maintenance-planner.md`, README, getting-started). The code half of that finding is left
+    open on purpose: see the entry on the ceiling vetoing compression, under *An 18-run
+    shrink*.
+  - Console: last log backup and oldest open transaction (`LogHistory`), and the shrink's
+    movement rate (`ShrinkMovedBytes`, `counterRate`).
 
 - [x] **0.47.0, a batch of fixes from the September campaigns.** Each was an entry above or a
   Todoist item without one; the reasoning lives in the commit messages and `CHANGELOG.md`.
