@@ -246,6 +246,15 @@ the `max_block_minutes` safety cap.** `TRUNCATEONLY` takes no `WAIT_AT_LOW_PRIOR
 aborting it otherwise stays the operator's call through a graceful stop, which is clean and
 re-entrant (the space already released is preserved).
 
+**A Phase A error is not fatal (v0.47.0).** A DBCC error from `TRUNCATEONLY` is decided by the
+same rule as a chunk error in §7.1: it means nothing could be released right now, so it is
+narrated and Phase B runs. Only the run's own cancellation ends the operation there. Until
+0.47.0 Phase A returned the error as fatal, so the same Msg 3140 that Phase B treats as a
+no-progress event lost a production run with no chunk tried and no tail walk (which runs at
+Phase B's entry); a plain re-run then released 29.8 GB in the pass it had called fatal. The
+earlier behavior had no stated rationale to preserve: it was the default of returning an
+error, never a decision.
+
 This gives the driver **two** monitoring postures, split on whether the statement is chunked:
 
 | Statement | Samples (killers, progress) | Reacts to pressure |

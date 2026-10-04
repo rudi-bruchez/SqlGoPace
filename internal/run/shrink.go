@@ -317,7 +317,7 @@ func (r *ShrinkRunner) RunTempdb(ctx context.Context, op ddl.ShrinkTempdb, res d
 		}
 		r.emitProgress(base)
 		outcome, terr := r.runTruncateOnly(ctx, f.Name, res, base, ignore, sink)
-		if terr != nil {
+		if terr != nil && !truncateOnlyFailed(terr, f.Name, sink) {
 			return nil, fmt.Errorf("shrink_tempdb %q: truncateonly: %w", f.Name, terr)
 		}
 		// watchedCapped falls through to the chunk loop, as in shrinkData: the cap yields
@@ -409,7 +409,7 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 	// graceful stop cancels it and the space it already released is preserved (a re-run
 	// resumes from the smaller size), so it stops cleanly rather than failing.
 	outcome, err := r.runTruncateOnly(ctx, f.Name, res, truncProgress, ignore, sink)
-	if err != nil {
+	if err != nil && !truncateOnlyFailed(err, f.Name, sink) {
 		return result, fmt.Errorf("shrink %q: truncateonly: %w", f.Name, err)
 	}
 	size, err := r.reader.FileSizeMB(ctx, f.Name)
@@ -447,6 +447,29 @@ func (r *ShrinkRunner) shrinkData(ctx context.Context, op ddl.Shrink, res ddl.Re
 		r.emitTail(sink, tp.finding, f.Name, true)
 	}
 	return out, err
+}
+
+// truncateOnlyFailed applies the chunk loop's error policy to the TRUNCATEONLY pass: a
+// DBCC error there means it released nothing right now (Msg 3140 "could not adjust the
+// space allocation" is the measured case, after a rebuild whose old extents were not yet
+// deallocated), which is information, not a broken operation. It narrates the error and
+// reports true so the caller carries on into the chunk loop, which exists to move what
+// TRUNCATEONLY cannot release, and whose entry is where the tail walk runs. Only our own
+// cancellation reports false. Until 0.47.0 the pass returned the error as fatal: the same
+// message was benign in a chunk and lost the run here, with no chunk tried and no tail
+// walk, on the one operation whose subject is what stands in the way.
+func truncateOnlyFailed(err error, file string, sink ReactionSink) bool {
+	if ownCancellation(err) {
+		return false
+	}
+	sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("TRUNCATEONLY on %q released nothing: %v; continuing with the chunked shrink", file, err)})
+	return true
+}
+
+// ownCancellation reports whether err is this run's own cancellation, the one statement
+// error the shrink driver treats as fatal.
+func ownCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // chunkLoop runs the page-moving chunk loop for one already-truncated file, from start
@@ -518,7 +541,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			// with work preserved (or, on the tempdb path, escalates to a cache flush). The last
 			// error is carried into the reason so it is never masked. Only our own cancellation
 			// is fatal.
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if ownCancellation(err) {
 				return result, err
 			}
 			step = halveStep(step, r.tuning, maxStep)

@@ -46,7 +46,10 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
 ### What it does that a bare DBCC does not
 
 - **`TRUNCATEONLY` first, always.** If the free space is already at the end of the file it
-  is reclaimed instantly, with no page movement and therefore no fragmentation.
+  is reclaimed instantly, with no page movement and therefore no fragmentation. A DBCC
+  error from this pass (typically Msg 3140, "could not adjust the space allocation", right
+  after a rebuild whose old extents are not yet released) is narrated and the shrink goes on
+  to the chunked phase, as a chunk error does. Only your own cancellation stops it there.
 - **A clean no-op.** Nothing to reclaim, or a target not below the current size, is
   reported as a successful "nothing to reclaim" rather than an error.
 - **Log files wait for your backup, they do not take one.** In `SIMPLE` recovery a

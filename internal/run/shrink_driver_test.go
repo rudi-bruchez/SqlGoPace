@@ -30,6 +30,7 @@ type fakeServer struct {
 	blockTruncate bool  // model a long-running TRUNCATEONLY: block until the context is canceled
 	blockShrink   bool  // model a long-running page-moving/log shrink: block until the context is canceled
 	chunkErr      error // if set, every page-moving chunk returns this error (a shrink that cannot move a page)
+	truncateErr   error // if set, the TRUNCATEONLY pass returns this error and releases nothing
 
 	// chunkErrs scripts transient chunk errors (e.g. Msg 845): each page-moving chunk exec
 	// pops and returns the front error instead of its normal behavior, until the queue is
@@ -79,6 +80,9 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 		if s.blockTruncate {
 			<-ctx.Done() // a long TRUNCATEONLY that only ends when the driver cancels it
 			return ctx.Err()
+		}
+		if s.truncateErr != nil {
+			return s.truncateErr
 		}
 		if s.truncateToMB != nil && *s.truncateToMB < s.sizeMB {
 			s.sizeMB = *s.truncateToMB
@@ -1232,4 +1236,53 @@ func TestTruncateOnlyCappedFallsThroughToTheChunkLoop(t *testing.T) {
 	if got[0].Chunks == 0 {
 		t.Errorf("Chunks = 0: the capped TRUNCATEONLY ended the operation instead of handing over to Phase B (%+v)", got[0])
 	}
+}
+
+// Measured on a production run that was lost to it: the TRUNCATEONLY pass returned
+// Msg 3140, "Could not adjust the space allocation", and the shrink failed having tried
+// nothing, not one chunk, and without the tail walk that sits at the chunk loop's entry.
+// The chunk loop treats that same message as a no-progress event, by design. A plain
+// re-run released 29.8 GB in the pass it had just called fatal.
+func TestShrinkDataContinuesPastAFailedTruncateOnly(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		truncateErr: errors.New("execute ddl: mssql: Could not adjust the space allocation for file 'Data'. (Msg 3140, Level 16, State 3)"),
+	}
+	var events []ReactionEvent
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final = 440
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, func(ev ReactionEvent) { events = append(events, ev) })
+	if err != nil {
+		t.Fatalf("Run() error = %v, want the chunk loop to run after a TRUNCATEONLY that released nothing", err)
+	}
+	if res[0].FinalMB != 440 || res[0].Chunks == 0 {
+		t.Errorf("got final=%d chunks=%d, want 440 reached by chunks", res[0].FinalMB, res[0].Chunks)
+	}
+	if !hasEventContaining(events, "Msg 3140") {
+		t.Errorf("events = %+v, want the TRUNCATEONLY error narrated, not swallowed", events)
+	}
+}
+
+func TestRunTempdbContinuesPastAFailedTruncateOnly(t *testing.T) {
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "tempdev", sizeMB: 1000, usedMB: 100, floorMB: 100,
+		truncateErr: errors.New("execute ddl: mssql: Could not adjust the space allocation for file 'tempdev'. (Msg 3140, Level 16, State 3)")}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v, want the chunk loop to run", err)
+	}
+	if len(res) != 1 || res[0].FinalMB != 200 {
+		t.Errorf("got %+v, want one file shrunk to 200 MB by chunks", res)
+	}
+}
+
+func hasEventContaining(events []ReactionEvent, sub string) bool {
+	for _, ev := range events {
+		if strings.Contains(ev.Detail, sub) {
+			return true
+		}
+	}
+	return false
 }
