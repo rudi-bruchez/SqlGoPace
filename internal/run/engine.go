@@ -1909,11 +1909,21 @@ func (e *Engine) advanceCursor(name string, cursor *int, i int) {
 }
 
 // updateSidecar applies mutate to the manifest's sidecar state and rewrites it, in place
-// (best-effort: a no-op when there is no sidecar to update). Used to record resume progress —
-// the cursor, plan fingerprint, and paused-resumable record — after each operation.
+// (a no-op when there is no sidecar to update). Used to record resume progress — the cursor,
+// plan fingerprint, and paused-resumable record — after each operation. An unreadable
+// sidecar is said, not skipped: progress that cannot be recorded turns a precise resume into
+// a restart or a replay, and the operator needs to know before an interruption, not after.
 func (e *Engine) updateSidecar(name string, mutate func(*State)) {
 	st, err := ReadState(e.sidecarPath(name))
+	if errors.Is(err, fs.ErrNotExist) {
+		return
+	}
 	if err != nil {
+		msg := fmt.Sprintf("warn: sidecar %s unreadable, resume progress is not being recorded (an interruption will restart or replay operations): %v", name, err)
+		fmt.Fprintln(e.out, msg)
+		if e.noticeSink != nil {
+			e.noticeSink(msg)
+		}
 		return
 	}
 	mutate(&st)
