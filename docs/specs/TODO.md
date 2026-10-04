@@ -1267,6 +1267,34 @@ reasoned about.
   WRITELOG/PAGEIOLATCH throttle already exists per driver. Reuses `SessionWaits` / `DiffWaits` /
   `CategorizeWaits`; `internal/tui` does not read them yet.
 
+- [ ] A resume level for log pressure, distinct from the pause level (hysteresis). Raised in
+  the public discussion of the launch post (2026-10-02). `waitForRelief`
+  (`internal/run/monitored_runner.go`) resumes on the first sample where
+  `!s.BlockingOthers && !s.LogOverCap`, so pause and resume share one threshold
+  (`log_max_percent` / `log_max_size_bytes`). A log hovering at the cap can therefore pause and
+  resume the operation on alternate polls. In practice a log pause usually ends with a log
+  backup, which drops usage far below the cap, and that is why it has not bitten yet; it is
+  luck, not design. Proposed: a lower resume level (for instance `log_resume_percent`,
+  defaulting some way under `log_max_percent`), on the model of the latches that already have
+  one, `LogFullAlarm` (`logalarm.go`) and `CPUPressureAlarm` (`cpualarm.go`), which today only
+  narrate and drive no reaction. `log_drain_timeout_minutes` must keep counting until usage is
+  under the resume level, not merely under the cap. Worth deciding in the same pass: blocking
+  has a dwell before reacting (`blocking_timeout_minutes`) but no quiet period before resuming.
+
+- [ ] Availability group state as a pressure signal. Raised in the same discussion, as the
+  context that changes what a given blocking duration means. Today the AG appears only twice:
+  `internal/mssql/databases.go` recognizes a secondary, and `log_reuse_wait =
+  AVAILABILITY_REPLICA` is quoted when the log fails to drain within
+  `log_drain_timeout_minutes`. Nothing reads the send or redo queues while an operation runs,
+  yet a rebuild or a shrink on the primary produces log the secondaries have to absorb: a
+  synchronous secondary falling behind slows application commits, an asynchronous one widens
+  the possible data loss, and a growing redo queue lengthens failover. Proposed: read
+  `log_send_queue_size` and `redo_queue_size` from `sys.dm_hadr_database_replica_states` on the
+  primary in the monitoring loop, and treat them as pressure alongside `LogOverCap` (pause,
+  then resume under a lower level, so it depends on the entry above). To settle: default
+  thresholds, whether synchronous and asynchronous replicas get different treatment, and the
+  decision recorded in the run log like every other reaction.
+
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
