@@ -63,7 +63,12 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
   The step climbs back once the pressure clears, so a single bad moment does not shrink the
   chunk for the rest of the run.
 
-A data-file shrink fragments indexes by design. Rebuild or reorganize afterwards if needed;
+A data-file shrink fragments indexes by design. Measured on a production shrink after five
+chunks had moved 33.6 GB (`sys.dm_db_index_physical_stats`, `LIMITED`): the nonclustered
+index the shrink was relocating stood at 53.46 % logical fragmentation over 7 363 368 pages,
+while the clustered index of the same table, which it never touched, stood at 0.62 % over
+7 077 868 pages. Same table, same rebuild a few hours earlier, two orders of magnitude apart.
+Rebuild or reorganize afterwards if needed;
 [`maintenance-planner.md`](maintenance-planner.md) can generate the pre-shrink reorganize
 pass for you.
 

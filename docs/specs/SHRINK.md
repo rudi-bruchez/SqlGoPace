@@ -559,8 +559,11 @@ is needed (the operation is already safe to stop).
 ### 12.1 Post-shrink maintenance chaining (design settled for Phase 2)
 
 **The need.** A **data** shrink fragments indexes by construction (pages are moved toward the
-front of the file, which scrambles the indexes' physical order). It is therefore natural to
-want to **follow it with a defragmentation**. The question raised: "add an option to the
+front of the file, which scrambles the indexes' physical order). Measured (2026-09-20): after
+five chunks moved 33.6 GB, the nonclustered index being relocated stood at 53.46 % logical
+fragmentation, the untouched clustered index of the same table at 0.62 %. That figure is what
+justifies the extra `sys.dm_db_index_physical_stats` read §12 lists at the end of a long
+operation. It is therefore natural to want to **follow it with a defragmentation**. The question raised: "add an option to the
 `shrink` operation to automatically chain a `plan --auto`?".
 
 **Layering decision — this is NOT a field of the `shrink` operation.** Three reasons settle
