@@ -26,7 +26,7 @@ mechanism available.
 >
 > **Take a backup you have actually tested restoring before running it on anything you care
 > about.** Rehearse on a copy of the database first. `--dry-run --explain` renders exactly
-> what would execute and takes no lock, so use it before every new manifest.
+> what would execute without executing it, so use it before every new manifest.
 >
 > Read [Blocking, yielding and kills](docs/blocking-and-kills.md) before enabling any kill
 > policy, and treat `shrink` with particular care: it is slow, it fragments indexes, and it
@@ -163,8 +163,8 @@ to kill a blocker, ignore it, or pause the operation:
 sqlgopace --config config.yaml --tui
 ```
 
-Either way, look before you leap. The dry run renders exactly what would execute and takes
-no lock:
+Either way, look before you leap. The dry run renders exactly what would execute, without executing
+it. Connected, it only reads the server (version detection, index expansion):
 
 ```bash
 sqlgopace --config config.yaml --dry-run --explain 01.to_run/010_rebuild.yaml

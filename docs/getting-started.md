@@ -144,7 +144,7 @@ ORDER BY t.name;
 ## 6. Look before you leap
 
 Never run a manifest you have not read as T-SQL first. The dry run renders exactly what
-would execute, takes no lock, and touches nothing:
+would execute and executes none of it; connected, it only reads the catalog:
 
 ```bash
 sqlgopace --config config.yaml --dry-run 01.to_run/010_rebuild.yaml

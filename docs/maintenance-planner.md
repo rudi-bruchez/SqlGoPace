@@ -37,7 +37,7 @@ because it is now an AG secondary for instance, is left for a future run.
 ## Using it
 
 ```bash
-# Analyse and print the manifests it would write. No files, no locks.
+# Analyse and print the manifests it would write. No files written, nothing executed.
 sqlgopace plan --config config.yaml --dry-run
 
 # The same, with the reasoning behind every decision
@@ -58,6 +58,13 @@ sqlgopace plan --config config.yaml --databases SALES,INVENTORY
 # Then review 01.to_run/*.yaml and run them as usual
 sqlgopace --config config.yaml
 ```
+
+The analysis still reads the server, and not only the catalog: when compression is in scope,
+each estimate (`sp_estimate_data_compression_savings`, once for ROW and once for PAGE) takes an
+IS lock on the table, waits if it cannot get one, scans the table under read committed, and
+loads a sample into tempdb. Run it where that is acceptable, or scope it with
+`--categories` or the profile's `compression.include`/`exclude` globs on a busy production
+server.
 
 | Flag | Effect |
 |---|---|

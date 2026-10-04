@@ -69,8 +69,12 @@ There are **two surfaces** over that planner (confirmed: build the first now, th
   `01.to_run/`** (or a chosen directory), each operation annotated with the *reasoning* behind it
   (chosen compression, measured fragmentation, estimated gain, write-intensity, the rule that fired).
   The operator **reviews, edits, reorders, or deletes** the manifests, then runs them through the
-  normal engine. Auditable, git-able, diff-able, `--dry-run` friendly — no surprises, no locks taken
-  during analysis beyond cheap reads.
+  normal engine. Auditable, git-able, diff-able, `--dry-run` friendly, no surprises. The analysis is not free
+  on a large table: when compression is in scope, `sp_estimate_data_compression_savings` takes an
+  IS lock on the table (and waits if it cannot get one), scans it under read committed, and loads
+  a sample into tempdb, once per compression type per object. *Superseded (0.48.0):* this line
+  used to promise "no locks taken during analysis beyond cheap reads", which is what made an
+  operator willing to point it at production; it was never true of the estimate.
 
 - **`--auto` run flag.** Once the analysis is trusted, analyze and run in a single invocation
   (unattended / SQL Agent / cron). Same planner, same engine: it writes the generated manifests into
