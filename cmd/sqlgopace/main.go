@@ -113,7 +113,7 @@ func cli(stdout, stderr io.Writer, args []string) error {
 		enabled: *useAuto, profile: *autoProfile, categories: *autoCats,
 		database: *autoDatabase, allDatabases: *autoAll, databases: *autoDatabases,
 	}
-	return runEngine(ctx, stdout, cfg, matrix, *useTUI, auto)
+	return runEngine(ctx, stdout, cfg, *configPath, matrix, *useTUI, auto)
 }
 
 // autoConfig carries the --auto analysis settings into the run path.
@@ -199,14 +199,19 @@ func dryRunConn(ctx context.Context, cfg *config.Config, db string, cache map[st
 // the foreground while the engine runs in the background. With auto.enabled, it
 // first analyses the database and writes the generated maintenance manifests into
 // the queue, then processes the queue — one unattended command, no review pause.
-func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix *ddl.Matrix,
+func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, configPath string, matrix *ddl.Matrix,
 	useTUI bool, auto autoConfig) (err error) {
 	// Report any error that stops the run itself; per-manifest outcomes keep their
 	// own events. See notifyRunFailure for what qualifies. A defer is the one shape
 	// none of the returns below can bypass.
 	defer func() { notifyRunFailure(ctx, stdout, notifiers(cfg), err) }()
 
-	fmt.Fprintf(stdout, "-- sqlgopace %s\n", version.Version())
+	// Named at startup and in every .log: a checkout can hold two divergent configs,
+	// and nothing else says which one this run loaded.
+	if abs, aerr := filepath.Abs(configPath); aerr == nil {
+		configPath = abs
+	}
+	fmt.Fprintf(stdout, "-- sqlgopace %s, config %s\n", version.Version(), configPath)
 	conn, err := mssql.Open(ctx, cfg.Database.ConnectionString, version.Version(), connOptions(cfg)...)
 	if err != nil {
 		return err
@@ -385,7 +390,7 @@ func runEngine(ctx context.Context, stdout io.Writer, cfg *config.Config, matrix
 		var (
 			current *currentManifest
 			fwd     *tuiForwarder
-			extra   []run.EngineOption
+			extra   = []run.EngineOption{run.WithProvenance(version.Version(), configPath)}
 		)
 		if useTUI {
 			current = &currentManifest{}

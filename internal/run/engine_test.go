@@ -1249,3 +1249,22 @@ func TestProcessAllRecordsPeakLogUse(t *testing.T) {
 		t.Errorf("log missing %q\n--- log ---\n%s", want, data)
 	}
 }
+
+// Two divergent configs in one checkout is ordinary (a local one and a shipped one),
+// and nothing in a .log said which one a run had loaded, nor which binary ran it.
+func TestProcessAllRecordsVersionAndConfigInTheLog(t *testing.T) {
+	eng, dirs := setupEngine(t, fakePreflighter{}, &fakeOpRunner{},
+		run.WithProvenance("0.47.0", "/srv/sqlgopace/config.yaml"))
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_a.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	for _, want := range []string{"sqlgopace: 0.47.0  config: /srv/sqlgopace/config.yaml", `"config": "/srv/sqlgopace/config.yaml"`} {
+		if !strings.Contains(string(data), want) {
+			t.Errorf("log missing %q\n--- log ---\n%s", want, data)
+		}
+	}
+}

@@ -110,6 +110,8 @@ type CheckLine struct {
 // RunReport is the full record of processing one manifest.
 type RunReport struct {
 	Manifest   string            `json:"manifest"`
+	Version    string            `json:"version,omitempty"` // the sqlgopace version that ran it
+	Config     string            `json:"config,omitempty"`  // absolute path of the config.yaml it loaded
 	Outcome    string            `json:"outcome"`
 	StartedAt  string            `json:"started_at"`
 	FinishedAt string            `json:"finished_at"`
@@ -242,6 +244,9 @@ func sizeName(s SizeLine) string {
 func Write(w io.Writer, r RunReport) error {
 	fmt.Fprintln(w, "SqlGoPace run report")
 	fmt.Fprintf(w, "manifest: %s\n", r.Manifest)
+	if r.Version != "" || r.Config != "" {
+		fmt.Fprintf(w, "sqlgopace: %s  config: %s\n", r.Version, r.Config)
+	}
 	fmt.Fprintf(w, "outcome: %s\n", r.Outcome)
 	fmt.Fprintf(w, "started: %s  finished: %s  duration: %dms\n", r.StartedAt, r.FinishedAt, r.DurationMS)
 	if r.CancelOnlyNotice != "" {

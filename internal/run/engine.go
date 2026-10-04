@@ -212,6 +212,7 @@ type Engine struct {
 	logWatchEvery    time.Duration               // poll cadence for the log-full watcher
 	sizes            SizeReader                  // reads structure sizes before/after a rebuild/reorganize (WithSizeReader)
 	logPeak          *LogPeak                    // highest log use the samplers read during an operation (WithLogPeak)
+	version, config  string                      // recorded in every .log (WithProvenance)
 	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
 	opListSink       func(string, []OpInfo)      // manifest name + its full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
@@ -430,6 +431,13 @@ func WithLogWatch(r LogWatchReader, every time.Duration) EngineOption {
 // scope line, no size lines, no report totals.
 func WithSizeReader(r SizeReader) EngineOption { return func(e *Engine) { e.sizes = r } }
 
+// WithProvenance records, in every run report, the sqlgopace version and the config
+// file that produced it. A checkout can hold two divergent configs, and editing the one
+// the run did not load is otherwise silent.
+func WithProvenance(version, config string) EngineOption {
+	return func(e *Engine) { e.version, e.config = version, config }
+}
+
 // WithLogPeak wires the tracker the samplers feed (ServerSampler.SetLogPeak), so each
 // operation's report carries the highest transaction-log use seen while it ran.
 func WithLogPeak(p *LogPeak) EngineOption { return func(e *Engine) { e.logPeak = p } }
@@ -581,7 +589,7 @@ func (e *Engine) deferredByWindow(ctx context.Context, name string) bool {
 
 func (e *Engine) processOne(ctx context.Context, name string) runOutcome {
 	start := e.clk.Now()
-	rep := &report.RunReport{Manifest: name, StartedAt: e.now()}
+	rep := &report.RunReport{Manifest: name, Version: e.version, Config: e.config, StartedAt: e.now()}
 
 	procPath, err := e.queue.Claim(name)
 	if err != nil {
