@@ -156,8 +156,15 @@ func batchStatement(o BatchDML, topToken string, res ResolvedOptions) string {
 
 // keyRangeWhere builds the WHERE body for a key_range statement: the lower bound
 // (key > watermark, omitted on the first batch), an optional upper bound (key <=
-// next), and the operator filter, all AND-ed. The watermark/next bounds are integer
-// literals the driver controls, so inlining them is safe.
+// next), the self-limiting clause, and the operator filter, all AND-ed. The
+// watermark/next bounds are integer literals the driver controls, so inlining them is
+// safe.
+//
+// The self-limiting clause is what makes a resume exactly-once for rows. The UPDATE
+// commits before its watermark is saved, so a crash replays the boundary batch; without
+// the clause the replay re-touched every row in it, firing AFTER UPDATE triggers and
+// temporal or audit writes a second time. With it, the next-key query skips rows already
+// at the target, so a replay finds nothing left in that range.
 func keyRangeWhere(o BatchDML, key string, watermark int64, hasWatermark bool, upper *int64) string {
 	k := quoteIdent(key)
 	var parts []string
@@ -166,6 +173,9 @@ func keyRangeWhere(o BatchDML, key string, watermark int64, hasWatermark bool, u
 	}
 	if upper != nil {
 		parts = append(parts, fmt.Sprintf("%s <= %d", k, *upper))
+	}
+	if self := o.selfLimitClause(); self != "" {
+		parts = append(parts, self)
 	}
 	if uw := o.userWhere(); uw != "" {
 		parts = append(parts, "("+uw+")")
@@ -187,9 +197,8 @@ func BatchKeyRangeNextSQL(o BatchDML, key string, batchSize int, watermark int64
 	return fmt.Sprintf("SELECT MAX(k) FROM (%s) x;", inner)
 }
 
-// BatchKeyRangeUpdateSQL updates the rows in (watermark, next] that match the filter.
-// Each key is processed exactly once across batches, so no self-limiting clause is
-// needed.
+// BatchKeyRangeUpdateSQL updates the rows in (watermark, next] that match the filter and
+// are not already at the target (see keyRangeWhere).
 func BatchKeyRangeUpdateSQL(o BatchDML, key string, watermark, next int64, hasWatermark bool, res ResolvedOptions) string {
 	where := keyRangeWhere(o, key, watermark, hasWatermark, &next)
 	return fmt.Sprintf("UPDATE %s SET %s WHERE %s%s;",
@@ -228,8 +237,6 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 	// check off. A false positive that teaches operators to disarm the guard is worse than
 	// no guard.
 	//
-	// key_range is the exception: its statement carries no self-limiting clause (each key
-	// is processed once), so crediting it with one would spare rows the walk does update.
 	return unmatchedRowsSQL(o, o.userWhere(), limit)
 }
 
@@ -243,13 +250,10 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 // verdict that turned on it would let the same manifest fail on an untouched table and
 // pass once a prior run had left rows at the target.
 //
-// It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause)
-// and under key_range (whose statement does not carry one), so preflight only pays for the
-// second probe when the two can differ.
+// It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause),
+// so preflight only pays for the second probe when the two can differ. Both strategies
+// of a literal UPDATE carry the clause (key_range since 0.48.0).
 func BatchUntouchedRowsSQL(o BatchDML, limit int) string {
-	if o.Batch.IsKeyRange() {
-		return unmatchedRowsSQL(o, o.userWhere(), limit)
-	}
 	return unmatchedRowsSQL(o, o.predicateWhere(), limit)
 }
 

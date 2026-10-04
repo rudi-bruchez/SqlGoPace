@@ -280,8 +280,20 @@ Three rules the parser enforces, each closing a way to lose data or hang:
   an unconditional delete, `TRUNCATE TABLE` is the right tool and this is not it.
 - `set_raw` without any predicate cannot self-limit under the `predicate` strategy, so it
   would loop forever. It is rejected; give it a self-limiting `where_raw`.
-- The `key_range` walk persists a watermark and re-applies the boundary batch on a resume,
-  so it is restricted to an idempotent literal `UPDATE`.
+- The `key_range` walk persists a watermark after each committed batch, so a crash between the
+  commit and the save replays the boundary batch. It is restricted to a literal `UPDATE`, and
+  since 0.48.0 every statement excludes the rows already at the target, so the replay changes
+  no row twice: an `AFTER UPDATE` trigger, a temporal table or an audit row sees each row
+  once. What is *not* exactly-once is the statement: a statement-level trigger still fires
+  on the replay, with an empty `inserted`. A trigger that does work per call without looking
+  at `inserted` must be written for that. Before 0.48.0 the replay re-touched every row of
+  the batch (measured: a trigger saw 10 rows for a 5-row batch replayed once).
+- **`on_failure: continue` freezes the resume point at the first failure.** The resume cursor
+  advances only over a contiguous run of completed operations, so after an interruption every
+  operation past the first failed one runs again, including those that had succeeded. Batched
+  DML with a literal `set` and index rebuilds with `intent: compression` absorb that (nothing
+  left to change, or skipped as satisfied); a `set_raw` whose `where_raw` does not consume
+  its own matches, or a rebuild with `intent: fragmentation`, does the work a second time.
 - **Editing the operation discards its watermark.** The walk records which statement it was
   walking, and a resume that finds a different one starts the walk over instead of picking up
   behind a position recorded against other SQL — which would silently skip every row below it.

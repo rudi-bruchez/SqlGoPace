@@ -360,24 +360,29 @@ func TestBatchKeyRangeSQL(t *testing.T) {
     batch: { strategy: key_range, key: OrderID }
 `).(ddl.BatchDML)
 
+	// Every key_range statement excludes the rows already at the target. The UPDATE
+	// commits before its watermark is saved, so a crash replays the boundary batch; without
+	// the clause the replay re-touched every row in it, firing AFTER UPDATE triggers and
+	// temporal or audit writes a second time (measured on SQL Server 2022: 10 rows shown to
+	// the trigger for a 5-row batch replayed once, 5 with the clause).
 	// First batch: no lower bound; next-key query orders and tops by the key.
 	if got, want := ddl.BatchKeyRangeNextSQL(op, "OrderID", 5000, 0, false),
-		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] ORDER BY [OrderID]) x;"; got != want {
+		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] WHERE ([Status] IS NULL OR [Status] <> N'Archived') ORDER BY [OrderID]) x;"; got != want {
 		t.Errorf("first next-key SQL\n got: %s\nwant: %s", got, want)
 	}
 	// Subsequent batch: lower bound on the watermark.
 	if got, want := ddl.BatchKeyRangeNextSQL(op, "OrderID", 5000, 1000, true),
-		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] WHERE [OrderID] > 1000 ORDER BY [OrderID]) x;"; got != want {
+		"SELECT MAX(k) FROM (SELECT TOP (5000) [OrderID] AS k FROM [dbo].[Orders] WHERE [OrderID] > 1000 AND ([Status] IS NULL OR [Status] <> N'Archived') ORDER BY [OrderID]) x;"; got != want {
 		t.Errorf("next-key SQL with watermark\n got: %s\nwant: %s", got, want)
 	}
-	// Update of the (watermark, next] range — no self-limiting clause needed.
+	// Update of the (watermark, next] range.
 	if got, want := ddl.BatchKeyRangeUpdateSQL(op, "OrderID", 1000, 2000, true, ddl.ResolvedOptions{}),
-		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] > 1000 AND [OrderID] <= 2000;"; got != want {
+		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] > 1000 AND [OrderID] <= 2000 AND ([Status] IS NULL OR [Status] <> N'Archived');"; got != want {
 		t.Errorf("range update SQL\n got: %s\nwant: %s", got, want)
 	}
 	// First-batch update has no lower bound.
 	if got, want := ddl.BatchKeyRangeUpdateSQL(op, "OrderID", 0, 2000, false, ddl.ResolvedOptions{}),
-		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] <= 2000;"; got != want {
+		"UPDATE [dbo].[Orders] SET [Status] = N'Archived' WHERE [OrderID] <= 2000 AND ([Status] IS NULL OR [Status] <> N'Archived');"; got != want {
 		t.Errorf("first range update SQL\n got: %s\nwant: %s", got, want)
 	}
 }
@@ -777,9 +782,10 @@ func TestBatchUnmatchedRowsCountsTheSelfLimit(t *testing.T) {
 	}
 }
 
-// A key_range walk's statement carries no self-limiting clause — each key is processed
-// once — so the probe must not credit it with sparing rows the walk will in fact update.
-func TestBatchUnmatchedRowsKeyRangeUsesTheFilterAlone(t *testing.T) {
+// A key_range walk's statement carries the self-limiting clause since 0.48.0 (it used to
+// re-touch rows already at the target on a resume), so the untouched-rows probe credits it
+// exactly as it credits the predicate strategy, and must not when the clause is absent.
+func TestBatchUntouchedRowsKeyRangeCreditsTheSelfLimit(t *testing.T) {
 	op := parseOneOp(t, `operations:
   - operation: batch_update
     schema: dbo
@@ -790,11 +796,11 @@ func TestBatchUnmatchedRowsKeyRangeUsesTheFilterAlone(t *testing.T) {
 `).(ddl.BatchDML)
 
 	got := ddl.BatchUntouchedRowsSQL(op, 1000)
-	if strings.Contains(got, "IS NULL OR") {
-		t.Errorf("key_range does not self-limit; the probe must not assume it does:\n%s", got)
+	if !strings.Contains(got, "IS NULL OR [Archived] <> 1") {
+		t.Errorf("key_range self-limits; the probe must credit it:\n%s", got)
 	}
-	if got != ddl.BatchUnmatchedRowsSQL(op, 1000) {
-		t.Errorf("under key_range the two probes ask the same question and must agree:\n%s", got)
+	if strings.Contains(ddl.BatchUnmatchedRowsSQL(op, 1000), "IS NULL OR") {
+		t.Errorf("the filter probe must stay the filter alone")
 	}
 }
 
