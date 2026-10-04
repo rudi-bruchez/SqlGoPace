@@ -211,6 +211,7 @@ type Engine struct {
 	logWatch         LogWatchReader              // when set, polls the transaction log for the full alarm
 	logWatchEvery    time.Duration               // poll cadence for the log-full watcher
 	sizes            SizeReader                  // reads structure sizes before/after a rebuild/reorganize (WithSizeReader)
+	logPeak          *LogPeak                    // highest log use the samplers read during an operation (WithLogPeak)
 	stepSink         func(StepEvent)             // manifest-level per-operation progress (stdout + TUI)
 	opListSink       func(string, []OpInfo)      // manifest name + its full operation list, once per manifest (TUI operations panel)
 	alertSink        func(ManifestFailure)       // notified when a manifest fails, so the TUI can show why
@@ -428,6 +429,10 @@ func WithLogWatch(r LogWatchReader, every time.Duration) EngineOption {
 // (OBJECT-SIZES.md §5). Without it (nil, the default) no size work happens at all: no
 // scope line, no size lines, no report totals.
 func WithSizeReader(r SizeReader) EngineOption { return func(e *Engine) { e.sizes = r } }
+
+// WithLogPeak wires the tracker the samplers feed (ServerSampler.SetLogPeak), so each
+// operation's report carries the highest transaction-log use seen while it ran.
+func WithLogPeak(p *LogPeak) EngineOption { return func(e *Engine) { e.logPeak = p } }
 
 // WithResumeCheck lets the engine recognize an interrupted-but-paused resumable
 // operation (session killed / connection lost) as recoverable rather than failed.
@@ -899,6 +904,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		return nil // carry on to the next operation
 	}
 	e.emitStep(stepEv)
+	e.logPeak.Take() // start this operation's peak; anything read before it belongs to no operation
 
 	// The sink is called from the runner (this goroutine) and from the held-through
 	// narrator (a sibling goroutine), so the shared report state is mutex-guarded.
@@ -1131,6 +1137,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 	opReactions := append([]report.ReactionLine(nil), reactions...)
 	opPeakBlocked := peakBlocked
 	reactionMu.Unlock()
+	logPeak := e.logPeak.Take()
 
 	opRep := report.OperationReport{
 		Index:          i + 1,
@@ -1140,6 +1147,7 @@ func (e *Engine) runStep(ctx context.Context, r *manifestRun, i int, step ddl.Pl
 		Options:        optionDecisions(step.Decisions),
 		Reactions:      opReactions,
 		PeakBlocked:    opPeakBlocked,
+		PeakLog:        peakLogReport(logPeak),
 		ContendedCount: r.contended.len(),
 		Waits:          waitLines,
 		WaitTotalMS:    waitTotal,
@@ -2025,6 +2033,14 @@ func opTarget(op ddl.Operation) string {
 }
 
 // shrinkReport maps the driver's per-file results into the run report.
+// peakLogReport converts a recorded peak for the report; nil when nothing was read.
+func peakLogReport(ls mssql.LogSpace) *report.PeakLogReport {
+	if ls.TotalBytes == 0 {
+		return nil
+	}
+	return &report.PeakLogReport{UsedBytes: ls.UsedBytes(), UsedPercent: ls.UsedPercent, FileBytes: ls.TotalBytes, ReuseWait: ls.ReuseWait}
+}
+
 func shrinkReport(results []ShrinkResult) []report.ShrinkFileReport {
 	if len(results) == 0 {
 		return nil

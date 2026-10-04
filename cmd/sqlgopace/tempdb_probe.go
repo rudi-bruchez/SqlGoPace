@@ -6,11 +6,10 @@ import (
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
 
-// logProbe is the database-scoped half of what a sampler reads: both statements report the
+// logProbe is the database-scoped half of what a sampler reads: the statement reports the
 // connection's *current* database, so which connection asks decides which database answers.
 type logProbe interface {
 	LogSpace(ctx context.Context) (mssql.LogSpace, error)
-	LogReuseWait(ctx context.Context) (string, error)
 }
 
 // sessionProbe is the instance-wide half: sys.dm_exec_requests joined to
@@ -39,10 +38,6 @@ type tempdbProbe struct {
 
 func (p tempdbProbe) LogSpace(ctx context.Context) (mssql.LogSpace, error) {
 	return p.db.LogSpace(ctx)
-}
-
-func (p tempdbProbe) LogReuseWait(ctx context.Context) (string, error) {
-	return p.db.LogReuseWait(ctx)
 }
 
 func (p tempdbProbe) ActiveSessions(ctx context.Context) ([]mssql.Session, error) {

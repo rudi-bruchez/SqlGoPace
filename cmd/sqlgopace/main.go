@@ -505,6 +505,9 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		cfg.OptionsOverride.AllowAbortBlockers
 	checker := run.NewPreflightChecker(conn, info, thresholds, killArmed)
 	sampler := run.NewServerSampler(conn, conn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	// One tracker for both samplers: whichever one an operation runs under feeds its peak.
+	logPeak := &run.LogPeak{}
+	sampler.SetLogPeak(logPeak)
 	// Selective blocker-kill policy (off unless armed in config). The killer reuses the
 	// sampler's per-poll session snapshot; the engine feeds it each manifest's kill rules.
 	var killOpt run.EngineOption
@@ -620,6 +623,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	tempdbSampler := run.NewServerSampler(
 		tempdbProbe{db: tempdbConn, sessions: conn},
 		tempdbConn, cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)
+	tempdbSampler.SetLogPeak(logPeak)
 	// No killers on this sampler, deliberately. docs/shrink.md states, under a heading
 	// that says so in as many words, that a tempdb shrink waits its blockers out and
 	// never kills them: they are legitimate application queries, and tempdb is shared by
@@ -658,6 +662,7 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 		run.WithBlockerReader(conn),
 		run.WithLogWatch(conn, cfg.Monitoring.LogPoll()),
 		run.WithSizeReader(conn),
+		run.WithLogPeak(logPeak),
 		run.WithLiveReload(),
 		run.WithResumeCheck(conn),
 		run.WithResumableAborter(conn),

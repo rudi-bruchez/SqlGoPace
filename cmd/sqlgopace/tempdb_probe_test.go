@@ -14,12 +14,7 @@ type fakeLogProbe struct {
 
 func (p *fakeLogProbe) LogSpace(context.Context) (mssql.LogSpace, error) {
 	p.calls++
-	return mssql.LogSpace{TotalBytes: 1}, nil
-}
-
-func (p *fakeLogProbe) LogReuseWait(context.Context) (string, error) {
-	p.calls++
-	return p.name, nil
+	return mssql.LogSpace{TotalBytes: 1, ReuseWait: p.name}, nil
 }
 
 type fakeSessionProbe struct{ calls int }
@@ -40,18 +35,12 @@ func TestTempdbProbeReadsTheLogInTempdb(t *testing.T) {
 	tempdb := &fakeLogProbe{name: "tempdb"}
 	p := tempdbProbe{db: tempdb, sessions: &fakeSessionProbe{}}
 
-	if _, err := p.LogSpace(context.Background()); err != nil {
+	got, err := p.LogSpace(context.Background())
+	if err != nil {
 		t.Fatalf("LogSpace() error = %v", err)
 	}
-	got, err := p.LogReuseWait(context.Background())
-	if err != nil {
-		t.Fatalf("LogReuseWait() error = %v", err)
-	}
-	if got != "tempdb" {
-		t.Errorf("LogReuseWait() = %q, want the read to land in tempdb", got)
-	}
-	if tempdb.calls != 2 {
-		t.Errorf("tempdb connection answered %d log read(s), want 2", tempdb.calls)
+	if got.ReuseWait != "tempdb" || tempdb.calls != 1 {
+		t.Errorf("LogSpace() = %+v after %d tempdb read(s), want the read to land in tempdb", got, tempdb.calls)
 	}
 }
 

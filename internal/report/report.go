@@ -64,6 +64,16 @@ type BatchDMLReport struct {
 	Reason    string `json:"reason,omitempty"`     // why it stopped early; empty on completion
 }
 
+// PeakLogReport is the highest transaction-log use read while an operation ran, with
+// the reuse wait seen at that moment: a peak under LOG_BACKUP measures a log that could
+// not truncate, not what the operation needed.
+type PeakLogReport struct {
+	UsedBytes   int64   `json:"used_bytes"`
+	UsedPercent float64 `json:"used_percent"`
+	FileBytes   int64   `json:"file_bytes"`
+	ReuseWait   string  `json:"reuse_wait,omitempty"`
+}
+
 // OperationReport is the outcome of one executed operation.
 type OperationReport struct {
 	Index          int                `json:"index"`
@@ -73,6 +83,7 @@ type OperationReport struct {
 	Options        []OptionDecision   `json:"options,omitempty"`
 	Reactions      []ReactionLine     `json:"reactions,omitempty"`
 	PeakBlocked    int                `json:"peak_blocked,omitempty"`
+	PeakLog        *PeakLogReport     `json:"peak_log,omitempty"`
 	ContendedCount int                `json:"contended_count,omitempty"`
 	ContendedFile  string             `json:"contended_file,omitempty"`
 	Waits          []WaitLine         `json:"waits,omitempty"`
@@ -263,6 +274,13 @@ func Write(w io.Writer, r RunReport) error {
 			}
 			if op.PeakBlocked > 0 {
 				fmt.Fprintf(w, "      peak blocked: %d session(s)\n", op.PeakBlocked)
+			}
+			if pl := op.PeakLog; pl != nil {
+				fmt.Fprintf(w, "      peak log: %s, %.0f%% of a %s file", HumanizeKB(pl.UsedBytes/1024), pl.UsedPercent, HumanizeKB(pl.FileBytes/1024))
+				if pl.ReuseWait != "" {
+					fmt.Fprintf(w, " (reuse_wait=%s)", pl.ReuseWait)
+				}
+				fmt.Fprintln(w)
 			}
 			if op.ContendedCount > 0 {
 				fmt.Fprintf(w, "      contended objects: %d — see %s\n", op.ContendedCount, op.ContendedFile)

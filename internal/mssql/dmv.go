@@ -14,6 +14,7 @@ import (
 type LogSpace struct {
 	TotalBytes  int64
 	UsedPercent float64
+	ReuseWait   string // log_reuse_wait_desc, read in the same statement
 }
 
 // UsedBytes returns the absolute used log space in bytes.
@@ -22,14 +23,15 @@ func (l LogSpace) UsedBytes() int64 {
 }
 
 const logSpaceSQL = `
-SELECT total_log_size_in_bytes, used_log_space_in_percent
-FROM sys.dm_db_log_space_usage
+SELECT u.total_log_size_in_bytes, u.used_log_space_in_percent, d.log_reuse_wait_desc
+FROM sys.dm_db_log_space_usage AS u
+JOIN sys.databases AS d ON d.database_id = u.database_id
 OPTION (RECOMPILE);`
 
 // LogSpace reads current transaction-log usage for the connected database.
 func (c *Conn) LogSpace(ctx context.Context) (LogSpace, error) {
 	var ls LogSpace
-	if err := c.pool.QueryRowContext(ctx, logSpaceSQL).Scan(&ls.TotalBytes, &ls.UsedPercent); err != nil {
+	if err := c.pool.QueryRowContext(ctx, logSpaceSQL).Scan(&ls.TotalBytes, &ls.UsedPercent, &ls.ReuseWait); err != nil {
 		return LogSpace{}, fmt.Errorf("read log space: %w", err)
 	}
 	return ls, nil

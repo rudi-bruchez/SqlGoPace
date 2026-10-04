@@ -559,13 +559,11 @@ func TestProbeResumableInconclusiveOnTimeout(t *testing.T) {
 }
 
 type fakeProbe struct {
-	ls        mssql.LogSpace
-	reuseWait string
-	sessions  []mssql.Session
+	ls       mssql.LogSpace
+	sessions []mssql.Session
 }
 
 func (f fakeProbe) LogSpace(context.Context) (mssql.LogSpace, error) { return f.ls, nil }
-func (f fakeProbe) LogReuseWait(context.Context) (string, error)     { return f.reuseWait, nil }
 func (f fakeProbe) ActiveSessions(context.Context) ([]mssql.Session, error) {
 	return f.sessions, nil
 }
@@ -613,8 +611,8 @@ func TestServerSamplerBlocking(t *testing.T) {
 }
 
 func TestServerSamplerLog(t *testing.T) {
-	t.Run("over percent cap reads reuse wait", func(t *testing.T) {
-		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 90}, reuseWait: "ACTIVE_TRANSACTION"}
+	t.Run("over percent cap carries the reuse wait read with it", func(t *testing.T) {
+		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 90, ReuseWait: "ACTIVE_TRANSACTION"}}
 		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
 		if err != nil {
 			t.Fatalf("Log() error = %v", err)
@@ -623,17 +621,103 @@ func TestServerSamplerLog(t *testing.T) {
 			t.Errorf("Log() = %+v, want OverCap=true ReuseWait=ACTIVE_TRANSACTION", got)
 		}
 	})
-	t.Run("healthy leaves reuse wait unread", func(t *testing.T) {
-		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 10}, reuseWait: "ACTIVE_TRANSACTION"}
+	t.Run("healthy reports no reuse wait", func(t *testing.T) {
+		probe := fakeProbe{ls: mssql.LogSpace{TotalBytes: 100, UsedPercent: 10, ReuseWait: "ACTIVE_TRANSACTION"}}
 		got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
 		if err != nil {
 			t.Fatalf("Log() error = %v", err)
 		}
-		if got.OverCap || got.ReuseWait != "" {
-			t.Errorf("Log() = %+v, want OverCap=false ReuseWait empty (not queried)", got)
+		if got.OverCap || got.ReuseWait != "" || got.Breach != "" {
+			t.Errorf("Log() = %+v, want OverCap=false and no reuse wait or breach", got)
 		}
 	})
 }
+
+// A log pause used to say only "transaction log over cap". An operator watching a
+// campaign pause with 79% of a 260 GB log free could not tell that the shipped 50 GB
+// byte cap had fired at 20% full: the sampler measured both numbers and kept a bool.
+func TestServerSamplerLogNamesTheCapThatFired(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+	tests := []struct {
+		name string
+		ls   mssql.LogSpace
+		want string
+	}{
+		{
+			"the byte cap, with the file mostly free",
+			mssql.LogSpace{TotalBytes: 260 * gb, UsedPercent: 20},
+			"used 52.0 GB, 20% of a 260.0 GB file, over the 50.0 GB cap (monitoring.log_max_size_bytes)",
+		},
+		{
+			"the percent cap, under the byte cap",
+			mssql.LogSpace{TotalBytes: 40 * gb, UsedPercent: 90},
+			"used 36.0 GB, 90% of a 40.0 GB file, over the 80% cap (monitoring.log_max_percent)",
+		},
+		{
+			"both",
+			mssql.LogSpace{TotalBytes: 100 * gb, UsedPercent: 85},
+			"used 85.0 GB, 85% of a 100.0 GB file, over the 50.0 GB cap (monitoring.log_max_size_bytes) and the 80% cap (monitoring.log_max_percent)",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewServerSampler(fakeProbe{ls: tt.ls}, staticSession(57), 50*gb, 80).Log(context.Background())
+			if err != nil {
+				t.Fatalf("Log() error = %v", err)
+			}
+			if got.Breach != tt.want {
+				t.Errorf("Log().Breach = %q\nwant           %q", got.Breach, tt.want)
+			}
+		})
+	}
+}
+
+// The peak is the figure that sizes a log file and says which shrink a database can
+// afford, and the sampler read it on every poll and discarded it. The reuse wait at the
+// peak is kept with it: 222 GB under LOG_BACKUP measures a log that could not truncate,
+// not what the workload needed.
+func TestLogPeakKeepsTheHighestReadingAndItsReuseWait(t *testing.T) {
+	peak := &LogPeak{}
+	probe := &seqProbe{reads: []mssql.LogSpace{
+		{TotalBytes: 1000, UsedPercent: 10, ReuseWait: "NOTHING"},
+		{TotalBytes: 1000, UsedPercent: 70, ReuseWait: "LOG_BACKUP"},
+		{TotalBytes: 2000, UsedPercent: 20, ReuseWait: "NOTHING"}, // bigger file, lower percent, fewer bytes
+	}}
+	s := NewServerSampler(probe, staticSession(57), 1<<40, 100)
+	s.SetLogPeak(peak)
+	for range probe.reads {
+		if _, err := s.Log(context.Background()); err != nil {
+			t.Fatalf("Log() error = %v", err)
+		}
+	}
+	got := peak.Take()
+	if got.UsedBytes() != 700 || got.ReuseWait != "LOG_BACKUP" {
+		t.Errorf("Take() = %+v (used %d), want the 700-byte reading under LOG_BACKUP", got, got.UsedBytes())
+	}
+	if again := peak.Take(); again != (mssql.LogSpace{}) {
+		t.Errorf("second Take() = %+v, want empty: each operation starts its own peak", again)
+	}
+}
+
+func TestLogPeakIsNilSafe(t *testing.T) {
+	var peak *LogPeak
+	peak.observe(mssql.LogSpace{TotalBytes: 1, UsedPercent: 1})
+	if got := peak.Take(); got != (mssql.LogSpace{}) {
+		t.Errorf("nil Take() = %+v, want empty", got)
+	}
+}
+
+type seqProbe struct {
+	reads []mssql.LogSpace
+	n     int
+}
+
+func (p *seqProbe) LogSpace(context.Context) (mssql.LogSpace, error) {
+	ls := p.reads[p.n]
+	p.n++
+	return ls, nil
+}
+func (p *seqProbe) ActiveSessions(context.Context) ([]mssql.Session, error) { return nil, nil }
 
 func TestServerSamplerSuppressesPendingVictim(t *testing.T) {
 	snap := amplifierSnapshot(16)
@@ -909,33 +993,3 @@ func TestServerSamplerFollowsTheExecutionSessionID(t *testing.T) {
 type staticSession int
 
 func (s staticSession) SPID() int { return int(s) }
-
-// reuseFailProbe answers LogSpace and fails only the reuse-wait attribution.
-type reuseFailProbe struct{ ls mssql.LogSpace }
-
-func (p reuseFailProbe) LogSpace(context.Context) (mssql.LogSpace, error) { return p.ls, nil }
-func (p reuseFailProbe) LogReuseWait(context.Context) (string, error) {
-	return "", errors.New("read log_reuse_wait_desc: connection reset by peer")
-}
-func (p reuseFailProbe) ActiveSessions(context.Context) ([]mssql.Session, error) { return nil, nil }
-
-// The threshold breach and the reason for it are two different reads, and only the second
-// one is optional. ServerSampler.Log used to discard both when the second failed —
-// returning LogSample{} and an error — so a log already known to be over cap was reported
-// as healthy because the engine could not say *why* it was over cap. Keep what was
-// measured; lose only what could not be attributed.
-func TestServerSamplerKeepsOverCapWhenTheReuseWaitReadFails(t *testing.T) {
-	probe := reuseFailProbe{ls: mssql.LogSpace{TotalBytes: 10_000, UsedPercent: 95}}
-
-	got, err := NewServerSampler(probe, staticSession(57), 1000, 80).Log(context.Background())
-
-	if err != nil {
-		t.Fatalf("Log() error = %v, want nil: the cap breach was measured, only its attribution was not", err)
-	}
-	if !got.OverCap {
-		t.Error("Log().OverCap = false; the log is at 95% against an 80% cap and that was read successfully")
-	}
-	if got.ReuseWait != "" {
-		t.Errorf("Log().ReuseWait = %q, want empty — nothing was read, so nothing may be asserted", got.ReuseWait)
-	}
-}

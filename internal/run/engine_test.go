@@ -1202,3 +1202,41 @@ func TestPreflightPhaseIsNarrated(t *testing.T) {
 		t.Errorf("notice sink got %v, want it to start with %q", notices, want)
 	}
 }
+
+// peakProbe answers the sampler's log read with a fixed reading.
+type peakProbe struct{ ls mssql.LogSpace }
+
+func (p peakProbe) LogSpace(context.Context) (mssql.LogSpace, error)        { return p.ls, nil }
+func (p peakProbe) ActiveSessions(context.Context) ([]mssql.Session, error) { return nil, nil }
+
+// samplingRunner polls the sampler while it "runs", as the monitoring pump does.
+type samplingRunner struct{ sampler *run.ServerSampler }
+
+func (r samplingRunner) Run(ctx context.Context, _ ddl.Operation, _ string, _ run.Capabilities, _ run.ReactionSink) error {
+	_, err := r.sampler.Log(ctx)
+	return err
+}
+
+func TestProcessAllRecordsPeakLogUse(t *testing.T) {
+	const gb = int64(1024 * 1024 * 1024)
+	peak := &run.LogPeak{}
+	before := run.NewServerSampler(peakProbe{mssql.LogSpace{TotalBytes: 500 * gb, UsedPercent: 90, ReuseWait: "ACTIVE_TRANSACTION"}}, fakeSession{spid: 70}, 1<<50, 100)
+	before.SetLogPeak(peak)
+	if _, err := before.Log(context.Background()); err != nil { // read before any operation: belongs to none
+		t.Fatalf("Log() error = %v", err)
+	}
+	during := run.NewServerSampler(peakProbe{mssql.LogSpace{TotalBytes: 260 * gb, UsedPercent: 20, ReuseWait: "LOG_BACKUP"}}, fakeSession{spid: 70}, 1<<50, 100)
+	during.SetLogPeak(peak)
+
+	eng, dirs := setupEngine(t, fakePreflighter{}, samplingRunner{during}, run.WithLogPeak(peak))
+	if _, err := eng.ProcessAll(context.Background()); err != nil {
+		t.Fatalf("ProcessAll() error = %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(dirs.Done, "010_a.yaml.log"))
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	if want := "peak log: 52.0 GB, 20% of a 260.0 GB file (reuse_wait=LOG_BACKUP)"; !strings.Contains(string(data), want) {
+		t.Errorf("log missing %q\n--- log ---\n%s", want, data)
+	}
+}

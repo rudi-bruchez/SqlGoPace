@@ -27,3 +27,12 @@ func TestDecideReaction(t *testing.T) {
 		})
 	}
 }
+
+func TestPressureDetailNamesTheLogBreach(t *testing.T) {
+	p := run.Pressure{LogOverCap: true, LogReuseWait: "LOG_BACKUP",
+		LogBreach: "used 52.0 GB, 20% of a 260.0 GB file, over the 50.0 GB cap (monitoring.log_max_size_bytes)"}
+	want := "transaction log over cap: used 52.0 GB, 20% of a 260.0 GB file, over the 50.0 GB cap (monitoring.log_max_size_bytes) (reuse_wait=LOG_BACKUP)"
+	if got := p.Detail(); got != want {
+		t.Errorf("Detail() = %q\nwant       %q", got, want)
+	}
+}

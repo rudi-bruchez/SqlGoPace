@@ -7,10 +7,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/ddl"
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
+	"github.com/rudi-bruchez/SqlGoPace/internal/report"
 )
 
 // Executor runs and controls a single DDL operation against the server. Pausing a
@@ -49,6 +51,7 @@ type Sample struct {
 	Blocking       bool   // our DDL is blocking any session, ignored or not (max_block cap)
 	LogOverCap     bool   // the transaction log is over its configured cap
 	LogReuseWait   string // why the log cannot truncate (only set when over cap)
+	LogBreach      string // which cap fired and at what value (only set when over cap)
 	// Blind names the monitoring channel that has stopped answering ("" while both are
 	// healthy). The other fields are the last values that channel reported, which is
 	// exactly why this one exists: they keep looking reassuring after the channel that
@@ -60,6 +63,7 @@ type Sample struct {
 type LogSample struct {
 	OverCap   bool
 	ReuseWait string // log_reuse_wait_desc, populated only when over cap
+	Breach    string // the measured use and the cap it crossed, populated only when over cap
 }
 
 // BlockState summarizes how our DDL is blocking other sessions in one poll: Any is
@@ -297,6 +301,7 @@ func supervise(
 				BlockingOthers: !caps.IgnoreBlocking && !blockingStart.IsZero() && clk.Since(blockingStart) >= blockingTimeout,
 				LogOverCap:     s.LogOverCap,
 				LogReuseWait:   s.LogReuseWait,
+				LogBreach:      s.LogBreach,
 				// Not gated on IgnoreBlocking: that option waives a reaction to something
 				// seen, never the ability to see.
 				Blind: s.Blind,
@@ -555,6 +560,7 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, spec pumpSpec) {
 			if o.err == nil {
 				cur.LogOverCap = o.ls.OverCap
 				cur.LogReuseWait = o.ls.ReuseWait
+				cur.LogBreach = o.ls.Breach
 				cur.Blind = blindChannel()
 				send()
 			}
@@ -570,7 +576,6 @@ func pumpSamples(ctx context.Context, samples chan<- Sample, spec pumpSpec) {
 // sampleProbe is the narrow set of server reads ServerSampler needs.
 type sampleProbe interface {
 	LogSpace(ctx context.Context) (mssql.LogSpace, error)
-	LogReuseWait(ctx context.Context) (string, error)
 	ActiveSessions(ctx context.Context) ([]mssql.Session, error)
 }
 
@@ -582,6 +587,7 @@ type ServerSampler struct {
 	logMaxPercent int
 	killer        *BlockerKiller // optional: kills matching blockers, reusing the Blocking snapshot
 	victims       *VictimKiller  // optional: kills amplifying maintenance victims we block
+	peak          *LogPeak       // optional: records the highest log use, for the report
 }
 
 // NewServerSampler returns a sampler for the given DDL session and log thresholds.
@@ -599,6 +605,40 @@ func (s *ServerSampler) SetKiller(k *BlockerKiller) { s.killer = k }
 // poll using the same session snapshot. A nil killer (the default) leaves the feature
 // off and Blocking behaves exactly as it did before.
 func (s *ServerSampler) SetVictimKiller(k *VictimKiller) { s.victims = k }
+
+// SetLogPeak attaches the tracker that records the highest log use this sampler reads.
+func (s *ServerSampler) SetLogPeak(p *LogPeak) { s.peak = p }
+
+// LogPeak keeps the highest transaction-log use the samplers read while an operation
+// runs, with the reuse wait seen at that moment. The engine takes it once per operation.
+// A nil *LogPeak records nothing.
+type LogPeak struct {
+	mu  sync.Mutex
+	max mssql.LogSpace
+}
+
+func (p *LogPeak) observe(ls mssql.LogSpace) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	if ls.UsedBytes() > p.max.UsedBytes() {
+		p.max = ls
+	}
+	p.mu.Unlock()
+}
+
+// Take returns the peak recorded since the last Take, and starts a new one.
+func (p *LogPeak) Take() mssql.LogSpace {
+	if p == nil {
+		return mssql.LogSpace{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	got := p.max
+	p.max = mssql.LogSpace{}
+	return got
+}
 
 // Blocking reports how our DDL is blocking other sessions: Any when it blocks at
 // least one session (ignored or not), Unignored when it blocks a session the operator
@@ -631,27 +671,37 @@ func (s *ServerSampler) Blocking(ctx context.Context, ignore IgnoredSessions) (B
 	return st, nil
 }
 
-// Log reports whether the transaction log is over its cap and, when it is, why it
-// cannot truncate (log_reuse_wait_desc). The reuse-wait query is only run when
-// over cap, to keep the steady-state poll cheap.
+// Log reports whether the transaction log is over its cap and, when it is, which cap
+// fired, at what value, and why the log cannot truncate (log_reuse_wait_desc). Use and
+// reuse wait come from one statement, so a breach is never reported without its cause.
 func (s *ServerSampler) Log(ctx context.Context) (LogSample, error) {
 	ls, err := s.probe.LogSpace(ctx)
 	if err != nil {
 		return LogSample{}, err
 	}
-	overCap := ls.UsedBytes() >= s.logMaxBytes || int(ls.UsedPercent) >= s.logMaxPercent
-	if !overCap {
+	s.peak.observe(ls)
+	breach := logBreach(ls, s.logMaxBytes, s.logMaxPercent)
+	if breach == "" {
 		return LogSample{}, nil
 	}
-	// The breach and the reason for it are two reads, and only the second is optional.
-	// Returning LogSample{} with the error here threw away a threshold crossing that had
-	// just been measured, because the attribution could not be fetched — so a log known to
-	// be over cap was reported as healthy, and the reaction that exists for exactly this
-	// did not fire. Keep what was measured; lose only what could not be attributed. The
-	// empty ReuseWait reads as "unknown" downstream, which is what it is.
-	reuseWait, err := s.probe.LogReuseWait(ctx)
-	if err != nil {
-		return LogSample{OverCap: true}, nil //nolint:nilerr // the breach was measured: see above
+	return LogSample{OverCap: true, ReuseWait: ls.ReuseWait, Breach: breach}, nil
+}
+
+// logBreach names the cap the log crossed, with the measurement that crossed it, or ""
+// when it is under both. Both measurements are given whichever cap fired: a byte cap
+// left at its shipped value fires at 20% of a large file, and only the pair says so.
+func logBreach(ls mssql.LogSpace, maxBytes int64, maxPercent int) string {
+	used := ls.UsedBytes()
+	var over []string
+	if used >= maxBytes {
+		over = append(over, fmt.Sprintf("the %s cap (monitoring.log_max_size_bytes)", report.HumanizeKB(maxBytes/1024)))
 	}
-	return LogSample{OverCap: true, ReuseWait: reuseWait}, nil
+	if int(ls.UsedPercent) >= maxPercent {
+		over = append(over, fmt.Sprintf("the %d%% cap (monitoring.log_max_percent)", maxPercent))
+	}
+	if len(over) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("used %s, %.0f%% of a %s file, over %s",
+		report.HumanizeKB(used/1024), ls.UsedPercent, report.HumanizeKB(ls.TotalBytes/1024), strings.Join(over, " and "))
 }

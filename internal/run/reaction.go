@@ -13,6 +13,7 @@ type Pressure struct {
 	BlockingOthers bool
 	LogOverCap     bool
 	LogReuseWait   string // log_reuse_wait_desc when over cap, for the reaction detail
+	LogBreach      string // which cap fired and at what value, for the reaction detail
 	Capped         bool   // the reaction was forced by the max_block safety cap
 	// Blind names the monitoring channel that stopped answering. It is not pressure the
 	// server is under; it is the loss of the ability to see any, which is why it reacts
@@ -40,14 +41,21 @@ func (p Pressure) reason() string {
 	}
 	switch {
 	case p.BlockingOthers && p.LogOverCap:
-		return fmt.Sprintf("blocking other sessions and transaction log over cap%s", reuseWaitSuffix(p.LogReuseWait))
+		return fmt.Sprintf("blocking other sessions and transaction log over cap%s%s", breachSuffix(p.LogBreach), reuseWaitSuffix(p.LogReuseWait))
 	case p.BlockingOthers:
 		return "blocking other sessions"
 	case p.LogOverCap:
-		return fmt.Sprintf("transaction log over cap%s", reuseWaitSuffix(p.LogReuseWait))
+		return fmt.Sprintf("transaction log over cap%s%s", breachSuffix(p.LogBreach), reuseWaitSuffix(p.LogReuseWait))
 	default:
 		return "pressure"
 	}
+}
+
+func breachSuffix(breach string) string {
+	if breach == "" {
+		return ""
+	}
+	return ": " + breach
 }
 
 func reuseWaitSuffix(reuseWait string) string {
