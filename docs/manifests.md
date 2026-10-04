@@ -127,6 +127,12 @@ one side rather than emitting a statement that fails: `RESUMABLE` is rejected in
 (Msg 11439) and cannot be combined with `SORT_IN_TEMPDB` (Msg 11438). `--explain` names
 every such decision.
 
+`maxdop` above 1 buys nothing for `rebuild_index`, `create_index` or `check_db` outside
+Enterprise (and Azure SQL): parallel index maintenance and parallel consistency checks are
+Enterprise-only, so the engine runs these on one thread whatever the value. The option is
+still emitted, since you wrote it, and its decision line in `--explain` and the `.log` says
+it is ignored on this edition.
+
 ## Sidecar files
 
 A run writes advisory files next to the report, all machine-readable and none of them read

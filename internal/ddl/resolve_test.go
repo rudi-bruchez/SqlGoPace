@@ -552,3 +552,35 @@ func decision(decisions []ddl.Decision, option string) (ddl.Decision, bool) {
 	}
 	return ddl.Decision{}, false
 }
+
+// Outside Enterprise (and Azure), CREATE INDEX and ALTER INDEX ... REBUILD run on one
+// thread whatever MAXDOP says: "Parallel index maintenance operations" is Enterprise-only
+// in the 2019, 2022 and 2025 edition matrices. A compression campaign's manifests all
+// carried maxdop: 4 on a Standard instance, which sent hours into "more CPU for a shorter
+// window". The value is still emitted (the operator wrote it), but the decision says it is
+// decorative.
+func TestResolveMaxDOPSaysWhenTheEditionIgnoresIt(t *testing.T) {
+	op := ddl.RebuildIndex{Schema: "dbo", Table: "T", Index: "IX", Options: ddl.OptionOverrides{MaxDOP: intPtr(4)}}
+	reason := func(tier ddl.Tier, md int) string {
+		op.Options.MaxDOP = intPtr(md)
+		_, decisions := ddl.Resolve(op, ddl.Target{MajorVersion: 16, Tier: tier}, resolveMatrix(), ddl.Policy{})
+		for _, d := range decisions {
+			if d.Option == "maxdop" {
+				return d.Reason
+			}
+		}
+		t.Fatalf("no maxdop decision")
+		return ""
+	}
+	if got := reason(ddl.TierStandard, 4); !strings.Contains(got, "ignored on this edition") {
+		t.Errorf("Standard maxdop 4 reason = %q, want it to say the engine ignores it", got)
+	}
+	for _, c := range []struct {
+		tier ddl.Tier
+		md   int
+	}{{ddl.TierEnterprise, 4}, {ddl.TierAzure, 4}, {ddl.TierStandard, 1}} {
+		if got := reason(c.tier, c.md); strings.Contains(got, "ignored") {
+			t.Errorf("%v maxdop %d reason = %q, want no warning", c.tier, c.md, got)
+		}
+	}
+}

@@ -210,7 +210,7 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	add(walpRel, "wait_at_low_priority", onOff(walp), walpReason)
 	add(sortRel, "sort_in_tempdb", onOff(sort), sortReason)
 	if res.MaxDOP != nil {
-		add(true, "maxdop", strconv.Itoa(*res.MaxDOP), "set by override")
+		add(true, "maxdop", strconv.Itoa(*res.MaxDOP), maxDOPReason(cmd, t.Tier, *res.MaxDOP))
 	}
 	if res.IgnoreBlocking {
 		add(true, "ignore_blocking", "ON", "set by override: hold the lock through blocking (reaction policy, not a WITH option)")
@@ -220,6 +220,24 @@ func Resolve(op Operation, t Target, m *Matrix, p Policy) (ResolvedOptions, []De
 	}
 
 	return res, decisions
+}
+
+// maxDOPReason explains a MAXDOP decision, and says when the edition makes it decorative.
+// "Parallel index maintenance operations" and "Parallel consistency check" are
+// Enterprise-only in the 2019, 2022 and 2025 edition matrices: elsewhere CREATE INDEX,
+// ALTER INDEX ... REBUILD and DBCC CHECKDB run on one thread regardless of MAXDOP. The
+// value is still emitted, since the operator wrote it, but the decision says it buys
+// nothing, which closes the "more CPU for a shorter window" lead before hours go into it.
+func maxDOPReason(cmd string, tier Tier, maxDOP int) string {
+	const base = "set by override"
+	if maxDOP == 1 || tier == TierEnterprise || tier == TierAzure {
+		return base
+	}
+	switch cmd {
+	case "rebuild_index", "create_index", "check_db":
+		return base + "; ignored on this edition: parallel index and consistency-check operations are Enterprise-only, so this runs on one thread"
+	}
+	return base
 }
 
 // DefaultShrinkMaxBlockMinutes is the safety cap a shrink gets when the manifest sets no
