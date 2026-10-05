@@ -26,7 +26,10 @@ mechanisms (pause/resume rather than kill/rollback).
 - **Silent + log** (default): non-interactive execution, everything is traced into the `.log` files.
 - **TUI**: flag `--tui` — interactive incident console (see §14).
 - **Dry-run**: flag `--dry-run` — prints the final DDL command (injected options included)
-  **without executing anything** and without taking a single lock.
+  **without executing anything**. Connected, it reads the server: detection, and the
+  `sys.indexes` read that expands `index: ALL`, which takes Sch-S and waits behind a Sch-M on
+  that table. Offline (`--assume-version`) it touches no server. (This line promised "without
+  taking a single lock" until 0.48.0; the catalog read was measured waiting on LCK_M_SCH_S.)
 - **Explain**: flag `--explain` — for each operation, shows *why* each option was added or
   removed (detected version/edition + matrix entry + config override).
 

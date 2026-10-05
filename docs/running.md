@@ -97,7 +97,7 @@ sqlgopace --config config.yaml
 # The same run, with the interactive incident console
 sqlgopace --config config.yaml --tui
 
-# Render the T-SQL for one manifest without executing or locking anything
+# Render the T-SQL for one manifest without executing it (it still reads the server)
 sqlgopace --config config.yaml --dry-run 01.to_run/010_rebuild.yaml
 
 # ... and say why each option was injected or dropped
@@ -122,7 +122,7 @@ work; see [blocking-and-kills.md](blocking-and-kills.md#rollback-on-cancel-opera
 | *(none)* | Silent run; everything is traced to a `.log` beside each processed manifest. |
 | `--config <path>` | Config file. Required to run. |
 | `--tui` | Interactive incident console (see below). |
-| `--dry-run` | Render the final T-SQL without executing or taking a lock. |
+| `--dry-run` | Render the final T-SQL without executing it. Connected, it reads the server's version and edition, and expands `index: ALL` from `sys.indexes`, which takes a shared schema lock and waits behind a schema change on that table. With `--assume-version` it touches no server. |
 | `--explain` | With `--dry-run`, show why each option was chosen, and list any `ignore_blocked_sessions` rules. |
 | `--assume-version <n>` | Offline dry-run target major version, for example `16` for SQL Server 2022. |
 | `--assume-edition <t>` | Offline target tier: `enterprise`, `standard`, `express`, `azure`. |

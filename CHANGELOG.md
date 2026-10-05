@@ -42,7 +42,8 @@ SQLite history does not record either yet.
 
 - The planner's analysis and the run's dry run no longer claim to take no locks:
   `sp_estimate_data_compression_savings` takes an IS lock, scans under read committed and
-  loads a sample into tempdb.
+  loads a sample into tempdb, and a connected dry run expands `index: ALL` from `sys.indexes`,
+  which takes Sch-S and waits behind a schema change.
 - `operations.md` names the `key_range` guarantee, and states that `on_failure: continue`
   freezes the resume point at the first failure.
 
