@@ -432,9 +432,12 @@ type fakeProber struct {
 	// number — the fake equivalent of the server summing pages within one partition.
 	structuresByPartition map[int][]mssql.StructureSize
 	unmatchedRows         int64
-	clusterKey            []mssql.KeyColumn
-	clusterKeyErr         error
-	queries               *int // probe call count, a pointer so a value copy still counts
+	// selfLimitedRows, when set, answers the second probe (the one carrying the
+	// idempotence clause) differently from the filter probe.
+	selfLimitedRows *int64
+	clusterKey      []mssql.KeyColumn
+	clusterKeyErr   error
+	queries         *int // probe call count, a pointer so a value copy still counts
 }
 
 func (f fakeProber) FileSpace(context.Context, string) ([]mssql.FileSpace, error) {
@@ -499,9 +502,12 @@ func (f fakeProber) HasAlterAnyConnection(context.Context) (bool, error) {
 
 // QueryInt answers the selectivity probe, counting the calls so a test can assert the
 // probe was skipped — which is half of what confirm_full_table now buys.
-func (f fakeProber) QueryInt(_ context.Context, _ string) (int64, bool, error) {
+func (f fakeProber) QueryInt(_ context.Context, q string) (int64, bool, error) {
 	if f.queries != nil {
 		*f.queries++
+	}
+	if f.selfLimitedRows != nil && strings.Contains(q, " IS NULL OR ") {
+		return *f.selfLimitedRows, true, nil
 	}
 	return f.unmatchedRows, true, nil
 }
@@ -1036,6 +1042,44 @@ func TestRunSkipsTheProbeWhenConfirmed(t *testing.T) {
 	}
 	if probes != 0 {
 		t.Errorf("ran %d probe queries, want 0 — confirm_full_table settles it", probes)
+	}
+}
+
+// A filter that excludes nothing, on a table where some rows already hold the target:
+// the predicate walk is warned about (the idempotence clause makes it survivable on
+// this table today), but a key_range walk is refused as it was before 0.48.0. Its
+// statements carry the same clause since then, for the replay, not as a reason to let
+// an unconfirmed whole-table rewrite through.
+func TestWholeTableGuardOnAPartlyConvertedTable(t *testing.T) {
+	for _, tt := range []struct {
+		strategy string
+		want     preflight.Severity
+	}{
+		{"predicate", preflight.Warn},
+		{"key_range", preflight.Fail},
+	} {
+		t.Run(tt.strategy, func(t *testing.T) {
+			p := healthyProber()
+			p.dmlPermission = true
+			p.unmatchedRows = 0 // the filter spares nothing
+			spared := int64(3)  // three rows already hold the target
+			p.selfLimitedRows = &spared
+			p.clusterKey = []mssql.KeyColumn{{Name: "Id", IsInteger: true, IsUnique: true}}
+			op := keyRangeOp()
+			op.Batch.Strategy = tt.strategy
+			m := &ddl.Manifest{Operations: []ddl.Operation{op}}
+			rep, err := preflight.Run(context.Background(), p, batchServerInfo, m, batchThresholds, false)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			guard, ok := findCheck(rep, "whole-table guard")
+			if !ok {
+				t.Fatalf("no whole-table guard check ran:\n%v", rep.Checks)
+			}
+			if guard.Severity != tt.want {
+				t.Errorf("guard = %v (%s), want %v", guard.Severity, guard.Detail, tt.want)
+			}
+		})
 	}
 }
 

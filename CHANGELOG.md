@@ -23,7 +23,10 @@ SQLite history does not record either yet.
   self-limiting clause: measured on SQL Server 2022, a 5-row batch replayed once showed an
   `AFTER UPDATE` trigger 10 rows. Every `key_range` statement now excludes rows already at the
   target. A statement-level trigger still fires on the replay, with an empty `inserted`. A
-  watermark saved by 0.47.0 stays valid.
+  watermark saved by 0.47.0 stays valid. The whole-table guard does not credit the clause: a
+  `key_range` filter that excludes nothing still fails preflight. "At the target" is equality
+  under the column's collation, so under a case-insensitive one `ARCHIVED` counts as
+  `archived` and is left as it is, as the `predicate` strategy always did.
 - A `.state.json` that cannot be read or written is reported (output and console) instead of
   silently stopping resume bookkeeping.
 
@@ -44,6 +47,9 @@ SQLite history does not record either yet.
   `sp_estimate_data_compression_savings` takes an IS lock, scans under read committed and
   loads a sample into tempdb, and a connected dry run expands `index: ALL` from `sys.indexes`,
   which takes Sch-S and waits behind a schema change.
+- The whole-table guard's table states that a filter excluding nothing is only a warning for a
+  `predicate` walk once some rows already hold the target (the behavior since 0.29.0), and
+  stays a failure for `key_range`.
 - `operations.md` names the `key_range` guarantee, and states that `on_failure: continue`
   freezes the resume point at the first failure.
 

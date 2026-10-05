@@ -277,7 +277,7 @@ waits each batch produced.
 | `batch.strategy` | `predicate` re-runs the same filter until it matches nothing. `key_range` walks a key column and persists a watermark, so a crash resumes mid-table. It requires a **single-column, unique, integer clustered key** — see below. |
 | `batch.key` | The key column, for `key_range`. It asserts which column that is rather than choosing: there is only ever one candidate, so naming a different one is an error. |
 | `batch.initial_rows` | Starting batch size. Auto-sized when omitted. |
-| `confirm_full_table` | Required whenever the filter spares no row — including a filter that is written but excludes nothing. Without it the manifest is rejected. |
+| `confirm_full_table` | Required whenever the filter spares no row — including a filter that is written but excludes nothing. Without it the manifest is rejected, except a `predicate` `batch_update` on a table where some rows already hold the target, which is warned about (see the table below). |
 
 Three rules the parser enforces, each closing a way to lose data or hang:
 
@@ -323,6 +323,7 @@ everything pays for a scan):
 | 0 | **Fail** — this is a whole-table operation however it is spelled. Set `confirm_full_table: true` if you mean it. |
 | 1–999 | **Warn**, with the number. "This deletes all but three rows" is something only you can judge. |
 | 1000 | **Pass** — the filter is doing its job. |
+| 0, but some rows already hold the target (`predicate` `batch_update` with a literal `set`) | Warn, and the run proceeds: the idempotence clause leaves those rows alone and rewrites every other row. A `key_range` walk gets Fail here, like any filter that excludes nothing. |
 
 So `where_raw: "1=1"`, and `where: [{column: Id, op: ">=", value: 0}]` on an identity column,
 are refused the same way an absent filter is. The probe is skipped entirely when
@@ -330,7 +331,10 @@ are refused the same way an absent filter is. The probe is skipped entirely when
 left for the check to establish.
 
 A literal `set` is self-limiting: the generated `WHERE` excludes rows already holding the
-target value, so the loop ends when nothing is left to change. `set: {Col: null}` is included
+target value, so the loop ends when nothing is left to change. "Holding" is equality under the
+column's collation: under a case- or accent-insensitive collation, and with SQL Server's
+trailing-space padding, `ARCHIVED` and `archived ` already hold `archived` and are not
+rewritten, on both strategies. A `set` does not normalize case, accents or trailing spaces. `set: {Col: null}` is included
 — it generates `Col IS NOT NULL`, not `Col <> NULL`, which would be `UNKNOWN` for every row
 and would never terminate.
 

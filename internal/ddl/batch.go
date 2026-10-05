@@ -249,10 +249,16 @@ func BatchUnmatchedRowsSQL(o BatchDML, limit int) string {
 // verdict that turned on it would let the same manifest fail on an untouched table and
 // pass once a prior run had left rows at the target.
 //
-// It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause),
-// so preflight only pays for the second probe when the two can differ. Both strategies
-// of a literal UPDATE carry the clause.
+// It is equal to BatchUnmatchedRowsSQL for a DELETE (which has no self-limiting clause)
+// and under key_range, so preflight only pays for the second probe when the two can
+// differ. A key_range statement does carry the clause since 0.48.0, but for the replay of
+// a boundary batch, not as selectivity: crediting it would turn a filter that excludes
+// nothing from Fail into Warn as soon as a few rows hold the target, and the walk would
+// rewrite the rest. key_range keeps the verdict it had before the clause existed.
 func BatchUntouchedRowsSQL(o BatchDML, limit int) string {
+	if o.Batch.IsKeyRange() {
+		return unmatchedRowsSQL(o, o.userWhere(), limit)
+	}
 	return unmatchedRowsSQL(o, o.predicateWhere(), limit)
 }
 

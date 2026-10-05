@@ -778,10 +778,10 @@ func TestBatchUnmatchedRowsCountsTheSelfLimit(t *testing.T) {
 	}
 }
 
-// A key_range walk's statement carries the self-limiting clause, so the untouched-rows
-// probe credits it exactly as it credits the predicate strategy, while the filter probe
-// stays the filter alone.
-func TestBatchUntouchedRowsKeyRangeCreditsTheSelfLimit(t *testing.T) {
+// A key_range walk's statement carries the self-limiting clause for its replay, but the
+// untouched-rows probe does not credit it: the whole-table guard stays Fail for a key_range
+// filter that excludes nothing, as it was before the clause existed.
+func TestBatchUntouchedRowsKeyRangeDoesNotCreditTheSelfLimit(t *testing.T) {
 	op := parseOneOp(t, `operations:
   - operation: batch_update
     schema: dbo
@@ -791,12 +791,8 @@ func TestBatchUntouchedRowsKeyRangeCreditsTheSelfLimit(t *testing.T) {
     batch: { strategy: key_range }
 `).(ddl.BatchDML)
 
-	got := ddl.BatchUntouchedRowsSQL(op, 1000)
-	if !strings.Contains(got, "IS NULL OR [Archived] <> 1") {
-		t.Errorf("key_range self-limits; the probe must credit it:\n%s", got)
-	}
-	if strings.Contains(ddl.BatchUnmatchedRowsSQL(op, 1000), "IS NULL OR") {
-		t.Errorf("the filter probe must stay the filter alone")
+	if got, want := ddl.BatchUntouchedRowsSQL(op, 1000), ddl.BatchUnmatchedRowsSQL(op, 1000); got != want {
+		t.Errorf("key_range must not credit the idempotence clause; the two probes differ:\n%s\n%s", got, want)
 	}
 }
 
