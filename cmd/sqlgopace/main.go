@@ -635,8 +635,8 @@ func buildEngine(ctx context.Context, cfg *config.Config, matrix *ddl.Matrix, co
 	// and promised the opposite without checking this wiring. 0.42.0 keeps the promise
 	// and drops the wiring. The reaction available here is WAIT_AT_LOW_PRIORITY on 2022+
 	// and a clean give-up otherwise. Do not re-attach them without changing that page
-	// first: newTempdbSampler returns a type that cannot be armed, and
-	// TestTempdbSamplerIsNeverArmedWithKillers guards its body.
+	// first: TestTempdbSamplerIsNeverArmedWithKillers allows a killer on the variable
+	// `sampler` alone, and fails on any other receiver.
 	tempdbShrinkRunner := run.NewShrinkRunner(tempdbConn, tempdbConn, tempdbSampler, run.System, run.ShrinkRunnerConfig{
 		Tuning:          shrinkTuning(cfg.Shrink),
 		PollInterval:    cfg.Monitoring.BlockingPoll(),
@@ -1140,8 +1140,9 @@ func feedConsole(ctx context.Context, program *tui.Program, conn *mssql.Conn, bl
 
 // newTempdbSampler builds the tempdb shrink's sampler and returns it as the narrow
 // run.Sampler, which has no SetKiller or SetVictimKiller: docs/shrink.md promises a tempdb
-// shrink never kills a blocker, and arming it from buildEngine now fails to compile.
-// TestTempdbSamplerIsNeverArmedWithKillers guards the body of this function.
+// shrink never kills a blocker. The narrow type alone does not hold that (a type assertion
+// gets the concrete sampler back); TestTempdbSamplerIsNeverArmedWithKillers does, by
+// allowing a killer on the variable `sampler` only and pinning this return type.
 func newTempdbSampler(tempdb, sessions *mssql.Conn, cfg *config.Config, peak *run.LogPeak) run.Sampler {
 	s := run.NewServerSampler(tempdbProbe{db: tempdb, sessions: sessions}, tempdb,
 		cfg.Monitoring.LogMaxSizeBytes, cfg.Monitoring.LogMaxPercent)

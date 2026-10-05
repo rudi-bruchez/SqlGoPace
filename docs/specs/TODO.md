@@ -1090,19 +1090,63 @@ reasoned about.
 
 ### Found while shipping 0.48.0 (2026-10-05)
 
-- **`TestE2EShrinkData` is intermittent, on `main` too, because it shrinks tempdb.** The e2e
-  DSN in the `Makefile` and `docs/testing.md` points at `database=tempdb`, so the test shrinks
-  tempdb's five small data files while every other integration test, in the same run, uses
-  tempdb. Measured against the project's SQL Server 2022 container: two failures in three runs
-  of `go test -tags=integration ./internal/mssql ./cmd/sqlgopace` on `main`, also on the commit
-  before 0.47.0, also with `-p 1` (so not package parallelism), also right after a restart. The
+- **`TestE2EShrinkData` is intermittent, on `main` too, for two separate reasons.**
+  The first: the e2e DSN in the `Makefile` and `docs/testing.md` points at `database=tempdb`,
+  so the test shrinks tempdb's five small data files while every other integration test, in
+  the same run, uses tempdb. Measured against the project's SQL Server 2022 container: two
+  failures in three runs of `go test -tags=integration ./internal/mssql ./cmd/sqlgopace` on
+  `main`, also on the commit before 0.47.0, also with `-p 1`, also right after a restart. That
   failure is the shrink's own clean give-up (`INCOMPLETE`, manifest to `04.failed/`) after
-  chunks of several seconds on 20 to 70 MB files. Run alone, it passes in under a second. Fix:
-  point the e2e tests at a dedicated database they create, and keep tempdb for a test that
-  means to shrink it. Not done in 0.48.0, which did not touch the shrink path; the 0.47.0
-  green runs were luck.
+  chunks of several seconds on 20 to 70 MB files. Run alone, it passes in under a second.
+  The second, found by an external reviewer (codex) on a database that was not tempdb: a data
+  race. `ShrinkRunner.emitProgress` is called from `chunkLoop` (`internal/run/shrink.go`,
+  per chunk) and from the `pumpServerProgress` goroutine (per server percent reading), with no
+  lock, and the progress callback in `buildEngine` writes both into `engineOut`. Under `-race`
+  the test fails with `race detected during execution of test`; four isolated runs stayed green,
+  so it needs the two to coincide. In production `engineOut` is stdout or the console, so lines
+  can interleave but nothing is corrupted. Fixes: point the e2e tests at a dedicated database
+  they create, and serialize `emitProgress` (a mutex in `ShrinkRunner`). Neither is done in
+  0.48.0, which did not touch the shrink path; the first version of this entry named only the
+  tempdb cause.
 - **`create_index` free-space check needs an estimate, not a read.** See the correction on the
   harm review's finding (6) above.
+
+### Found by the external reviews of 0.48.0 (2026-10-05)
+
+A harm review and a code review (codex, opencode/DeepSeek, and an internal pass) ran on the
+0.48.0 branch. What touched the release's own claims was fixed before it shipped (the
+remaining "no lock" sentences, the key_range whole-table guard kept at Fail, the collation
+note, the tempdb no-kill test made an allowlist). The rest predates 0.48.0 and is left for the
+next release, worst first:
+
+- **`plan --categories` never excludes CHECKDB, and `--auto` runs it.** `decideCheckDB`
+  (`internal/maint/decide.go`) reads only `checkdb.enabled`, which the shipped profile sets;
+  no code asks `cats.Has("checkdb")`. codex ran `plan --auto --categories compression` and it
+  executed a full DBCC CHECKDB. One filter; the most expensive finding for a stranger.
+- **`MAINTENANCE.md` promises `maintenance.max_operations` and `time_budget_minutes`**
+  (sections on batching, risks, multi-database) and nothing reads either key. Supersede the
+  spec text or implement the budget; until then an `--auto` user has no aggregate cap.
+- **`--categories compression` alone plans nothing.** Page counts are read only when `index`
+  is selected (`internal/plan/plan.go`), so every index is "page_count 0 below floor". codex
+  ran it. Take the count from the inventory when only compression is selected.
+- **The README says "you review them before anything runs" and never names `--auto`.** One
+  sentence.
+- **A bracketed user-defined type (`dbo.[Review Type]`) is refused by `dataTypeShape`**, which
+  0.47.0 passed through and SQL Server accepts (codex ran both). Rare; allow a bracketed part.
+- **`moving 0 MB/s` below 1 MiB/s** (`internal/tui/view.go`, the rate is truncated to whole MB
+  before `HumanizeMB`): a slow, working shrink reads as stalled. Render KB/s below 1 MB/s.
+- **`shrink.no_progress_before_flush` is documented and read but absent from the shipped
+  `config.yaml`** and its twin, so the knob behind the tempdb cache flush is not discoverable.
+- **"Dry run renders exactly what executes"** (README, getting-started) is false for shrink and
+  batched DML, whose dry-run SQL is representative with placeholders. Say so.
+- **An inert batch-size rule**: `internal/run/batch_calc.go` shrinks the next batch on
+  `BlockingSeconds > 30`, and its own comment says nothing populates that field.
+
+Rejected, with the reason, so they are not raised again: the recovery requeue of a live peer
+when the queue lock is bypassed on NFSv3 (documented, needs two mistakes); a missing TLS
+`MinVersion` in `email.go` (Go's client floor is already TLS 1.2); the console's `k` not
+re-reading the SPID (the host re-verifies before KILL); "the key_range self-limit is
+duplicated in two code paths" (both call `selfLimitClause`, and both paths have a test).
 
 ### Deferred from 0.47.0 (2026-10-04)
 
@@ -1249,7 +1293,11 @@ Kept so the entries above are not re-proposed. Each names the evidence in the tr
   - An unreadable sidecar is reported (`updateSidecar`, `internal/run/engine.go`,
     `TestUpdateSidecarSaysWhenTheSidecarIsUnreadable`; codex F-10).
   - The tempdb no-kill promise is held by `TestTempdbSamplerIsNeverArmedWithKillers`, which reads
-    the package AST; it fails on the 0.13.0 wiring put back.
+    the package AST as an allowlist: a killer only on the variable `sampler`, `sampler` only
+    from a non-tempdb `NewServerSampler`, and `newTempdbSampler` returning `run.Sampler`. It
+    fails on the 0.13.0 wiring put back and on the three edits an external reviewer (opencode)
+    got past its first, constructor-following version: a type assertion, a struct field, a
+    widened return type.
   - `intent: relocation` (`internal/ddl/manifest.go`, `TestRelocationIntentRunsEvenWhenSatisfied`).
   - `data_compression` allowlist and column-type shape (`validateDataCompression`,
     `validateDataType`, `internal/ddl/allowlist_test.go`; codex F-08).
