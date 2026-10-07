@@ -89,7 +89,9 @@ Combine with the `-ldflags` override above to produce versioned release artifact
 
 Releases are cut by pushing a tag. `.github/workflows/release.yml` cross-compiles every
 target on one runner, packages each with `LICENSE` and `README.md`, writes a `sha256`
-checksum file, and creates the GitHub release with generated notes.
+checksum file, and creates the GitHub release. Its note is the version's section of
+`CHANGELOG.md`, printed by `scripts/release-notes.sh`, so the section is written before the
+tag: a tag without one fails before anything is built.
 
 ```bash
 # 1. bump the version and commit it

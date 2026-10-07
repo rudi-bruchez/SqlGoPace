@@ -41,6 +41,17 @@ jobs:
           fi
           echo "version=${tag#v}" >> "$GITHUB_ENV"
 
+      # The changelog section is the release note: written when the version is
+      # cut, it says why, which a list of commits cannot. Built right after the
+      # tag check, so a tag whose section is missing or empty fails early.
+      # Outside the checkout, so the tree stays clean for the build.
+      - name: Notes
+        run: |
+          set -eu
+          scripts/release-notes.sh "$version" "$GITHUB_REPOSITORY" \
+            "sqlgopace_${version}_checksums.txt" > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+
       - name: Test
         run: go test -race ./...
 
@@ -100,8 +111,9 @@ jobs:
           tag="$RELEASE_TAG"
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
+            gh release edit "$tag" --notes-file "$RUNNER_TEMP/notes.md"
           else
             gh release create "$tag" dist/* \
               --title "$tag" \
-              --generate-notes
+              --notes-file "$RUNNER_TEMP/notes.md"
           fi

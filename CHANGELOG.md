@@ -14,6 +14,14 @@ The version a run used, and the config file it loaded, are written into its `.lo
 sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
 SQLite history does not record either yet.
 
+## [Unreleased]
+
+### Changed
+
+- The GitHub release page carries this file's section for the version, followed by how to
+  verify a download against the checksums file, instead of a generated list of commits. A
+  tag whose section is missing or empty fails before anything is built.
+
 ## [0.48.0] - 2026-10-05
 
 ### Fixed
