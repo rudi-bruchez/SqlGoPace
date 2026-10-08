@@ -7,8 +7,11 @@
 # repositories as scripts/release-notes.sh: change them together.
 #
 # Reads both heading forms in use: "## [0.5.0] - 2026-10-06" (Keep a Changelog)
-# and "## 0.7.0, 13 September 2026". The previous version is the next version
-# heading below, so a shallow checkout without tags is enough.
+# and "## 0.7.0, 13 September 2026". The compare link starts from the nearest
+# older version in the file that has a tag on origin (git ls-remote, which a
+# shallow checkout can run): a version may have a section and no tag. Without
+# access to origin it falls back to the next version heading below.
+# RELEASE_NOTES_TAGS, one tag per line, replaces the ls-remote (tests).
 set -eu
 version=${1:?usage: release-notes.sh <version> <owner/repo> [checksums-file] [changelog]}
 version=${version#v}
@@ -16,7 +19,7 @@ repo=${2:?usage: release-notes.sh <version> <owner/repo> [checksums-file] [chang
 checksums=${3:-}
 changelog=${4:-CHANGELOG.md}
 
-# One pass: the body of the section, then a line "\x01<previous version>".
+# One pass: the body of the section, then a line "\x01<older versions, newest first>".
 out=$(awk -v want="$version" '
   function headver(line,   s) {
     s = line
@@ -25,7 +28,7 @@ out=$(awk -v want="$version" '
   }
   /^## / {
     h = headver($0)
-    if (found && prev == "" && h != "") prev = h
+    if (found && h != "" && h != want) older = older " " h
     inside = (h == want)
     if (inside) found = 1
     next
@@ -38,7 +41,7 @@ out=$(awk -v want="$version" '
     last = n;  while (last >= first && body[last] ~ /^[ \t]*$/) last--
     if (first > last) exit 4
     for (i = first; i <= last; i++) print body[i]
-    printf "\001%s\n", prev
+    printf "\001%s\n", older
   }
 ' "$changelog") || {
   rc=$?
@@ -49,7 +52,16 @@ out=$(awk -v want="$version" '
   exit 1
 }
 
-previous=${out##*$'\001'}
+older=${out##*$'\001'}
+if [ -n "${RELEASE_NOTES_TAGS+set}" ]; then
+  tags=$RELEASE_NOTES_TAGS
+else
+  tags=$(git ls-remote --tags origin 2>/dev/null | sed -n 's|.*refs/tags/\([^^]*\)$|\1|p') || tags=
+fi
+previous=
+for v in $older; do
+  if [ -z "$tags" ] || printf '%s\n' "$tags" | grep -qxF "v$v"; then previous=$v; break; fi
+done
 printf '%s\n' "${out%$'\n\001'*}"
 
 if [ -n "$checksums" ]; then
