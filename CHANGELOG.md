@@ -24,6 +24,11 @@ SQLite history does not record either yet.
 
 ## [0.48.0] - 2026-10-05
 
+A `key_range` batch resumed after a crash changes no row twice, and a resume state that cannot
+be read or written is reported. Manifests are checked more strictly: a `data_compression` value or a
+column `type` outside the accepted forms now refuses to load, so check yours before upgrading.
+The console adds the log backup age, the oldest open transaction and the shrink's movement rate.
+
 ### Fixed
 
 - A `key_range` resume changes no row twice. The range `UPDATE` commits before its watermark
