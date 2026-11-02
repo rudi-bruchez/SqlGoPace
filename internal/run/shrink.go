@@ -490,6 +490,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 	var blocked time.Duration  // cumulative unproductive time (no-gain chunks, stalls, relief waits)
 	shrinkStart := r.clk.Now() // anchors the ETA from the reduction rate achieved so far
 	var lastMaint *MaintBlock  // most recent in-flight maintenance-block observation from runChunk
+	var tally yieldTally       // yields since the last chunk that gained space
 
 	for current > final {
 		// Graceful stop: each chunk commits, so stopping between chunks preserves work;
@@ -515,36 +516,19 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
 		out := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog, tp != nil)
-		stopped, err := out.stopped, out.err
 		if out.maint != nil {
 			lastMaint = out.maint
 		}
-		if err != nil {
-			// A DBCC SHRINKFILE chunk error almost never means the operation is broken — it
-			// means the shrink could not move a page right now (Msg 3140 "could not adjust the
-			// space allocation", Msg 845 buffer-latch time-out, a WAIT_AT_LOW_PRIORITY timeout,
-			// a transient contention error, …). We decide success by progress, not by matching a
-			// specific message number: treat any such error as a no-progress event — a smaller
-			// step, then stall's bounded budget (MaxNoProgress / SelfWaitTimeout) stops cleanly
-			// with work preserved (or, on the tempdb path, escalates to a cache flush). The last
-			// error is carried into the reason so it is never masked. Only our own cancellation
-			// is fatal.
-			if ownCancellation(err) {
-				return result, err
-			}
-			step = halveStep(step, r.tuning, maxStep)
-			blocked += r.clk.Since(t0) // a failed (no-move) chunk is unproductive time
-			bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
-			r.applyMaintBlock(sink, f, tp, lastMaint)
-			if werr != nil {
-				return result, werr
-			} else if bound != "" {
-				result.FinalMB = current
-				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s: %v; work preserved", bound, err))
-				r.captureGiveUpTail(ctx, f, sink, tp)
-				return result, nil
-			}
-			continue
+		// A DBCC SHRINKFILE chunk error almost never means the operation is broken — it
+		// means the shrink could not move a page right now (Msg 3140 "could not adjust the
+		// space allocation", Msg 845 buffer-latch time-out, a WAIT_AT_LOW_PRIORITY timeout,
+		// a transient contention error, …). We decide success by progress, not by matching a
+		// specific message number: the file size is read after every chunk, errored or not,
+		// and only a chunk that gained nothing goes to the no-progress handling below. The
+		// last error is carried into the reason so it is never masked. Only our own
+		// cancellation is fatal.
+		if ownCancellation(out.err) {
+			return result, out.err
 		}
 		elapsed := r.clk.Since(t0)
 		after, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
@@ -557,7 +541,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		// A chunk stopped under pressure: wait for relief before trying again. A
 		// log-drain timeout is a clean stop (work preserved); a canceled context or
 		// any other error is propagated, not swallowed as success.
-		if stopped {
+		if out.stopped {
 			r0 := r.clk.Now()
 			err := r.awaitRelief(ctx, ignore, sink)
 			blocked += r.clk.Since(r0) // waiting for pressure to clear is unproductive time
@@ -576,10 +560,37 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		}
 
 		if newSize >= current {
-			// No gain: WALP timeout (49516) or data pinned at the file end, or we are
-			// blocked by another session (self-wait, §8.2). Wait and retry, stopping
-			// cleanly at whichever bound trips first — count or total wait time.
-			blocked += elapsed // the chunk ran but moved nothing (WALP timeout / blocked)
+			// No gain. Say why before deciding what it costs: a chunk the supervisor stopped
+			// for pressure yielded, which says nothing about whether the shrink can move pages,
+			// so above the step floor it only shrinks the step and retries without spending
+			// the no-progress budget. Anything else (WALP timeout 49516, data pinned at the
+			// file end, a chunk error, our own session blocked, §8.2) is a stall.
+			blocked += elapsed // the chunk ran but moved nothing
+			running := false
+			if prof == nil && !out.stopped { // tempdb is never backed up; a yield wins anyway
+				_, found, berr := r.reader.RunningDataBackup(ctx)
+				if berr != nil {
+					sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("shrink %q: could not read running backups: %v", f.Name, berr)})
+				}
+				running = berr == nil && found
+			}
+			switch classifyNoGain(out.stopped, running) {
+			case causeYield:
+				if out.yield != nil {
+					tally.add(*out.yield)
+				}
+				wasAboveFloor := step > r.tuning.MinStepMB
+				step = halveStep(step, r.tuning, maxStep)
+				if wasAboveFloor {
+					continue
+				}
+			default: // causeStall, and causeBackup until the backup wait lands
+				if out.err != nil {
+					step = halveStep(step, r.tuning, maxStep) // a failed chunk retries smaller
+				}
+			}
+			// Wait and retry, stopping cleanly at whichever bound trips first — count or
+			// total wait time.
 			s0 := r.clk.Now()
 			bound, werr := r.stall(ctx, f.Name, &noProgress, &backoff, &stallWaited, sink, prof)
 			blocked += r.clk.Since(s0)
@@ -587,19 +598,25 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			if werr != nil {
 				return result, werr
 			} else if bound != "" {
+				detail := fmt.Sprintf("no further progress after %s; work preserved", bound)
+				if out.err != nil {
+					detail = fmt.Sprintf("no further progress after %s: %v; work preserved", bound, out.err)
+				}
 				result.FinalMB = current
-				result.Reason = giveUpReason(tp, fmt.Sprintf("no further progress after %s; work preserved", bound))
+				result.Reason = giveUpReason(tp, detail)
 				r.captureGiveUpTail(ctx, f, sink, tp)
 				return result, nil
 			}
 			continue
 		}
 
-		// Progress: adjust the step from this chunk's cost and advance.
+		// Progress, whatever else happened (an errored chunk that shrank counts too): adjust
+		// the step from this chunk's cost and advance.
 		noProgress = 0
 		backoff = r.tuning.NoProgressBackoff
 		stallWaited = 0
-		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), stopped, r.tuning, maxStep)
+		tally.reset()
+		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), out.stopped, r.tuning, maxStep)
 		current = newSize
 		result.Chunks++
 		result.FinalMB = current

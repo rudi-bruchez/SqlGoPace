@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -76,6 +77,10 @@ type fakeServer struct {
 	backups     []mssql.BackupRequest
 	backupCalls int
 
+	// sizeErr, if set, makes FileSizeMB fail. Set it from onExec to fail only the reads
+	// that follow a given chunk, since Run reads the size before the chunk loop.
+	sizeErr error
+
 	execLog  []string
 	killed   bool
 	reuseIdx int
@@ -145,7 +150,12 @@ func (s *fakeServer) FileSpace(_ context.Context, fileType string) ([]mssql.File
 	}}, nil
 }
 
-func (s *fakeServer) FileSizeMB(_ context.Context, _ string) (int, error) { return s.sizeMB, nil }
+func (s *fakeServer) FileSizeMB(_ context.Context, _ string) (int, error) {
+	if s.sizeErr != nil {
+		return 0, s.sizeErr
+	}
+	return s.sizeMB, nil
+}
 
 func (s *fakeServer) LogReuse(_ context.Context) (string, string, error) {
 	r := "NOTHING"
@@ -1421,5 +1431,226 @@ func TestShrinkSnapshotAtYieldSurvivesReadError(t *testing.T) {
 	}
 	if len(out.yield.Blocked) != 0 || out.yield.Self.Blocked {
 		t.Errorf("yield = %+v, want no sessions", *out.yield)
+	}
+}
+
+// chunkGatedSampler reports blocking scoped to chunks rather than polls: while the chunk
+// counter (incremented by the fake's onExec on each page-moving chunk) is between 1 and
+// blockChunks, it reports our statement as blocking an ignored session and advances the
+// clock by step, so only the max_block cap can stop the chunk; otherwise it reports none.
+// blockingSampler's stopAfter counts polls, and the pump can fire an extra poll before
+// sampling stops, so a poll count does not map to a chunk count.
+type chunkGatedSampler struct {
+	clk         *ManualClock
+	step        time.Duration
+	chunks      *atomic.Int32
+	blockChunks int32
+}
+
+func (g *chunkGatedSampler) Blocking(context.Context, IgnoredSessions) (BlockState, error) {
+	if n := g.chunks.Load(); n < 1 || n > g.blockChunks {
+		return BlockState{}, nil
+	}
+	g.clk.Advance(g.step)
+	return BlockState{Any: true}, nil
+}
+
+func (g *chunkGatedSampler) Log(context.Context) (LogSample, error) { return LogSample{}, nil }
+
+func isPageMovingChunk(sql string) bool {
+	return strings.Contains(sql, "DBCC SHRINKFILE") && !strings.Contains(sql, "TRUNCATEONLY")
+}
+
+// chunkTargets returns the targets of the page-moving chunks in the exec log, in order.
+func chunkTargets(log []string) []int {
+	var out []int
+	for _, stmt := range log {
+		if isPageMovingChunk(stmt) {
+			out = append(out, parseChunkTarget(stmt))
+		}
+	}
+	return out
+}
+
+// yieldingSetup wires a 4000 MB data file (final 440) whose first blockChunks chunks block
+// an ignored session until max_block_minutes stops them, and run cleanly afterward.
+func yieldingSetup(blockChunks int32, tune func(*ShrinkTuning)) (*fakeServer, *ShrinkRunner) {
+	clk := NewManualClock(time.Unix(0, 0))
+	s := &fakeServer{fileType: mssql.FileTypeRows, name: "Data", sizeMB: 4000, usedMB: 400, blockShrink: true}
+	chunks := &atomic.Int32{}
+	s.onExec = func(sql string) {
+		if isPageMovingChunk(sql) && chunks.Add(1) > blockChunks {
+			s.blockShrink = false
+		}
+	}
+	r := newTestRunner(s, clk)
+	tune(&r.tuning)
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = &chunkGatedSampler{clk: clk, step: 40 * time.Second, chunks: chunks, blockChunks: blockChunks}
+	return s, r
+}
+
+type eventLog struct {
+	mu     sync.Mutex
+	events []ReactionEvent
+}
+
+func (l *eventLog) sink(e ReactionEvent) { l.mu.Lock(); l.events = append(l.events, e); l.mu.Unlock() }
+
+func (l *eventLog) pausesContaining(sub string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, e := range l.events {
+		if e.Kind == "pause" && strings.Contains(e.Detail, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// A yield above the step floor halves the step and retries without spending the
+// no-progress budget: the supervisor stopped the chunk for pressure, which says nothing
+// about whether the shrink can move pages.
+func TestShrinkYieldHalvesWithoutCountingAboveFloor(t *testing.T) {
+	// Steps 400, 200, 100, then 50 = MinStepMB: three yields, all above the floor.
+	s, r := yieldingSetup(3, func(tu *ShrinkTuning) { tu.InitialStepSmallMB = 400 })
+	var ev eventLog
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final 440
+	res, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, ev.sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	targets := chunkTargets(s.execLog)
+	want := []int{3600, 3800, 3900}
+	if len(targets) < 3 || targets[0] != want[0] || targets[1] != want[1] || targets[2] != want[2] {
+		t.Errorf("chunk targets = %v, want the first three %v (step halved on each yield)", targets, want)
+	}
+	if n := ev.pausesContaining("made no progress"); n != 0 {
+		t.Errorf("%d 'made no progress' pauses, want 0 (a yield above the floor spends no budget)", n)
+	}
+	if res[0].FinalMB != 440 || res[0].Reason != "" {
+		t.Errorf("got final=%d reason=%q, want 440 reached with no reason", res[0].FinalMB, res[0].Reason)
+	}
+}
+
+// At the step floor a yield can shrink nothing further, so it spends the no-progress
+// budget like a stall and the run ends.
+func TestShrinkYieldAtFloorSpendsBudget(t *testing.T) {
+	_, r := yieldingSetup(1000, func(tu *ShrinkTuning) { tu.MinStepMB = 100 })
+	var ev eventLog
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, ev.sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if res[0].Reason == "" {
+		t.Errorf("Reason is empty, want a give-up reason (budget spent at the floor)")
+	}
+	if n := ev.pausesContaining("made no progress"); n == 0 {
+		t.Errorf("no 'made no progress' pause, want the budget spent")
+	}
+}
+
+// A yield wins over a running backup: the backup is not even read after a yield.
+func TestShrinkYieldWinsOverBackup(t *testing.T) {
+	s, r := yieldingSetup(3, func(tu *ShrinkTuning) { tu.InitialStepSmallMB = 400 })
+	for range 5 {
+		s.backups = append(s.backups, mssql.BackupRequest{})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	if _, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, discard); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	targets := chunkTargets(s.execLog)
+	if len(targets) < 3 || targets[0] != 3600 || targets[1] != 3800 || targets[2] != 3900 {
+		t.Errorf("chunk targets = %v, want the first three [3600 3800 3900]", targets)
+	}
+	if s.backupCalls != 0 {
+		t.Errorf("backupCalls = %d, want 0 (a yield is never classified as a backup)", s.backupCalls)
+	}
+}
+
+// A chunk that returned an error but did shrink the file made progress: the loop decides
+// by size, so the next chunk starts from the reduced size, not from a retry.
+func TestShrinkErroredChunkThatShrankIsProgress(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErrs: []error{mssqldb.Error{Number: 3140, Message: "Could not adjust the space allocation for file 'Data'."}},
+	}
+	first := true
+	s.onExec = func(sql string) {
+		if isPageMovingChunk(sql) && first {
+			first = false
+			s.sizeMB -= 100 // the chunk moved pages before raising its error
+		}
+	}
+	var ev eventLog
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"} // final 440, step 100
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, ev.sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	// From 900 with the step grown 100 -> 125 by a clean, fast chunk: 775. Treated as a
+	// failure instead, the step would halve and the retry would target 1000 - 50 = 950.
+	targets := chunkTargets(s.execLog)
+	if len(targets) < 2 || targets[0] != 900 || targets[1] != 775 {
+		t.Errorf("chunk targets = %v, want [900 775 ...] (next chunk computed from the reduced size)", targets)
+	}
+	if n := ev.pausesContaining("made no progress"); n != 0 {
+		t.Errorf("%d 'made no progress' pauses, want 0", n)
+	}
+	if res[0].FinalMB != 440 {
+		t.Errorf("FinalMB = %d, want 440", res[0].FinalMB)
+	}
+}
+
+// The size is read after an errored chunk too, and a failed read fails the run rather
+// than being absorbed as a stall. Every chunk errors, so a loop that skips the read after
+// an error never reads the size again and gives up cleanly instead.
+func TestShrinkSizeReadErrorAfterChunkErrorFails(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErr: mssqldb.Error{Number: 3140, Message: "Could not adjust the space allocation for file 'Data'."},
+	}
+	s.onExec = func(sql string) {
+		if isPageMovingChunk(sql) {
+			s.sizeErr = errors.New("file size unavailable")
+		}
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	if _, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard); err == nil {
+		t.Fatal("Run() error = nil, want the size-read error")
+	}
+}
+
+// tempdb is never backed up, so a stall there never reads running backups.
+func TestTempdbNeverReadsBackups(t *testing.T) {
+	s := newTempdbFakeServer(mssql.FileSpace{Name: "tempdev", SizeMB: 1000, UsedMB: 100})
+	s.floorMB["tempdev"] = 1000 // chunks never shrink: a persistent stall
+	r := newTestTempdbRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	res, err := r.RunTempdb(context.Background(), ddl.ShrinkTempdb{TargetSizeMB: 200}, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("RunTempdb() error = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason == "" {
+		t.Fatalf("got %+v, want one file stopped by the stall", res)
+	}
+	if s.backupCalls != 0 {
+		t.Errorf("backupCalls = %d, want 0 on tempdb", s.backupCalls)
 	}
 }
