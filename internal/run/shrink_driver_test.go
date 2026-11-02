@@ -51,6 +51,15 @@ type fakeServer struct {
 
 	sessions []mssql.Session // returned by ActiveSessions (constant across calls)
 
+	// sessionsMu guards sessions: clearSessionsOnCancel writes it on the ExecDDL goroutine
+	// while sampling goroutines read it through ActiveSessions.
+	sessionsMu sync.Mutex
+	// clearSessionsOnCancel empties sessions when a blockShrink statement is canceled, so a
+	// snapshot taken after the cancel sees nothing.
+	clearSessionsOnCancel bool
+	// sessionsErr, if set, makes ActiveSessions fail.
+	sessionsErr error
+
 	// sampledOnce, if non-nil, is closed the first time ActiveSessions is called, so a test can
 	// hold a chunk open until the in-flight self-block sampler has read.
 	sampledOnce chan struct{}
@@ -98,6 +107,11 @@ func (s *fakeServer) ExecDDL(ctx context.Context, sql string) error {
 	case strings.Contains(sql, "DBCC SHRINKFILE"):
 		if s.blockShrink {
 			<-ctx.Done() // a long shrink that only ends when the driver cancels it
+			if s.clearSessionsOnCancel {
+				s.sessionsMu.Lock()
+				s.sessions = nil
+				s.sessionsMu.Unlock()
+			}
 			return ctx.Err()
 		}
 		if len(s.chunkErrs) > 0 {
@@ -170,6 +184,11 @@ func (s *fakeServer) ActiveSessions(context.Context) ([]mssql.Session, error) {
 			close(s.sampledOnce)
 		}
 	}
+	if s.sessionsErr != nil {
+		return nil, s.sessionsErr
+	}
+	s.sessionsMu.Lock()
+	defer s.sessionsMu.Unlock()
 	return s.sessions, nil
 }
 
@@ -1346,5 +1365,61 @@ func TestShrinkGiveUpNamesTheBoundThatTripped(t *testing.T) {
 				t.Errorf("Reason = %q\nwant     %q", res[0].Reason, tt.want)
 			}
 		})
+	}
+}
+
+// TestShrinkSnapshotAtYieldBeforeCancel: the sessions our chunk was blocking are read
+// before the chunk is canceled. Canceling ends the blocking, so a read made afterward would
+// find nothing to name.
+func TestShrinkSnapshotAtYieldBeforeCancel(t *testing.T) {
+	clk := NewManualClock(time.Unix(0, 0))
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 4000, usedMB: 400,
+		blockShrink: true, clearSessionsOnCancel: true,
+		sessions: []mssql.Session{{SPID: 61, BlockingSPID: 99, Login: "svc_loader", OpenTransactions: 2}},
+	}
+	r := newTestRunner(s, clk)
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = &blockingSampler{clk: clk, step: 40 * time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out := r.runChunk(ctx, "Data", 1000, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, discard, ShrinkProgress{}, false)
+	if !out.stopped {
+		t.Fatalf("stopped = false, want true (err = %v)", out.err)
+	}
+	if out.yield == nil {
+		t.Fatal("yield = nil, want a snapshot when the chunk yields")
+	}
+	if len(out.yield.Blocked) != 1 || out.yield.Blocked[0].Login != "svc_loader" {
+		t.Errorf("Blocked = %+v, want the one svc_loader session read before the cancel", out.yield.Blocked)
+	}
+}
+
+// TestShrinkSnapshotAtYieldSurvivesReadError: a failed read must not turn a yield into an
+// error; the snapshot is simply empty.
+func TestShrinkSnapshotAtYieldSurvivesReadError(t *testing.T) {
+	clk := NewManualClock(time.Unix(0, 0))
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 4000, usedMB: 400,
+		blockShrink: true, sessionsErr: errors.New("dmv unavailable"),
+	}
+	r := newTestRunner(s, clk)
+	r.pollIntv = 2 * time.Millisecond
+	r.sampler = &blockingSampler{clk: clk, step: 40 * time.Second}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	out := r.runChunk(ctx, "Data", 1000, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, discard, ShrinkProgress{}, false)
+	if !out.stopped || out.err != nil {
+		t.Fatalf("stopped = %v, err = %v, want a clean yield", out.stopped, out.err)
+	}
+	if out.yield == nil {
+		t.Fatal("yield = nil, want an empty snapshot")
+	}
+	if len(out.yield.Blocked) != 0 || out.yield.Self.Blocked {
+		t.Errorf("yield = %+v, want no sessions", *out.yield)
 	}
 }

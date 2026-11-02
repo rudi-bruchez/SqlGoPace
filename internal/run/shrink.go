@@ -514,9 +514,10 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 
 		before, _ := r.reader.SessionWaits(ctx, r.exec.SPID())
 		t0 := r.clk.Now()
-		stopped, mb, err := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog, tp != nil)
-		if mb != nil {
-			lastMaint = mb
+		out := r.runChunk(ctx, f.Name, next, res, ignore, sink, prog, tp != nil)
+		stopped, err := out.stopped, out.err
+		if out.maint != nil {
+			lastMaint = out.maint
 		}
 		if err != nil {
 			// A DBCC SHRINKFILE chunk error almost never means the operation is broken — it
@@ -715,6 +716,15 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 	}
 }
 
+// chunkOutcome is how one runChunk call ended. yield is non-nil exactly when stopped is
+// true: it holds what the monitor saw at the moment the chunk was stopped.
+type chunkOutcome struct {
+	stopped bool
+	maint   *MaintBlock
+	yield   *yieldSnapshot
+	err     error
+}
+
 // runChunk runs one page-moving shrink statement under monitoring. It returns
 // stopped=true when sustained pressure made the driver stop the chunk (context
 // cancel, KILL via the pool as a fallback) with its committed work preserved;
@@ -724,7 +734,7 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 // maintenance operation blocking the chunk — the only window such a block is
 // observable, since between chunks our session has no live request row (see
 // pumpSelfBlock) — and returns the first such observation, if any.
-func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, base ShrinkProgress, watchSelfBlock bool) (stopped bool, maint *MaintBlock, err error) {
+func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, res ddl.ResolvedOptions, ignore IgnoreSource, sink ReactionSink, base ShrinkProgress, watchSelfBlock bool) chunkOutcome {
 	stmt := ddl.ShrinkChunkSQL(file, targetMB, res)
 
 	execCtx, cancelExec := context.WithCancel(ctx)
@@ -739,6 +749,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	// Re-emit progress with the chunk's live server-side percent_complete while it runs.
 	go r.pumpServerProgress(sampleCtx, base)
 
+	var maint *MaintBlock
 	var selfBlockCh chan MaintBlock
 	if watchSelfBlock {
 		selfBlockCh = make(chan MaintBlock, 1)
@@ -761,12 +772,34 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	}
 
 	if action == Continue {
-		return false, maint, serr
+		return chunkOutcome{maint: maint, err: serr}
 	}
 
+	// Read the blocked sessions before the cancel: canceling ends the blocking, so a read
+	// made afterward would find nothing to name.
+	yield := r.snapshotYield(ctx)
 	sink(ReactionEvent{Kind: "pause", Detail: "shrink chunk stopped under pressure; committed work preserved — " + pressure.Detail()})
 	r.cancelAndAwait(cancelExec, done, sink, "abort did not stop the chunk within the grace period")
-	return true, maint, nil
+	return chunkOutcome{stopped: true, maint: maint, yield: &yield}
+}
+
+// snapshotYield reads the sessions our DDL is blocking, and our own blocker if any. A
+// failed read gives an empty snapshot: it only decorates a give-up reason, so it must
+// not turn a yield into an error.
+func (r *ShrinkRunner) snapshotYield(ctx context.Context) yieldSnapshot {
+	sessions, err := r.reader.ActiveSessions(ctx)
+	if err != nil {
+		return yieldSnapshot{}
+	}
+	spid := r.exec.SPID()
+	var snap yieldSnapshot
+	for _, s := range sessions {
+		if s.BlockedBy(spid) {
+			snap.Blocked = append(snap.Blocked, s)
+		}
+	}
+	snap.Self = mssql.FindSelfBlock(sessions, spid)
+	return snap
 }
 
 // cancelAndAwait cancels the running statement and waits for it to stop, falling back to a
