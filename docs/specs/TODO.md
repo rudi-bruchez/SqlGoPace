@@ -1179,6 +1179,38 @@ duplicated in two code paths" (both call `selfLimitClause`, and both paths have 
   steps (below 1/8 of the current size, each growth makes exactly one VLF of that size). A loop
   of growth statements is what makes the technique practical. Needs its own spec.
 
+### Found writing the Pachadata tempdb shrink article (2026-11-01)
+
+Lab work for the article « Réduire la taille de tempdb » (pachadata.com, published 2026-11-02;
+measurement journal in the article's `notes-de-redaction.md`, SQL Server 2025 CU10 on Linux).
+The published article announces the first two fixes for a coming release, so they are promises,
+not ideas. Tracked in Todoist, project SqlGoPace.
+
+- **`flushcaches` empties a cache that did not hold the blocking work tables.** The flush
+  (`internal/run/shrink.go`, `CHECKPOINT` then `DBCC FREESYSTEMCACHE ('Temporary Tables & Table
+  Variables')`) freed none of them in the lab. Work tables kept with a cached plan (a `STATIC`
+  cursor, a recursive CTE spool) were freed only by removing the plan: `FREESYSTEMCACHE ('SQL
+  Plans')` for ad hoc batches, `('Object Plans')` for a procedure, or one plan with `DBCC
+  FREEPROCCACHE (plan_handle)`. Proposed flow: on Msg 5207, find the sessions and the cached
+  plans that hold tempdb pages, remove only those plans, then retry the chunk; a wider flush stays
+  a last resort behind an explicit option.
+- **The initial `TRUNCATEONLY` pass can raise tempdb's configured size.** A partial shrink,
+  `TRUNCATEONLY` included, sets the configured size (`sys.master_files`) to the size reached,
+  which can be above the value before the run. If `shrink_tempdb` gives up after that pass,
+  tempdb restarts larger than it was. Options: read `sys.master_files` before the run and restore
+  it at the end with `ALTER DATABASE tempdb MODIFY FILE` (accepted for tempdb, applied at
+  restart), or drop the leading pass; either way, report any file whose configured size went up.
+- **The docs name the wrong message.** `docs/shrink.md` (line 168) and `TEMPDB-SHRINK.md` (§5)
+  say `Msg 5240` "work table page could not be moved". That message is 5207 (severity 10,
+  « Page %d:%d could not be moved because it is a work table page »); 5240 is « File ID %d of
+  database ID %d cannot be shrunk as it is either being shrunk by another process or is empty ».
+  The code does not test a message number, and `shrink_driver_test.go` already says so: the fix
+  is to the two documents only.
+- **`WAIT_AT_LOW_PRIORITY` does not cover every blocker of a tempdb shrink.** A sort that spills
+  holds an S lock on `DATABASE: 2:0 [ENCRYPTION_SCAN]` per statement, and the shrink waits on
+  `LCK_M_BU`; neither `ABORT_AFTER_WAIT = SELF` nor `BLOCKERS` acts on it. Worth a line in
+  `docs/shrink.md` so a stalled run is not read as a bug.
+
 ## Iterations still to design / implement
 
 - [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested
