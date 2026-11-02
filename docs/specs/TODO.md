@@ -999,59 +999,6 @@ A 500 GB `DBCC SHRINKFILE` against `PRODDB` on a synchronous AG stopped after 15
 having reclaimed 33.6 GB of it. Outcome `INCOMPLETE`, work preserved, which is the designed
 behaviour. What is wrong is how little it tried and what it did with what it already knew.
 
-- **The tail object is identified before the give-up but never feeds the decision.** The
-  backward page walk ran at `+12s`, long before the first failure, and named the object owning
-  the file's last allocated page: `dbo.MEASUREMENT` `index_id = 8`, `0 pages from end`, a
-  covering nonclustered index of 57.7 GB. That fact reached the operator only in the report,
-  after the run ended. It should steer the loop instead: re-probe the tail on each no-progress
-  event and branch on whether it moved. **A tail object that is the same object across
-  successive retries while `halveStep` is shrinking the ask is a structural blocker** and
-  waiting is pointless, so stop at once with the object named in the reason rather than burning
-  the whole budget. A tail object that keeps changing is workload churn re-using the freed
-  space, which is exactly the case Microsoft documents for Azure SQL ("a workload might start
-  using the storage space freed by shrink before shrink truncates the file"), and there waiting
-  is the right answer and the budget should be generous. Today both cases get the same 90
-  seconds. The measured run: three attempts asking for 8 GB, then 4, then 2, each returning
-  `Could not adjust the space allocation for file`, with nothing in the server error log for
-  the window (no 665, no 1450, no 5202/5203) — the signature of a structural blocker, and the
-  driver could have said so at the second retry.
-  **CORRECTION, measured 2026-09-20 22:10-23:34, and it invalidates the heuristic above as
-  stated.** The rule proposed here was "same tail object across successive retries while
-  `halveStep` shrinks the ask = structural blocker, stop at once". A later run of the same
-  campaign falsifies it. The shrink stalled **five separate times**, each episode backing off
-  30 s then 1 m then 2 m, with `dbo.MEASUREMENT` index_id 5 named as the tail object
-  throughout — the same object, across retries, exactly the signature this entry calls
-  structural. It was not. With the budget raised to `max_no_progress: 10` and
-  `self_wait_timeout_minutes: 30`, every one of those five episodes recovered on its own and
-  the run finished at 100 % of target: 746 347 MB -> 381 298 MB, 365 049 MB reclaimed in 39
-  chunks, 1 h 22 m. Total blocked time 1 042 s, i.e. 17 minutes of pure waiting that turned
-  into 356 GB.
-
-  Two consequences. **The defaults would have thrown that away**: at `max_no_progress: 3` the
-  first episode stops the run on its third backoff, and the 5-minute cumulative cap kills it
-  regardless, so the shrink would have ended around 680 GB instead of 372 GB. That is the
-  second point of this entry proven in production, and it is now the higher-value half.
-  **And identity of the tail object is not the discriminator.** The same object can mean
-  "actively being written into the space you just freed", which is churn and wants patience,
-  or "cannot be moved", which is structural and wants a relocation. Distinguishing them needs
-  something else — whether the file size moved at all between episodes, whether the object is
-  taking writes, whether the *page* at the tail changed even though the object did not. Do not
-  build the identity heuristic; it would have stopped a run that was working.
-- **The no-progress budget is sized for a chunk, not for an overnight shrink.** *Partly shipped
-  in 0.47.0*: the give-up reason names the bound that tripped, and `config.yaml` and
-  `configuration.md` state the interaction. Still open, and a behavior change needing its own
-  decision: the defaults themselves, and scaling the budget to the size of the reclaim. The
-  original entry follows. Defaults are
-  `max_no_progress: 3` with `no_progress_backoff_seconds: 30` doubling to a 300 s ceiling, so
-  a shrink planned to run for a night gives up after **90 seconds of waiting across three
-  tries**. Worse, `self_wait_timeout_minutes: 5` caps the *cumulative* wait, so raising
-  `max_no_progress` alone changes almost nothing: the two interact and neither comment says so.
-  Fix is small and in two parts. State the interaction in `config.yaml` next to both keys, and
-  make the give-up reason name which bound tripped (count or cumulative wait) rather than the
-  present single `no further progress` for both. Then consider scaling the budget to the size
-  of the reclaim: a shrink whose remaining work is measured in hundreds of gigabytes should
-  wait minutes, not seconds, before concluding that a transient blocker is permanent.
-
 ### Found relocating a tail object, and in the run that did nothing (2026-09-20)
 
 Same campaign as the entry above, the next two hours of it. All three were measured, not
@@ -1238,15 +1185,6 @@ and measured on SQL Server 2022 CU26 in a container.
 
 ## Iterations still to design / implement
 
-- [ ] **[Shrink stall causes](superpowers/specs/2026-11-02-shrink-stall-causes-design.md)**,
-  designed and reviewed 2026-11-02, ready for a plan. A chunk the driver stopped itself halves
-  the step instead of counting as a stall; a chunk that fails or gains nothing during a data
-  backup of the same database (`Msg 3140` State 5, measured) waits for the backup instead of
-  spending the budget; one 30-minute patience budget by default; a give-up reason naming the
-  cause. Covers the Todoist p1 "backup-aware stall", whose `TODO.md` entry was never committed,
-  and supersedes the two tail-object entries of 2026-09-20 when it lands. Its second lot, the
-  relocation, was withdrawn after review: see the next entry.
-
 - [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested
   after a live campaign spent an evening doing this by hand, three rounds of the same loop. A
   shrink that stops `INCOMPLETE` on a tail object already knows the name of what blocks it: the
@@ -1381,6 +1319,23 @@ and measured on SQL Server 2022 CU26 in a container.
 ## Shipped
 
 Kept so the entries above are not re-proposed. Each names the evidence in the tree.
+
+- [x] 0.49.0, shrink stall causes ([design](superpowers/specs/2026-11-02-shrink-stall-causes-design.md)).
+  Evidence: `internal/run/shrink_stall.go` (`classifyNoGain`, `yieldTally`) and, in
+  `internal/run/shrink.go`, `chunkLoop` and `awaitBackup`.
+  - A chunk the supervisor stopped halves the step and retries without spending the budget while
+    the step is above `min_step_mb`; an errored chunk that still shrank counts as progress.
+  - A no-gain chunk during a `BACKUP DATABASE` on the same database waits for it (Msg 3140
+    State 5 measured on SQL Server 2022 CU26). `RunningDataBackup` is in `internal/mssql`.
+  - The defaults are 15 attempts and 30 minutes (`applyDefaults`, `internal/config/config.go`).
+    This closes "The no-progress budget is sized for a chunk, not for an overnight shrink":
+    scaling the budget to the size of the reclaim was not done, a flat patient default was.
+  - The give-up reason names the yields, the bound, the step floor and the tail object read at
+    give-up. This closes "The tail object is identified before the give-up but never feeds the
+    decision", with its 2026-09-20 correction kept: the identity of the tail object does not
+    tell a structural blocker from workload churn (the same `index_id` was named through five
+    stall episodes that all recovered), so it is reported in the reason and does not steer the
+    loop.
 
 - [x] **0.48.0, the autonomous half of the remaining backlog.**
   - `key_range` is at-least-once for statements and once for rows: every statement carries the

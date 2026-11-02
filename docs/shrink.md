@@ -62,6 +62,24 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
   chunks, which is free because committed work is kept, and shrinks the next chunk smaller.
   The step climbs back once the pressure clears, so a single bad moment does not shrink the
   chunk for the rest of the run.
+- A chunk the supervisor stopped is not a stall. When a chunk is stopped because it
+  blocked a writer or a reader, the driver halves the step and tries again at once, without
+  spending the no-progress budget, as long as the step is above `min_step_mb`. The next chunk
+  is smaller and may fit between the writer's inserts. At the floor, a stopped chunk counts as
+  a stall.
+- A running data backup is waited out. A chunk that gains nothing while a `BACKUP DATABASE`
+  (full or differential) runs on the same database waits for the backup to finish, polling
+  every `no_progress_backoff_seconds`, then retries at the same step. The wait has no ceiling,
+  does not spend the no-progress budget, and a graceful stop interrupts it with the work
+  preserved. Measured on SQL Server 2022 CU26: with `WAIT_AT_LOW_PRIORITY` chunks, a chunk that
+  meets the backup usually ends without error and without gain, and a plain chunk can fail with
+  Msg 3140 State 5 even after reaching its target, so the driver identifies the backup in
+  `sys.dm_exec_requests` instead of reading the error number. Log backups do not stop a chunk
+  and are ignored. SqlGoPace never starts, delays or kills a backup.
+- Patience by default. Any other stall waits with a backoff of 30 s doubling to 300 s, and
+  gives up after 15 attempts or 30 minutes of cumulative waiting, whichever comes first. At
+  the defaults the time bound trips first, after about 32 minutes. Before 0.49.0 the defaults
+  were 3 attempts and 5 minutes, a minute and a half of waiting in practice.
 
 A data-file shrink fragments indexes by design. Measured on a production shrink after five
 chunks had moved 33.6 GB (`sys.dm_db_index_physical_stats`, `LIMITED`): the nonclustered
@@ -71,6 +89,18 @@ while the clustered index of the same table, which it never touched, stood at 0.
 Rebuild or reorganize afterwards if needed;
 [`maintenance-planner.md`](maintenance-planner.md) can generate the pre-shrink reorganize
 pass for you.
+
+### The give-up reason
+
+When a shrink stops short of its target, the reason names what it saw, in this order, separated
+by semicolons: who it kept yielding to (`yielded 3 times (blocking login=svc_loader)`), the
+bound that tripped (`no further progress after 3 attempts without a gain
+(shrink.max_no_progress)` or the time bound `shrink.self_wait_timeout_minutes`), `step at
+min_step_mb (100 MB)` when yields brought the step to the floor, the tail object read at that
+moment (`tail object at give-up: dbo.MEASUREMENT index_id=5, 12 pages from end`, SQL Server
+2019 and later), and `work preserved`. A concurrent index rebuild or `DBCC` replaces the whole
+reason with its own wording. Raise `max_no_progress` and `self_wait_timeout_minutes` together
+when a long shrink should wait longer; see [`configuration.md`](configuration.md).
 
 ### Recording what it could not get past
 

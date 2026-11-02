@@ -309,11 +309,11 @@ shrink:
   min_step_mb:                50  # floor: below this, per-loop overhead dominates
   max_step_mb:              8192  # absolute ceiling: do not saturate I/O in one move
   max_chunk_seconds:         300  # ceiling on chunk duration: stops growth, never shrinks a step
-  max_no_progress:             3  # consecutive no-gain chunks before stopping cleanly
+  max_no_progress:            15  # consecutive no-gain chunks before stopping cleanly
   no_progress_before_flush:    2  # no-progress events before the tempdb cache flush
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk, doubling
   no_progress_backoff_max_seconds: 300   # backoff ceiling
-  self_wait_timeout_minutes:         5   # max wait while blocked before a clean stop
+  self_wait_timeout_minutes:        30   # max wait while blocked before a clean stop
   log_reuse_wait_timeout_minutes:   30   # max wait for a scheduled BACKUP LOG
 ```
 
@@ -326,15 +326,39 @@ much (WRITELOG or PAGEIOLATCH_EX past their thresholds, or the supervisor stoppi
 because it was blocking others), grown by a quarter after any chunk that was not, held once a
 chunk reaches `max_chunk_seconds`.
 
+A chunk the supervisor stopped (a yield) halves the step and is retried at once, without
+spending the no-progress budget, while the step is above `min_step_mb`. At the floor a yield
+counts as a stall like any other no-gain chunk. A chunk that returned an error but still
+shrank the file counts as progress.
+
+A no-gain chunk while a data backup (`BACKUP DATABASE`, full or differential) runs on the same
+database is not a stall either. The driver waits for the backup to end, polling every
+`no_progress_backoff_seconds`, with no ceiling, then retries the chunk at the same step and
+with the budget untouched. It reports one `pause` reaction naming `BACKUP DATABASE` with the
+session id and start time, and one `info` reaction with the time waited, and a graceful stop
+interrupts the wait with the work preserved. Log backups are ignored: measured harmless to a
+chunk. `shrink_tempdb` never waits for a backup.
+
 `max_no_progress` and `self_wait_timeout_minutes` are the two give-up bounds of a stalled
 shrink, and whichever trips first stops it cleanly with the work preserved. They interact:
 `self_wait_timeout_minutes` caps the *cumulative* backoff wait, so raising `max_no_progress`
-alone changes almost nothing. At the defaults a stall gives up after three tries and about
-90 seconds of waiting, which suits a chunk and not an overnight shrink: on a production
-campaign, five separate stalls on the same tail object all recovered on their own once both
-were raised (`max_no_progress: 10`, `self_wait_timeout_minutes: 30`), and the run reclaimed
-356 GB that the defaults would have given up on. The give-up reason names the bound that
-tripped, with its key, since 0.47.0.
+alone changes almost nothing. The defaults are 15 and 30 minutes since 0.49.0 (3 and 5 before,
+roughly a minute and a half of waiting). With the backoff at 30 seconds doubling to the 300 second cap,
+the time bound trips first: the 10th stall finds 32 minutes 30 seconds already waited and
+stops. On a production campaign, five separate stalls on the same tail object all recovered on
+their own once the bounds were raised to 10 and 30 minutes, and the run reclaimed 356 GB that
+the old defaults would have given up on. An operator whose `config.yaml` sets
+`max_no_progress: 3` or `self_wait_timeout_minutes: 5` keeps the short behavior and should
+revisit both. `max_no_progress` must stay above `no_progress_before_flush`, which is 2: a
+value of 2 or less fails to load.
+
+The give-up reason names the bound that tripped, with its key, and the cause it saw. Its parts,
+in order, are separated by semicolons: the yield tally (`yielded 3 times (blocking
+login=svc_loader)`), `no further progress after <bound>`, `step at min_step_mb (N MB)` when
+yields reached the floor, `tail object at give-up: <schema>.<table> index_id=<id>, <n> pages
+from end` when the walk found one (SQL Server 2019 and later), and `work preserved`. For
+example: `yielded 3 times (blocking login=svc_loader); no further progress after 3 attempts
+without a gain (shrink.max_no_progress); step at min_step_mb (100 MB); work preserved`.
 
 `max_chunk_seconds` is a **ceiling, not a target**. It stops the step growing; it never shrinks
 one. A chunk longer than it is not a problem to correct — `DBCC SHRINKFILE` restarts its

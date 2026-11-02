@@ -84,13 +84,15 @@ shrink:
   max_step_mb:           8192    # absolute chunk ceiling
   max_chunk_seconds:      300    # ceiling on chunk duration: stops the step growing, never shrinks it
   # The two give-up bounds interact: whichever trips first stops the shrink, and the
-  # second one caps the CUMULATIVE wait, so raising max_no_progress alone changes little.
-  # At these defaults a stalled shrink gives up after about 90 s of waiting. For a long
-  # (overnight) shrink, raise both; the give-up reason names the one that tripped.
-  max_no_progress:          3    # consecutive no-gain chunks before a clean stop
+  # second one caps the CUMULATIVE wait. At these defaults the time bound trips first, at
+  # the 10th stall after about 32 minutes of backoff (30 s doubling to the 300 s cap); the
+  # 15 tries of max_no_progress matter once the backoff cap or the timeout is raised. A
+  # chunk the supervisor stops, or one that meets a running data backup, does not count here
+  # while the step is above min_step_mb. The give-up reason names the bound that tripped.
+  max_no_progress:         15    # consecutive no-gain chunks before a clean stop
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
   no_progress_backoff_max_seconds: 300   # backoff ceiling
-  self_wait_timeout_minutes: 5   # max total wait while blocked (Sch-M / snapshot) before clean stop
+  self_wait_timeout_minutes: 30  # max total wait while blocked (Sch-M / snapshot) before clean stop
   log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free a FULL-recovery log
 
 # Tuning for batched DML (`batch_update` / `batch_delete`). Entirely OPTIONAL: omit the

@@ -161,9 +161,13 @@ no-gain chunk / Msg 5240 / 845
     widens the same escalation, never a separate trigger).
 
 `NoProgressBeforeFlush` **default = `2`** no-progress events. It must be **`< MaxNoProgress`** (the
-existing give-up count, `3`) so the flush fires *before* the clean give-up **and leaves retry room
-after** — at `2`, the flush fires on the second stall, the counter resets, and there is still budget
-before the give-up at `3`. Config validation rejects `NoProgressBeforeFlush >= MaxNoProgress`.
+existing give-up count, `15` since 0.49.0, `3` before) so the flush fires *before* the clean
+give-up **and leaves retry room after**: at `2`, the flush fires on the second stall, the counter
+resets, and there is still budget before the give-up. Config validation rejects
+`NoProgressBeforeFlush >= MaxNoProgress`. The time bound (`self_wait_timeout_minutes`, `30` since
+0.49.0) trips first at the default backoff, after about 32 minutes. Tempdb never waits for a data
+backup (the backup wait of `SHRINK.md` §8.8 is skipped), and a supervisor-stopped chunk halves the
+step before it counts as a stall, as for a user database.
 - **Flush runs at most once per run** (the caches are instance-wide; flushing per file would repeat
   the perf hit for nothing). A shared `flushed` flag spans all files.
 - **845** is folded in as a retryable no-progress event; the flush (which frees internal caches) is
@@ -207,7 +211,7 @@ before the give-up at `3`. Config validation rejects `NoProgressBeforeFlush >= M
   correct once the context is tempdb. Add only the flush exec helper. tempdb is always SIMPLE
   recovery, so no log-reuse gate on the data path.
 - **`internal/preflight`** — tempdb reachability/file checks on the existing shrink model.
-- **`internal/config`** — default for `NoProgressBeforeFlush` (`3`, `< MaxNoProgress`) and the
+- **`internal/config`** — default for `NoProgressBeforeFlush` (`2`, `< MaxNoProgress`) and the
   shrink tuning already used. (`aggressive` widening is deferred out of v1, §5.)
 - **README / operator skill** — document the operation, its non-goals, and the `flushcaches`
   trade-off.

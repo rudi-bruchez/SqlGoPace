@@ -196,9 +196,8 @@ max_no_progress`), so the note says to lower both together.
 
 The reason names the cause, the bound with the time actually waited, and the fact that work is
 preserved. It is built after the give-up tail walk, from its result: `captureGiveUpTail` today
-runs after `result.Reason` is set and returns nothing, so it changes to return its finding, and
-the same finding goes on `ShrinkResult` (and still to the sink and the `.contended.yaml`, as
-now). Shapes (wording is the builder's):
+runs after `result.Reason` is set and returns nothing, so it changes to return its finding, which
+still goes to the sink and the `.contended.yaml`, as now. Shapes (wording is the builder's):
 
 - yield: `yielded 7 times (blocking login=<login>, open transaction; chunk itself blocked by
   session 60, login=<login>); step at min_step_mb (50 MB); 32m30s of waiting

@@ -14,9 +14,36 @@ The version a run used, and the config file it loaded, are written into its `.lo
 sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
 SQLite history does not record either yet.
 
-## [Unreleased]
+## [0.49.0] - 2026-11-02
+
+A stalled shrink is more patient and says why it stopped. The give-up defaults move from 3
+attempts and 5 minutes to 15 attempts and 30 minutes: an operator whose `config.yaml` sets
+`max_no_progress: 3` or `self_wait_timeout_minutes: 5` keeps the short behavior and should
+revisit both, and a `max_no_progress` of 2 or less now fails to load because
+`no_progress_before_flush` is 2.
 
 ### Changed
+
+- `shrink.max_no_progress` defaults to 15 (was 3) and `shrink.self_wait_timeout_minutes` to 30
+  (was 5). At the default backoff (30 s doubling to 300 s) the time bound trips first, at the
+  10th stall after 32 minutes 30 seconds of waiting. Both YAML copies carry the new comment.
+- A shrink chunk the supervisor stopped under pressure halves the step and retries at once
+  without spending the no-progress budget while the step is above `min_step_mb`; at the floor
+  it counts as a stall. A chunk that returned an error but still shrank the file counts as
+  progress.
+- A no-gain chunk while a `BACKUP DATABASE` runs on the same database waits for the backup to
+  end instead of stalling: no ceiling, polled every `no_progress_backoff_seconds`, stopped by
+  a graceful stop with the work preserved, one `pause` and one `info` reaction. Log backups
+  and `shrink_tempdb` are excluded. Measured on SQL Server 2022 CU26: a chunk that meets a
+  backup usually ends without error and without gain, and a plain chunk can fail with Msg 3140
+  State 5 even after reaching its target, so the backup is identified in
+  `sys.dm_exec_requests`, not by the error number.
+- The give-up reason of a data shrink names the yields it kept hitting (`yielded 3 times
+  (blocking login=...)`), the step floor when reached, and the tail object read at give-up
+  (`tail object at give-up: <schema>.<table> index_id=<id>, <n> pages from end`).
+- The GitHub release page carries this file's section for the version, followed by how to
+  verify a download against the checksums file, instead of a generated list of commits. A
+  tag whose section is missing or empty fails before anything is built.
 
 - The GitHub release page carries this file's section for the version, followed by how to
   verify a download against the checksums file, instead of a generated list of commits. A

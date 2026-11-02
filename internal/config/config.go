@@ -470,11 +470,11 @@ func (s *ShrinkConfig) applyDefaults() {
 	setIf(&s.MinStepMB, 50)
 	setIf(&s.MaxStepMB, 8192)
 	setIf(&s.MaxChunkSeconds, 300)
-	setIf(&s.MaxNoProgress, 3)
+	setIf(&s.MaxNoProgress, 15)
 	setIf(&s.NoProgressBeforeFlush, 2)
 	setIf(&s.NoProgressBackoffSeconds, 30)
 	setIf(&s.NoProgressBackoffMaxSeconds, 300)
-	setIf(&s.SelfWaitTimeoutMinutes, 5)
+	setIf(&s.SelfWaitTimeoutMinutes, 30)
 	setIf(&s.LogReuseWaitTimeoutMinutes, 30)
 }
 

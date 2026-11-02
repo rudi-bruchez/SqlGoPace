@@ -159,11 +159,11 @@ func TestShrinkConfigDefaultsWhenAbsent(t *testing.T) {
 		{"min_step_mb", s.MinStepMB, 50},
 		{"max_step_mb", s.MaxStepMB, 8192},
 		{"max_chunk_seconds", s.MaxChunkSeconds, 300},
-		{"max_no_progress", s.MaxNoProgress, 3},
+		{"max_no_progress", s.MaxNoProgress, 15},
 		{"no_progress_before_flush", s.NoProgressBeforeFlush, 2},
 		{"no_progress_backoff_seconds", s.NoProgressBackoffSeconds, 30},
 		{"no_progress_backoff_max_seconds", s.NoProgressBackoffMaxSeconds, 300},
-		{"self_wait_timeout_minutes", s.SelfWaitTimeoutMinutes, 5},
+		{"self_wait_timeout_minutes", s.SelfWaitTimeoutMinutes, 30},
 		{"log_reuse_wait_timeout_minutes", s.LogReuseWaitTimeoutMinutes, 30},
 	}
 	for _, c := range checks {

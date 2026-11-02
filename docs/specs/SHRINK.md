@@ -225,6 +225,10 @@ for current > finalTarget {
     dLog    := deltaLogSpace()
 
     if newSize >= current {                        // no gain (cf. §8.3)
+        switch cause(stopped, backupRunning) {     // §8.3, §8.8
+        case yield:  step = halve(step); if step was above min { continue }
+        case backup: waitForBackup(); continue     // no step change, no budget spent
+        }
         noProgress++
         if noProgress >= maxNoProgress { return resumable } // or wait + retry
         wait backoff; continue
@@ -343,10 +347,10 @@ shrink:
   min_step_mb:             50    # below this, per-loop overhead dominates the gain
   max_step_mb:           1024    # cap so we don't saturate the I/O in one go
   max_chunk_seconds:      300    # ceiling on chunk duration: stops growth, never shrinks a step
-  max_no_progress:          3    # consecutive chunks without gain before a clean stop
+  max_no_progress:         15    # consecutive chunks without gain before a clean stop
   no_progress_backoff_seconds:      30   # wait before retry, doubled on each no-progress
   no_progress_backoff_max_seconds: 300   # backoff cap (5 min)
-  self_wait_timeout_minutes: 5   # max wait on Sch-M / snapshot before a clean stop (§8.2)
+  self_wait_timeout_minutes: 30  # max wait on Sch-M / snapshot before a clean stop (§8.2)
   log_reuse_wait_timeout_minutes: 30  # max wait for a scheduled BACKUP LOG to free the log (§5.2)
 ```
 
@@ -411,14 +415,42 @@ A shrink can be **blocked by** other sessions (RCSI/SI snapshot transactions →
   prefer **waiting** (the shrink will resume), then a **clean stop** if the wait exceeds a
   threshold (the work is preserved).
 
+That threshold is `self_wait_timeout_minutes`, `30` since 0.49.0 (`5` before). It caps the
+cumulative backoff wait of a stall episode, and a chunk that gains space resets it. At the
+default backoff (30 s doubling to a 300 s cap) the 10th stall finds 32 minutes 30 seconds already
+waited and gives up, before `max_no_progress` (`15`) is reached.
+
 ### 8.3 No-progress / silent WALP 49516 timeout
 
 Under `WAIT_AT_LOW_PRIORITY`, if the Sch-M lock isn't acquired within ~1 min, the shrink
 **finishes with no visible error and without having done anything** (error 49516 appears only
 in the SQL Server log). So the return code can't be trusted. Detection by **size comparison**:
 if `newSize >= current` after a chunk (49516, or data at the end of the file that can't be
-moved), increment a no-progress counter → backoff + retry, then a clean stop past
-`maxNoProgress`.
+moved), the chunk is a candidate stall. Since 0.49.0 the cause is read first
+(`classifyNoGain`, `internal/run/shrink_stall.go`), and only a chunk that is neither a yield nor
+a backup wait increments the no-progress counter → backoff + retry, then a clean stop past
+`maxNoProgress` (`15` since 0.49.0, `3` before) or the time bound of §8.2.
+
+A chunk that returned an error but still shrank the file is progress, not a stall: success is
+decided by the file size, never by the error number.
+
+A yield is a chunk the supervisor stopped under pressure (it was blocking a writer, say). It
+says nothing about whether pages can move, so above `min_step_mb` the driver halves the step and
+retries at once, without backoff and without spending the budget; the next chunk is smaller and
+may fit between the writer's inserts. At the floor a yield counts as a stall. Each yield is
+tallied (who it blocked, by login) until a chunk gains space, and the tally goes into the
+give-up reason (§8.3.1).
+
+#### 8.3.1 The give-up reason
+
+The reason is assembled from parts separated by semicolons, in this order: the yield tally
+(`yielded 3 times (blocking login=svc_loader)`), `no further progress after <bound>` (the bound
+names its key, `shrink.max_no_progress` or `shrink.self_wait_timeout_minutes`, and the last chunk
+error when there was one), `step at min_step_mb (N MB)` when yields reached the floor, `tail
+object at give-up: <schema>.<table> index_id=<id>, <n> pages from end` when the walk of §8.6
+found one, and `work preserved`. A maintenance block (§8.7) replaces the whole reason. Example
+from a test: `yielded 3 times (blocking login=svc_loader); no further progress after 3 attempts
+without a gain (shrink.max_no_progress); step at min_step_mb (100 MB); work preserved`.
 
 ### 8.4 Log during a data shrink
 
@@ -452,7 +484,8 @@ Two triggers (`ShrinkRunner.walkTail` finds; `emitTail` logs and, optionally, re
 
 - **Reactive (always on):** `captureGiveUpTail` runs once when `chunkLoop` gives up ("no
   further progress") for a data file — the definitive "couldn't get past the tail" moment — and
-  records the result. Not run on a graceful stop / `ErrStopped` (that resumes later).
+  records the result. Since 0.49.0 it returns its finding, which also goes into the give-up
+  reason (§8.3.1), so the operator reads the tail object in the one line the run ends with. Not run on a graceful stop / `ErrStopped` (that resumes later).
 - **Proactive (`identify_tail_object: true`):** runs once at `chunkLoop` entry, **after**
   `TRUNCATEONLY` (so the free-page bound reflects the post-truncate size and the last
   allocated page is the real one). Its finding is **logged, then stashed** on the `tailProbe`
@@ -509,6 +542,37 @@ structural blocker a pre-shrink reorganize should target. Below SQL 2019, or whe
 itself fails, there is no sidecar entry at all — only the `.log`/TUI message; the give-up reason
 still names the blocker, there's just nothing to feed back into the planner.
 
+### 8.8 Backup wait
+
+`DBCC SHRINKFILE` cannot move pages while `BACKUP DATABASE` holds the file. Measured on SQL
+Server 2022 CU26 (2026-11-02, throwaway databases, full and differential backups to a file): with
+`WAIT_AT_LOW_PRIORITY` chunks, a chunk that meets the backup usually ends without error and
+without gain; a plain chunk can fail with `Msg 3140, Level 16, State 5` (`Could not adjust the
+space allocation for file`), even after its pages were moved to below its target. The chunk does
+not wait for the backup, whatever `SET LOCK_TIMEOUT` says. `BACKUP LOG` does not stop a chunk
+(740 log backups in 40 s, every chunk advanced, each slower), and a backup started while a chunk
+runs completes normally. A field run showed the cost of treating this as a stall: three chunks
+failed with Msg 3140 during a differential backup, and the shrink gave up eighteen seconds before
+the backup ended.
+
+The classification does not depend on the error number. After a no-gain chunk the driver reads
+`sys.dm_exec_requests` for `command = 'BACKUP DATABASE'` on the same database (`DB_ID()` on the
+driver's connection, which is in the target database; `RunningDataBackup` in `internal/mssql`).
+If one is running, `awaitBackup` waits for it to end:
+
+- no ceiling: the wait lasts as long as the backup, polling every `no_progress_backoff_seconds`;
+- stop-aware: a graceful stop returns with the work preserved
+  (`stopped: graceful stop during a backup wait (work preserved)`);
+- two reactions: one `pause` naming `BACKUP DATABASE` with the session id and start time, and one
+  `info` with the time waited;
+- no side effect on the loop: the step is unchanged and the no-progress budget and the stall
+  wait are untouched, so the chunk is retried as it was.
+
+A failed read of the running backups is a `warn` and the chunk is then handled as a stall. Log
+backups are excluded. A yield wins over a backup, since the supervisor already acted. A tempdb
+shrink never looks for a backup (tempdb is not backed up). SqlGoPace never starts, delays or
+kills a backup.
+
 ## 9. Progress, reporting, TUI
 
 - **Deterministic progress** (an advantage of chunking, unlike the fluctuating
@@ -540,6 +604,7 @@ is needed (the operation is already safe to stop).
 |---------------|------|---------------|------------------|
 | 5202 / 5203 | Informational (SQL log) | Shrink blocked by a snapshot transaction | Self-wait (§8.2): wait, then clean stop |
 | 49516 | Level 16 error (SQL log) | WALP timeout, Sch-M not acquired | No-progress (§8.3): backoff + retry |
+| 3140, State 5 | Level 16 error | Chunk could not adjust the file's space allocation, measured while a data backup ran, also after reaching its target | Classified by the running backup, not the number (§8.8): wait for the backup, then retry; without a backup, a stall (§8.3) |
 | 9002 | Error | Transaction log full | Pause + reduce the stepsize (§8.4) |
 | No reduction | Normal | No free space, or not at the end of the file | TRUNCATEONLY already tried; no-progress → clean stop |
 | Log not shrinkable | Normal | Active VLFs at the end, or `log_reuse_wait ≠ NOTHING` | Bounded wait for the log to free up (§5.2), never a BACKUP LOG; clean abandon at timeout |
