@@ -1211,7 +1211,41 @@ not ideas. Tracked in Todoist, project SqlGoPace.
   `LCK_M_BU`; neither `ABORT_AFTER_WAIT = SELF` nor `BLOCKERS` acts on it. Worth a line in
   `docs/shrink.md` so a stalled run is not read as a bug.
 
+### Found reading the logs of two stalled shrinks (2026-11-02)
+
+Read from one field run's sidecars (kept outside the repository) while designing
+[2026-11-02-shrink-stall-causes-design.md](superpowers/specs/2026-11-02-shrink-stall-causes-design.md),
+and measured on SQL Server 2022 CU26 in a container.
+
+- [ ] **The queue runs sidecars as manifests.** `isManifest` (`internal/run/queue.go`) accepts
+  any `.yaml`/`.yml`, so a `X.yaml.blocked.yaml` or `X.yaml.contended.yaml` moved back into
+  `01.to_run/` with its manifest is claimed and fails with `unknown field "observed"`, each
+  leaving a `.log` of its own in `04.failed/`. Seen in the field when an operator re-queued a
+  failed manifest together with its sidecars. Fix: skip the sidecar suffixes the engine writes
+  (`blockedCaptureSuffix`, `contendedCaptureSuffix`, the amplifiers and recovery sidecars) and
+  say so in the discovery log.
+- [ ] **A second run of a manifest overwrites the first run's `.log`.** The morning run that
+  stalled on a differential backup was lost when the afternoon run of the same manifest wrote
+  its report under the same name; only the operator's notes kept the timeline. Proposed:
+  rotate an existing `.log` (timestamp suffix) rather than overwrite it.
+- [ ] **`rebuild_heap` never gets `WAIT_AT_LOW_PRIORITY`, and the matrix says it does not
+  exist.** `ddl_compatibility.yaml` states "no RESUMABLE and no WAIT_AT_LOW_PRIORITY for a heap
+  rebuild, on any version". `ALTER TABLE ... REBUILD WITH (ONLINE = ON (WAIT_AT_LOW_PRIORITY
+  (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)))` is accepted on 2022 (RESUMABLE is
+  indeed rejected, Msg 155). Every planner-generated heap rebuild therefore takes its final Sch-M
+  without a low-priority wait. Measure the lowest supporting version (2016, 2017, 2019), fix the
+  row, ship as its own fix. Prerequisite of lot 2 of the design above.
+
 ## Iterations still to design / implement
+
+- [ ] **[Shrink stall causes](superpowers/specs/2026-11-02-shrink-stall-causes-design.md)**,
+  designed 2026-11-02, two lots. Lot 1: a chunk the driver stopped itself halves the step
+  instead of counting as a stall; a chunk that fails during a data backup of the same database
+  (`Msg 3140` State 5 after ~2 s, measured) waits for the backup instead of spending the budget;
+  one 30-minute patience budget by default; a give-up reason naming the cause. Lot 2:
+  `unblock_tail`, the opt-in relocation of the tail object found at give-up, under fixed guard
+  rails. Covers the Todoist p1 "backup-aware stall", whose `TODO.md` entry was never committed,
+  and supersedes the entry below and the two tail-object entries of 2026-09-20 as each lot lands.
 
 - [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested
   after a live campaign spent an evening doing this by hand, three rounds of the same loop. A
