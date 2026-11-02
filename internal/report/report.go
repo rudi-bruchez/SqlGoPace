@@ -341,12 +341,12 @@ func Write(w io.Writer, r RunReport) error {
 	return err
 }
 
-// WriteFile writes the report to path.
 // oneLine keeps an error on its "error:" line. The driver prints each error of a batch
 // on its own line (go-mssqldb 1.11), and errors that do not go through the execution
 // path's withErrorNumber still arrive that way.
 func oneLine(s string) string { return strings.ReplaceAll(s, "\n", "; ") }
 
+// WriteFile writes the report to path.
 func WriteFile(path string, r RunReport) error {
 	var buf bytes.Buffer
 	if err := Write(&buf, r); err != nil {
