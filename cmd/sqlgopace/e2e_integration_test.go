@@ -395,6 +395,11 @@ func TestE2EShrinkWaitsForBackup(t *testing.T) {
 	if !bytes.Contains(logBytes, []byte("BACKUP DATABASE")) {
 		t.Errorf("run log does not name the BACKUP DATABASE the shrink waited for")
 	}
+	// A chunk that ran into the backup must be retried, not counted against the
+	// no-progress budget: without the wait, the same run backs off as a stall.
+	if bytes.Contains(logBytes, []byte("made no progress")) {
+		t.Errorf("run log has a no-progress reaction: the backup was counted as a stall")
+	}
 }
 
 func TestE2ERebuildIndex(t *testing.T) {
