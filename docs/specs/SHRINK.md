@@ -226,7 +226,7 @@ for current > finalTarget {
 
     if newSize >= current {                        // no gain (cf. §8.3)
         switch cause(stopped, backupRunning) {     // §8.3, §8.8
-        case yield:  step = halve(step); if step was above min { continue }
+        case yield:  step = halve(step); if step was above min { wait(backoff); continue }
         case backup: waitForBackup(); continue     // no step change, no budget spent
         }
         noProgress++
@@ -436,7 +436,7 @@ decided by the file size, never by the error number.
 
 A yield is a chunk the supervisor stopped under pressure (it was blocking a writer, say). It
 says nothing about whether pages can move, so above `min_step_mb` the driver halves the step and
-retries after the pressure clears (`awaitRelief`), with no backoff and without spending the budget; the next chunk is smaller and
+retries after the pressure clears (`awaitRelief`) and one `no_progress_backoff_seconds` pause, not doubled and not counted in the budget (`awaitRelief` returns at once, the only blocker being the canceled chunk, so without the pause a smaller chunk would block the same session back to back); the next chunk is smaller and
 may fit between the writer's inserts. At the floor a yield counts as a stall. Each yield is
 tallied (who it blocked, by login) until a chunk gains space, and the tally goes into the
 give-up reason (§8.3.1).

@@ -584,6 +584,19 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				wasAboveFloor := step > r.tuning.MinStepMB
 				step = halveStep(step, r.tuning, maxStep)
 				if wasAboveFloor {
+					// One flat backoff, outside the budget: awaitRelief returned at once (the
+					// only blocker was our canceled chunk), so without it a smaller chunk
+					// would hit the session we just yielded to, back to back.
+					w0 := r.clk.Now()
+					werr := r.wait(ctx, r.tuning.NoProgressBackoff)
+					blocked += r.clk.Since(w0)
+					if werr != nil {
+						if errors.Is(werr, ErrStopped) {
+							result.FinalMB = current
+							result.Reason = "stopped: graceful stop (work preserved)"
+						}
+						return result, werr
+					}
 					continue
 				}
 			case causeBackup:

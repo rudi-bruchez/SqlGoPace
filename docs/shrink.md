@@ -63,8 +63,8 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
   The step climbs back once the pressure clears, so a single bad moment does not shrink the
   chunk for the rest of the run.
 - A chunk the supervisor stopped is not a stall. When a chunk is stopped because it
-  blocked a writer or a reader, the driver halves the step and tries again at once, without
-  spending the no-progress budget, as long as the step is above `min_step_mb`. The next chunk
+  blocked a writer or a reader, the driver halves the step and tries again after one `no_progress_backoff_seconds` pause, which
+  gives the blocked session time to finish and is not counted in the no-progress budget, as long as the step is above `min_step_mb`. The next chunk
   is smaller and may fit between the writer's inserts. At the floor, a stopped chunk counts as
   a stall.
 - A running data backup is waited out. A chunk that gains nothing while a `BACKUP DATABASE`

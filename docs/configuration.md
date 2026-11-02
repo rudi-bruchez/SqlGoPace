@@ -326,8 +326,8 @@ much (WRITELOG or PAGEIOLATCH_EX past their thresholds, or the supervisor stoppi
 because it was blocking others), grown by a quarter after any chunk that was not, held once a
 chunk reaches `max_chunk_seconds`.
 
-A chunk the supervisor stopped (a yield) halves the step and is retried after the pressure clears, with no backoff, without
-spending the no-progress budget, while the step is above `min_step_mb`. At the floor a yield
+A chunk the supervisor stopped (a yield) halves the step and is retried after the pressure clears and one `no_progress_backoff_seconds` pause (not counted in
+the no-progress budget), while the step is above `min_step_mb`. At the floor a yield
 counts as a stall like any other no-gain chunk. A chunk that returned an error but still
 shrank the file counts as progress.
 

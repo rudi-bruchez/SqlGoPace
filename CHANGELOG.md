@@ -28,7 +28,8 @@ revisit both, and a `max_no_progress` of 2 or less now fails to load because
   (was 5). At the default backoff (30 s doubling to 300 s) the time bound trips first, at the
   10th stall after 32 minutes 30 seconds of waiting. Both YAML copies carry the new comment.
 - A shrink chunk the supervisor stopped under pressure halves the step and retries after the pressure
-  clears, with no backoff, without spending the no-progress budget while the step is above
+  clears and one `no_progress_backoff_seconds` pause (not doubled, not counted in the
+  no-progress budget), so the session it yielded to can finish; this is while the step is above
   `min_step_mb`; at the floor it counts as a stall. A chunk that returned an error but still shrank the file counts as
   progress.
 - A no-gain chunk while a `BACKUP DATABASE` runs on the same database waits for the backup to

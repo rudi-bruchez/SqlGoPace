@@ -1528,6 +1528,16 @@ func TestShrinkYieldHalvesWithoutCountingAboveFloor(t *testing.T) {
 	// Steps 400, 200, 100, then 50 = MinStepMB: three yields, all above the floor.
 	s, r := yieldingSetup(3, func(tu *ShrinkTuning) { tu.InitialStepSmallMB = 400 })
 	var ev eventLog
+	// Record each wait with the number of chunks run so far: a pause must sit between
+	// a yielded chunk and the next one.
+	var waits []int
+	inner := r.wait
+	r.wait = func(c context.Context, d time.Duration) error {
+		if d == r.tuning.NoProgressBackoff {
+			waits = append(waits, len(chunkTargets(s.execLog)))
+		}
+		return inner(c, d)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -1543,6 +1553,10 @@ func TestShrinkYieldHalvesWithoutCountingAboveFloor(t *testing.T) {
 	}
 	if n := ev.pausesContaining("made no progress"); n != 0 {
 		t.Errorf("%d 'made no progress' pauses, want 0 (a yield above the floor spends no budget)", n)
+	}
+	// Chunks 1, 2, 3 yielded: one backoff after each, before the next chunk starts.
+	if len(waits) < 3 || waits[0] != 1 || waits[1] != 2 || waits[2] != 3 {
+		t.Errorf("backoff waits after chunk counts %v, want the first three [1 2 3]", waits)
 	}
 	if res[0].FinalMB != 440 || res[0].Reason != "" {
 		t.Errorf("got final=%d reason=%q, want 440 reached with no reason", res[0].FinalMB, res[0].Reason)
