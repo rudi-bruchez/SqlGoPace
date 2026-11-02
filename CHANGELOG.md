@@ -27,11 +27,11 @@ revisit both, and a `max_no_progress` of 2 or less now fails to load because
 - `shrink.max_no_progress` defaults to 15 (was 3) and `shrink.self_wait_timeout_minutes` to 30
   (was 5). At the default backoff (30 s doubling to 300 s) the time bound trips first, at the
   10th stall after 32 minutes 30 seconds of waiting. Both YAML copies carry the new comment.
-- A shrink chunk the supervisor stopped under pressure halves the step and retries after the pressure
-  clears and one `no_progress_backoff_seconds` pause (not doubled, not counted in the
-  no-progress budget), so the session it yielded to can finish; this is while the step is above
-  `min_step_mb`; at the floor it counts as a stall. A chunk that returned an error but still shrank the file counts as
-  progress.
+- While the step is above `min_step_mb`, a shrink chunk the supervisor stopped under pressure
+  halves the step and retries after the pressure clears and one `no_progress_backoff_seconds`
+  pause (not doubled, not counted in the no-progress budget), so the session it yielded to can
+  finish. At the floor it counts as a stall. A chunk that returned an error but still shrank
+  the file counts as progress.
 - A no-gain chunk while a `BACKUP DATABASE` runs on the same database waits for the backup to
   end instead of stalling: no ceiling, polled every `no_progress_backoff_seconds`, stopped by
   a graceful stop with the work preserved, one `pause` and one `resume` reaction. Log backups
