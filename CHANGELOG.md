@@ -14,6 +14,20 @@ The version a run used, and the config file it loaded, are written into its `.lo
 sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
 SQLite history does not record either yet.
 
+## [0.49.1] - 2026-11-02
+
+A dependency update with no change in behavior. `govulncheck -mode binary` on the 0.49.0
+release binary flagged 19 known vulnerabilities in `golang.org/x/crypto` v0.50.0 and
+`golang.org/x/text` v0.36.0, both pulled in by `go-mssqldb`; a source scan found none of them
+reachable from SqlGoPace's code.
+
+### Changed
+
+- `golang.org/x/crypto` moves to v0.58.0, `golang.org/x/text` to v0.43.0, and
+  `golang.org/x/sys` to v0.49.0, which the first requires. The rebuilt binary has no
+  module vulnerability left in `govulncheck`; the one remaining source-mode entry,
+  `x/crypto/openpgp` (GO-2026-5932, no fix), is a package SqlGoPace does not import.
+
 ## [0.49.0] - 2026-11-02
 
 A stalled shrink is more patient and says why it stopped. The give-up defaults move from 3
