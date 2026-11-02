@@ -1234,18 +1234,18 @@ and measured on SQL Server 2022 CU26 in a container.
   (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)))` is accepted on 2022 (RESUMABLE is
   indeed rejected, Msg 155). Every planner-generated heap rebuild therefore takes its final Sch-M
   without a low-priority wait. Measure the lowest supporting version (2016, 2017, 2019), fix the
-  row, ship as its own fix. Prerequisite of lot 2 of the design above.
+  row, ship as its own fix. It was a prerequisite of the withdrawn relocation lot of the design above.
 
 ## Iterations still to design / implement
 
 - [ ] **[Shrink stall causes](superpowers/specs/2026-11-02-shrink-stall-causes-design.md)**,
-  designed 2026-11-02, two lots. Lot 1: a chunk the driver stopped itself halves the step
-  instead of counting as a stall; a chunk that fails during a data backup of the same database
-  (`Msg 3140` State 5 after ~2 s, measured) waits for the backup instead of spending the budget;
-  one 30-minute patience budget by default; a give-up reason naming the cause. Lot 2:
-  `unblock_tail`, the opt-in relocation of the tail object found at give-up, under fixed guard
-  rails. Covers the Todoist p1 "backup-aware stall", whose `TODO.md` entry was never committed,
-  and supersedes the entry below and the two tail-object entries of 2026-09-20 as each lot lands.
+  designed and reviewed 2026-11-02, ready for a plan. A chunk the driver stopped itself halves
+  the step instead of counting as a stall; a chunk that fails or gains nothing during a data
+  backup of the same database (`Msg 3140` State 5, measured) waits for the backup instead of
+  spending the budget; one 30-minute patience budget by default; a give-up reason naming the
+  cause. Covers the Todoist p1 "backup-aware stall", whose `TODO.md` entry was never committed,
+  and supersedes the two tail-object entries of 2026-09-20 when it lands. Its second lot, the
+  relocation, was withdrawn after review: see the next entry.
 
 - [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested
   after a live campaign spent an evening doing this by hand, three rounds of the same loop. A
@@ -1293,6 +1293,38 @@ and measured on SQL Server 2022 CU26 in a container.
   above about the tail object not steering the decision: an automatic unblock acting on a stale
   reading relocates the wrong object. It also wants `intent: relocation`, because a generator
   cannot emit `fragmentation` and mean "move this".
+
+  **Designed as `unblock_tail` on 2026-11-02, then withdrawn; redesign from a different
+  premise.** Lot 2 of the first version of
+  [2026-11-02-shrink-stall-causes-design.md](superpowers/specs/2026-11-02-shrink-stall-causes-design.md)
+  (commit `fff1037`) ran an opt-in online rebuild of the tail object at give-up. A seven-reader
+  panel found it unsound, and the premise failed a measurement: successive online rebuilds of a
+  5 020-page table in a 74 752-page file (2022 CU26) placed it at pages 39 728-45 654, then
+  40 655-70 492, then 330-14 368, then 30 592-45 384. A rebuild does not move an object toward the
+  start of the file; the allocator can put it nearer the end. What the panel found, for whoever
+  picks this up:
+  - LOB pages do not move on any rebuild form (online, resumable, offline, heap), and the tail
+    walk cannot tell a LOB page from an in-row page of the same index (no allocation unit in
+    `TailObject`); `DBCC SHRINKFILE` itself does move them.
+  - The walk can name a system internal table (`sys.plan_persist_plan`, Query Store, on a fresh
+    2022 database), against which `ALTER INDEX` fails with Msg 1088.
+  - `Resolve` treats a hand-built `RebuildIndex` (`Kind` unknown) as rowstore: it would emit
+    `ONLINE`/`RESUMABLE` for a columnstore (Msg 35328), a legacy LOB table (Msg 2725, `text`,
+    `ntext`, `image`, FILESTREAM), a `timestamp` key (Msg 10639) or a computed key column
+    (Msg 10644). `RebuildIndex` also needs the index name, which the walk does not return.
+  - The manifest's `kill_blocking_sessions` rules stay armed for every operation of the
+    manifest, so "never kills a session" needs those killers disabled for the round, not only
+    `ABORT_AFTER_WAIT = SELF`; and a `SELF` timeout ends in Msg 1222, which the engine routes to
+    `04.failed`, not `INCOMPLETE`.
+  - `preflight.require_data_free_space` would refuse the rebuild exactly when the file is full.
+  - `State.Paused` and `ownsPausedResumable` match on the plan index plus the operation's own
+    target, and recovery drops the sidecar at cursor 0, so neither a paused relocation nor a
+    round count survives a crash as designed; a resumable relocation canceled into `INCOMPLETE`
+    is left paused on the server with no owner.
+  - One `DATA_COMPRESSION` value per operation cannot preserve partitions compressed
+    differently, though omitting the option does preserve them (measured).
+  - On Standard, the edition of the field server, an online rebuild does not exist, so the
+    feature can never fire there.
 
 - [ ] **[Remote TUI (server / client)](remote-tui.md)** — follow and act on a run from another
   process. Proposes `--serve :port` (SSE broadcast hub) plus `--connect host:port` (reuses the
