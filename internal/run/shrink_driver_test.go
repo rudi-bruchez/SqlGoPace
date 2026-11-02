@@ -1509,6 +1509,18 @@ func (l *eventLog) pausesContaining(sub string) int {
 	return n
 }
 
+func (l *eventLog) countKind(kind, sub string) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := 0
+	for _, e := range l.events {
+		if e.Kind == kind && strings.Contains(e.Detail, sub) {
+			n++
+		}
+	}
+	return n
+}
+
 // A yield above the step floor halves the step and retries without spending the
 // no-progress budget: the supervisor stopped the chunk for pressure, which says nothing
 // about whether the shrink can move pages.
@@ -1652,5 +1664,96 @@ func TestTempdbNeverReadsBackups(t *testing.T) {
 	}
 	if s.backupCalls != 0 {
 		t.Errorf("backupCalls = %d, want 0 on tempdb", s.backupCalls)
+	}
+}
+
+// A chunk that gains nothing while a data backup runs waits the backup out, then retries
+// the same target: the wait is neither a stall nor a step halving.
+func TestShrinkWaitsForDataBackup(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErrs: []error{mssqldb.Error{Number: 3140, Message: "Could not adjust the space allocation for file 'Data'."}},
+		backups:   []mssql.BackupRequest{{SessionID: 56}, {SessionID: 56}, {SessionID: 56}},
+	}
+	var ev eventLog
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, ev.sink)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason != "" || res[0].FinalMB > res[0].TargetMB {
+		t.Fatalf("result = %+v, want the target reached with no reason", res)
+	}
+	targets := chunkTargets(s.execLog)
+	if len(targets) < 2 || targets[0] != targets[1] {
+		t.Errorf("chunk targets = %v, want the chunk after the wait to repeat the failed target", targets)
+	}
+	if n := ev.pausesContaining("BACKUP DATABASE"); n != 1 {
+		t.Errorf("pause events naming BACKUP DATABASE = %d, want 1", n)
+	}
+	if n := ev.countKind("info", "BACKUP DATABASE"); n != 1 {
+		t.Errorf("info events naming BACKUP DATABASE = %d, want 1", n)
+	}
+	if n := ev.pausesContaining("made no progress"); n != 0 {
+		t.Errorf("made no progress events = %d, want 0", n)
+	}
+}
+
+// Two counted stalls, then a chunk that is a backup wait, then progress: with
+// max_no_progress 3 the wait must not be the third stall.
+func TestShrinkBackupWaitLeavesBudgetAlone(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErrs: []error{errors.New("plain stall"), errors.New("plain stall"), mssqldb.Error{Number: 3140}},
+	}
+	chunks := 0
+	s.onExec = func(sql string) {
+		if isPageMovingChunk(sql) {
+			chunks++
+			if chunks == 3 {
+				s.backups = append(s.backups, mssql.BackupRequest{SessionID: 56}, mssql.BackupRequest{SessionID: 56}, mssql.BackupRequest{SessionID: 56})
+			}
+		}
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.tuning.MaxNoProgress = 3
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(res) != 1 || res[0].Reason != "" || res[0].FinalMB > res[0].TargetMB {
+		t.Fatalf("result = %+v, want the target reached with no reason (the backup wait is not a stall)", res)
+	}
+}
+
+// A graceful stop during a backup wait ends the wait at its next poll.
+func TestShrinkBackupWaitHonorsGracefulStop(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data", sizeMB: 1000, usedMB: 400, floorMB: 400,
+		chunkErrs: []error{mssqldb.Error{Number: 3140}},
+	}
+	for range 1000 {
+		s.backups = append(s.backups, mssql.BackupRequest{SessionID: 56})
+	}
+	clk := NewManualClock(time.Unix(0, 0))
+	r := newTestRunner(s, clk)
+	waits := 0
+	r.wait = func(_ context.Context, d time.Duration) error { waits++; clk.Advance(d); return nil }
+	r.stop = func() bool { return waits >= 1 }
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if !errors.Is(err, ErrStopped) {
+		t.Fatalf("Run() error = %v, want ErrStopped", err)
+	}
+	if len(res) != 1 || !strings.Contains(res[0].Reason, "backup wait") {
+		t.Errorf("result = %+v, want a reason naming the backup wait", res)
+	}
+	if dropped := 1000 - len(s.backups); dropped > 2 {
+		t.Errorf("backup reads = %d, want at most 2 (classification plus one poll)", dropped)
 	}
 }

@@ -567,8 +567,10 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			// file end, a chunk error, our own session blocked, §8.2) is a stall.
 			blocked += elapsed // the chunk ran but moved nothing
 			running := false
+			var backup mssql.BackupRequest
 			if prof == nil && !out.stopped { // tempdb is never backed up; a yield wins anyway
-				_, found, berr := r.reader.RunningDataBackup(ctx)
+				b, found, berr := r.reader.RunningDataBackup(ctx)
+				backup = b
 				if berr != nil {
 					sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("shrink %q: could not read running backups: %v", f.Name, berr)})
 				}
@@ -584,7 +586,21 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				if wasAboveFloor {
 					continue
 				}
-			default: // causeStall, and causeBackup until the backup wait lands
+			case causeBackup:
+				// A data backup holds the file: this chunk says nothing about whether pages
+				// can move, so wait the backup out without touching the step or the budget.
+				b0 := r.clk.Now()
+				err := r.awaitBackup(ctx, f.Name, backup, sink, prog)
+				blocked += r.clk.Since(b0)
+				if err != nil {
+					if errors.Is(err, ErrStopped) {
+						result.FinalMB = current
+						result.Reason = "stopped: graceful stop during a backup wait (work preserved)"
+					}
+					return result, err
+				}
+				continue
+			default: // causeStall
 				if out.err != nil {
 					step = halveStep(step, r.tuning, maxStep) // a failed chunk retries smaller
 				}
@@ -630,6 +646,40 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		})
 	}
 	return result, nil
+}
+
+// awaitBackup waits until no data backup runs on the database any more. A shrink cannot
+// move pages while BACKUP DATABASE holds the file (Msg 3140, or a silent no-gain), so the
+// chunk is retried afterwards, not counted against the no-progress budget. It returns nil
+// once the backup is gone (or cannot be read), ErrStopped on a graceful stop, and the
+// context error on cancellation.
+func (r *ShrinkRunner) awaitBackup(ctx context.Context, file string, first mssql.BackupRequest, sink ReactionSink, prog ShrinkProgress) error {
+	start := r.clk.Now()
+	sink(ReactionEvent{Kind: "pause", Detail: fmt.Sprintf(
+		"shrink %q waiting for BACKUP DATABASE (session %d, started %s) to finish",
+		file, first.SessionID, first.StartTime.Format(time.RFC3339))})
+	b := first
+	for {
+		prog.Statement = fmt.Sprintf("-- waiting for BACKUP DATABASE (session %d, %.0f%% done)", b.SessionID, b.PercentComplete)
+		r.emitProgress(prog)
+		if stopRequested(r.stop) {
+			return ErrStopped
+		}
+		if err := r.wait(ctx, r.tuning.NoProgressBackoff); err != nil {
+			return err
+		}
+		next, found, err := r.reader.RunningDataBackup(ctx)
+		if err != nil {
+			sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("shrink %q: could not read running backups: %v", file, err)})
+			break
+		}
+		if !found {
+			break
+		}
+		b = next
+	}
+	sink(ReactionEvent{Kind: "info", Detail: fmt.Sprintf("shrink %q: BACKUP DATABASE finished after %s; retrying the chunk", file, r.clk.Since(start))})
+	return nil
 }
 
 // shrinkLog runs the log-file algorithm (design §5.2): gate on the recovery model,
