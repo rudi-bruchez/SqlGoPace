@@ -1183,6 +1183,37 @@ and measured on SQL Server 2022 CU26 in a container.
   without a low-priority wait. Measure the lowest supporting version (2016, 2017, 2019), fix the
   row, ship as its own fix. It was a prerequisite of the withdrawn relocation lot of the design above.
 
+### Found by the final review of the stall-cause branch (2026-11-02)
+
+Deferred from `feat/shrink-stall-causes`, each with the reason it was not fixed there.
+
+- [ ] **A deterministic chunk error is treated as a stall.** A database that is read-only, or
+  now an AG secondary, fails every chunk the same way, and the error now costs about 32 minutes
+  of backoff before give-up instead of 90 s at the old defaults. Errors that cannot clear by
+  waiting should be classified fatal. Deferred: the list of such errors needs measuring, and it
+  changes the error taxonomy, not the stall causes.
+- [ ] **The backup e2e does not assert the shrink reached its target.** It checks that the
+  manifest is in `03.done` and that no stall was logged. Deferred: the target depends on how
+  many chunks race the backup loop, so a stable assertion needs a deterministic backup stub.
+- [ ] **A chunk that errored but still shrank leaves no trace in the `.log`.** It counts as
+  progress silently; a `warn` would keep field logs honest. Deferred: small, but it touches
+  the report format.
+- [ ] **The backup-read `warn` is not throttled.** If the DMV read keeps failing, every no-gain
+  chunk emits one. Deferred: a failing DMV read means the monitor is already degraded.
+- [ ] **`lastMaint` is never cleared on progress, and an above-floor yield skips
+  `applyMaintBlock`.** A maintenance block seen hours earlier can still replace a later
+  give-up reason wholesale. Deferred: needs a decision on how long a maintenance observation
+  stays relevant.
+- [ ] **The unchunked `TRUNCATEONLY` pass meets a running backup and does not wait for it.** It
+  logs a Msg 3140 `warn` and moves on; a backup already running at start costs one chunk.
+  Deferred: the pass is a single statement outside the chunk loop, and the loss is bounded.
+- [ ] **The stall backoff `pause` reaction never gets a `resume`.** The console stays PAUSED
+  after a stall that later progresses. Predates this branch; the backup wait now closes its
+  own pause, the stall path does not.
+- [ ] **Preflight does not check `VIEW SERVER STATE`.** Without it the monitor goes blind, and
+  `RunningDataBackup` cannot see another session's backup either, so the wait never starts.
+  Deferred: the permission check belongs to the whole preflight, not to the shrink.
+
 ## Iterations still to design / implement
 
 - [ ] **Autonomous tail unblocking: let a stalled shrink relocate its own blocker.** Requested

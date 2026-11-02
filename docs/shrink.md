@@ -76,6 +76,9 @@ blocking queries. It does not apply to log files, and `DBCC SHRINKFILE` takes no
   Msg 3140 State 5 even after reaching its target, so the driver identifies the backup in
   `sys.dm_exec_requests` instead of reading the error number. Log backups do not stop a chunk
   and are ignored. SqlGoPace never starts, delays or kills a backup.
+  A backup that never ends (a stuck target) holds the shrink, and the rest of the queue, for as
+  long as it runs. The way out is a graceful stop or ending the named backup session; a rerun
+  meets the same backup again.
 - Patience by default. Any other stall waits with a backoff of 30 s doubling to 300 s, and
   gives up after 15 attempts or 30 minutes of cumulative waiting, whichever comes first. At
   the defaults the time bound trips first, after about 32 minutes. Before 0.49.0 the defaults

@@ -436,7 +436,7 @@ decided by the file size, never by the error number.
 
 A yield is a chunk the supervisor stopped under pressure (it was blocking a writer, say). It
 says nothing about whether pages can move, so above `min_step_mb` the driver halves the step and
-retries at once, without backoff and without spending the budget; the next chunk is smaller and
+retries after the pressure clears (`awaitRelief`), with no backoff and without spending the budget; the next chunk is smaller and
 may fit between the writer's inserts. At the floor a yield counts as a stall. Each yield is
 tallied (who it blocked, by login) until a chunk gains space, and the tally goes into the
 give-up reason (§8.3.1).
@@ -565,7 +565,7 @@ If one is running, `awaitBackup` waits for it to end:
 - stop-aware: a graceful stop returns with the work preserved
   (`stopped: graceful stop during a backup wait (work preserved)`);
 - two reactions: one `pause` naming `BACKUP DATABASE` with the session id and start time, and one
-  `info` with the time waited;
+  `resume` with the time waited, which closes the console's paused state;
 - no side effect on the loop: the step is unchanged and the no-progress budget and the stall
   wait are untouched, so the chunk is retried as it was.
 

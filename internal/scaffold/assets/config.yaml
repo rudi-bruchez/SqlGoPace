@@ -87,8 +87,9 @@ shrink:
   # second one caps the CUMULATIVE wait. At these defaults the time bound trips first, at
   # the 10th stall after about 32 minutes of backoff (30 s doubling to the 300 s cap); the
   # 15 tries of max_no_progress matter once the backoff cap or the timeout is raised. A
-  # chunk the supervisor stops, or one that meets a running data backup, does not count here
-  # while the step is above min_step_mb. The give-up reason names the bound that tripped.
+  # chunk the supervisor stops does not count here while the step is above min_step_mb; a
+  # chunk that meets a running data backup never counts, at any step. The give-up reason
+  # names the bound that tripped.
   max_no_progress:         15    # consecutive no-gain chunks before a clean stop
   no_progress_backoff_seconds:      30   # wait before retrying a stalled chunk (doubles each time)
   no_progress_backoff_max_seconds: 300   # backoff ceiling
