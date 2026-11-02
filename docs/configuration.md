@@ -356,8 +356,9 @@ The give-up reason names the bound that tripped, with its key, and the cause it 
 in order, are separated by semicolons: the yield tally (`yielded 3 times (blocking
 login=svc_loader)`), `no further progress after <bound>`, `step at min_step_mb (N MB)` when
 yields reached the floor, `tail object at give-up: <schema>.<table> index_id=<id>, <n> pages
-from end` when the walk found one (SQL Server 2019 and later), and `work preserved`. For
-example: `yielded 3 times (blocking login=svc_loader); no further progress after 3 attempts
+from end` when the walk found one (SQL Server 2019 and later), and `work preserved`. The yield
+tally can end with `; chunk itself blocked by session N, login=X` when the chunk's own session
+was blocked. For example: `yielded 3 times (blocking login=svc_loader); no further progress after 3 attempts
 without a gain (shrink.max_no_progress); step at min_step_mb (100 MB); work preserved`.
 
 `max_chunk_seconds` is a **ceiling, not a target**. It stops the step growing; it never shrinks

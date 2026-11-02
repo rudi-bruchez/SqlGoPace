@@ -98,7 +98,8 @@ bound that tripped (`no further progress after 3 attempts without a gain
 (shrink.max_no_progress)` or the time bound `shrink.self_wait_timeout_minutes`), `step at
 min_step_mb (100 MB)` when yields brought the step to the floor, the tail object read at that
 moment (`tail object at give-up: dbo.MEASUREMENT index_id=5, 12 pages from end`, SQL Server
-2019 and later), and `work preserved`. A concurrent index rebuild or `DBCC` replaces the whole
+2019 and later), and `work preserved`. The yield part can end with `; chunk itself blocked by
+session 60, login=svc_loader` when the chunk's own session was blocked. A concurrent index rebuild or `DBCC` replaces the whole
 reason with its own wording. Raise `max_no_progress` and `self_wait_timeout_minutes` together
 when a long shrink should wait longer; see [`configuration.md`](configuration.md).
 

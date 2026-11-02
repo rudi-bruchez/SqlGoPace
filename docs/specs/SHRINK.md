@@ -448,7 +448,8 @@ The reason is assembled from parts separated by semicolons, in this order: the y
 names its key, `shrink.max_no_progress` or `shrink.self_wait_timeout_minutes`, and the last chunk
 error when there was one), `step at min_step_mb (N MB)` when yields reached the floor, `tail
 object at give-up: <schema>.<table> index_id=<id>, <n> pages from end` when the walk of §8.6
-found one, and `work preserved`. A maintenance block (§8.7) replaces the whole reason. Example
+found one, and `work preserved`. The yield tally can end with `; chunk itself blocked by
+session N, login=X` when the chunk's own session was blocked (`yieldTally.describe`). A maintenance block (§8.7) replaces the whole reason. Example
 from a test: `yielded 3 times (blocking login=svc_loader); no further progress after 3 attempts
 without a gain (shrink.max_no_progress); step at min_step_mb (100 MB); work preserved`.
 

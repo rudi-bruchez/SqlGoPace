@@ -225,7 +225,7 @@ Unit tests with the existing fakes (`ShrinkReader` fakes, fake clock), no databa
 - the backup wait emits exactly two reactions;
 - the tempdb path never calls the backup read;
 - the give-up reason carries the yielded-to sessions of the current stall only, and the fresh
-  tail finding, which is also on `ShrinkResult`;
+  tail finding, which is in the reason only;
 - default config: a stall gives up on the time bound, at the tenth stall, not on the count.
 
 One e2e test under the `integration` tag, on its own throwaway database: a loop of `BACKUP

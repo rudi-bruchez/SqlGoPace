@@ -45,10 +45,6 @@ revisit both, and a `max_no_progress` of 2 or less now fails to load because
   verify a download against the checksums file, instead of a generated list of commits. A
   tag whose section is missing or empty fails before anything is built.
 
-- The GitHub release page carries this file's section for the version, followed by how to
-  verify a download against the checksums file, instead of a generated list of commits. A
-  tag whose section is missing or empty fails before anything is built.
-
 ## [0.48.0] - 2026-10-05
 
 A `key_range` batch resumed after a crash changes no row twice, and a resume state that cannot
