@@ -2,6 +2,7 @@ package run
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -298,5 +299,28 @@ func TestProactiveTailRecordedOnGiveUp(t *testing.T) {
 				t.Errorf("events = %+v, want the two readings compared: %q", events, tt.narration)
 			}
 		})
+	}
+}
+
+// The give-up reason names the object found at the file's tail at give-up, read fresh.
+func TestGiveUpReasonNamesFreshTail(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true,
+		tailSeq: []mssql.TailObject{
+			{ObjectID: 13, Schema: "dbo", Table: "Early", IndexID: 1, PageFromEnd: 4},
+			{ObjectID: 21, Schema: "dbo", Table: "MEASUREMENT", IndexID: 5, PageFromEnd: 2},
+		},
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.major = 15
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%", IdentifyTailObject: true}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, func(ReactionEvent) {})
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if want := "tail object at give-up: dbo.MEASUREMENT index_id=5, 2 pages from end"; !strings.Contains(res[0].Reason, want) {
+		t.Errorf("Reason = %q, want it to contain %q", res[0].Reason, want)
 	}
 }

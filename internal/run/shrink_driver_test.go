@@ -1757,3 +1757,48 @@ func TestShrinkBackupWaitHonorsGracefulStop(t *testing.T) {
 		t.Errorf("backup reads = %d, want at most 2 (classification plus one poll)", dropped)
 	}
 }
+
+// A give-up after yields names who the run yielded to and that the step sat at its floor.
+func TestGiveUpReasonNamesYieldedLogin(t *testing.T) {
+	s, r := yieldingSetup(1000, func(tu *ShrinkTuning) { tu.MinStepMB = 100 })
+	s.sessions = []mssql.Session{{SPID: 61, BlockingSPID: 99, Login: "svc_loader"}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(ctx, op, ddl.ResolvedOptions{MaxBlockMinutes: 1}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, want := range []string{"yielded", "login=svc_loader", "min_step_mb"} {
+		if !strings.Contains(res[0].Reason, want) {
+			t.Errorf("Reason = %q, want it to contain %q", res[0].Reason, want)
+		}
+	}
+	t.Logf("Reason = %s", res[0].Reason)
+}
+
+// The bound that tripped is named with the time actually waited, not the attempt count.
+func TestGiveUpReasonPrintsTimeWaited(t *testing.T) {
+	s := &fakeServer{
+		fileType: mssql.FileTypeRows, name: "Data",
+		sizeMB: 1000, usedMB: 400, floorMB: 400, noProgress: true,
+	}
+	r := newTestRunner(s, NewManualClock(time.Unix(0, 0)))
+	r.tuning.MaxNoProgress = 15
+	r.tuning.SelfWaitTimeout = 30 * time.Minute
+	r.tuning.NoProgressBackoff = 30 * time.Second
+	r.tuning.NoProgressBackoffMax = 300 * time.Second
+
+	op := ddl.Shrink{Type: "data", Files: "Data", TargetFreeSpace: "10%"}
+	res, err := r.Run(context.Background(), op, ddl.ResolvedOptions{}, nil, discard)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if !strings.Contains(res[0].Reason, "32m30s of waiting (shrink.self_wait_timeout_minutes)") {
+		t.Errorf("Reason = %q, want the time waited and its setting", res[0].Reason)
+	}
+	if strings.Contains(res[0].Reason, "max_no_progress") {
+		t.Errorf("Reason = %q, must not name max_no_progress", res[0].Reason)
+	}
+}

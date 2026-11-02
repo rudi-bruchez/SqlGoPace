@@ -614,13 +614,28 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			if werr != nil {
 				return result, werr
 			} else if bound != "" {
-				detail := fmt.Sprintf("no further progress after %s; work preserved", bound)
-				if out.err != nil {
-					detail = fmt.Sprintf("no further progress after %s: %v; work preserved", bound, out.err)
+				// Capture the tail first: its finding goes in the reason. Order: who the run
+				// yielded to, the bound, the step floor, the tail object, then the promise.
+				tail := r.captureGiveUpTail(ctx, f, sink, tp)
+				var parts []string
+				if d := tally.describe(); d != "" {
+					parts = append(parts, d)
 				}
+				stalled := "no further progress after " + bound
+				if out.err != nil {
+					stalled = fmt.Sprintf("%s: %v", stalled, out.err)
+				}
+				parts = append(parts, stalled)
+				if tally.count() > 0 && step == r.tuning.MinStepMB {
+					parts = append(parts, fmt.Sprintf("step at min_step_mb (%d MB)", step))
+				}
+				if tail != nil {
+					parts = append(parts, fmt.Sprintf("tail object at give-up: %s.%s index_id=%d, %d pages from end",
+						tail.Schema, tail.Table, tail.IndexID, tail.PageFromEnd))
+				}
+				parts = append(parts, "work preserved")
 				result.FinalMB = current
-				result.Reason = giveUpReason(tp, detail)
-				r.captureGiveUpTail(ctx, f, sink, tp)
+				result.Reason = giveUpReason(tp, strings.Join(parts, "; "))
 				return result, nil
 			}
 			continue
@@ -1248,15 +1263,15 @@ func (r *ShrinkRunner) emitTail(sink ReactionSink, f *TailFinding, fileName stri
 // feeds `plan --confirmed`, so it must be current. When both exist the two are compared in
 // the narration, and the stash is cleared so shrinkData does not record the stale one too. warn=false: a run that never opted in must not be nagged about a
 // pre-2019 server just for stalling.
-func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) {
+func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace, sink ReactionSink, tp *tailProbe) *TailFinding {
 	if tp == nil {
-		return
+		return nil
 	}
 	entry := tp.finding
 	tp.finding = nil
 	tf := r.walkTail(ctx, f, sink, tp.warned, false)
 	if tf == nil {
-		return
+		return nil
 	}
 	if entry != nil {
 		if entry.ObjectID == tf.ObjectID && entry.IndexID == tf.IndexID {
@@ -1268,6 +1283,7 @@ func (r *ShrinkRunner) captureGiveUpTail(ctx context.Context, f mssql.FileSpace,
 	}
 	r.markTransient(tf, tp)
 	r.emitTail(sink, tf, f.Name, true)
+	return tf
 }
 
 // markTransient tags a give-up tail finding as transient-maintenance when a concurrent
@@ -1288,6 +1304,9 @@ func (r *ShrinkRunner) markTransient(tf *TailFinding, tp *tailProbe) {
 
 // giveUpReason builds the give-up reason, naming a concurrent maintenance op when one was
 // found blocking the shrink; base is the default reason for a non-maintenance give-up.
+// The maintenance wording replaces the whole assembled base, yield tally and tail object
+// included, on purpose: a tail pinned by concurrent maintenance is the cause, and the
+// operator's action (re-run after maintenance) does not depend on the rest.
 func giveUpReason(tp *tailProbe, base string) string {
 	if tp != nil && tp.maintBlock != nil {
 		return fmt.Sprintf("stopped: file tail pinned by concurrent maintenance (%s, session %d) — "+
