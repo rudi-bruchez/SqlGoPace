@@ -1693,8 +1693,8 @@ func TestShrinkWaitsForDataBackup(t *testing.T) {
 	if n := ev.pausesContaining("BACKUP DATABASE"); n != 1 {
 		t.Errorf("pause events naming BACKUP DATABASE = %d, want 1", n)
 	}
-	if n := ev.countKind("info", "BACKUP DATABASE"); n != 1 {
-		t.Errorf("info events naming BACKUP DATABASE = %d, want 1", n)
+	if n := ev.countKind("resume", "BACKUP DATABASE"); n != 1 {
+		t.Errorf("resume events naming BACKUP DATABASE = %d, want 1", n)
 	}
 	if n := ev.pausesContaining("made no progress"); n != 0 {
 		t.Errorf("made no progress events = %d, want 0", n)

@@ -674,8 +674,10 @@ func (r *ShrinkRunner) awaitBackup(ctx context.Context, file string, first mssql
 		"shrink %q waiting for BACKUP DATABASE (session %d, started %s) to finish",
 		file, first.SessionID, first.StartTime.Format(time.RFC3339))})
 	b := first
+	confirmed := true
 	for {
-		prog.Statement = fmt.Sprintf("-- waiting for BACKUP DATABASE (session %d, %.0f%% done)", b.SessionID, b.PercentComplete)
+		prog.Statement = fmt.Sprintf("-- waiting for BACKUP DATABASE (session %d, %.0f%% done, waited %s)",
+			b.SessionID, b.PercentComplete, r.clk.Since(start).Round(time.Second))
 		r.emitProgress(prog)
 		if stopRequested(r.stop) {
 			return ErrStopped
@@ -686,6 +688,7 @@ func (r *ShrinkRunner) awaitBackup(ctx context.Context, file string, first mssql
 		next, found, err := r.reader.RunningDataBackup(ctx)
 		if err != nil {
 			sink(ReactionEvent{Kind: "warn", Detail: fmt.Sprintf("shrink %q: could not read running backups: %v", file, err)})
+			confirmed = false
 			break
 		}
 		if !found {
@@ -693,7 +696,12 @@ func (r *ShrinkRunner) awaitBackup(ctx context.Context, file string, first mssql
 		}
 		b = next
 	}
-	sink(ReactionEvent{Kind: "info", Detail: fmt.Sprintf("shrink %q: BACKUP DATABASE finished after %s; retrying the chunk", file, r.clk.Since(start))})
+	// "resume" closes the console's PAUSED state, as awaitLogReuse does.
+	end := "BACKUP DATABASE finished"
+	if !confirmed {
+		end = "BACKUP DATABASE could not be confirmed finished"
+	}
+	sink(ReactionEvent{Kind: "resume", Detail: fmt.Sprintf("shrink %q: %s after %s; retrying the chunk", file, end, r.clk.Since(start))})
 	return nil
 }
 
