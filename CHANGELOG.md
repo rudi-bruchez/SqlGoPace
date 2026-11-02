@@ -14,6 +14,23 @@ The version a run used, and the config file it loaded, are written into its `.lo
 sidecar since 0.47.0; earlier versions of this paragraph said so before it was true. The
 SQLite history does not record either yet.
 
+## [0.50.0] - 2026-11-02
+
+The SQL Server driver moves to go-mssqldb 1.11.2, which renders server errors differently.
+SqlGoPace now writes them in one fixed form, so a failed statement reads the same in the
+console, the `.log` and the webhook whatever the driver prints.
+
+### Changed
+
+- `github.com/microsoft/go-mssqldb` moves from v1.10.0 to v1.11.2. Its error text now lists
+  every error of the batch, one per line, where 1.10 printed only the last message.
+- A failed statement's error reads `mssql: Msg 1505, Level 16, State 1: <text>`, one entry
+  per server error of the batch, joined by `; `. It used to read
+  `mssql: <text> (Msg 1505, Level 16, State 1)` with only the last error. A script or alert
+  that matches on the old wording needs updating; the numbers themselves are unchanged.
+- The `error:` lines of the `.log` stay on one line: a multi-line error from any other path
+  has its line breaks replaced by `; `.
+
 ## [0.49.1] - 2026-11-02
 
 A dependency update with no change in behavior. `govulncheck -mode binary` on the 0.49.0

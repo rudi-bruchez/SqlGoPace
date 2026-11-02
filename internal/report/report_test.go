@@ -252,3 +252,26 @@ func TestWriteSizesUnread(t *testing.T) {
 		t.Errorf("report missing the manifest-level unread line:\n%s", b.String())
 	}
 }
+
+// A driver error that spans several lines stays on its "error:" line, so the .log keeps
+// one line per field.
+func TestWriteKeepsErrorsOnOneLine(t *testing.T) {
+	r := report.RunReport{
+		Manifest:   "010_a.yaml",
+		Error:      "mssql: first (1505)\nmssql: second (3621)",
+		Operations: []report.OperationReport{{Index: 1, CommandType: "create_index", Outcome: "failed", Error: "mssql: a (1505)\nmssql: b (3621)"}},
+	}
+	var buf bytes.Buffer
+	if err := report.Write(&buf, r); err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	human, _, _ := strings.Cut(buf.String(), report.JSONDelimiter)
+	for _, want := range []string{
+		"      error: mssql: a (1505); mssql: b (3621)\n",
+		"\nerror: mssql: first (1505); mssql: second (3621)\n",
+	} {
+		if !strings.Contains(human, want) {
+			t.Errorf("report missing %q\n%s", want, human)
+		}
+	}
+}

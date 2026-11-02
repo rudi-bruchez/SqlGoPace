@@ -28,9 +28,17 @@ func TestWithErrorNumber(t *testing.T) {
 			"SQL Server had internal error: Msg 1105, Level 17, State 2: Could not allocate space for object 'dbo.T'.",
 		},
 		{
-			"an ordinary error gains its number, not a second copy of its text",
+			"an ordinary error gains its level and state",
 			full,
-			"mssql: Could not allocate space for object 'dbo.T'. (Msg 1105, Level 17, State 2)",
+			"mssql: Msg 1105, Level 17, State 2: Could not allocate space for object 'dbo.T'.",
+		},
+		{
+			"every error of the batch is kept, on one line, cause first",
+			mssqldb.Error{Number: 3621, Message: "The statement has been terminated.", All: []mssqldb.Error{
+				{Number: 1505, Class: 16, State: 1, Message: "The CREATE UNIQUE INDEX statement terminated because a duplicate key was found."},
+				{Number: 3621, Message: "The statement has been terminated."},
+			}},
+			"mssql: Msg 1505, Level 16, State 1: The CREATE UNIQUE INDEX statement terminated because a duplicate key was found.; Msg 3621, Level 0, State 0: The statement has been terminated.",
 		},
 		{
 			"a non-server error is untouched",

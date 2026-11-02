@@ -280,22 +280,42 @@ func (c *Conn) execStatement(ctx context.Context, statement string) (sql.Result,
 	return res, err
 }
 
-// withErrorNumber puts the server's error number in the message. The driver's
-// mssql.Error renders as "mssql: <text>" with no number, and a fatal error that aborts
-// the batch arrives as ServerError, whose message is the fixed "SQL Server had internal
-// error" with the real number and text reachable only through Unwrap. A report then
-// cannot tell 1105 (no space) from 1205 (deadlock) from 9002 (log full), which call for
-// three different reactions. The original error stays in the chain.
+// withErrorNumber renders the server's errors on one line, each with its number. The
+// driver's mssql.Error prints every error of the batch, one per line, with the number
+// but not the level or state (since go-mssqldb 1.11; 1.10 printed only the last text),
+// and a fatal error that aborts the batch arrives as ServerError, whose message is the
+// fixed "SQL Server had internal error" with the real number and text reachable only
+// through Unwrap. A report then cannot tell 1105 (no space) from 1205 (deadlock) from
+// 9002 (log full), which call for three different reactions, and a multi-line message
+// breaks the one-line error field of the .log. The original error stays in the chain.
 func withErrorNumber(err error) error {
 	var me mssqldb.Error
 	if !errors.As(err, &me) || me.Number == 0 {
 		return err
 	}
-	if !strings.Contains(err.Error(), me.Message) {
-		return fmt.Errorf("%w: Msg %d, Level %d, State %d: %s", err, me.Number, me.Class, me.State, me.Message)
+	chain := me.All
+	if len(chain) == 0 {
+		chain = []mssqldb.Error{me}
 	}
-	return fmt.Errorf("%w (Msg %d, Level %d, State %d)", err, me.Number, me.Class, me.State)
+	parts := make([]string, len(chain))
+	for i, e := range chain {
+		parts[i] = fmt.Sprintf("Msg %d, Level %d, State %d: %s", e.Number, e.Class, e.State, e.Message)
+	}
+	prefix, _, _ := strings.Cut(err.Error(), "\n")
+	if strings.HasPrefix(prefix, "mssql: ") { // the driver's own text, which parts restate
+		prefix = "mssql"
+	}
+	return numberedError{err: err, msg: prefix + ": " + strings.Join(parts, "; ")}
 }
+
+// numberedError is withErrorNumber's result: its own text, the driver error behind it.
+type numberedError struct {
+	err error
+	msg string
+}
+
+func (e numberedError) Error() string { return e.msg }
+func (e numberedError) Unwrap() error { return e.err }
 
 // repairIfBroken re-pins the execution connection when the statement before it left
 // it unusable. Aborting a statement — which is how the cancel reaction and a resumable

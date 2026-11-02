@@ -72,13 +72,15 @@ func TestIntegrationLogSpaceAndSPID(t *testing.T) {
 	}
 }
 
-// The driver renders a server error as "mssql: <text>" with no number. Against a real
-// server, a failed statement's message must carry it, so a report can tell 1105 from 1205.
+// The driver renders a server error as "mssql: <text> (<number>)", one line per error of
+// the batch since go-mssqldb 1.11, with no level or state. Against a real server, a
+// failed statement's message must carry them on one line, so a report can tell 1105 from
+// 1205 and the .log keeps one line per field.
 func TestIntegrationExecDDLErrorCarriesTheNumber(t *testing.T) {
 	conn, ctx := openTestConn(t)
 	err := conn.ExecDDL(ctx, "SELECT 1/0;")
-	if err == nil || !strings.Contains(err.Error(), "Msg 8134") {
-		t.Fatalf("ExecDDL() error = %v, want it to name Msg 8134", err)
+	if err == nil || !strings.Contains(err.Error(), "Msg 8134, Level 16") || strings.Contains(err.Error(), "\n") {
+		t.Fatalf("ExecDDL() error = %q, want one line naming Msg 8134, Level 16", err)
 	}
 }
 

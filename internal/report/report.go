@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 )
 
 // JSONDelimiter separates the human summary from the JSON block in a run log.
@@ -311,7 +312,7 @@ func Write(w io.Writer, r RunReport) error {
 			}
 			renderSizes(w, op)
 			if op.Error != "" {
-				fmt.Fprintf(w, "      error: %s\n", op.Error)
+				fmt.Fprintf(w, "      error: %s\n", oneLine(op.Error))
 			}
 			fmt.Fprintf(w, "      %s\n", op.SQL)
 		}
@@ -326,7 +327,7 @@ func Write(w io.Writer, r RunReport) error {
 		fmt.Fprintf(w, "\n%s\n", r.CancelOnlySummary)
 	}
 	if r.Error != "" {
-		fmt.Fprintf(w, "\nerror: %s\n", r.Error)
+		fmt.Fprintf(w, "\nerror: %s\n", oneLine(r.Error))
 	}
 
 	data, err := json.MarshalIndent(r, "", "  ")
@@ -341,6 +342,11 @@ func Write(w io.Writer, r RunReport) error {
 }
 
 // WriteFile writes the report to path.
+// oneLine keeps an error on its "error:" line. The driver prints each error of a batch
+// on its own line (go-mssqldb 1.11), and errors that do not go through the execution
+// path's withErrorNumber still arrive that way.
+func oneLine(s string) string { return strings.ReplaceAll(s, "\n", "; ") }
+
 func WriteFile(path string, r RunReport) error {
 	var buf bytes.Buffer
 	if err := Write(&buf, r); err != nil {
