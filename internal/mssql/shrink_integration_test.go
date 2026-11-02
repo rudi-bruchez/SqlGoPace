@@ -111,3 +111,15 @@ func TestFileGrowthsIntegration(t *testing.T) {
 			f.Name, f.SizeMB, f.IsPercent, f.Growth, f.NextGrowthMB(), f.MaxSizeMB)
 	}
 }
+
+func TestIntegrationRunningDataBackupNone(t *testing.T) {
+	conn, ctx := openTestConn(t)
+
+	b, found, err := conn.RunningDataBackup(ctx)
+	if err != nil {
+		t.Fatalf("RunningDataBackup() error = %v", err)
+	}
+	if found {
+		t.Fatalf("RunningDataBackup() found = true (%+v), want false with no backup running", b)
+	}
+}

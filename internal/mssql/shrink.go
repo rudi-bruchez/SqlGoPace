@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"time"
 )
 
 // File type filters for FileSpace. They match sys.database_files.type_desc.
@@ -256,5 +257,29 @@ func (c *Conn) FindTailObject(ctx context.Context, fileID, maxPagesBack int) (Ta
 	default:
 		t.Schema, t.Table = schema.String, name.String
 		return t, true, nil
+	}
+}
+
+// BackupRequest is a data backup running on the current database.
+type BackupRequest struct {
+	SessionID       int
+	PercentComplete float64
+	StartTime       time.Time
+}
+
+const runningDataBackupSQL = `SELECT TOP (1) session_id, percent_complete, start_time FROM sys.dm_exec_requests WHERE command = 'BACKUP DATABASE' AND database_id = DB_ID() ORDER BY start_time;`
+
+// RunningDataBackup reports the oldest data backup running on the current database.
+// found=false means none is running.
+func (c *Conn) RunningDataBackup(ctx context.Context) (BackupRequest, bool, error) {
+	var b BackupRequest
+	err := c.pool.QueryRowContext(ctx, runningDataBackupSQL).Scan(&b.SessionID, &b.PercentComplete, &b.StartTime)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return BackupRequest{}, false, nil
+	case err != nil:
+		return BackupRequest{}, false, fmt.Errorf("read running backup: %w", err)
+	default:
+		return b, true, nil
 	}
 }

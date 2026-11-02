@@ -62,6 +62,11 @@ type fakeServer struct {
 	tailCalls int
 	tailSeq   []mssql.TailObject // if set, successive FindTailObject results (the last repeats); overrides tail
 
+	// backups scripts RunningDataBackup: each call pops the front element (found) until the
+	// slice is empty, then reports none.
+	backups     []mssql.BackupRequest
+	backupCalls int
+
 	execLog  []string
 	killed   bool
 	reuseIdx int
@@ -173,6 +178,16 @@ func (s *fakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, e
 		return mssql.Progress{}, false, nil
 	}
 	return mssql.Progress{PercentComplete: s.percentComplete, Command: "DbccFilesCompact"}, true, nil
+}
+
+func (s *fakeServer) RunningDataBackup(context.Context) (mssql.BackupRequest, bool, error) {
+	s.backupCalls++
+	if len(s.backups) == 0 {
+		return mssql.BackupRequest{}, false, nil
+	}
+	b := s.backups[0]
+	s.backups = s.backups[1:]
+	return b, true, nil
 }
 
 func (s *fakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObject, bool, error) {
@@ -879,8 +894,9 @@ type tempdbFakeServer struct {
 
 	floorMB map[string]int // per-file chunk floor (defaults to 0 if absent)
 
-	execLog []string
-	onExec  func(sql string)
+	execLog     []string
+	onExec      func(sql string)
+	backupCalls int
 }
 
 func newTempdbFakeServer(files ...mssql.FileSpace) *tempdbFakeServer {
@@ -956,6 +972,11 @@ func (s *tempdbFakeServer) ActiveSessions(context.Context) ([]mssql.Session, err
 }
 func (s *tempdbFakeServer) Progress(_ context.Context, _ int) (mssql.Progress, bool, error) {
 	return mssql.Progress{}, false, nil
+}
+
+func (s *tempdbFakeServer) RunningDataBackup(context.Context) (mssql.BackupRequest, bool, error) {
+	s.backupCalls++
+	return mssql.BackupRequest{}, false, nil
 }
 
 func (s *tempdbFakeServer) FindTailObject(_ context.Context, _, _ int) (mssql.TailObject, bool, error) {

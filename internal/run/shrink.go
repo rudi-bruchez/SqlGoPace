@@ -29,6 +29,9 @@ type ShrinkReader interface {
 	// ActiveSessions is the running-request snapshot used to identify a session blocking the
 	// shrink (via mssql.FindSelfBlock) and classify it as transient maintenance.
 	ActiveSessions(ctx context.Context) ([]mssql.Session, error)
+	// RunningDataBackup reports a data backup running on the shrunk database. Log backups are
+	// excluded on purpose: measured harmless to a shrink.
+	RunningDataBackup(ctx context.Context) (mssql.BackupRequest, bool, error)
 }
 
 var _ ShrinkReader = (*mssql.Conn)(nil)
