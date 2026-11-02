@@ -7,11 +7,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	mssqldb "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
 
 	"github.com/rudi-bruchez/SqlGoPace/internal/mssql"
 )
@@ -196,6 +201,199 @@ func TestE2EShrinkData(t *testing.T) {
 	// both valid successful outcomes depending on the seeded free space).
 	if !bytes.Contains(logBytes, []byte("shrink ")) {
 		t.Errorf("run log missing a shrink summary\n--- log ---\n%s", logBytes)
+	}
+}
+
+// e2eDB opens a plain database/sql pool on database, reusing the DSN's server and
+// credentials. The test needs connections the tool does not own: one to run the backup
+// loop, one to set up and drop the database.
+func e2eDB(t *testing.T, dsn, database string) *sql.DB {
+	t.Helper()
+	cfg, err := msdsn.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse DSN: %v", err)
+	}
+	cfg.Database = database
+	return sql.OpenDB(mssqldb.NewConnectorConfig(cfg))
+}
+
+const (
+	backupDB   = "sqlgopace_e2e_backup"
+	backupFile = "/var/opt/mssql/data/sqlgopace_e2e_backup.bak"
+)
+
+// dropBackupDB removes the test database, its backup history and its backup file. It is
+// both the cleanup and the guard against a database a previous run left behind.
+func dropBackupDB(ctx context.Context, master *sql.DB) error {
+	for _, s := range []string{
+		"IF DB_ID(N'" + backupDB + "') IS NOT NULL ALTER DATABASE [" + backupDB + "] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;",
+		"DROP DATABASE IF EXISTS [" + backupDB + "];",
+		"EXEC msdb.dbo.sp_delete_database_backuphistory @database_name = N'" + backupDB + "';",
+		"EXEC master.sys.xp_delete_files N'" + backupFile + "';",
+	} {
+		if _, err := master.ExecContext(ctx, s); err != nil {
+			return fmt.Errorf("%s: %w", s, err)
+		}
+	}
+	return nil
+}
+
+const e2eBackupShrinkManifest = `
+description: e2e shrink data against a running backup
+database: sqlgopace_e2e_backup
+operations:
+  - operation: shrink
+    type: data
+    files: all
+    targetfreespace: 10%
+`
+
+// TestE2EShrinkWaitsForBackup runs a data shrink while BACKUP DATABASE loops on the same
+// database. A shrink chunk cannot move pages while a data backup holds the file, so
+// without awaitBackup the chunks gain nothing and the shrink stalls; with it, the run log
+// names the backup it waited for.
+//
+// The backup goes to a file, not to NUL: measured by the design review, a backup to NUL
+// of this database takes 0.6 s, every chunk waits it out and advances, and no backup wait
+// is ever seen. The loop is bounded in time (90 s) rather than by the shrink, because
+// awaitBackup waits as long as a data backup runs and an unbounded loop would make the
+// shrink wait for the test.
+func TestE2EShrinkWaitsForBackup(t *testing.T) {
+	dsn := e2eDSN(t)
+	ctx := context.Background()
+
+	master := e2eDB(t, dsn, "master")
+	t.Cleanup(func() { _ = master.Close() })
+	if err := dropBackupDB(ctx, master); err != nil {
+		t.Fatalf("drop leftover database: %v", err)
+	}
+	if _, err := master.ExecContext(ctx, "CREATE DATABASE ["+backupDB+"];"); err != nil {
+		t.Skipf("CREATE DATABASE refused: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := dropBackupDB(context.Background(), master); err != nil {
+			t.Errorf("cleanup: %v", err)
+		}
+	})
+
+	db := e2eDB(t, dsn, backupDB)
+	t.Cleanup(func() { _ = db.Close() })
+	for _, s := range []string{
+		"ALTER DATABASE [" + backupDB + "] SET RECOVERY SIMPLE;",
+		"CREATE TABLE dbo.dropped (id int IDENTITY PRIMARY KEY, payload char(7000) NOT NULL);",
+		"CREATE TABLE dbo.kept (id int IDENTITY PRIMARY KEY, payload char(7000) NOT NULL);",
+		"INSERT INTO dbo.dropped (payload) SELECT TOP (60000) 'x' FROM sys.all_objects a CROSS JOIN sys.all_objects b;",
+		"INSERT INTO dbo.kept (payload) SELECT TOP (60000) 'x' FROM sys.all_objects a CROSS JOIN sys.all_objects b;",
+		"DROP TABLE dbo.dropped;",
+		"CHECKPOINT;",
+	} {
+		if _, err := db.ExecContext(ctx, s); err != nil {
+			t.Fatalf("seed statement %q: %v", s, err)
+		}
+	}
+	// Dropping a table this size is a deferred drop: its pages are deallocated by a
+	// background task a few seconds later, and that task waits for any running BACKUP
+	// DATABASE to finish (measured on 2022 CU26). Started now, the backup loop would keep
+	// the space allocated and the shrink would find nothing to reclaim.
+	freed := false
+	for wait := time.Now().Add(60 * time.Second); time.Now().Before(wait); time.Sleep(500 * time.Millisecond) {
+		var sizeMB, usedMB int
+		if err := db.QueryRowContext(ctx, "SELECT size/128, FILEPROPERTY(name, 'SpaceUsed')/128 FROM sys.database_files WHERE type = 0;").Scan(&sizeMB, &usedMB); err != nil {
+			t.Fatalf("read data file space: %v", err)
+		}
+		if usedMB < sizeMB*2/3 {
+			freed = true
+			break
+		}
+	}
+	if !freed {
+		t.Fatal("dropped table's pages not deallocated within 60 s")
+	}
+
+	backupConn := e2eDB(t, dsn, "master")
+	done := make(chan struct{})
+	finished := make(chan struct{})
+	backupErr := make(chan error, 1)
+	// Registered after the database cleanup, so it runs first: the loop is stopped
+	// before the database is dropped under it.
+	t.Cleanup(func() {
+		close(done)
+		<-finished
+		_ = backupConn.Close()
+	})
+	go func() {
+		defer close(finished)
+		deadline := time.Now().Add(90 * time.Second)
+		for time.Now().Before(deadline) {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			_, err := backupConn.ExecContext(context.Background(), "BACKUP DATABASE ["+backupDB+"] TO DISK = '"+backupFile+
+				"' WITH INIT, COPY_ONLY, NO_COMPRESSION, BUFFERCOUNT = 1, MAXTRANSFERSIZE = 65536;")
+			if err != nil {
+				backupErr <- err
+				return
+			}
+		}
+	}()
+
+	// Start the shrink against a live backup, seen the way the tool sees it.
+	seen := false
+	for wait := time.Now().Add(30 * time.Second); time.Now().Before(wait); time.Sleep(100 * time.Millisecond) {
+		var n int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sys.dm_exec_requests WHERE command = 'BACKUP DATABASE' AND database_id = DB_ID();").Scan(&n); err != nil {
+			t.Fatalf("poll for backup: %v", err)
+		}
+		if n > 0 {
+			seen = true
+			break
+		}
+	}
+	if !seen {
+		select {
+		case err := <-backupErr:
+			t.Fatalf("no backup seen within 30 s; backup loop error: %v", err)
+		default:
+			t.Fatal("no backup seen within 30 s")
+		}
+	}
+
+	root := t.TempDir()
+	toRun := filepath.Join(root, "01.to_run")
+	if err := os.MkdirAll(toRun, 0o755); err != nil {
+		t.Fatalf("mkdir to_run: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(toRun, "010_shrink.yaml"), []byte(e2eBackupShrinkManifest), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	cfgPath := writeE2EConfig(t, root, dsn)
+
+	var out bytes.Buffer
+	if err := cli(&out, &out, []string{"--config", cfgPath}); err != nil {
+		t.Fatalf("cli(run) error = %v\n--- output ---\n%s", err, out.String())
+	}
+
+	select {
+	case err := <-backupErr:
+		t.Errorf("backup loop failed: %v", err)
+	default:
+	}
+	donePath := filepath.Join(root, "03.done", "010_shrink.yaml")
+	if _, err := os.Stat(donePath); err != nil {
+		t.Errorf("manifest not in done: %v\n--- output ---\n%s", err, out.String())
+	}
+	logBytes, err := os.ReadFile(donePath + ".log")
+	if err != nil {
+		logBytes, err = os.ReadFile(filepath.Join(root, "04.failed", "010_shrink.yaml.log"))
+		if err != nil {
+			t.Fatalf("run log not written: %v\n--- output ---\n%s", err, out.String())
+		}
+	}
+	t.Logf("run log:\n%s", logBytes)
+	if !bytes.Contains(logBytes, []byte("BACKUP DATABASE")) {
+		t.Errorf("run log does not name the BACKUP DATABASE the shrink waited for")
 	}
 }
 
