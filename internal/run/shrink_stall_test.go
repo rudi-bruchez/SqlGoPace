@@ -36,8 +36,8 @@ func TestYieldTallyDescribe(t *testing.T) {
 			t.Errorf("describe() = %q, missing %q", got, want)
 		}
 	}
-	if y.count() != 3 {
-		t.Errorf("count() = %d, want 3", y.count())
+	if y.n != 3 {
+		t.Errorf("n = %d, want 3", y.n)
 	}
 
 	t.Run("tie breaks to the login seen first", func(t *testing.T) {
@@ -48,9 +48,8 @@ func TestYieldTallyDescribe(t *testing.T) {
 		}
 	})
 
-	y.reset()
-	if y.describe() != "" || y.count() != 0 {
-		t.Errorf("after reset: describe=%q count=%d", y.describe(), y.count())
+	if got := (yieldTally{}).describe(); got != "" {
+		t.Errorf("empty tally: describe=%q, want empty", got)
 	}
 }
 

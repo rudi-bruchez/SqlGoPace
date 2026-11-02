@@ -1399,9 +1399,6 @@ func TestShrinkSnapshotAtYieldBeforeCancel(t *testing.T) {
 	if !out.stopped {
 		t.Fatalf("stopped = false, want true (err = %v)", out.err)
 	}
-	if out.yield == nil {
-		t.Fatal("yield = nil, want a snapshot when the chunk yields")
-	}
 	if len(out.yield.Blocked) != 1 || out.yield.Blocked[0].Login != "svc_loader" {
 		t.Errorf("Blocked = %+v, want the one svc_loader session read before the cancel", out.yield.Blocked)
 	}
@@ -1426,11 +1423,8 @@ func TestShrinkSnapshotAtYieldSurvivesReadError(t *testing.T) {
 	if !out.stopped || out.err != nil {
 		t.Fatalf("stopped = %v, err = %v, want a clean yield", out.stopped, out.err)
 	}
-	if out.yield == nil {
-		t.Fatal("yield = nil, want an empty snapshot")
-	}
 	if len(out.yield.Blocked) != 0 || out.yield.Self.Blocked {
-		t.Errorf("yield = %+v, want no sessions", *out.yield)
+		t.Errorf("yield = %+v, want no sessions", out.yield)
 	}
 }
 

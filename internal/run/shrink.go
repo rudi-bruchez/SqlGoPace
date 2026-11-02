@@ -491,14 +491,20 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 	shrinkStart := r.clk.Now() // anchors the ETA from the reduction rate achieved so far
 	var lastMaint *MaintBlock  // most recent in-flight maintenance-block observation from runChunk
 	var tally yieldTally       // yields since the last chunk that gained space
+	// stopAt records a graceful stop at the current size; any other error passes through.
+	stopAt := func(err error, why string) (ShrinkResult, error) {
+		if errors.Is(err, ErrStopped) {
+			result.FinalMB = current
+			result.Reason = "stopped: graceful stop" + why + " (work preserved)"
+		}
+		return result, err
+	}
 
 	for current > final {
 		// Graceful stop: each chunk commits, so stopping between chunks preserves work;
 		// the next run resumes the shrink from the current (already reduced) size.
 		if stopRequested(r.stop) {
-			result.FinalMB = current
-			result.Reason = "stopped: graceful stop (work preserved)"
-			return result, ErrStopped
+			return stopAt(ErrStopped, "")
 		}
 		// Emit progress every iteration, not only after a chunk gains space, so a shrink
 		// that is blocked or stalling still shows its live current size, chunk count, step,
@@ -551,11 +557,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 					result.Reason = "stopped: log did not drain before timeout (work preserved)"
 					return result, nil
 				}
-				if errors.Is(err, ErrStopped) {
-					result.FinalMB = current
-					result.Reason = "stopped: graceful stop (work preserved)"
-				}
-				return result, err
+				return stopAt(err, "")
 			}
 		}
 
@@ -578,9 +580,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			}
 			switch classifyNoGain(out.stopped, running) {
 			case causeYield:
-				if out.yield != nil {
-					tally.add(*out.yield)
-				}
+				tally.add(out.yield)
 				wasAboveFloor := step > r.tuning.MinStepMB
 				step = halveStep(step, r.tuning, maxStep)
 				if wasAboveFloor {
@@ -591,11 +591,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 					werr := r.wait(ctx, r.tuning.NoProgressBackoff)
 					blocked += r.clk.Since(w0)
 					if werr != nil {
-						if errors.Is(werr, ErrStopped) {
-							result.FinalMB = current
-							result.Reason = "stopped: graceful stop (work preserved)"
-						}
-						return result, werr
+						return stopAt(werr, "")
 					}
 					continue
 				}
@@ -606,11 +602,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 				err := r.awaitBackup(ctx, f.Name, backup, sink, prog)
 				blocked += r.clk.Since(b0)
 				if err != nil {
-					if errors.Is(err, ErrStopped) {
-						result.FinalMB = current
-						result.Reason = "stopped: graceful stop during a backup wait (work preserved)"
-					}
-					return result, err
+					return stopAt(err, " during a backup wait")
 				}
 				continue
 			default: // causeStall
@@ -627,28 +619,10 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 			if werr != nil {
 				return result, werr
 			} else if bound != "" {
-				// Capture the tail first: its finding goes in the reason. Order: who the run
-				// yielded to, the bound, the step floor, the tail object, then the promise.
+				// Capture the tail first: its finding goes in the reason.
 				tail := r.captureGiveUpTail(ctx, f, sink, tp)
-				var parts []string
-				if d := tally.describe(); d != "" {
-					parts = append(parts, d)
-				}
-				stalled := "no further progress after " + bound
-				if out.err != nil {
-					stalled = fmt.Sprintf("%s: %v", stalled, out.err)
-				}
-				parts = append(parts, stalled)
-				if tally.count() > 0 && step == r.tuning.MinStepMB {
-					parts = append(parts, fmt.Sprintf("step at min_step_mb (%d MB)", step))
-				}
-				if tail != nil {
-					parts = append(parts, fmt.Sprintf("tail object at give-up: %s.%s index_id=%d, %d pages from end",
-						tail.Schema, tail.Table, tail.IndexID, tail.PageFromEnd))
-				}
-				parts = append(parts, "work preserved")
 				result.FinalMB = current
-				result.Reason = giveUpReason(tp, strings.Join(parts, "; "))
+				result.Reason = giveUpReason(tp, giveUpDetail(tally, bound, out.err, step, r.tuning.MinStepMB, tail))
 				return result, nil
 			}
 			continue
@@ -659,7 +633,7 @@ func (r *ShrinkRunner) chunkLoop(ctx context.Context, f mssql.FileSpace, start, 
 		noProgress = 0
 		backoff = r.tuning.NoProgressBackoff
 		stallWaited = 0
-		tally.reset()
+		tally = yieldTally{}
 		step = AdjustStepMB(step, elapsed, waitDeltas(before, after), out.stopped, r.tuning, maxStep)
 		current = newSize
 		result.Chunks++
@@ -819,12 +793,12 @@ func (r *ShrinkRunner) awaitLogReuse(ctx context.Context, sink ReactionSink) err
 	}
 }
 
-// chunkOutcome is how one runChunk call ended. yield is non-nil exactly when stopped is
-// true: it holds what the monitor saw at the moment the chunk was stopped.
+// chunkOutcome is how one runChunk call ended. When stopped, yield holds what the monitor
+// saw at the moment the chunk was stopped; otherwise it is empty.
 type chunkOutcome struct {
 	stopped bool
 	maint   *MaintBlock
-	yield   *yieldSnapshot
+	yield   yieldSnapshot
 	err     error
 }
 
@@ -883,7 +857,7 @@ func (r *ShrinkRunner) runChunk(ctx context.Context, file string, targetMB int, 
 	yield := r.snapshotYield(ctx)
 	sink(ReactionEvent{Kind: "pause", Detail: "shrink chunk stopped under pressure; committed work preserved — " + pressure.Detail()})
 	r.cancelAndAwait(cancelExec, done, sink, "abort did not stop the chunk within the grace period")
-	return chunkOutcome{stopped: true, maint: maint, yield: &yield}
+	return chunkOutcome{stopped: true, maint: maint, yield: yield}
 }
 
 // snapshotYield reads the sessions our DDL is blocking, and our own blocker if any. A

@@ -69,10 +69,6 @@ func (t *yieldTally) add(s yieldSnapshot) {
 	}
 }
 
-func (t *yieldTally) reset() { *t = yieldTally{} }
-
-func (t yieldTally) count() int { return t.n }
-
 // describe summarizes the yields for the give-up reason; empty when there were none.
 func (t yieldTally) describe() string {
 	if t.n == 0 {
@@ -97,4 +93,27 @@ func (t yieldTally) describe() string {
 		fmt.Fprintf(&b, "; chunk itself blocked by session %d, login=%s", t.lastSelf.SPID, t.lastSelf.Login)
 	}
 	return b.String()
+}
+
+// giveUpDetail assembles the give-up reason in this order: who the run yielded to, the
+// bound that tripped (with the last chunk error), the step floor when yields drove the
+// step there, the tail object, then the promise.
+func giveUpDetail(t yieldTally, bound string, chunkErr error, step, minStep int, tail *TailFinding) string {
+	var parts []string
+	if d := t.describe(); d != "" {
+		parts = append(parts, d)
+	}
+	stalled := "no further progress after " + bound
+	if chunkErr != nil {
+		stalled = fmt.Sprintf("%s: %v", stalled, chunkErr)
+	}
+	parts = append(parts, stalled)
+	if t.n > 0 && step == minStep {
+		parts = append(parts, fmt.Sprintf("step at min_step_mb (%d MB)", step))
+	}
+	if tail != nil {
+		parts = append(parts, fmt.Sprintf("tail object at give-up: %s.%s index_id=%d, %d pages from end",
+			tail.Schema, tail.Table, tail.IndexID, tail.PageFromEnd))
+	}
+	return strings.Join(append(parts, "work preserved"), "; ")
 }

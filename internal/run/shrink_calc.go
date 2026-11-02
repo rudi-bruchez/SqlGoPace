@@ -172,8 +172,7 @@ func AdjustStepMB(step int, elapsed time.Duration, w WaitDeltas, stopped bool, t
 }
 
 // halveStep is the multiplicative-decrease half of the AIMD law. It lives here, rather than
-// inline, because the driver halves the step on other paths too. chunkLoop has three callers:
-// AdjustStepMB, a chunk that errored without moving a page, and a yield above the floor. All go
+// inline, because the driver halves the step on other paths too (grep its callers). All go
 // through this so the decrease has one home: anyone re-deriving the stability ratio in
 // AdjustStepMB has to account for every caller.
 func halveStep(step int, t ShrinkTuning, maxStep int) int {
